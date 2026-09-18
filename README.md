@@ -43,6 +43,10 @@ is annoying.
 | [`docs/import-adapters.md`](docs/import-adapters.md) | The `Record` schema and adapter contract — how new sources slot in |
 | [`docs/v1-tech-design.md`](docs/v1-tech-design.md) | Technical design, the adversarial review that reshaped it, and build order |
 
+Backlog: **13 epics, 72 issues** across phase 1 (private drafting), phase 1.5 (a shared
+document-grounded duo), phase 2 (public answering, permissions, trust) and phase 3 (actions,
+role duos).
+
 ## Principles
 
 - **Trust is per-topic and per-action, never global.** Promote slowly, demote fast.
@@ -50,6 +54,7 @@ is annoying.
 - **The user never writes their personality — they approve a draft of it.**
 - **Self-created duos only**, always labelled, instantly killable.
 - **Start with what needs no one's permission.** Every approval you wait on is a week not shipped.
+- **A persona without decision history is a commodity.** Never build a persona-authoring product, and never call a duo an employee.
 
 ## License
 

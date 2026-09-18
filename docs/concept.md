@@ -208,3 +208,63 @@ Written up properly, this list *is* the security review submission.
 - Not a search engine over documents
 - Not a clone, not an impersonation, never unlabelled
 - No duos *of* someone, created *by* someone else. Self-created only, instantly killable.
+- **Not a persona-authoring product.** No builder UI, no template gallery, no marketplace. See §12.
+- Nothing is ever called a "virtual employee". See §12.
+
+## 12. Synthetic personas and role duos
+
+A duo mirrors a real person. A **synthetic persona** has no human original — it is authored rather
+than derived. The extension is tempting because it deletes every hard problem in this document at
+once: no consent, no impersonation, no reputation on the line, no accountability chain, no
+cold start, and published-material-only grounding that is far easier to clear for inference.
+
+### Why it cannot be the product
+
+A persona with no human original has no decision history. It has documents and a prompt — which
+makes it, by construction, the RAG-bot-with-a-personality-skin that §3 says we must not be. It
+also puts us in the same lane as every agent-building platform, including the sanctioned internal
+one, holding the weaker hand.
+
+And the palatability has a price attached. **A duo's answer carries weight because a named officer
+stands behind it. A synthetic persona's answer carries none.** Palatability and authority are
+inversely related here: what makes synthetic personas easy to ship is exactly what makes them
+matter less.
+
+### The version that is strong: role duos
+
+The valuable object is probably neither one officer's duo nor an invented policy bot, but the duo
+of a **role** — the deployment access desk, the clearance desk — seeded from the real decisions of
+everyone who has held that post.
+
+The contribution of the synthetic-persona idea is that it **decouples decision history from one
+specific human**. That decoupling is the move worth making:
+
+| | Personal duo | Synthetic persona | **Role duo** |
+|---|---|---|---|
+| Grounded in decisions | ✅ | ❌ documents only | ✅ |
+| No individual's reputation at stake | ❌ | ✅ | ✅ |
+| Survives rotation | ❌ | n/a | ✅ natively |
+| Gets enough traffic to learn | ❌ small team | ✅ | ✅ |
+
+A persona without decision history is a commodity. Decision history without a single person
+attached is what an organisation would actually institutionalise.
+
+### How it enters the roadmap
+
+1. **Phase 1, as a primitive.** A duo is modelled as an entity whose owner may be a person, a
+   role, or nothing, and knowledge sources are pluggable between *derived* and *authored*. Cheap
+   now; painful to retrofit once the trust grid and audit log exist. A synthetic persona also
+   gives us something to exercise the draft pipeline against before any corpus exists.
+2. **Phase 1.5, as a bridge.** One narrow, document-grounded shared duo for the team. It ships
+   while the gating unknowns are still open, touches no personal data, and gets the runtime used.
+3. **Phase 3, as role duos.** Absorbs continuity: handover, transfer, and archival all become
+   special cases of a duo belonging to a desk rather than to a person.
+
+### Two guardrails
+
+- **Never build a persona-authoring product.** Synthetic personas are configuration — a file next
+  to the standing orders. The moment there is a "create your agent" screen, this is a platform, it
+  is in the internal platform team's lane, and focus is gone.
+- **Never call them employees.** "Virtual employee" in a public-service context reads as headcount
+  replacement, and that framing will kill the project by people who never look at what it does.
+  Role duo, desk duo, duty desk — all fine.

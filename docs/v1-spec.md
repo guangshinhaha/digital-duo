@@ -66,7 +66,7 @@ speak.
 | Trust grid, promotion/demotion ledger | Nothing to promote until there is public answering |
 | Actions beyond drafting (T2–T4) | Not until drafting is demonstrably good |
 | Deflection dashboards / weekly receipts | No audience to convince — that is an adoption artifact, not a pilot one |
-| Multi-tenant anything | Build for one duo, hardcode the owner, generalise when a teammate asks |
+| Multi-tenant anything | Build for one duo — but model it as an entity rather than scattering the owner through the code, so a role duo or a shared duo needs no retrofit (`concept.md` §12) |
 | Live capture, gov-tool connectors | Blocked on docs/approvals. Stub the adapters. |
 
 ### The one thing that must not be cut
@@ -111,6 +111,9 @@ Explicitly *not* a criterion: answer quality scores. At this scale, judgement be
 - **Keep the model layer abstracted.** A prototype stack will not survive a production security
   review; the whole thing must be re-pointable at approved infrastructure without a rewrite.
 - **Standing orders are a real file**, versioned, human-diffable — not a system-prompt blob.
+- **A duo is an entity, not a global.** Its owner may be a person, a role, or nothing, and its
+  knowledge sources are pluggable between derived and authored. This is the one concession to
+  `concept.md` §12 made in v1, and it is cheap only if made now.
 - **Provenance on everything.** Every draft carries its sources; every standing order carries the
   threads it came from. Retrofitting provenance is painful; adding it at the start is free.
 - **Position as a layer on the sanctioned AI stack**, not a competitor to it.
