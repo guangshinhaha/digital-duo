@@ -41,6 +41,7 @@ is annoying.
 | [`docs/concept.md`](docs/concept.md) | Product thesis, the wedge, trust ladder, the Mirror onboarding, consent design, risks |
 | [`docs/v1-spec.md`](docs/v1-spec.md) | v1 scope, what's deferred and why, sequencing, pilot success criteria |
 | [`docs/import-adapters.md`](docs/import-adapters.md) | The `Record` schema and adapter contract — how new sources slot in |
+| [`docs/v1-tech-design.md`](docs/v1-tech-design.md) | Technical design, the adversarial review that reshaped it, and build order |
 
 ## Principles
 
