@@ -1,30 +1,54 @@
 # Digital Duo
 
-Your AI counterpart. A platform where anyone can create a digital agent of themselves — their
-personality, their knowledge, and their authorized actions — that colleagues can `@mention`
-in Slack (and elsewhere) to consult, get decisions, or have work done on their behalf.
+Your AI counterpart. A platform where a person creates a digital agent of themselves — their
+voice, their knowledge, and their authorised actions — that colleagues can consult, and that
+eventually acts on their behalf within limits they set.
 
-> Status: idea / exploration. Nothing here is built yet.
+Not a clone. A **duo**: a second you that holds your context, works inside boundaries you grant,
+and never poses as you.
 
-## The one-liner
+> **Status:** concept converged, pre-build. Internal GovTech project. Pilot = author + immediate team.
 
-Not a chatbot. A **duo** — a second you that holds your context and acts within limits you set.
+## The bet
 
-## Core concepts
+A knowledge base is not documents — it is **decisions**. What makes a duo worth consulting is
+that it knows what you would say *no* to, what you would push back on, what you would escalate.
+That lives in past Slack threads and AI chat history, not in uploaded PDFs.
 
-| Concept | What it is |
+The output is a **readable, editable list of standing orders** — not a black-box fine-tune. When
+someone asks "why did it do that," you open a file and point at a line.
+
+## v1 in one loop
+
+```
+someone asks you in Slack
+      ↓
+your duo drafts a reply — visible only to you
+      ↓
+you send / edit / ignore
+      ↓
+the edit becomes a standing order
+```
+
+Private drafting first, because it delivers value at a team size of one and carries zero
+embarrassment risk. Public answering comes when the duo is good enough that withholding it
+is annoying.
+
+## Docs
+
+| Doc | What's in it |
 |---|---|
-| **Persona** | Voice, tone, values, decision heuristics, "what I'd say no to" |
-| **Knowledge** | Docs, notes, past messages, meeting transcripts — grounded, cited, permissioned |
-| **Actions** | Scoped tools the duo may use (approve PR, answer FAQ, book time, draft reply) |
-| **Boundaries** | Confidence thresholds, escalation rules, auto vs. ask-first, audit trail |
-| **Surfaces** | Slack, email, web, API, meetings |
+| [`docs/concept.md`](docs/concept.md) | Product thesis, the wedge, trust ladder, the Mirror onboarding, consent design, risks |
+| [`docs/v1-spec.md`](docs/v1-spec.md) | v1 scope, what's deferred and why, sequencing, pilot success criteria |
+| [`docs/import-adapters.md`](docs/import-adapters.md) | The `Record` schema and adapter contract — how new sources slot in |
 
-## Repo layout (planned)
+## Principles
 
-```
-docs/    concept notes, architecture, decisions
-```
+- **Trust is per-topic and per-action, never global.** Promote slowly, demote fast.
+- **Anything external or irreversible is never autonomous.** A stated principle, not a caveat.
+- **The user never writes their personality — they approve a draft of it.**
+- **Self-created duos only**, always labelled, instantly killable.
+- **Start with what needs no one's permission.** Every approval you wait on is a week not shipped.
 
 ## License
 
