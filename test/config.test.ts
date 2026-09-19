@@ -18,6 +18,7 @@ describe("loadConfig", () => {
       selfConsistencySamples: 3,
       recencyHalfLifeDays: 180,
     });
+    expect(config.eval).toEqual({ holdoutDays: 42 });
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -37,6 +38,7 @@ describe("loadConfig", () => {
       DUO_CONFIDENCE_ESCALATION_THRESHOLD: "0.6",
       DUO_CONFIDENCE_SELF_CONSISTENCY_SAMPLES: "5",
       DUO_CONFIDENCE_RECENCY_HALF_LIFE_DAYS: "90",
+      DUO_EVAL_HOLDOUT_DAYS: "21",
     });
     expect(config).toEqual({
       providerName: "ollama",
@@ -50,6 +52,7 @@ describe("loadConfig", () => {
         selfConsistencySamples: 5,
         recencyHalfLifeDays: 90,
       },
+      eval: { holdoutDays: 21 },
     });
   });
 

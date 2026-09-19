@@ -9,6 +9,8 @@ import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./co
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
+import { runEvalOffline } from "./commands/eval.js";
+import { WOULD_HAVE_SENT_CAVEAT } from "./eval/offline-eval.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import {
@@ -1169,6 +1171,56 @@ actionsCommand
         for (const grant of result.lapsedGrants) {
           console.log(`  [${grant.topicId}] ${grant.tier}: ${grant.previousLevel} -> ask`);
         }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The offline evaluation harness (v1-tech-design.md §1.10, epic e6):
+// draft quality on a real time-based held-out split (#35).
+const evalCommand = program.command("eval").description("Offline evaluation: draft quality on a real time-based held-out split");
+
+function parseIntegerOption(flag: string): (value: string) => number {
+  return (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`${flag} expects a number, got "${value}"`);
+    }
+    return parsed;
+  };
+}
+
+evalCommand
+  .command("offline")
+  .description(
+    "Time-split the corpus, re-run derivation on the train split only, and score drafts against real held-out answers (#35)",
+  )
+  .option("--sample <n>", "evaluate only this many held-out pairs (a seeded, reproducible sample)", parseIntegerOption("--sample"))
+  .option("--seed <n>", "seed for sampling and ordering, for a reproducible run", parseIntegerOption("--seed"))
+  .action(async (options: { sample?: number; seed?: number }) => {
+    const config = loadConfig();
+    try {
+      const report = await runEvalOffline(config, { sampleSize: options.sample, seed: options.seed });
+      console.log(
+        `Holdout: ${report.holdoutDays} day(s) (corpus spans ${report.corpusSpanDays.toFixed(1)} day(s); cutoff ${report.cutoff}).`,
+      );
+      console.log(
+        `Train: ${report.trainRecordCount} record(s). Held out: ${report.heldOutRecordCount} record(s), ` +
+          `${report.heldOutPairCount} qa_pair(s) — evaluated ${report.evaluatedCount} (seed ${report.seed}).`,
+      );
+      console.log(
+        `Rules induced from the train split alone: ${report.confirmedRuleCount} confirmed, ` +
+          `${report.inconsistentRuleCount} inconsistent, ${report.weakSignalRuleCount} weak signal.`,
+      );
+      console.log(
+        `Mean similarity to the real answer: ${report.meanSimilarity.toFixed(3)}. Would-have-sent rate: ` +
+          `${report.wouldHaveSentRate.toFixed(3)}. Escalation rate: ${report.escalationRate.toFixed(3)}.`,
+      );
+      console.log("");
+      console.log(WOULD_HAVE_SENT_CAVEAT);
+      if (report.humanReviewSample.length > 0) {
+        console.log(`Spot-check these by hand: ${report.humanReviewSample.join(", ")}`);
       }
     } catch (error) {
       reportError(error);
