@@ -250,7 +250,21 @@ ceremony on work that doesn't need it:
   the second. 209 tests. Self-review found no fixable issues. No asker resolution yet — that's
   #49, next.
 
-**Next:** #49 (wave W2, epic `e10` — permissions). Per §1/§2, `e10` and `e64` (shared-duos) still
+- #49 (PR [#97](https://github.com/guangshinhaha/digital-duo/pull/97), merged, squash commit
+  `ebbbbeb`) — lighter path: `src/permissions/directory.ts` (new): `AskerIdentity`, read from a
+  checked-in `duo/directory.json` — the source-of-truth stand-in, same "checked-in file,
+  hand-maintained" convention `duo/topics.json` already established; provisioning clearances
+  stays out of scope, this only reads. `resolveAsker` matches by id case-insensitively and comes
+  back `{resolved: false}` for a no-match rather than throwing; `effectiveClearance` gives an
+  unresolved asker the lowest defined clearance, the most restrictive treatment (AC2).
+  `src/permissions/retrieval.ts` (new): `retrieveForAsker`, the one entry point for asker-scoped
+  retrieval — resolves the directory + asker *before* calling #20's `hybridSearch`, then filters
+  the returned candidates immediately into `generationContext` (what may go downstream) and
+  `excluded` (what matched but was filtered, and why), so there's no code path through which an
+  excluded record ever reaches generation. 222 tests. Self-review found no fixable issues. No
+  answering/generation or audit log yet — that's #50, next.
+
+**Next:** #50 (wave W2, epic `e10` — permissions). Per §1/§2, `e10` and `e64` (shared-duos) still
 run strictly one at a time on `main` within wave W2, not concurrently with each other or with
 anything else.
 
