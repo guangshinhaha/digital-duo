@@ -1,5 +1,6 @@
 import type { DuoConfig } from "../config.js";
 import { createLlmAdjudicator, runPairExtraction, type PairExtractionSummary } from "../derivation/qa-pairs.js";
+import { createLlmRuleTextGenerator, runRuleInduction, type RuleInductionSummary } from "../derivation/rules.js";
 import { createLlmTopicLabeler, runTopicAssignment, type TopicAssignmentResult } from "../derivation/topics.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { ProviderConfigError } from "../provider/types.js";
@@ -50,4 +51,22 @@ export async function runDeriveTopics(config: DuoConfig, env: NodeJS.ProcessEnv 
   const embeddingProvider = createOllamaEmbeddingProvider(config);
 
   return runTopicAssignment(config.storePath, passphrase, config.duoDir, embeddingProvider, { labelTopic });
+}
+
+/**
+ * Implements `duo derive rules`. Only the `confirmed`-case rule phrasing is
+ * ever handed to an LLM (v1-tech-design.md §1.5 step 3); the deterministic
+ * default (the topic's most central answer, verbatim) is used whenever no
+ * provider is configured, same best-effort shape as the other derive
+ * commands.
+ */
+export async function runDeriveRules(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): Promise<RuleInductionSummary> {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+
+  const provider = tryResolveProvider(config);
+  const generateRuleText = provider ? createLlmRuleTextGenerator(provider) : undefined;
+  const embeddingProvider = createOllamaEmbeddingProvider(config);
+
+  return runRuleInduction(config.storePath, passphrase, embeddingProvider, { generateRuleText });
 }
