@@ -4,6 +4,7 @@ import { tryResolveProvider } from "../provider/registry.js";
 import { type EnforceCeilingOutcome, enforceClassificationCeiling, parseClassificationCeiling } from "../permissions/classification.js";
 import { answerForAsker, type AnswerForAskerResult } from "../permissions/answer.js";
 import { type AuditEntry, getAuditEntry, listAuditEntries } from "../permissions/audit.js";
+import { answerPublicly, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -32,6 +33,28 @@ export async function runAskAsAsker(
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
   return answerForAsker(config.storePath, passphrase, config.duoDir, question, askerRef, embeddingProvider, inferenceProvider);
+}
+
+/**
+ * Implements `duo permissions ask-public <question> --as <askerRef>` (#43):
+ * a colleague's question, drafted privately as v1 always does, and posted
+ * publicly only when the topic holds T0 autonomy, the evidence clears
+ * confidence, and nothing about it is refused. `askerRef` is recorded for
+ * the public-answer log only — #43 is explicit that per-asker
+ * differentiation is out of scope, so it is never resolved against
+ * duo/directory.json here the way `runAskAsAsker` resolves it.
+ */
+export async function runAnswerPublicly(
+  question: string,
+  askerRef: string,
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<PublicAnswerOutcome> {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const embeddingProvider = createOllamaEmbeddingProvider(config);
+  const inferenceProvider = tryResolveProvider(config);
+  return answerPublicly(config.storePath, passphrase, config.duoDir, question, askerRef, embeddingProvider, inferenceProvider, config.confidence);
 }
 
 /** Implements `duo permissions audit` (#51 AC1): every audit entry, oldest first — the owner's full list to scan or pipe. */
