@@ -28,7 +28,11 @@ const DEFAULT_CONFIDENCE_WEIGHT_RECENCY = 0.1;
 const DEFAULT_CONFIDENCE_WEIGHT_SELF_REPORT = 0.05;
 // Below this composite score, the draft pipeline (#32/#34) suppresses the
 // draft in favor of an escalation (#33 AC2).
-const DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD = 0.55;
+// Exported (unlike this file's other DEFAULT_* constants) because
+// drafting/draft-log.ts's own fallback for a caller that omits
+// escalationThreshold must never silently drift from this one — see that
+// module's DEFAULT_ESCALATION_THRESHOLD doc comment.
+export const DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD = 0.55;
 // Fixed sample count for self-consistency (#33 AC checklist): generate
 // this many drafts and measure their agreement.
 const DEFAULT_CONFIDENCE_SELF_CONSISTENCY_SAMPLES = 3;

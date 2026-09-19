@@ -44,6 +44,19 @@ describe("queueStandingOrderCandidate — an escalation can be turned into a rul
     });
   });
 
+  it("is idempotent: a second call against the same draft returns the same id and queues nothing new (a client remount re-submitting must never duplicate)", () => {
+    const storePath = initStore();
+    const draftId = seedEscalatedDraft(storePath);
+
+    const first = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "Bonuses are 5% of salary.");
+    const second = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "A different answer, same draft.");
+
+    expect(second).toBe(first);
+    const candidates = listStandingOrderCandidates(storePath, PASSPHRASE);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].answerText).toBe("Bonuses are 5% of salary.");
+  });
+
   it("refuses to queue a candidate against a draft that was never escalated", () => {
     const storePath = initStore();
     const draftId = appendDraft(storePath, PASSPHRASE, {

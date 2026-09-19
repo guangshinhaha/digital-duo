@@ -56,6 +56,16 @@ export class NotAnEscalationError extends Error {
  * the pipeline was confident enough to answer) can be turned into one of
  * these.
  */
+/**
+ * Idempotent by `draftId`: an escalation can only ever be "answered" once
+ * in the sense this table records, so a second call against the same
+ * draft (a retried request, a client remounting and re-showing an answer
+ * box that hasn't caught up with a just-recorded outcome) returns the
+ * already-queued candidate's id rather than inserting a duplicate. Same
+ * dedup shape `corrections/queue.ts`'s `queueCorrectionCandidate` already
+ * uses for the same reason. The *text* of a resubmission is ignored on a
+ * repeat call — the first answer queued is the one of record.
+ */
 export function queueStandingOrderCandidate(storePath: string, passphrase: string, draftId: string, answerText: string): string {
   const draft = getDraft(storePath, passphrase, draftId);
   if (!draft) {
@@ -67,13 +77,17 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
 
   const id = randomUUID();
   const createdAt = new Date().toISOString();
-  withDatabase(storePath, passphrase, true, (db) => {
+  return withDatabase(storePath, passphrase, true, (db) => {
     ensureStandingOrderCandidateSchema(db);
+    const existing = db.prepare(`SELECT id FROM standing_order_candidates WHERE draft_id = ?`).get(draftId) as { id: string } | undefined;
+    if (existing) {
+      return existing.id;
+    }
     db.prepare(
       `INSERT INTO standing_order_candidates (id, draft_id, question, answer_text, status, created_at, reviewed_at) VALUES (?, ?, ?, ?, 'pending', ?, NULL)`,
     ).run(id, draftId, draft.question, answerText, createdAt);
+    return id;
   });
-  return id;
 }
 
 interface StandingOrderCandidateRow {

@@ -1,8 +1,8 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
-import { appendDraft, DraftNotFoundError, getDraft, listDrafts, recordDraftOutcome } from "../src/drafting/draft-log.js";
-import { createEncryptedStore } from "../src/store/store.js";
+import { appendDraft, DraftNotFoundError, ensureDraftLogSchema, getDraft, listDrafts, recordDraftOutcome } from "../src/drafting/draft-log.js";
+import { createEncryptedStore, withDatabase, type Database } from "../src/store/store.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -275,5 +275,59 @@ describe("listDrafts", () => {
 
     const cutoff = new Date(new Date(firstDraft!.createdAt).getTime() + 1).toISOString();
     expect(listDrafts(storePath, PASSPHRASE, { before: cutoff }).map((draft) => draft.id)).toEqual([first]);
+  });
+});
+
+describe("ensureDraftLogSchema — migrating a pre-existing drafts table", () => {
+  /** The exact 12-column shape `drafts` had before `refused`/`escalation_threshold` existed — reproduces a real `duo serve`/`duo draft` store that ran before this change, since `CREATE TABLE IF NOT EXISTS` alone is a no-op against a table that already exists. */
+  function createPreMigrationDraftsTable(db: Database): void {
+    db.exec(`
+      CREATE TABLE drafts (
+        id TEXT PRIMARY KEY,
+        question TEXT NOT NULL,
+        thread_context TEXT,
+        draft_text TEXT,
+        escalated INTEGER NOT NULL,
+        escalation_reason TEXT,
+        confidence_score REAL NOT NULL,
+        sources TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        outcome TEXT,
+        outcome_recorded_at TEXT,
+        sent_text TEXT
+      ) STRICT
+    `);
+  }
+
+  it("adds the missing columns to a table created before they existed, rather than throwing on the next append", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      createPreMigrationDraftsTable(db);
+    });
+
+    // Before the fix this threw: "table drafts has no column named refused"
+    // — CREATE TABLE IF NOT EXISTS never alters a table that already exists.
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.refused).toBe(false);
+    expect(draft?.escalationThreshold).toBe(0.55);
+  });
+
+  it("running the migration twice is a no-op, not an error", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      createPreMigrationDraftsTable(db);
+      ensureDraftLogSchema(db);
+      expect(() => ensureDraftLogSchema(db)).not.toThrow();
+    });
   });
 });

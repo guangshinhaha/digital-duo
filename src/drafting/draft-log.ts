@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD } from "../config.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 
@@ -62,6 +63,24 @@ export interface DraftRecord {
   readonly escalationThreshold: number;
 }
 
+/**
+ * Columns added to `drafts` after its first release, each with the
+ * default a pre-existing row should read as. `CREATE TABLE IF NOT
+ * EXISTS` is a no-op against a table that already exists — it does
+ * nothing to add a column to a `drafts` table created by an
+ * already-running `duo serve` or an earlier `duo draft` call, so a
+ * bare schema-string change here would throw "table drafts has no
+ * column named …" on the very next `appendDraft` against that
+ * pre-existing store. `ensureDraftLogSchema` below applies these via
+ * `ALTER TABLE … ADD COLUMN` against any table that predates them,
+ * checked with `PRAGMA table_info` so this stays a no-op once a store
+ * is already current.
+ */
+const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: string }[] = [
+  { column: "refused", ddl: "ALTER TABLE drafts ADD COLUMN refused INTEGER NOT NULL DEFAULT 0" },
+  { column: "escalation_threshold", ddl: "ALTER TABLE drafts ADD COLUMN escalation_threshold REAL NOT NULL DEFAULT 0.55" },
+];
+
 export function ensureDraftLogSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS drafts (
@@ -78,9 +97,20 @@ export function ensureDraftLogSchema(db: Database): void {
       outcome_recorded_at TEXT,
       sent_text TEXT,
       refused INTEGER NOT NULL DEFAULT 0,
+      -- Keep in sync with DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD (config.ts)
+      -- — a SQL DDL literal can't reference a TS constant directly.
       escalation_threshold REAL NOT NULL DEFAULT 0.55
     ) STRICT
   `);
+
+  const existingColumns = new Set(
+    (db.prepare(`PRAGMA table_info(drafts)`).all() as unknown as { name: string }[]).map((row) => row.name),
+  );
+  for (const migration of DRAFT_LOG_MIGRATIONS) {
+    if (!existingColumns.has(migration.column)) {
+      db.exec(migration.ddl);
+    }
+  }
 }
 
 export interface AppendDraftInput {
@@ -93,12 +123,9 @@ export interface AppendDraftInput {
   readonly sources: readonly DraftSource[];
   /** See `DraftRecord.refused`'s doc comment. `false` for a non-escalated draft. Optional — defaults to `false`, the correct value for every caller that isn't drafting/pipeline.ts's refused-subject path. */
   readonly refused?: boolean;
-  /** See `DraftRecord.escalationThreshold`'s doc comment — the threshold in effect for this call. Optional — defaults to the shipped default (0.55, matching DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD in config.ts) for a caller that isn't threading a real DuoConfig["confidence"] through. */
+  /** See `DraftRecord.escalationThreshold`'s doc comment — the threshold in effect for this call. Optional — defaults to `DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD` (config.ts) for a caller that isn't threading a real `DuoConfig["confidence"]` through. */
   readonly escalationThreshold?: number;
 }
-
-/** Mirrors config.ts's own DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD — duplicated as a literal rather than imported, since draft-log.ts is a low-level storage module that otherwise has no dependency on config.ts, and this is only ever the fallback for a caller that doesn't have (or care about) a real configured threshold. */
-const DEFAULT_ESCALATION_THRESHOLD = 0.55;
 
 /** Appends one draft (answered or escalated) and returns its id. */
 export function appendDraft(storePath: string, passphrase: string, input: AppendDraftInput): string {
@@ -122,7 +149,7 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
       JSON.stringify(input.sources),
       createdAt,
       input.refused ? 1 : 0,
-      input.escalationThreshold ?? DEFAULT_ESCALATION_THRESHOLD,
+      input.escalationThreshold ?? DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD,
     );
   });
   return id;
