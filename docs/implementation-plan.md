@@ -210,10 +210,29 @@ ceremony on work that doesn't need it:
   evidence row. `duo derive rules` CLI command. 179 tests. Self-review found no fixable issues.
   No file sync or voice profile yet — that's #26, next.
 
-**Next:** #26 (W2, epic `e3` — voice profile and the rules file sync, the last issue in this
-chain) — check its label before assuming which path applies. `e3` (derivation), `e10`
-(permissions), and `e64` (shared-duos) run as parallel epics per §1, though concurrency stays
-sequential through W2 per §2's locked decision.
+- #26 (PR [#93](https://github.com/guangshinhaha/digital-duo/pull/93), merged, squash commit
+  `4737f7e`) — lighter path: `src/derivation/rules-sync.ts` reconciles `duo/rules/*.md` (one
+  file per rule, named `<rule id>.md`, YAML frontmatter carrying id/topic/status/support/
+  consistency/timestamps/evidence, markdown body) with the `rules` table — hand-edits to the
+  files win, even over what #25's induction most recently computed, which is what makes an edit
+  "stick" across a later re-run (sync is meant to run after induction). A rule with no file yet
+  gets one materialized; a malformed file is reported by name and reason with its DB row left
+  untouched and the file never deleted; a rule whose file is deleted is removed from the store
+  with its evidence. A hidden `duo/rules/.sync-state.json` tracks which rule ids have ever been
+  materialized, telling "never synced yet" apart from "synced, now deleted" without needing a
+  migration to #25's already-shipped schema. Refactored `rules.ts`'s write path into shared
+  `putRule`/`deleteRule`/`readRuleRow` helpers so induction and sync share one implementation.
+  `src/derivation/voice.ts`: statistical voice profile (median length, hedge/bullet/emoji/
+  greeting/sign-off rates) over the owner's own records, LLM-described register only
+  (best-effort, same degrade shape as #23-25), written to `duo/voice.md` — never overwritten
+  once it exists unless `--force` is passed. `duo derive sync` / `duo derive voice` CLI
+  commands, completing the `derive` group. 195 tests. Self-review found no fixable issues.
+  **Wave W2's epic `e3` (derivation) is now complete** — all of #23, #24, #25, #26 merged in
+  order, one at a time on `main`.
+
+**Next:** #48 (wave W2, epic `e10` — permissions), which the orchestrating session runs as its
+own separate chain. Per §1/§2, `e10` and `e64` (shared-duos) still run strictly one at a time on
+`main` within wave W2, not concurrently with each other or with anything else.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
