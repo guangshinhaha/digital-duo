@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
+import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import { runPurge } from "./commands/purge.js";
 import { runStatus } from "./commands/status.js";
@@ -65,6 +66,43 @@ program
         return;
       }
       console.log(`Purged ${result.paths.length} file(s) under ${result.dataDir}. Nothing recoverable remains.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const importCommand = program.command("import").description("Import records from a source into the store");
+
+importCommand
+  .command("claude")
+  .description("Import a Claude data export (conversations.json) into the store")
+  .argument("<path>", "path to the Claude export JSON file")
+  .action((path: string) => {
+    const config = loadConfig();
+    try {
+      const summary = runImportClaude(path, config);
+      console.log(
+        `Imported ${summary.written} record(s) (${summary.skipped} already present) from ` +
+          `${summary.workRelevantConversationCount}/${summary.conversationCount} work-relevant conversation(s).`,
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+importCommand
+  .command("paste")
+  .description("Import a pasted conversation transcript (a text file of Human:/Assistant: lines) into the store")
+  .argument("<path>", "path to a text file containing the pasted transcript")
+  .action((path: string) => {
+    const config = loadConfig();
+    try {
+      const summary = runImportPaste(path, config);
+      if (!summary.workRelevant) {
+        console.log("Transcript judged not work-relevant; nothing imported.");
+        return;
+      }
+      console.log(`Imported ${summary.written} record(s) (${summary.skipped} already present).`);
     } catch (error) {
       reportError(error);
     }
