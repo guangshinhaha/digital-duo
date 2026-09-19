@@ -90,6 +90,8 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
           consistency: 0.95,
           createdAt: new Date().toISOString(),
           lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "approved",
+          origin: "derived",
         },
         pairs.map((pair) => pair.id),
       );
