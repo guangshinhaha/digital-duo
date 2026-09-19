@@ -531,9 +531,122 @@ the next matched topic. One regression test added. **578 tests, full suite green
 **Wave W3 is now complete.** All three epics — `e4` (mirror), `e5` (drafting), `e11` (trust) —
 are merged, plus the cross-epic refusal-check hotfix. `main` tip: `273ccee`.
 
-**Next: wave W4**, three concurrent chains (same worktree-per-chain pattern as W3): `e6` (eval,
-#35→36), `e7` (corrections, #37→38→39), `e12` (actions, #56→60→57→58→59). `e8` (Slack, #40→41→42)
-stays skipped — blocked on #15 (G2, Slack access) regardless of pacing policy, per §2/§4.
+**Wave W4** — same worktree-per-chain concurrency pattern as W3 (three chains, none touching
+this doc directly; consolidated below once all three reported in). `e8` (Slack, #40→41→42)
+stayed skipped, blocked on #15 regardless of pacing policy, per §2/§4.
+
+- `e6` (eval, #35→36): #35 PR [#133](https://github.com/guangshinhaha/digital-duo/pull/133)
+  `46e83a7` (task, lighter path) — `src/eval/time-split.ts` (`splitCorpusByTime`, before
+  derivation — AR-7), `src/eval/held-out-assertion.ts` (checks, not assumes, that no rule cites
+  held-out evidence), `src/eval/offline-eval.ts` (`runOfflineEval`: isolated scratch store, real
+  derivation over the train split only, real `draftReply` scoring against real held-out answers).
+  `duo eval offline`. Auto-approves rules inside the scratch store only (no owner exists in an
+  automated run), a real refusal conflict still blocks approval; skips #29's onboarding gate
+  since this harness runs "before Slack is ever connected" per §1.10, but still honors a real
+  refusals.md if one exists. Review finding: `--sample`/`--seed` silently coerced a bad value to
+  `NaN` → an empty evaluated set with no error; fixed with a validating parser. #36 PR
+  [#136](https://github.com/guangshinhaha/digital-duo/pull/136) `f95d16c` (task, lighter path) —
+  `eval/gate-labels.json` (46 hand-labelled mentions, versioned), `src/eval/gate-eval.ts`
+  (`scoreRelevanceGate`: precision/recall/coverage reported separately, never averaged;
+  `assertPrecisionFloor`). **705 tests at the end of this chain.** Real finding, correctly not
+  fixed here (out of #36's own scope, #31/`e5` already merged): scored against the fixture, the
+  relevance gate's precision is 0.750 against a 0.95 floor, entirely from rhetorical questions
+  scored as genuine — pinned as a regression tripwire in `test/gate-eval.test.ts` and filed as
+  [#137](https://github.com/guangshinhaha/digital-duo/issues/137) for a follow-up fix to #31.
+
+- `e7` (corrections, #37→38→39): #37 PR
+  [#130](https://github.com/guangshinhaha/digital-duo/pull/130) `4e288c4` (task, lighter path) —
+  `src/corrections/classify.ts` (`classifyEdit`: trivial-edit short-circuit, then a deterministic
+  content-word-overlap heuristic for style/substance/both, optional best-effort LLM), `queue.ts`
+  (`correction_candidates`, deduped). Extended `recordDraftOutcome` (#32) with an optional
+  `sentText` param, backward compatible. Review fix: an "edited" outcome against an *escalated*
+  draft (nothing to diff) threw past the CLI's own already-recorded success — fixed to record
+  first, then handle that case. #38 PR
+  [#131](https://github.com/guangshinhaha/digital-duo/pull/131) `a0e6897` (**full path**, `story`
+  label) — `src/corrections/review.ts`: `listPendingReview` merges #37's queue with #34's
+  `standing_order_candidates`; flags a substance candidate that contradicts an active rule.
+  `approveCandidate` writes with provenance (style → `duo/voice.md`'s new "## Corrections"
+  section; substance → a new active rule via `writeRuleByHand`) only after the write succeeds; a
+  conflicting substance candidate is refused outright (`CandidateConflictError`), never silently
+  accumulated alongside the rule it contradicts. `duo corrections review/approve/reject`. #39 PR
+  [#135](https://github.com/guangshinhaha/digital-duo/pull/135) `a626082` (task, lighter path,
+  more surface than typical) — `Rule` gains `supersededByRuleId`/`correctionDraftId`/
+  `correctionQuestion`, `reviewStatus` gains `"superseded"` (persists across re-induction,
+  `listActiveRules` excludes it for free); `writeCorrectionRule` writes every file first, then
+  one DB round trip, so a failure touches the store nowhere and the candidate stays queued. `duo
+  corrections approve <id> --supersedes <ruleId>`. **648 tests at the end of this chain.** Review
+  findings: five pre-existing test files needed the three new `Rule` fields (`tsconfig.json`
+  excludes `test/`, so this class of break isn't caught statically — same gap PR #124 hit for a
+  different field, back in W3); a test-authoring bug (double `createEncryptedStore` silently
+  wiped a rule a prior step wrote, fixed with an `existsSync` guard); one genuinely flaky CLI test
+  given an explicit timeout budget. Design decision documented in the PR: "the rule it came from"
+  resolved via #38's conflict heuristic plus an explicit `--supersedes`, not by tracing the
+  originating draft's own cited rule — flagged as a possible future enhancement, not built, since
+  no AC requires it.
+
+- `e12` (actions, #56→60→57→58→59 — dependency-corrected order): #56 PR
+  [#129](https://github.com/guangshinhaha/digital-duo/pull/129) `7c25670` (task, lighter path) —
+  `src/actions/registry.ts` (`classifyActionTier`/`registerAction`/`resolveActionForUse`, the
+  one choke point every later module in this epic routes through), `src/actions/attempt-log.ts`
+  (append-only `action_attempts`, same DB-trigger pattern as `audit_log`/`trust_ledger`). Review
+  fix: `--reversible`/`--obligates` silently coerced a typo'd value to `false`; fixed to throw on
+  anything but exact `"true"`/`"false"`. #60 PR
+  [#132](https://github.com/guangshinhaha/digital-duo/pull/132) `7d8dcb9` (task, lighter path) —
+  `trust_cells` gains `CHECK (tier IN ('T0','T1','T2','T3'))` (a T4 row cannot exist even via raw
+  SQL, on top of #52's compile-time exclusion); `src/actions/t4-guard.ts`
+  (`createT4Request`/`confirmAndExecuteT4Request`, the only function anywhere allowed to run a T4
+  side effect, always stage-then-confirm); a T4 grant attempt is logged, not just refused. Review
+  fix (a pattern re-caught twice more later in this same chain): `withDatabase` only persists a
+  mutation when its callback *returns* — the refusal path logged an attempt then threw from
+  inside that same transaction, silently discarding the very log entry meant to record it;
+  restructured so the callback always returns and the throw happens after commit. #57 PR
+  [#134](https://github.com/guangshinhaha/digital-duo/pull/134) `493c7d4` (**full path**, `story`
+  label) — `src/actions/preparation.ts`: visibility inherited from the owner's own encrypted
+  store, no submit/send/share function anywhere in the module (checked structurally); T1
+  deliberately ignores the trust grid, matching `duo draft`'s existing "works at n=1" posture.
+  Review fix: the built-in `prepare_*` action was unconditionally re-registered on every call,
+  which would silently undo any future re-tiering of that action id — fixed to register once, on
+  first use. #58 PR [#138](https://github.com/guangshinhaha/digital-duo/pull/138) `d7b0d3e`
+  (**full path**, `story` label) — `src/actions/reversible.ts`
+  (`performReversibleAction`/`undoReversibleAction`: registration → revertibility (escalates T3
+  if not) → grid autonomy (escalates T2 if not `"auto"`) → run `perform()` once; a thrown
+  `perform` rolls back and is reported, never a silent partial effect). Review fix: the same
+  throw-discards-the-transaction bug as #60, hit and fixed again in this module's own refusal
+  path. #59 PR [#139](https://github.com/guangshinhaha/digital-duo/pull/139) `3241afd` (**full
+  path**, `story` label) — `src/actions/binding.ts` (`prepareBindingAction`: stages only, no
+  execute parameter exists at all); `approvePendingAction` checks expiry inline so a late
+  approval can never sneak past the window even without a prior sweep. One deliberate change to
+  already-shipped code, required by this issue's own AC ("no T3 action is autonomous on first
+  grant"): `src/trust/grants.ts`'s `grantAutonomy` now caps a T3 grant at `"approve"`, never
+  `"auto"` — resolving the issue's own open question ("should any T3 ever reach full autonomy")
+  as none, by design. Review findings: `getApprovalStats` counted a later retraction as if the
+  original approval never happened (fixed to count both together); the `grants.ts` change
+  correctly invalidated a pre-existing `t4-guard.test.ts` expectation, updated. **744 tests at the
+  end of this chain.** No T4-severity gap found. One pattern flagged for awareness, not a
+  confirmed bug elsewhere: the throw-discards-the-transaction issue hit three times in this
+  chain's own new code was not audited across the ~28 pre-existing `withDatabase(mutate:true)`
+  call sites elsewhere, since none of them combine a throw with a required attempt-log write the
+  way these new modules did.
+
+**Cross-epic hotfix, found after all three W4 chains reported in** (PR
+[#140](https://github.com/guangshinhaha/digital-duo/pull/140), squash `a214c11`): the `e7`
+chain's own agent flagged — correctly left out of its own three issues' scope — that
+`src/derivation/voice.ts`'s `runVoiceProfile`, when run with `force: true`, overwrote the entire
+`duo/voice.md` file, including the `"## Corrections"` section #38/#39 append to it — a log with
+no database projection to rebuild it from. Fixed directly: the section is now read back before
+the overwrite and re-appended verbatim after the fresh statistical/register content. One
+regression test added. **745 tests, full suite green.**
+
+**Wave W4 is now complete.** All three epics — `e6` (eval), `e7` (corrections), `e12` (actions)
+— are merged, plus the Corrections-log-preservation hotfix. `e8` stays skipped pending #15. One
+follow-up issue filed against already-merged `e5` ([#137](https://github.com/guangshinhaha/digital-duo/issues/137),
+relevance gate precision), not actioned in this run. `main` tip: `a214c11`.
+
+**Next: wave W5** (`e9`, public-answering): #43→44→45→**46∥47**, the first wave to consume the
+full permission engine (`e10`) and trust grid (`e11`) built ahead of it in W2/W3. Single chain
+(no other epic runs alongside it this wave) — the plan allows #46/#47 to run in parallel with
+each other since they're the tail of one epic, but running the chain sequentially through them is
+equally correct and simpler; use judgment on whether splitting them is worth a second worktree.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
