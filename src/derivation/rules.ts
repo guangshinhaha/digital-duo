@@ -259,31 +259,14 @@ export async function runRuleInduction(
 
   const rules = withDatabase(storePath, passphrase, true, (db) => {
     ensureRulesSchema(db);
-    const readExisting = db.prepare(`SELECT created_at, last_confirmed_at FROM rules WHERE id = ?`);
-    const upsertRule = db.prepare(`
-      INSERT INTO rules (id, topic_id, text, status, support_count, consistency, created_at, last_confirmed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        text = excluded.text, status = excluded.status, support_count = excluded.support_count,
-        consistency = excluded.consistency, last_confirmed_at = excluded.last_confirmed_at
-    `);
-    const clearEvidence = db.prepare(`DELETE FROM rule_evidence WHERE rule_id = ?`);
-    const insertEvidence = db.prepare(`INSERT INTO rule_evidence (rule_id, qa_pair_id) VALUES (?, ?)`);
-
     const finalRules: Rule[] = [];
     for (const { rule, evidencePairIds } of computed) {
-      const existing = readExisting.get(rule.id) as { created_at: string; last_confirmed_at: string | null } | undefined;
-      const createdAt = existing?.created_at ?? now;
-      const lastConfirmedAt = rule.status === "confirmed" ? now : existing?.last_confirmed_at ?? null;
-
-      upsertRule.run(rule.id, rule.topicId, rule.text, rule.status, rule.supportCount, rule.consistency, createdAt, lastConfirmedAt);
-
-      clearEvidence.run(rule.id);
-      for (const pairId of evidencePairIds) {
-        insertEvidence.run(rule.id, pairId);
-      }
-
-      finalRules.push({ ...rule, createdAt, lastConfirmedAt });
+      const existing = readRuleRow(db, rule.id);
+      const createdAt = existing?.createdAt ?? now;
+      const lastConfirmedAt = rule.status === "confirmed" ? now : existing?.lastConfirmedAt ?? null;
+      const finalRule: Rule = { ...rule, createdAt, lastConfirmedAt };
+      putRule(db, finalRule, evidencePairIds);
+      finalRules.push(finalRule);
     }
     return finalRules;
   });
@@ -318,6 +301,40 @@ function rowToRule(row: RuleRow): Rule {
     createdAt: row.created_at,
     lastConfirmedAt: row.last_confirmed_at,
   };
+}
+
+/** Reads one rule row on an already-open handle — the shared primitive both `runRuleInduction` and #26's file sync build on, rather than each re-deriving the upsert/read dance. */
+export function readRuleRow(db: Database, id: string): Rule | undefined {
+  ensureRulesSchema(db);
+  const row = db.prepare(`SELECT * FROM rules WHERE id = ?`).get(id) as RuleRow | undefined;
+  return row ? rowToRule(row) : undefined;
+}
+
+/** Upserts a rule row and fully replaces its evidence in one call, on an already-open handle. */
+export function putRule(db: Database, rule: Rule, evidencePairIds: readonly string[]): void {
+  ensureRulesSchema(db);
+  db.prepare(
+    `
+    INSERT INTO rules (id, topic_id, text, status, support_count, consistency, created_at, last_confirmed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      topic_id = excluded.topic_id, text = excluded.text, status = excluded.status, support_count = excluded.support_count,
+      consistency = excluded.consistency, created_at = excluded.created_at, last_confirmed_at = excluded.last_confirmed_at
+  `,
+  ).run(rule.id, rule.topicId, rule.text, rule.status, rule.supportCount, rule.consistency, rule.createdAt, rule.lastConfirmedAt);
+
+  db.prepare(`DELETE FROM rule_evidence WHERE rule_id = ?`).run(rule.id);
+  const insertEvidence = db.prepare(`INSERT INTO rule_evidence (rule_id, qa_pair_id) VALUES (?, ?)`);
+  for (const pairId of evidencePairIds) {
+    insertEvidence.run(rule.id, pairId);
+  }
+}
+
+/** Deletes a rule and every rule_evidence row citing it, on an already-open handle — what #26's sync calls when a rule's file has been deleted (AC3). */
+export function deleteRule(db: Database, id: string): void {
+  ensureRulesSchema(db);
+  db.prepare(`DELETE FROM rule_evidence WHERE rule_id = ?`).run(id);
+  db.prepare(`DELETE FROM rules WHERE id = ?`).run(id);
 }
 
 export function listRules(storePath: string, passphrase: string): Rule[] {

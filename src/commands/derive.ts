@@ -1,7 +1,9 @@
 import type { DuoConfig } from "../config.js";
 import { createLlmAdjudicator, runPairExtraction, type PairExtractionSummary } from "../derivation/qa-pairs.js";
 import { createLlmRuleTextGenerator, runRuleInduction, type RuleInductionSummary } from "../derivation/rules.js";
+import { syncRulesFiles, type RuleSyncSummary } from "../derivation/rules-sync.js";
 import { createLlmTopicLabeler, runTopicAssignment, type TopicAssignmentResult } from "../derivation/topics.js";
+import { createLlmRegisterDescriber, runVoiceProfile, type VoiceProfileResult } from "../derivation/voice.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { ProviderConfigError } from "../provider/types.js";
 import { resolveProvider } from "../provider/registry.js";
@@ -69,4 +71,35 @@ export async function runDeriveRules(config: DuoConfig, env: NodeJS.ProcessEnv =
   const embeddingProvider = createOllamaEmbeddingProvider(config);
 
   return runRuleInduction(config.storePath, passphrase, embeddingProvider, { generateRuleText });
+}
+
+/**
+ * Implements `duo derive sync`: reconciles `duo/rules/*.md` with the
+ * `rules` table (v1-tech-design.md §1.3 — "hand-edits to the files win, and
+ * a sync step reconciles them"). Purely file/DB work, no provider needed.
+ */
+export function runDeriveSync(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): RuleSyncSummary {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return syncRulesFiles(config.storePath, passphrase, config.duoDir);
+}
+
+/**
+ * Implements `duo derive voice`. The register description is best-effort
+ * LLM (same shape as the other derive commands); never overwrites an
+ * existing duo/voice.md unless `--force` is passed, so a hand-edit is
+ * never silently lost.
+ */
+export async function runDeriveVoice(
+  config: DuoConfig,
+  force: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<VoiceProfileResult> {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+
+  const provider = tryResolveProvider(config);
+  const describeRegister = provider ? createLlmRegisterDescriber(provider) : undefined;
+
+  return runVoiceProfile(config.storePath, passphrase, config.duoDir, { describeRegister, force });
 }
