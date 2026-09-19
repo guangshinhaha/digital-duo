@@ -5,10 +5,12 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import {
   InvalidReviewActionError,
+  RefusalConflictError,
   RuleNotFoundError,
   approveRule,
   describeRuleWithEvidence,
   listActiveRules,
+  listRefusalConflicts,
   listRulesForReview,
   promoteRule,
   rejectRule,
@@ -20,6 +22,7 @@ import { readTopicsFile } from "../src/derivation/topics.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import { createEncryptedStore } from "../src/store/store.js";
+import { upsertRefusal } from "../src/trust/refusals.js";
 import { readFileSync } from "node:fs";
 
 const tempDir = useTempDir();
@@ -157,7 +160,7 @@ describe("promoteRule — AC3: a weak signal promoted by hand is owner-asserted,
     const promoted = promoteRule(storePath, PASSPHRASE, dir, ruleId);
     expect(promoted.reviewStatus).toBe("approved");
     expect(promoted.origin).toBe("owner_asserted");
-    expect(listActiveRules(storePath, PASSPHRASE).map((rule) => rule.id)).toContain(ruleId);
+    expect(listActiveRules(storePath, PASSPHRASE, dir).map((rule) => rule.id)).toContain(ruleId);
   });
 
   it("refuses to promote a rule that isn't a weak signal", async () => {
@@ -183,7 +186,7 @@ describe("writeRuleByHand — AC4: writing a rule from scratch when nothing clea
 
     const topics = readTopicsFile(dir);
     expect(topics.find((topic) => topic.id === rule.topicId)?.label).toBe("Expense approvals");
-    expect(listActiveRules(storePath, PASSPHRASE).map((r) => r.id)).toContain(rule.id);
+    expect(listActiveRules(storePath, PASSPHRASE, dir).map((r) => r.id)).toContain(rule.id);
   });
 
   it("refuses an empty label or empty text", () => {
@@ -229,5 +232,56 @@ describe("listRulesForReview — AC4: no rules cleared threshold at all", () => 
     const listing = listRulesForReview(storePath, PASSPHRASE);
     expect(listing.weakSignals).toEqual([]);
     expect(listing.rejected).toHaveLength(1);
+  });
+});
+
+describe("refusal conflicts — #29 AC3: a refusal outranks a conflicting derived rule", () => {
+  it("refuses to approve a confirmed rule whose topic conflicts with a standing refusal", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedRule(storePath, "topic-leave", CONFIRMED_ANSWERS);
+    // The topic's own label, from #24's default labeler, is one of the answer texts truncated —
+    // simplest to just refuse by the topic id directly, which findConflictingRefusal also matches.
+    upsertRefusal(dir, "topic-leave", "Never speak for me on leave policy.");
+
+    expect(() => approveRule(storePath, PASSPHRASE, dir, "topic-leave")).toThrow(RefusalConflictError);
+    expect(listRules(storePath, PASSPHRASE)[0].reviewStatus).toBe("pending"); // untouched
+  });
+
+  it("refuses to promote a weak signal whose topic conflicts with a standing refusal", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedRule(storePath, "topic-thin", WEAK_ANSWERS);
+    upsertRefusal(dir, "topic-thin", "reason");
+
+    expect(() => promoteRule(storePath, PASSPHRASE, dir, "topic-thin")).toThrow(RefusalConflictError);
+  });
+
+  it("refuses to write a hand rule whose label conflicts with a standing refusal, before minting a topic", () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    upsertRefusal(dir, "Headcount", "Never speak for me on this.");
+
+    expect(() => writeRuleByHand(storePath, PASSPHRASE, dir, "Headcount", "some rule text")).toThrow(RefusalConflictError);
+    expect(readTopicsFile(dir)).toEqual([]); // no topic minted for the refused attempt
+  });
+
+  it("a refusal written AFTER approval still suppresses the rule from listActiveRules (the guarantee holds unconditionally)", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedRule(storePath, "topic-leave", CONFIRMED_ANSWERS);
+    const approved = approveRule(storePath, PASSPHRASE, dir, "topic-leave");
+    expect(listActiveRules(storePath, PASSPHRASE, dir).map((r) => r.id)).toContain(approved.id);
+
+    upsertRefusal(dir, "topic-leave", "Changed my mind — never speak on this.");
+
+    expect(listActiveRules(storePath, PASSPHRASE, dir).map((r) => r.id)).not.toContain(approved.id);
+    // The stored decision itself is untouched — it really was approved at the time.
+    expect(listRules(storePath, PASSPHRASE)[0].reviewStatus).toBe("approved");
+
+    const conflicts = listRefusalConflicts(storePath, PASSPHRASE, dir);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].rule.id).toBe(approved.id);
+    expect(conflicts[0].refusal.heading).toBe("topic-leave");
   });
 });

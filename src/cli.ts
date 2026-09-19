@@ -11,7 +11,11 @@ import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import {
   runMirrorPortrait,
+  runMirrorRefusalAdd,
+  runMirrorRefusalConfirmNone,
+  runMirrorRefusalsList,
   runMirrorRuleApprove,
+  runMirrorRuleConflicts,
   runMirrorRulePromote,
   runMirrorRuleReject,
   runMirrorRuleShow,
@@ -742,6 +746,16 @@ rulesCommand
         console.log("");
         console.log(`Already reviewed: ${listing.approved.length} approved, ${listing.rejected.length} rejected.`);
       }
+      // #29 AC3: "the refusal wins ... the conflict is surfaced to the
+      // owner" — an approved rule a later refusal now suppresses.
+      const conflicts = runMirrorRuleConflicts(config);
+      if (conflicts.length > 0) {
+        console.log("");
+        console.log(`Suppressed by a standing refusal (${conflicts.length}) — approved, but not active:`);
+        for (const { rule, refusal } of conflicts) {
+          console.log(`  [${rule.id}] conflicts with refusal "${refusal.heading}": ${refusal.reason}`);
+        }
+      }
     } catch (error) {
       reportError(error);
     }
@@ -821,6 +835,71 @@ rulesCommand
     try {
       const rule = runMirrorRuleWrite(options.label, options.text, config);
       console.log(`Wrote [${rule.id}] (owner-asserted, approved): ${rule.text}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The one part of the Mirror deliberately not derived (#29,
+// docs/concept.md §10): subjects this duo must never speak for the owner
+// on. No store needed — this is pure duo/refusals.md file state, same as
+// duo/topics.json/voice.md's own commands.
+const refusalsCommand = mirrorCommand
+  .command("refusals")
+  .description("Record what your duo must never speak for you on (#29)");
+
+refusalsCommand
+  .command("list")
+  .description("Show recorded refusals, or that none have been decided on yet")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const { decided, refusals } = runMirrorRefusalsList(config);
+      if (!decided) {
+        console.log(
+          "No decision about refusals has been recorded yet. This is asked once, explicitly — record at least one " +
+            'with `duo mirror refusals add "<subject>" "<reason>"`, or confirm there truly are none with ' +
+            "`duo mirror refusals confirm-none`.",
+        );
+        return;
+      }
+      if (refusals.length === 0) {
+        console.log("Reviewed: the owner has deliberately recorded no refusals.");
+        return;
+      }
+      console.log(`${refusals.length} refusal(s) recorded:`);
+      for (const refusal of refusals) {
+        console.log(`  ## ${refusal.heading}`);
+        console.log(`     ${refusal.reason}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+refusalsCommand
+  .command("add")
+  .description("Record (or edit) a refusal — a subject your duo must never speak for you on, and why (#29 AC1)")
+  .argument("<heading>", "the subject refused (matched against a topic's label or id — #29 AC3)")
+  .argument("<reason>", "why, shown back whenever this refusal blocks something")
+  .action((heading: string, reason: string) => {
+    const config = loadConfig();
+    try {
+      const refusals = runMirrorRefusalAdd(heading, reason, config);
+      console.log(`Recorded ${refusals.length} refusal(s). Written to ${config.duoDir}/refusals.md.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+refusalsCommand
+  .command("confirm-none")
+  .description("Deliberately record that there are no refusals — a real, recorded choice, not an empty file by default (#29 AC2)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      runMirrorRefusalConfirmNone(config);
+      console.log(`Recorded: no refusals. Written to ${config.duoDir}/refusals.md.`);
     } catch (error) {
       reportError(error);
     }

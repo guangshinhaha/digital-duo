@@ -140,3 +140,73 @@ describe("duo mirror rules", () => {
     expect(unknown.stderr).toMatch(/no rule with id/i);
   });
 });
+
+describe("duo mirror refusals", () => {
+  it("says plainly that no decision has been recorded yet, before anything exists (AC2)", async () => {
+    const duoDirPath = join(tempDir(), "duo");
+    const result = await runCli(["mirror", "refusals", "list"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/no decision about refusals/i);
+    expect(result.stdout).toMatch(/asked once, explicitly/i);
+  });
+
+  it("records a refusal, which then shows up in the listing (AC1)", async () => {
+    const duoDirPath = join(tempDir(), "duo");
+    const add = await runCli(["mirror", "refusals", "add", "Headcount", "Never speak for me on comp or headcount."], {
+      cwd: tempDir(),
+      env: { DUO_DIR: duoDirPath },
+    });
+    expect(add.exitCode).toBe(0);
+    expect(add.stdout).toMatch(/recorded 1 refusal/i);
+
+    const list = await runCli(["mirror", "refusals", "list"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toMatch(/Headcount/);
+    expect(list.stdout).toMatch(/Never speak for me on comp or headcount/);
+  });
+
+  it("records a deliberate choice of none, distinct from never having been asked (AC2)", async () => {
+    const duoDirPath = join(tempDir(), "duo");
+    const confirm = await runCli(["mirror", "refusals", "confirm-none"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(confirm.exitCode).toBe(0);
+
+    const list = await runCli(["mirror", "refusals", "list"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toMatch(/deliberately recorded no refusals/i);
+  });
+
+  it("refuses confirm-none when refusals already exist, without discarding them", async () => {
+    const duoDirPath = join(tempDir(), "duo");
+    await runCli(["mirror", "refusals", "add", "Headcount", "reason"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+
+    const confirm = await runCli(["mirror", "refusals", "confirm-none"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(confirm.exitCode).not.toBe(0);
+    expect(confirm.stderr).toMatch(/already recorded/i);
+
+    const list = await runCli(["mirror", "refusals", "list"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(list.stdout).toMatch(/Headcount/);
+  });
+
+  it("surfaces a rule the refusal now suppresses in `duo mirror rules list` (AC3)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+
+    const write = await runCli(
+      ["mirror", "rules", "write", "--label", "Headcount", "--text", "some rule"],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath } },
+    );
+    expect(write.exitCode).toBe(0);
+
+    // A refusal on the exact same label, added after the rule was already approved.
+    await runCli(["mirror", "refusals", "add", "Headcount", "Never speak for me on this."], {
+      cwd: tempDir(),
+      env: { DUO_DIR: duoDirPath },
+    });
+
+    const list = await runCli(["mirror", "rules", "list"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath } });
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toMatch(/suppressed by a standing refusal/i);
+    expect(list.stdout).toMatch(/Never speak for me on this/);
+  });
+});

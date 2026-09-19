@@ -7,6 +7,7 @@ import { listQaPairs } from "./qa-pairs.js";
 import { serializeRuleFile } from "./rules-sync.js";
 import { listRuleEvidence, listRules, putRule, readRuleEvidenceRows, readRuleRow, type Rule } from "./rules.js";
 import { readTopicsFile, writeTopicsFile, type Topic } from "./topics.js";
+import { findConflictingRefusal, findRefusalByHeading, type Refusal } from "../trust/refusals.js";
 
 /**
  * The Mirror's rule review screen (#28, docs/concept.md §7): the owner
@@ -28,6 +29,26 @@ export class RuleNotFoundError extends Error {
 
 /** Thrown when a review action's precondition on the rule's derivation `status` isn't met (e.g. approving something that isn't `confirmed`). Names the rule, its actual status, and what was required. */
 export class InvalidReviewActionError extends Error {}
+
+/**
+ * #29 AC3: "a refusal outranks a conflicting derived rule." Thrown by
+ * approve/promote/write-by-hand to refuse making a refused subject's rule
+ * active in the first place — the strongest form of "surfaced to the
+ * owner", since it stops the contradiction from ever being created rather
+ * than merely warning about it afterward.
+ */
+export class RefusalConflictError extends Error {
+  readonly refusal: Refusal;
+
+  constructor(ruleOrLabel: string, refusal: Refusal) {
+    super(
+      `"${ruleOrLabel}" conflicts with a standing refusal ("${refusal.heading}": ${refusal.reason}) — ` +
+        "the refusal wins. Remove or narrow that refusal in duo/refusals.md first if this rule should be active.",
+    );
+    this.name = "RefusalConflictError";
+    this.refusal = refusal;
+  }
+}
 
 function requireRule(storePath: string, passphrase: string, ruleId: string): Rule {
   const rule = withDatabase(storePath, passphrase, false, (db) => readRuleRow(db, ruleId));
@@ -80,6 +101,10 @@ export function approveRule(storePath: string, passphrase: string, duoDir: strin
         `A weak signal can be promoted instead (\`duo mirror rules promote\`).`,
     );
   }
+  const conflict = findConflictingRefusal(duoDir, rule.topicId);
+  if (conflict) {
+    throw new RefusalConflictError(ruleId, conflict);
+  }
   return saveReviewedRule(storePath, passphrase, duoDir, { ...rule, reviewStatus: "approved" });
 }
 
@@ -115,6 +140,10 @@ export function promoteRule(storePath: string, passphrase: string, duoDir: strin
         `A confirmed rule is approved instead (\`duo mirror rules approve\`).`,
     );
   }
+  const conflict = findConflictingRefusal(duoDir, rule.topicId);
+  if (conflict) {
+    throw new RefusalConflictError(ruleId, conflict);
+  }
   return saveReviewedRule(storePath, passphrase, duoDir, { ...rule, reviewStatus: "approved", origin: "owner_asserted" });
 }
 
@@ -139,6 +168,14 @@ export function writeRuleByHand(storePath: string, passphrase: string, duoDir: s
   }
   if (trimmedText.length === 0) {
     throw new InvalidReviewActionError("A hand-written rule needs non-empty text.");
+  }
+  // Checked by label rather than findConflictingRefusal: this rule's topic
+  // doesn't exist yet, so there is no topicId to look up a refusal against
+  // until after the mint below — checking first (AC3) means a refused
+  // subject is refused *before* a new topic is even created for it.
+  const labelConflict = findRefusalByHeading(duoDir, trimmedLabel);
+  if (labelConflict) {
+    throw new RefusalConflictError(trimmedLabel, labelConflict);
   }
 
   const topics = readTopicsFile(duoDir);
@@ -236,7 +273,41 @@ export function listRulesForReview(storePath: string, passphrase: string): RuleR
  * separate epic), but the filter exists now so that epic needs no rules.ts
  * changes to start reading it, the same "field present, logic deferred"
  * idiom #50's `rulesUsed` already uses.
+ *
+ * Re-checks every approved rule against `duo/refusals.md` on every call,
+ * not just at approval time (#29 AC3): a refusal written *after* a rule
+ * was approved must still suppress it — "the refusal wins" has to hold
+ * against a stale approval, not only against a fresh one. This is the one
+ * enforcement point that actually matters: approveRule/promoteRule/
+ * writeRuleByHand refusing a conflicted rule up front is a courtesy that
+ * catches the common case early, but this filter is what makes the
+ * guarantee hold unconditionally.
  */
-export function listActiveRules(storePath: string, passphrase: string): Rule[] {
-  return listRules(storePath, passphrase).filter((rule) => rule.reviewStatus === "approved");
+export function listActiveRules(storePath: string, passphrase: string, duoDir: string): Rule[] {
+  return listRules(storePath, passphrase).filter(
+    (rule) => rule.reviewStatus === "approved" && findConflictingRefusal(duoDir, rule.topicId) === undefined,
+  );
+}
+
+/** One approved rule currently suppressed by a refusal written after it was approved, and which refusal. */
+export interface RefusalConflict {
+  readonly rule: Rule;
+  readonly refusal: Refusal;
+}
+
+/**
+ * Every approved rule `listActiveRules` is currently excluding because of
+ * a refusal — "the conflict is surfaced to the owner" (#29 AC3), reused by
+ * `duo mirror rules list`. Deliberately does not un-approve or otherwise
+ * touch the rule's stored reviewStatus: the rule stays "approved" in the
+ * record (that was a real, true decision at the time), it is simply not
+ * *active* while the conflicting refusal stands.
+ */
+export function listRefusalConflicts(storePath: string, passphrase: string, duoDir: string): RefusalConflict[] {
+  return listRules(storePath, passphrase)
+    .filter((rule) => rule.reviewStatus === "approved")
+    .flatMap((rule) => {
+      const refusal = findConflictingRefusal(duoDir, rule.topicId);
+      return refusal ? [{ rule, refusal }] : [];
+    });
 }
