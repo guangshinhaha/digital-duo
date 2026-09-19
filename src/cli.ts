@@ -4,7 +4,7 @@ import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
-import { runDraft, runRecordDraftOutcome } from "./commands/draft.js";
+import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
@@ -374,7 +374,11 @@ program
       const result = await runDraft(question, threadContext, config);
       if (result.kind === "escalation") {
         console.log(result.reason);
-        console.error(`(escalated — draft id ${result.draftId})`);
+        console.error(
+          result.refused
+            ? `(escalated, refused — draft id ${result.draftId})`
+            : `(escalated — draft id ${result.draftId}; run duo draft-answer ${result.draftId} <answer> to record it as a standing-order candidate)`,
+        );
         return;
       }
       console.log(result.text);
@@ -405,6 +409,25 @@ program
     try {
       runRecordDraftOutcome(draftId, outcome as (typeof DRAFT_OUTCOMES)[number], config);
       console.log(`Recorded draft ${draftId} as ${outcome}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// #34 AC3: an escalation the owner knows the answer to becomes a queued
+// standing-order candidate, entering the same batched review any other
+// correction will (v1-tech-design.md §1.9, epic e7 — not yet built; this
+// is the table it will read from).
+program
+  .command("draft-answer")
+  .description("Answer an escalated draft yourself, queuing a standing-order candidate for later batched review")
+  .argument("<draftId>", "the escalated draft's id, printed by `duo draft`")
+  .argument("<answer>", "your answer to the question that was escalated")
+  .action((draftId: string, answer: string) => {
+    const config = loadConfig();
+    try {
+      const candidateId = runRecordEscalationAnswer(draftId, answer, config);
+      console.log(`Queued standing-order candidate ${candidateId} from draft ${draftId}. It will be reviewed in the next batch.`);
     } catch (error) {
       reportError(error);
     }

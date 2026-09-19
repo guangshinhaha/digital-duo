@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
@@ -241,5 +242,87 @@ describe("draftReply — a thread of context can be supplied (#32 AC4)", () => {
     // self-report call asks a different question and wouldn't carry the
     // thread context, so this checks every prompt the provider actually saw.
     expect(seenPrompts.some((prompt) => prompt.includes("it depends on tenure"))).toBe(true);
+  });
+});
+
+describe("draftReply — a refused subject escalates without reasoning about it (#34 AC2)", () => {
+  function writeRefusalsFile(dir: string, subjects: string[]): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "refusals.md"), subjects.map((s) => `- ${s}`).join("\n"), "utf8");
+  }
+
+  it("escalates citing the refusal, even though a confirmed rule would otherwise answer it", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath); // topic "vacation leave" — squarely on-topic if this question weren't refused
+    const dir = duoDir();
+    writeRefusalsFile(dir, ["vacation"]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      null,
+      embeddingProvider,
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("escalation");
+    if (result.kind !== "escalation") throw new Error("expected an escalation");
+    expect(result.refused).toBe(true);
+    expect(result.reason).toContain("vacation");
+    expect(result.reason).toContain("duo/refusals.md");
+  });
+
+  it("never calls retrieval or the inference provider at all for a refused question", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const dir = duoDir();
+    writeRefusalsFile(dir, ["vacation"]);
+    let calls = 0;
+    const countingProvider = { name: "fake", async complete() { calls += 1; return "should never run"; } };
+
+    await draftReply(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      null,
+      createFakeEmbeddingProvider(),
+      countingProvider,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(calls).toBe(0);
+  });
+
+  it("still writes exactly one (escalated) draft-log row for a refused question", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    writeRefusalsFile(dir, ["salary"]);
+
+    const result = await draftReply(storePath, PASSPHRASE, dir, "what is my salary", null, createFakeEmbeddingProvider(), undefined, CONFIDENCE_CONFIG);
+    if (result.kind !== "escalation") throw new Error("expected an escalation");
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.escalated).toBe(true);
+    expect(stored?.draftText).toBeNull();
+  });
+
+  it("marks a non-refused escalation (thin evidence) as refused: false", async () => {
+    const storePath = initStore();
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "what is the meaning of life",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+    if (result.kind !== "escalation") throw new Error("expected an escalation");
+    expect(result.refused).toBe(false);
   });
 });

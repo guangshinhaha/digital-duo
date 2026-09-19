@@ -23,6 +23,8 @@ const RULE: Rule = {
   consistency: 0.9,
   createdAt: "2026-01-01T00:00:00.000Z",
   lastConfirmedAt: "2026-01-01T00:00:00.000Z",
+  reviewStatus: "approved",
+  origin: "derived",
 };
 
 describe("buildDraftPrompt", () => {

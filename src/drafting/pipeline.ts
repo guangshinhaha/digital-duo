@@ -10,8 +10,10 @@ import {
 } from "./confidence.js";
 import { gatherDraftContext, type DraftContext } from "./context.js";
 import { appendDraft, type DraftSource } from "./draft-log.js";
-import { explainEscalation, noEvidenceEscalationReason } from "./escalation.js";
+import { explainEscalation, noEvidenceEscalationReason, refusedSubjectEscalationReason } from "./escalation.js";
 import { buildDraftPrompt, extractiveDraft, pickRepresentativeSample } from "./generate.js";
+import { matchesRefusedSubject } from "./relevance-gate.js";
+import { readRefusalsFile } from "./refusals.js";
 
 export interface DraftAnswer {
   readonly kind: "draft";
@@ -25,6 +27,8 @@ export interface DraftEscalation {
   readonly kind: "escalation";
   readonly draftId: string;
   readonly reason: string;
+  /** True when this escalation is a refusal (#34 AC2) rather than a confidence-driven one — set without ever having reasoned about an answer, so a caller can tell "won't" apart from "can't" without parsing `reason`'s text. */
+  readonly refused: boolean;
   readonly confidence: ConfidenceResult | undefined;
 }
 
@@ -82,6 +86,26 @@ export async function draftReply(
   inferenceProvider: InferenceProvider | undefined,
   confidenceConfig: DuoConfig["confidence"],
 ): Promise<DraftPipelineResult> {
+  // Checked first, before any retrieval or generation: a refused subject
+  // escalates "without reasoning about it" (#34 AC2) — there is no
+  // internal draft composed and then withheld, because nothing below
+  // this point ever runs for a refused question.
+  const refusals = readRefusalsFile(duoDir);
+  const matchedRefusal = matchesRefusedSubject(question, refusals);
+  if (matchedRefusal !== undefined) {
+    const reason = refusedSubjectEscalationReason(matchedRefusal);
+    const draftId = appendDraft(storePath, passphrase, {
+      question,
+      threadContext,
+      draftText: null,
+      escalated: true,
+      escalationReason: reason,
+      confidenceScore: 0,
+      sources: [],
+    });
+    return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
+  }
+
   const context = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider);
   const sources = buildSources(context);
 
@@ -107,7 +131,7 @@ export async function draftReply(
       confidenceScore: 0,
       sources,
     });
-    return { kind: "escalation", draftId, reason, confidence: undefined };
+    return { kind: "escalation", draftId, reason, refused: false, confidence: undefined };
   }
 
   let samples: readonly string[];
@@ -155,7 +179,7 @@ export async function draftReply(
       confidenceScore: confidence.score,
       sources,
     });
-    return { kind: "escalation", draftId, reason, confidence };
+    return { kind: "escalation", draftId, reason, refused: false, confidence };
   }
 
   const text = pickRepresentativeSample(samples, sampleEmbeddings);

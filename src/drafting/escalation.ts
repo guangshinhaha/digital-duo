@@ -33,10 +33,27 @@ export function explainEscalation(confidence: ConfidenceResult, context: DraftCo
   }
 
   const reasonList = weak.length > 0 ? weak.join("; ") : "overall confidence is too low even though no single signal stands out";
-  return `I'd escalate this one rather than guess (confidence ${confidence.score.toFixed(2)}, below the ${confidence.threshold} threshold): ${reasonList}.`;
+  const wouldHelp =
+    "Answering it yourself and recording that answer would give the next question on this topic something to draw on.";
+  return `I'd escalate this one rather than guess (confidence ${confidence.score.toFixed(2)}, below the ${confidence.threshold} threshold): ${reasonList}. ${wouldHelp}`;
 }
 
 /** The immediate-escalation case: there was nothing to draft from at all — no rule, no evidence, no provider fallback. Never even scored against the threshold, since every signal that could carry weight is necessarily zero. */
 export function noEvidenceEscalationReason(): string {
-  return "I'd escalate this one: no standing order or past exchange in the corpus covers this question at all.";
+  return (
+    "I'd escalate this one: no standing order or past exchange in the corpus covers this question at all. " +
+    "Answering it yourself and recording that answer would give the next question on this topic something to draw on."
+  );
+}
+
+/**
+ * #34 AC2: a refused subject escalates citing the refusal by name, and
+ * nothing else — no signal breakdown, no "what would help" suggestion,
+ * because none of that reasoning ever ran. Naming the matched refusal
+ * text (rather than a generic "this is refused") is what makes the
+ * escalation self-explaining without the owner having to go check
+ * duo/refusals.md themselves.
+ */
+export function refusedSubjectEscalationReason(matchedRefusal: string): string {
+  return `I'd escalate this one: it touches "${matchedRefusal}", which is on the refusal list (duo/refusals.md) — I won't reason about it at all.`;
 }

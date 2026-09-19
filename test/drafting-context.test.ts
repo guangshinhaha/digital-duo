@@ -101,6 +101,39 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
     expect(context.ruleHit?.id).toBe("topic-leave");
     expect(context.ruleHit?.status).toBe("confirmed");
   });
+
+  it("does not treat a confirmed-but-not-yet-owner-approved rule as a hit (#28's review gate)", async () => {
+    const storePath = initStore();
+    const question = record({ kind: "question_to_me", author: "other", text: "a question about leave", threadId: "t-shared" });
+    const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "t-shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave-pending" })));
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      putRule(
+        db,
+        {
+          id: "topic-leave-pending",
+          topicId: "topic-leave-pending",
+          text: "Standard leave is five days per quarter.",
+          status: "confirmed",
+          supportCount: 3,
+          consistency: 0.95,
+          createdAt: new Date().toISOString(),
+          lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "pending", // the owner hasn't signed off on this yet
+          origin: "derived",
+        },
+        pairs.map((pair) => pair.id),
+      );
+    });
+
+    const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(context.ruleHit).toBeUndefined();
+  });
 });
 
 describe("gatherDraftContext — freshest evidence age", () => {
