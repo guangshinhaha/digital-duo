@@ -100,8 +100,7 @@ thing to drift, and the only client is the owner, so there is nothing to redact.
 
 | Method | Path | Returns | Module |
 |---|---|---|---|
-| `GET` | `/duos` | `DuoSummary[]` *(new, 1.6)* | `duo/loader`, `shared-duo/loader` |
-| `POST` | `/duos/:id/ask` | `AnswerForAskerResult` | `permissions/answer` |
+| `GET` | `/duos` | `DuoSummary[]` *(new, 1.6)* | `duo/registry` |
 | `POST` | `/drafts` | `DraftPipelineResult` | `drafting/pipeline` |
 | `GET` | `/drafts?outcome=pending` | `DraftRecord[]` | `drafting/draft-log` |
 | `GET` | `/drafts/:id` | `DraftRecord` | `drafting/draft-log` |
@@ -114,22 +113,28 @@ thing to drift, and the only client is the owner, so there is nothing to redact.
 | `GET` | `/trust/grid` | `GridRow[]` | `trust/grid` |
 | `GET` | `/audit` | `AuditEntry[]` | `permissions/audit` |
 
-`POST /drafts` is the one slow route — self-consistency sampling runs `selfConsistencySamples`
-completions. It returns `202` with a draft id immediately and pushes the result over the
-WebSocket, because a phone on a tailnet will not hold a 40-second request open.
+There is deliberately no `/duos/:id/ask` route. Asking the **personal** duo something *is*
+drafting — there is no separate "ask" action for it, the same way `duo ask`/`duo draft` never
+took a duo id — so that's `POST /drafts`. Asking the **shared** duo (`answerForAsker`,
+`permissions/answer.ts`) is real but out of scope for this pass: it needs an `askerRef` resolved
+against `duo/directory.json`, which is a permissions question this document hasn't worked through
+yet, not a hard blocker. `runAsk` (`commands/ask.ts`) is a raw, ungrounded provider passthrough
+used only to verify provider configuration (R4/R5) — it is never a route backing anything a client
+shows the owner.
 
-`DraftPipelineResult` is already a discriminated union on `kind`, so the client renders a draft and
-an escalation from one switch with no shape-guessing:
+`POST /drafts` returns the full `DraftPipelineResult` **synchronously** in v1 — 201, not 202. Self-
+consistency sampling without a configured inference provider falls back to the fast, deterministic
+extractive draft; with a real provider this can run tens of seconds, and a 202-plus-WebSocket-push
+shape (the client gets a draft id back immediately, the real result arrives over the socket) is the
+obvious next step once that becomes the common case. Deferred rather than built speculatively: a
+synchronous, fully-tested route now beats a half-tested job queue.
 
-```ts
-type DraftPipelineResult =
-  | { kind: "draft";      draftId: string; text: string;   sources: readonly DraftSource[]; confidence: ConfidenceResult }
-  | { kind: "escalation"; draftId: string; reason: string; refused: boolean; confidence: ConfidenceResult | undefined }
-```
-
-`refused` exists so the client can tell **"won't"** from **"can't"** without parsing prose. They get
-different treatments: a refusal is a boundary the owner set and should read as the system working;
-a low-confidence escalation is the duo being honest and invites `POST /drafts/:id/answer`.
+`DraftPipelineResult` is a discriminated union on `kind` (see `drafting/pipeline.ts` for the
+authoritative shape — not reproduced here, so this document can't drift from it), so the client
+renders a draft and an escalation from one switch with no shape-guessing. Its `refused` field
+exists so the client can tell **"won't"** from **"can't"** without parsing prose: a refusal is a
+boundary the owner set and should read as the system working, while a low-confidence escalation is
+the duo being honest and invites `POST /drafts/:id/answer`.
 
 ## 1.5 Errors
 
@@ -158,9 +163,18 @@ poll, forever. → `listDrafts(storePath, passphrase, { outcome?: DraftOutcome |
 defaulting to today's behaviour so no caller changes.
 
 **G-c · There is no "list my duos".** The sidebar is the first thing the client renders and nothing
-returns it: `duo/loader.ts` resolves one duo from a definition and `shared-duo/loader.ts` resolves
-the team's. → A `DuoSummary { id, name, kind: "own" | "shared", knowledgeKind: "derived" | "authored" }`
-and a function that lists both, with `duo list` beside it.
+returns it. → `listAvailableDuos` (`duo/registry.ts`) plus `duo list`.
+
+This is deliberately **not** a general multi-duo registry, and role duos (`src/role-duo/`,
+already landed) are the reason why: each is addressed by an explicit definition file path passed
+to `duo role-duo`, and nothing anywhere enumerates which definition files exist. Inventing a
+registry entry format for them here would mean the daemon listing a kind of duo the CLI itself
+cannot list — exactly the "a surface must never add a behaviour" rule this document opened with.
+So `/duos` returns at most two entries: the personal duo (always — this process *is* its personal
+duo) and the shared duo (best-effort, if `shared-duo/persona.json` resolves to a human owner).
+A role duo you hold or seeded is real and useful, but it's reached today the way the CLI reaches
+it — `duo role-duo seed <path>` with the path you already have — not through the sidebar. Giving
+role duos a real registry is v1.5-shaped follow-up work, not a gap this pass silently papers over.
 
 Each is small. Each is a real gap the client would otherwise paper over with logic in a route
 handler, which is the failure mode this document is written to prevent.

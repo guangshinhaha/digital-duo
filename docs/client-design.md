@@ -96,19 +96,22 @@ three once at boot and the routes are thin wrappers — no reimplementation, no 
 
 | Endpoint | Backed by | Notes |
 |---|---|---|
-| `GET /duos` | `duo/loader.ts`, `shared-duo/loader.ts` | The sidebar: your duo, plus the team's shared one. |
-| `POST /duos/:id/ask` | `runAsk`, `runSharedAsk` | T0 retrieval. Always returns citations. |
-| `POST /draft` | `runDraft` | Relevance gate → confidence → draft **or** escalation. |
-| `POST /drafts/:id/outcome` | `runRecordDraftOutcome` | Send / Edit / Ignore. The edit is the training signal. |
-| `GET /review` | `listCorrectionCandidates` | The batched queue. Never auto-writes. |
-| `GET /mirror/portrait` | `runMirrorPortrait` | The interruption portrait. |
-| `GET /mirror/rules` | `runMirrorRulesList` | Rules, weak signals, conflicts. |
-| `POST /mirror/rules/:id` | `runMirrorRuleApprove` / `Reject` / `Promote` | Approve, reject, promote a weak signal. |
-| `GET /trust/grid` | `listGrid` | Read-only on mobile (AR-17). |
-| `GET /audit` | `runListAuditEntries` | Every answer, already logged. |
+| `GET /duos` | `duo/registry.ts` | The sidebar: your duo, plus the shared one if configured. |
+| `POST /drafts` | `drafting/pipeline.ts` | Relevance gate → confidence → draft **or** escalation. Asking your own duo something *is* drafting — there's no separate ask action for it, same as the CLI. |
+| `POST /drafts/:id/outcome` | `corrections/classify.ts` | Send / Edit / Ignore. The edit is the training signal. |
+| `GET /review` | `corrections/queue.ts` | The batched queue. Never auto-writes. |
+| `GET /mirror/portrait` | `derivation/portrait.ts` | The interruption portrait. |
+| `GET /mirror/rules` | `derivation/rule-review.ts` | Rules, weak signals, conflicts. |
+| `POST /mirror/rules/:id/:action` | `derivation/rule-review.ts` | Approve, reject, promote a weak signal. |
+| `GET /trust/grid` | `trust/grid.ts` | Read-only on mobile (AR-17). |
+| `GET /audit` | `permissions/audit.ts` | Every answer, already logged. |
 
 Adding a surface must not add a behaviour. If the client needs something the CLI cannot do, that
 is a gap in the core, and it gets fixed in the core.
+
+This table is the shape of the idea; `client-tech-design.md` §1.4 is the actual route contract —
+exact paths, response types, and the two deliberate omissions (no `/duos/:id/ask`, no async
+draft pipeline yet) — and is authoritative where the two differ.
 
 ## 1.4 The unlock problem
 
