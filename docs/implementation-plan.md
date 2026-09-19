@@ -349,9 +349,39 @@ ceremony on work that doesn't need it:
   explaining the boundary, not an actual import — tightened to match only a real import/call
   pattern. No answering CLI, citation dates, or usage tracking yet — that's #69, next.
 
-**Next:** #69 (wave W2, epic `e64` — shared-duos), story-labeled: ask the team's shared duo a
-question, full `lfg` path per §4. Per §1/§2, `e10` and `e64` ran strictly one at a time on `main`
-within wave W2, not concurrently with each other or with anything else — `e64` continues alone.
+- #69 (PR [#107](https://github.com/guangshinhaha/digital-duo/pull/107), merged, squash commit
+  `49c69c0`) — **full path** (`story` label, §4): `src/shared-duo/documents.ts` —
+  `PublishedDocument`/`parsePublishedDocument` reads a document's title and update date off its
+  own text (the `"<Title> (updated YYYY-MM-DD): <body>"` convention — the same
+  read-a-marking-off-the-text idiom #48's `detectClassification` uses), so #69's citation/
+  staleness needs are met with **no schema change to #65's general `Duo` primitive** —
+  `knowledge.documents` stays a plain `string[]`. `isStale` flags a document not revisited in 180
+  days. `src/shared-duo/loader.ts` gains `assertDocumentsAreWellFormed`, extending #67/#68's
+  load-time validation chain to the new convention. `src/shared-duo/answer.ts`'s
+  `answerSharedDuo` now returns per-citation title/date/staleness and writes exactly one
+  usage-log entry per call, answered or declined. `src/shared-duo/usage-log.ts` +
+  `src/commands/shared.ts` + `duo shared ask`/`duo shared gaps`: a durable, plain-JSON,
+  owner-only log of every question asked; `unresolvedQuestionGaps` groups repeated out-of-scope
+  questions by normalized text, most-repeated first (#69 AC4). Design decisions: "which surface
+  first" resolved as the CLI (consistent with every other "ask" feature already shipped, and
+  explicit in the issue that the epic shouldn't inherit #40's Slack block); "links to the source
+  material" interpreted as a named document title, not a literal URL (these are configured
+  strings, not files); "passes the question on" implemented as durable, owner-reviewable logging
+  rather than a live notification, since no chat/email surface is decided yet. 304 tests (30 new).
+  Multi-angle review (adversarial + simplification, per the story path) found two real issues
+  fixed before commit: the usage log's default path sat under `data/`, the *personal* duo's
+  store directory `duo purge` deletes wholesale — a personal purge would have silently wiped the
+  shared team duo's entire usage history — moved to its own gitignored `shared-duo-runtime/`
+  directory, with a regression test; and the document-date regex accepted syntactically-shaped
+  but impossible calendar dates (e.g. `2026-13-45`), which `Date` rolls over silently rather than
+  rejecting — added a round-trip validation so a typo fails loudly at load time. Also
+  deduplicated `answerSharedDuo`'s two near-identical usage-log writes into one. No attribution
+  enforcement or usage reporting yet — that's #70, next.
+
+**Next:** #70 (wave W2, epic `e64` — shared-duos), story-labeled: make it obvious a shared duo has
+no personal author, full `lfg` path per §4. Per §1/§2, `e10` and `e64` ran strictly one at a time
+on `main` within wave W2, not concurrently with each other or with anything else — `e64` continues
+alone.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
