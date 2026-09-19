@@ -134,6 +134,42 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
     const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
     expect(context.ruleHit).toBeUndefined();
   });
+
+  it("does not treat an approved rule as a hit once its topic has a conflicting refusal (#29 AC3, checked live)", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    const question = record({ kind: "question_to_me", author: "other", text: "a question about leave", threadId: "t-shared" });
+    const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "t-shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave-refused" })));
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      putRule(
+        db,
+        {
+          id: "topic-leave-refused",
+          topicId: "topic-leave-refused",
+          text: "Standard leave is five days per quarter.",
+          status: "confirmed",
+          supportCount: 3,
+          consistency: 0.95,
+          createdAt: new Date().toISOString(),
+          lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "approved",
+          origin: "derived",
+        },
+        pairs.map((pair) => pair.id),
+      );
+    });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "refusals.md"), "## topic-leave-refused\n\nNever speak for me on leave policy.\n", "utf8");
+
+    const context = await gatherDraftContext(storePath, PASSPHRASE, dir, "how much vacation leave do I get", embeddingProvider);
+    expect(context.ruleHit).toBeUndefined();
+  });
 });
 
 describe("gatherDraftContext — freshest evidence age", () => {
