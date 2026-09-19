@@ -80,3 +80,58 @@ describe("duo permissions ask", () => {
     expect(result.stderr).not.toMatch(/declined/i);
   });
 });
+
+describe("duo permissions audit", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["permissions", "audit"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("reports no entries yet on a fresh store", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["permissions", "audit"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/no audit entries/i);
+  });
+
+  it("lists an entry written by a prior `duo permissions ask`, and --id shows its full reconstruction", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const askResult = await runCli(["permissions", "ask", "what is the vacation policy?", "--as", "alice"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(askResult.exitCode).toBe(0);
+
+    const listResult = await runCli(["permissions", "audit"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(listResult.exitCode).toBe(0);
+    expect(listResult.stdout).toMatch(/asker=alice/);
+    const idMatch = listResult.stdout.match(/\[([0-9a-f-]{36})\]/);
+    expect(idMatch).not.toBeNull();
+
+    const showResult = await runCli(["permissions", "audit", "--id", idMatch![1]], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(showResult.exitCode).toBe(0);
+    const entry = JSON.parse(showResult.stdout);
+    expect(entry.askerRef).toBe("alice");
+    expect(entry.question).toBe("what is the vacation policy?");
+    expect(entry.answerText).toBe("I don't have anything I can share with you on that.");
+    expect(entry.declined).toBe(true);
+  });
+
+  it("reports an unknown id clearly and exits non-zero", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["permissions", "audit", "--id", "nope"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/no audit entry/i);
+  });
+});

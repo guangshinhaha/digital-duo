@@ -3,6 +3,7 @@ import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-prov
 import { tryResolveProvider } from "../provider/registry.js";
 import { type EnforceCeilingOutcome, enforceClassificationCeiling, parseClassificationCeiling } from "../permissions/classification.js";
 import { answerForAsker, type AnswerForAskerResult } from "../permissions/answer.js";
+import { type AuditEntry, getAuditEntry, listAuditEntries } from "../permissions/audit.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -31,4 +32,18 @@ export async function runAskAsAsker(
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
   return answerForAsker(config.storePath, passphrase, config.duoDir, question, askerRef, embeddingProvider, inferenceProvider);
+}
+
+/** Implements `duo permissions audit` (#51 AC1): every audit entry, oldest first — the owner's full list to scan or pipe. */
+export function runListAuditEntries(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): AuditEntry[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listAuditEntries(config.storePath, passphrase);
+}
+
+/** Implements `duo permissions audit --id <id>` (#51 AC1): one entry in full — everything needed to reconstruct that exact answer. */
+export function runShowAuditEntry(id: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): AuditEntry | undefined {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return getAuditEntry(config.storePath, passphrase, id);
 }

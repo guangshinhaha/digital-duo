@@ -1,7 +1,7 @@
 import type { IngestRecord } from "../ingest/record.js";
 import { stripMarkingLine } from "../ingest/record.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
-import { appendAuditEntry } from "./audit.js";
+import { appendAuditEntry, type AuditConfidence } from "./audit.js";
 import { retrieveForAsker } from "./retrieval.js";
 
 /**
@@ -81,6 +81,11 @@ export async function answerForAsker(
     answer = extractiveAnswer(visibleRecords);
   }
 
+  // A coarse, honest signal (#51 AC1) — not a calibrated probability, just
+  // what actually happened: nothing to be confident about (declined), a
+  // degraded retrieval channel, or the ordinary case.
+  const confidence: AuditConfidence = declined ? "low" : retrieval.usedEmbeddings ? "high" : "degraded";
+
   const auditEntryId = appendAuditEntry(storePath, passphrase, {
     question,
     askerRef,
@@ -93,6 +98,7 @@ export async function answerForAsker(
       reason: excluded.reason,
     })),
     rulesUsed: [],
+    confidence,
     declined,
     answerText: answer,
   });
