@@ -306,9 +306,32 @@ ceremony on work that doesn't need it:
   reconstructible (#51) — this is the full permission engine v1-spec.md §3 deferred, now built
   ahead of phase 2 / public answering (wave W5's `e9`), which will be the first real consumer.
 
-**Next:** #67 (wave W2, epic `e64` — shared-duos), which the orchestrating session runs as its
-own separate chain. Per §1/§2, `e10` and `e64` ran strictly one at a time on `main` within wave
-W2, not concurrently with each other or with anything else — `e64` now proceeds alone.
+- #67 (PR [#103](https://github.com/guangshinhaha/digital-duo/pull/103), merged, squash commit
+  `9e5da19`) — lighter path: `src/shared-duo/` (new directory, epic `e64`'s home), layered on the
+  general `Duo` primitive #65 shipped rather than a second, parallel definition mechanism.
+  `shared-duo/persona.json` — a real, checked-in persona file at the repo root, sibling to `duo/`
+  (the personal duo's derived-output directory) — is the one config for Phase 1.5's bridge duo
+  (concept.md §12). `loadSharedDuo`/`createSharedDuo` reuse #65's `parseDuoDefinition` for the
+  general shape, then `assertHumanOwner` enforces the one constraint specific to a *shared* duo:
+  loading fails, naming the duo and the owner's actual kind, unless `owner.kind === "person"` —
+  the general `Duo` entity deliberately allows `role`/`none` owners for later phases (role duos,
+  synthetic personas), but a shared duo has "nobody to escalate to and nobody accountable for it"
+  otherwise (#67 AC2), checked at load time rather than left to whichever call reaches
+  `requireHumanOwner()` first. No write path anywhere in the module — the only way the persona
+  file changes is a hand-edited diff proposed and merged through version control (AC3). Scope
+  decision: `knowledge.documents` stays plain strings (reusing #65's `AuthoredKnowledgeSource`
+  as-is) with no per-document citation name or freshness date yet — that richer structure belongs
+  to #68/#69's *answering* work, not this issue's *loading* work. 266 tests (13 new). Self-review
+  found no fixable issues. Also fixed as environment setup, not a code change: this worktree's
+  `node_modules` was empty (a stale checkout), which made every CLI-spawning test fail with
+  `spawn .../tsx ENOENT` and the branch's initial `git checkout -b ... main` resolve to a stale
+  local `main` ref three issues behind `origin/main` — the first was fixed with `npm install`, the
+  second by re-basing onto `origin/main` before any commit landed. No answering, citation, or
+  attribution logic yet — that's #68, next.
+
+**Next:** #68 (wave W2, epic `e64` — shared-duos): ground the shared duo in published material
+only. Per §1/§2, `e10` and `e64` ran strictly one at a time on `main` within wave W2, not
+concurrently with each other or with anything else — `e64` continues alone.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
