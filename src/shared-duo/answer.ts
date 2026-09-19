@@ -85,11 +85,16 @@ export interface SharedDuoAnswer {
  * (#69 AC2's "passes the question on", AC4's repeated-question gaps) —
  * done here, not by the CLI, so a call from anywhere always logs, the
  * same "the answering function itself owns the log write" shape #50's
- * answerForAsker uses for the personal duo's audit log.
+ * answerForAsker uses for the personal duo's audit log. `askerId` is
+ * recorded for #71's usage report (distinct/repeat askers) only — it is
+ * never resolved against a directory or used to filter what the answer
+ * draws from, since a shared duo does no per-asker permissioning at all
+ * (v1-spec.md §3).
  */
 export async function answerSharedDuo(
   duo: Duo,
   question: string,
+  askerId: string,
   usageLogPath: string,
   asOf: Date = new Date(),
 ): Promise<SharedDuoAnswer> {
@@ -115,6 +120,7 @@ export async function answerSharedDuo(
 
   appendUsageEntry(usageLogPath, {
     question,
+    askerId,
     declined: result.declined,
     citedTitles: result.citations.map((citation) => citation.title),
     staleCitation: result.citations.some((citation) => citation.stale),

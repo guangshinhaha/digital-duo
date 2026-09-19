@@ -2,16 +2,30 @@ import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { answerSharedDuo, type SharedDuoAnswer } from "../shared-duo/answer.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { loadUsageLog, unresolvedQuestionGaps, type QuestionGap } from "../shared-duo/usage-log.js";
+import { buildUsageReport, type SharedDuoUsageReport } from "../shared-duo/usage-report.js";
 
-/** Implements `duo shared ask <question>` (#69): loads the persona file fresh on every call — a hand-edited, merged change to it takes effect on the very next ask, with nothing to restart. */
-export async function runSharedAsk(question: string, env: NodeJS.ProcessEnv = process.env): Promise<SharedDuoAnswer> {
+/** Who a `duo shared ask` is recorded under when `--as` is omitted — asking still works without naming yourself, and #71's usage report simply lumps every such ask together rather than treating it as one distinct asker per call. */
+const ANONYMOUS_ASKER = "anonymous";
+
+/** Implements `duo shared ask <question> [--as <askerId>]` (#69, `--as` added by #71): loads the persona file fresh on every call — a hand-edited, merged change to it takes effect on the very next ask, with nothing to restart. */
+export async function runSharedAsk(
+  question: string,
+  askerId: string = ANONYMOUS_ASKER,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<SharedDuoAnswer> {
   const { personaPath, usageLogPath } = loadSharedDuoConfig(env);
   const duo = loadSharedDuo(personaPath);
-  return answerSharedDuo(duo, question, usageLogPath);
+  return answerSharedDuo(duo, question, askerId, usageLogPath);
 }
 
 /** Implements `duo shared gaps` (#69 AC4): the out-of-scope questions the shared duo has been asked, most-repeated first. */
 export function runSharedGaps(env: NodeJS.ProcessEnv = process.env): QuestionGap[] {
   const { usageLogPath } = loadSharedDuoConfig(env);
   return unresolvedQuestionGaps(loadUsageLog(usageLogPath));
+}
+
+/** Implements `duo shared usage` (#71): the honest usage picture — total questions, distinct/repeat askers, answer/escalation rate, the weekly trend, unanswerable-question gaps, and whether the duo has been abandoned or never used at all. */
+export function runSharedUsage(env: NodeJS.ProcessEnv = process.env): SharedDuoUsageReport {
+  const { usageLogPath } = loadSharedDuoConfig(env);
+  return buildUsageReport(loadUsageLog(usageLogPath));
 }

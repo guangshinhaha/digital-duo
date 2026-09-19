@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCli } from "./helpers/run-cli.js";
@@ -82,6 +82,18 @@ describe("duo shared ask", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toMatch(/human owner/i);
   });
+
+  it("records the asker given with --as, and defaults to anonymous when omitted (#71)", async () => {
+    const personaPath = writePersona(tempDir());
+    const usageLogPath = join(tempDir(), "usage.json");
+    const cliEnv = env(personaPath, usageLogPath);
+
+    await runCli(["shared", "ask", "leave requests", "--as", "alice"], { cwd: tempDir(), env: cliEnv });
+    await runCli(["shared", "ask", "leave requests"], { cwd: tempDir(), env: cliEnv });
+
+    const logged = JSON.parse(readFileSync(usageLogPath, "utf8")) as Array<{ askerId: string }>;
+    expect(logged.map((e) => e.askerId)).toEqual(["alice", "anonymous"]);
+  });
 });
 
 describe("a personal `duo purge` never touches the shared duo's usage log", () => {
@@ -125,5 +137,48 @@ describe("duo shared gaps", () => {
     const result = await runCli(["shared", "gaps"], { cwd: tempDir(), env: { DUO_SHARED_USAGE_LOG_PATH: usageLogPath } });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/2x\s+what is the parking policy/i);
+  });
+});
+
+describe("duo shared usage", () => {
+  it("says plainly, in those words, that the duo is not being used when nothing has been asked (#71 AC4)", async () => {
+    const usageLogPath = join(tempDir(), "usage.json");
+    const result = await runCli(["shared", "usage"], { cwd: tempDir(), env: { DUO_SHARED_USAGE_LOG_PATH: usageLogPath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("The shared duo is not being used.");
+  });
+
+  it("reports questions, distinct/repeat askers, answer/escalation rate, and gaps after real use", async () => {
+    const personaPath = writePersona(tempDir());
+    const usageLogPath = join(tempDir(), "usage.json");
+    const cliEnv = env(personaPath, usageLogPath);
+
+    await runCli(["shared", "ask", "leave requests", "--as", "alice"], { cwd: tempDir(), env: cliEnv });
+    await runCli(["shared", "ask", "what is the parking policy", "--as", "alice"], { cwd: tempDir(), env: cliEnv });
+    await runCli(["shared", "ask", "what is the parking policy", "--as", "bob"], { cwd: tempDir(), env: cliEnv });
+
+    const result = await runCli(["shared", "usage"], { cwd: tempDir(), env: { DUO_SHARED_USAGE_LOG_PATH: usageLogPath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Total questions: 3");
+    expect(result.stdout).toMatch(/Distinct askers: 2 \(1 asked more than once\)/);
+    expect(result.stdout).toMatch(/Answer rate: 33%/);
+    expect(result.stdout).toMatch(/Escalation rate: 67%/);
+    expect(result.stdout).toMatch(/2x\s+what is the parking policy/i);
+  });
+
+  it("states plainly, with the date, when usage has stopped rather than smoothing it into an average (#71 AC2)", async () => {
+    const usageLogPath = join(tempDir(), "usage.json");
+    mkdirSync(join(tempDir()), { recursive: true });
+    writeFileSync(
+      usageLogPath,
+      JSON.stringify([
+        { id: "1", createdAt: "2020-01-01T00:00:00.000Z", question: "old question", askerId: "alice", declined: false, citedTitles: [], staleCitation: false },
+      ]),
+    );
+
+    const result = await runCli(["shared", "usage"], { cwd: tempDir(), env: { DUO_SHARED_USAGE_LOG_PATH: usageLogPath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/stopped/i);
+    expect(result.stdout).toContain("2020-01-01");
   });
 });
