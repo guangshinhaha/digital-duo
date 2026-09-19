@@ -264,9 +264,30 @@ ceremony on work that doesn't need it:
   excluded record ever reaches generation. 222 tests. Self-review found no fixable issues. No
   answering/generation or audit log yet — that's #50, next.
 
-**Next:** #50 (wave W2, epic `e10` — permissions). Per §1/§2, `e10` and `e64` (shared-duos) still
-run strictly one at a time on `main` within wave W2, not concurrently with each other or with
-anything else.
+- #50 (PR [#99](https://github.com/guangshinhaha/digital-duo/pull/99), merged, squash commit
+  `d60397a`) — **full path** (`story` label, §4): `src/permissions/answer.ts` (new):
+  `answerForAsker`, the first real "the duo answers" mechanism — "(what I know) x (what I would
+  tell you)", resolved before generation via #49's `retrieveForAsker`. Only `generationContext`
+  (what the asker's clearance permits) ever reaches a prompt or the extractive fallback; a
+  best-effort inference provider degrades to the visible records' own text when unset or
+  unreachable, same shape as #23-#26. `src/permissions/audit.ts` (new): minimal insert-only audit
+  log for this issue's own AC3 (question, asker, clearance applied, records used/excluded + why,
+  declined, exact answer text) — only an append function is exported; #51 builds the read/
+  reconstruction side. `duo permissions ask <question> --as <askerId>` CLI command. Design
+  decision on the issue's own flagged open question (does declining leak that something was
+  restricted?): resolved conservatively — `DECLINE_MESSAGE` is one fixed string, byte-identical
+  whether nothing matched at all or everything that matched was excluded for clearance, verified
+  by a test. Multi-angle review (adversarial + simplification passes, per the story path) found
+  two real issues fixed before commit: a visible record's own classification marking line was
+  being echoed verbatim into answers (added `stripMarkingLine` to `src/ingest/record.ts`), and
+  the CLI silently swallowed retrieval's degraded-to-full-text warning (now surfaced, same as
+  `duo search`). Also lifted `derive.ts`'s local best-effort-provider-resolution helper into a
+  shared `tryResolveProvider` in `src/provider/registry.ts`. 242 tests. No hardened append-only
+  guarantees or owner-facing read view yet — that's #51, next.
+
+**Next:** #51 (wave W2, epic `e10` — permissions), the last issue in this chain. Per §1/§2, `e10`
+and `e64` (shared-duos) still run strictly one at a time on `main` within wave W2, not
+concurrently with each other or with anything else.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
