@@ -285,9 +285,30 @@ ceremony on work that doesn't need it:
   shared `tryResolveProvider` in `src/provider/registry.ts`. 242 tests. No hardened append-only
   guarantees or owner-facing read view yet — that's #51, next.
 
-**Next:** #51 (wave W2, epic `e10` — permissions), the last issue in this chain. Per §1/§2, `e10`
-and `e64` (shared-duos) still run strictly one at a time on `main` within wave W2, not
-concurrently with each other or with anything else.
+- #51 (PR [#101](https://github.com/guangshinhaha/digital-duo/pull/101), merged, squash commit
+  `eed8f6a`) — lighter path: extends #50's minimal insert-only `audit_log` into a full read/
+  reconstruction surface. `getAuditEntry`/`listAuditEntries` return the parsed `AuditEntry` shape
+  (question, asker, clearance applied, records used/excluded + why, rules used, confidence,
+  declined, exact answer text). Adds `confidence` (`"low" | "degraded" | "high"`, a coarse honest
+  signal, not a calibrated probability) and `correctsEntryId` + `appendCorrection`, which records
+  a correction as a brand-new entry referencing the one it corrects rather than touching it.
+  Append-only enforced two ways: still no update/delete export anywhere in the module, *and*
+  `ensureAuditSchema` now installs `BEFORE UPDATE`/`BEFORE DELETE` triggers on `audit_log` that
+  `RAISE(ABORT)` — a database-level refusal that holds even against a future bug in this
+  codebase, not only against a convenience function nobody wrote. `duo permissions audit`
+  (list) / `duo permissions audit --id <id>` (one entry's full reconstruction) — the
+  owner-opens-the-audit-log surface. `src/permissions/answer.ts` now computes and records
+  `confidence` per answer. 253 tests. Self-review found no fixable issues beyond what the ACs
+  themselves called for. **Wave W2's epic `e10` (permissions) is now complete** — all of #48,
+  #49, #50, #51 merged in order, one at a time on `main`. Every issue's schema fields were
+  captured on ingest (#48), resolved to a real asker+clearance before retrieval (#49), used to
+  filter what an answer may draw from (#50), and everything about that answer is now
+  reconstructible (#51) — this is the full permission engine v1-spec.md §3 deferred, now built
+  ahead of phase 2 / public answering (wave W5's `e9`), which will be the first real consumer.
+
+**Next:** #67 (wave W2, epic `e64` — shared-duos), which the orchestrating session runs as its
+own separate chain. Per §1/§2, `e10` and `e64` ran strictly one at a time on `main` within wave
+W2, not concurrently with each other or with anything else — `e64` now proceeds alone.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
