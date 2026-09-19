@@ -1,6 +1,7 @@
 import type { DuoConfig } from "../config.js";
 import { grantAutonomy, type GrantOutcome } from "../trust/grants.js";
-import { isTrustTier, listGrid, type GridRow, type TrustTier } from "../trust/grid.js";
+import { isTrustTier, listGrid, type GridRow, type TrustCell, type TrustTier } from "../trust/grid.js";
+import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers, type PromotionOffer } from "../trust/promotion.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -42,4 +43,27 @@ export function runTrustGrant(
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return grantAutonomy(config.storePath, passphrase, config.duoDir, { scopeText, tier, topicId: options.topicId });
+}
+
+/** Implements `duo trust promotions` (#54): the batched digest of every cell currently due for a promotion offer, evidence included. */
+export function runTrustPromotions(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PromotionOffer[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return getPendingPromotionOffers(config.storePath, passphrase, config.duoDir);
+}
+
+/** Implements `duo trust promote <topicId> <tier> --accept|--decline` (#54 AC1/AC2/AC3): the owner's explicit tap — nothing promotes without it. */
+export function runTrustPromote(
+  topicId: string,
+  tierValue: string,
+  decision: "accept" | "decline",
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): TrustCell {
+  const tier = parseTrustTier(tierValue);
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return decision === "accept"
+    ? acceptPromotionOffer(config.storePath, passphrase, topicId, tier)
+    : declinePromotionOffer(config.storePath, passphrase, topicId, tier);
 }
