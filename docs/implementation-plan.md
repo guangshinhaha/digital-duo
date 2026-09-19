@@ -193,10 +193,27 @@ ceremony on work that doesn't need it:
   `IngestRecord.topics` — record-store.ts documents records as insert-only, so topic linkage
   lives entirely on `qa_pairs.topic_id`. No rule induction yet — that's #25, next.
 
-**Next:** #25 (W2, epic `e3` — per-topic rule induction with evidence and a support filter) —
-check its label before assuming which path applies. `e3` (derivation), `e10` (permissions), and
-`e64` (shared-duos) run as parallel epics per §1, though concurrency stays sequential through W2
-per §2's locked decision.
+- #25 (PR [#91](https://github.com/guangshinhaha/digital-duo/pull/91), merged, squash commit
+  `11b8f2d`) — lighter path: `src/derivation/rules.ts`. Recomputes one rule per topic from
+  scratch on every run, over every `qa_pair` currently assigned to it — unlike #24's topic ids, a
+  topic's consistency/support genuinely changes as evidence accumulates, so re-running updates a
+  rule in place rather than just extending it. Consistency is average pairwise cosine similarity
+  among a topic's answer embeddings (backfilled via #20's `embedRecords`); ≥3 supporting pairs
+  and ≥0.7 average similarity promotes a `confirmed` rule, below the support threshold produces a
+  `weak_signal` candidate (AR-3), at/above threshold but inconsistent produces an `inconsistent`
+  record carrying its conflicting examples rather than a fabricated averaged policy. Rule text
+  for the confirmed case defaults to the topic's most central answer verbatim, optionally
+  LLM-phrased (best-effort, same degrade-rather-than-fail shape as #23/#24) — the inconsistent
+  case is deliberately never handed to an LLM, so the disagreement itself stays visible. One rule
+  per topic in v1 (`rule.id === topic.id`), documented as a deliberate simplification.
+  `rule_evidence` fully replaced each run; every rule (any status) always carries at least one
+  evidence row. `duo derive rules` CLI command. 179 tests. Self-review found no fixable issues.
+  No file sync or voice profile yet — that's #26, next.
+
+**Next:** #26 (W2, epic `e3` — voice profile and the rules file sync, the last issue in this
+chain) — check its label before assuming which path applies. `e3` (derivation), `e10`
+(permissions), and `e64` (shared-duos) run as parallel epics per §1, though concurrency stays
+sequential through W2 per §2's locked decision.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
