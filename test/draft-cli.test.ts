@@ -85,7 +85,9 @@ describe("duo draft — a refused subject escalates citing the refusal (#34 AC2)
     const duoDir = join(tempDir(), "duo");
     await initStore(storePath, tempDir());
     mkdirSync(duoDir, { recursive: true });
-    writeFileSync(join(duoDir, "refusals.md"), "- salary\n", "utf8");
+    // duo/refusals.md's one real format (../src/trust/refusals.ts, #53/#29):
+    // "## <subject>" headings with a reason body.
+    writeFileSync(join(duoDir, "refusals.md"), "## salary\n\nNever speak for me on this.\n", "utf8");
 
     const result = await runCli(["draft", "what is my salary"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDir } });
     expect(result.exitCode).toBe(0);

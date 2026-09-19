@@ -246,9 +246,11 @@ describe("draftReply — a thread of context can be supplied (#32 AC4)", () => {
 });
 
 describe("draftReply — a refused subject escalates without reasoning about it (#34 AC2)", () => {
+  // duo/refusals.md's one real format (../src/trust/refusals.ts, #53/#29):
+  // "## <subject>" headings with a reason body.
   function writeRefusalsFile(dir: string, subjects: string[]): void {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "refusals.md"), subjects.map((s) => `- ${s}`).join("\n"), "utf8");
+    writeFileSync(join(dir, "refusals.md"), subjects.map((s) => `## ${s}\n\nreason\n`).join("\n"), "utf8");
   }
 
   it("escalates citing the refusal, even though a confirmed rule would otherwise answer it", async () => {
