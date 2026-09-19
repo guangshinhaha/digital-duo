@@ -107,9 +107,19 @@ ceremony on work that doesn't need it:
   made `dirname()` resolve to the cwd, so an unguarded `duo purge --yes` could delete the whole
   project or home directory; added a guard (`assertSafeDataDir`) that refuses cwd/home/root as
   the data directory before touching disk. No ingest pipeline yet — that's #18, next.
+- #18 (PR [#79](https://github.com/guangshinhaha/digital-duo/pull/79), merged, squash commit
+  `f4d69f3`) — lighter path: `src/ingest/record.ts` (the `IngestRecord` type per
+  `import-adapters.md` §2 — named to avoid shadowing TS's built-in `Record<K,V>` — plus
+  boundary validation and content-hashed ids) and `src/ingest/record-store.ts` (`writeRecords`/
+  `getRecord`/`countRecords`/`searchRecords` over a `records` table and an FTS5 `records_fts`
+  index, ranked via bm25). Extended `src/store/store.ts` with `withDatabase()`, the shared
+  decrypt/run/re-encrypt-on-success helper #17 anticipated. 91 tests. One review finding, fixed
+  before merge: FTS5's query grammar parses characters like `-` as operators, so a raw search
+  string such as `nonexistent-term-xyz` threw `no such column: term` instead of returning no
+  results; fixed by tokenizing the query and quoting each word as a literal phrase before it
+  reaches `MATCH`. No adapter yet — that's #19, next.
 
-**Next:** #18 (W1, start of epic `e2` — ingest) — check its label before assuming which path
-applies.
+**Next:** #19 (W1, epic `e2` — ingest) — check its label before assuming which path applies.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
