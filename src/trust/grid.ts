@@ -85,12 +85,27 @@ function rowToCell(row: TrustCellRow): TrustCell {
   };
 }
 
-/** Created on demand, matching every other table in this codebase (ensureRecordsSchema et al.) rather than only at `duo init`. */
+/**
+ * Created on demand, matching every other table in this codebase
+ * (ensureRecordsSchema et al.) rather than only at `duo init`.
+ *
+ * The `tier` CHECK constraint (#60 AC1) is the database-level half of T4's
+ * structural exclusion — `TrustTier`/`isTrustTier` already made it a
+ * compile-time impossibility to pass "T4" through this module's own typed
+ * functions (#52), but a `CHECK` constraint holds even against a caller
+ * that reaches the database directly (raw SQL, a future migration, a bug
+ * that widens `tier`'s type) the same way `src/permissions/audit.ts`'s
+ * `BEFORE UPDATE`/`BEFORE DELETE` triggers hold against code that never
+ * called this module's own functions at all. There is and can be no row in
+ * this table for T4 — not "none granted yet", literally none insertable —
+ * so no configuration, grant, or promotion can ever produce autonomous T4
+ * execution through the grid.
+ */
 export function ensureTrustSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS trust_cells (
       topic_id TEXT NOT NULL,
-      tier TEXT NOT NULL,
+      tier TEXT NOT NULL CHECK (tier IN ('T0', 'T1', 'T2', 'T3')),
       level TEXT NOT NULL,
       source TEXT NOT NULL,
       clean_streak INTEGER NOT NULL DEFAULT 0,

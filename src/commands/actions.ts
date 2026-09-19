@@ -8,6 +8,7 @@ import {
   type RegisterActionResult,
   type RegisteredAction,
 } from "../actions/registry.js";
+import { confirmAndExecuteT4Request, createT4Request, listPendingT4Requests, type PendingT4Request } from "../actions/t4-guard.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -78,4 +79,38 @@ export function runActionsAttempts(config: DuoConfig, env: NodeJS.ProcessEnv = p
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return listActionAttempts(config.storePath, passphrase);
+}
+
+/** Implements `duo actions t4 request` (#60 AC1): stages a T4 request. Nothing executes until a separate, explicit `duo actions t4 confirm` call. */
+export function runActionsT4Request(
+  actionId: string,
+  options: { topic: string; reasoning: string },
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): PendingT4Request {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return createT4Request(config.storePath, passphrase, { actionId, topicId: options.topic, reasoning: options.reasoning });
+}
+
+/** Implements `duo actions t4 pending` — every T4 request awaiting the owner's explicit confirmation. */
+export function runActionsT4Pending(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingT4Request[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listPendingT4Requests(config.storePath, passphrase);
+}
+
+/**
+ * Implements `duo actions t4 confirm <requestId>` — the owner's own
+ * explicit, at-the-moment-of-execution confirmation (#60 AC1). There is
+ * genuinely nothing to execute yet (defining which actions are T4 is out
+ * of scope, per the issue itself), so this wiring's `execute` callback is a
+ * no-op placeholder for whatever a future connector supplies — the
+ * mechanism this exercises (staged request, explicit confirm, exactly-once
+ * execution) is real and identical to what a real T4 action will use.
+ */
+export function runActionsT4Confirm(requestId: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingT4Request {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return confirmAndExecuteT4Request(config.storePath, passphrase, requestId, () => {});
 }

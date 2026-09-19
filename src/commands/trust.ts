@@ -1,11 +1,12 @@
 import type { DuoConfig } from "../config.js";
+import { appendActionAttempt, ensureActionAttemptLogSchema } from "../actions/attempt-log.js";
 import { grantAutonomy, type GrantOutcome } from "../trust/grants.js";
 import { isTrustTier, listGrid, type GridRow, type TrustCell, type TrustTier } from "../trust/grid.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers, type PromotionOffer } from "../trust/promotion.js";
 import { applyCorrection, type DemotionResult } from "../trust/demotion.js";
 import { listLedgerEntries, type TrustLedgerEntry } from "../trust/ledger.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
-import { requireStoreExists } from "../store/store.js";
+import { requireStoreExists, withDatabase } from "../store/store.js";
 
 export class InvalidTrustTierError extends Error {
   constructor(value: string) {
@@ -34,13 +35,42 @@ export interface RunTrustGrantOptions {
   readonly topicId?: string;
 }
 
-/** Implements `duo trust grant <text> --tier <T0-T3> [--topic <id>]` (#53 AC1/AC2/AC3): applies immediately unless ambiguous (owner re-runs with --topic) or it conflicts with a written refusal. */
+/**
+ * Implements `duo trust grant <text> --tier <T0-T3> [--topic <id>]` (#53
+ * AC1/AC2/AC3): applies immediately unless ambiguous (owner re-runs with
+ * --topic) or it conflicts with a written refusal.
+ *
+ * #60 AC3: an attempt to grant T4 specifically — "an instruction, standing
+ * order, or prompt attempting to authorise autonomous T4 execution" — is
+ * refused (same `InvalidTrustTierError` #52 already threw) but also
+ * written to the action attempt log, distinct from every other invalid
+ * tier string, which is just a typo and not worth recording.
+ */
 export function runTrustGrant(
   scopeText: string,
   options: RunTrustGrantOptions,
   config: DuoConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): GrantOutcome {
+  // A plain typo (e.g. "T9") keeps the original, unconditional order —
+  // rejected before the store is even required to exist (#53's own
+  // behavior, unchanged). Only a T4 attempt specifically also requires the
+  // store, to log the bypass attempt (#60 AC3) before still refusing.
+  if (options.tier.toUpperCase() === "T4") {
+    requireStoreExists(config.storePath);
+    const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+    withDatabase(config.storePath, passphrase, true, (db) => {
+      ensureActionAttemptLogSchema(db);
+      appendActionAttempt(db, {
+        actionId: "trust_grant",
+        topicId: options.topicId ?? null,
+        tier: "T4",
+        outcome: "refused_t4_bypass",
+        detail: { scopeText, requestedTier: options.tier },
+      });
+    });
+  }
+
   const tier = parseTrustTier(options.tier);
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
