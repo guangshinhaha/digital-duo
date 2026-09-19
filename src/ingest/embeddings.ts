@@ -12,7 +12,7 @@ import { ensureRecordsSchema, getRecord, searchRecords, type RankedRecord } from
  * overhead is irrelevant (out of scope per #20: no sqlite-vec, no
  * dedicated vector index — brute-force cosine over this table is enough).
  */
-function ensureEmbeddingSchema(db: Database): void {
+export function ensureEmbeddingSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS record_embeddings (
       record_id TEXT PRIMARY KEY,
