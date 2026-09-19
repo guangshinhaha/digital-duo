@@ -17,7 +17,7 @@ describe("loadUsageLog", () => {
 
   it("rejects a malformed (non-array) log file", () => {
     const path = logPath();
-    appendUsageEntry(path, { question: "x", declined: false, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "x", askerId: "asker-1", declined: false, citedTitles: [], staleCitation: false });
     writeFileSync(path, JSON.stringify({ not: "an array" }));
     expect(() => loadUsageLog(path)).toThrow(InvalidUsageLogError);
   });
@@ -28,6 +28,7 @@ describe("appendUsageEntry", () => {
     const path = logPath();
     const entry = appendUsageEntry(path, {
       question: "what is the leave policy?",
+      askerId: "asker-1",
       declined: false,
       citedTitles: ["Leave requests"],
       staleCitation: false,
@@ -47,8 +48,8 @@ describe("appendUsageEntry", () => {
 
   it("appends to an existing log rather than overwriting it", () => {
     const path = logPath();
-    appendUsageEntry(path, { question: "first", declined: false, citedTitles: [], staleCitation: false });
-    appendUsageEntry(path, { question: "second", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "first", askerId: "asker-1", declined: false, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "second", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
     expect(loadUsageLog(path).map((e) => e.question)).toEqual(["first", "second"]);
   });
 });
@@ -56,9 +57,9 @@ describe("appendUsageEntry", () => {
 describe("unresolvedQuestionGaps (#69 AC4)", () => {
   it("groups the same declined question, case- and whitespace-insensitively, and counts repeats", () => {
     const path = logPath();
-    appendUsageEntry(path, { question: "What is the parking policy?", declined: true, citedTitles: [], staleCitation: false });
-    appendUsageEntry(path, { question: "what is the parking policy? ", declined: true, citedTitles: [], staleCitation: false });
-    appendUsageEntry(path, { question: "WHAT IS THE PARKING POLICY?", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "What is the parking policy?", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "what is the parking policy? ", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "WHAT IS THE PARKING POLICY?", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
 
     const gaps = unresolvedQuestionGaps(loadUsageLog(path));
     expect(gaps).toEqual([{ question: "What is the parking policy?", count: 3 }]);
@@ -66,15 +67,15 @@ describe("unresolvedQuestionGaps (#69 AC4)", () => {
 
   it("never counts an answered question as a gap", () => {
     const path = logPath();
-    appendUsageEntry(path, { question: "covered question", declined: false, citedTitles: ["Leave requests"], staleCitation: false });
+    appendUsageEntry(path, { question: "covered question", askerId: "asker-1", declined: false, citedTitles: ["Leave requests"], staleCitation: false });
     expect(unresolvedQuestionGaps(loadUsageLog(path))).toEqual([]);
   });
 
   it("sorts distinct gaps by how many times each was asked, most first", () => {
     const path = logPath();
-    appendUsageEntry(path, { question: "rare gap", declined: true, citedTitles: [], staleCitation: false });
-    appendUsageEntry(path, { question: "common gap", declined: true, citedTitles: [], staleCitation: false });
-    appendUsageEntry(path, { question: "common gap", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "rare gap", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "common gap", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
+    appendUsageEntry(path, { question: "common gap", askerId: "asker-1", declined: true, citedTitles: [], staleCitation: false });
 
     expect(unresolvedQuestionGaps(loadUsageLog(path))).toEqual([
       { question: "common gap", count: 2 },

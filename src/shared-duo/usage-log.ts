@@ -18,6 +18,16 @@ export interface SharedDuoUsageEntry {
   readonly id: string;
   readonly createdAt: string;
   readonly question: string;
+  /**
+   * Who asked, as a free-text identifier the caller supplies (`duo shared
+   * ask --as <askerId>`) — never resolved against #49's asker directory
+   * or used to scope what the answer draws from, since a shared duo
+   * doesn't do per-asker permissioning at all (v1-spec.md §3: one team,
+   * shared footing). It exists solely so #71's usage report can count
+   * distinct and repeat askers; defaults to "anonymous" when omitted, so
+   * asking still works without naming yourself.
+   */
+  readonly askerId: string;
   readonly declined: boolean;
   readonly citedTitles: readonly string[];
   readonly staleCitation: boolean;

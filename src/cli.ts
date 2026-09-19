@@ -9,7 +9,7 @@ import { runInit } from "./commands/init.js";
 import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
-import { runSharedAsk, runSharedGaps } from "./commands/shared.js";
+import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
 import { runStatus } from "./commands/status.js";
 
 const program = new Command();
@@ -345,9 +345,10 @@ sharedCommand
       "an out-of-scope question is declined and named to the owner to escalate to",
   )
   .argument("<question>", "the question to ask")
-  .action(async (question: string) => {
+  .option("--as <askerId>", "who is asking (recorded for the usage report only — a shared duo does no per-asker permissioning; defaults to \"anonymous\")")
+  .action(async (question: string, options: { as?: string }) => {
     try {
-      const result = await runSharedAsk(question);
+      const result = await runSharedAsk(question, options.as);
       console.log(result.text);
       if (result.declineReason === "not_a_decision_maker") {
         console.error("(declined — this isn't something the shared duo can decide; passed on to its owner)");
@@ -371,6 +372,41 @@ sharedCommand
       }
       for (const gap of gaps) {
         console.log(`${gap.count}x  ${gap.question}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+sharedCommand
+  .command("usage")
+  .description(
+    "Report whether the shared duo is actually being used: questions, distinct/repeat askers, " +
+      "answer/escalation rate, the weekly trend, and unanswerable-question gaps (#71) — a bad answer is allowed",
+  )
+  .action(() => {
+    try {
+      const report = runSharedUsage();
+      console.log(report.summary);
+      if (report.totalQuestions === 0) {
+        return;
+      }
+      console.log(`Total questions: ${report.totalQuestions}`);
+      console.log(`Distinct askers: ${report.distinctAskers} (${report.repeatAskers} asked more than once)`);
+      console.log(
+        `Answer rate: ${(report.answerRate * 100).toFixed(0)}% · Escalation rate: ${(report.escalationRate * 100).toFixed(0)}%`,
+      );
+      console.log("Weekly trend:");
+      for (const week of report.weeklyTrend) {
+        console.log(`  ${week.weekStart}: ${week.questionCount}`);
+      }
+      if (report.gaps.length === 0) {
+        console.log("No repeated out-of-scope questions.");
+      } else {
+        console.log("Out-of-scope gaps (most repeated first):");
+        for (const gap of report.gaps) {
+          console.log(`  ${gap.count}x  ${gap.question}`);
+        }
       }
     } catch (error) {
       reportError(error);
