@@ -72,3 +72,24 @@ describe("duo derive topics", () => {
     expect(result.stdout).toMatch(/assigned 0 pair/i);
   });
 });
+
+describe("duo derive rules", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["derive", "rules"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("reports zero induced on an empty, initialized store, without contacting Ollama", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["derive", "rules"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_OLLAMA_HOST: UNROUTABLE_HOST },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/induced 0 rule/i);
+  });
+});

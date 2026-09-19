@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
-import { runDerivePairs, runDeriveTopics } from "./commands/derive.js";
+import { runDerivePairs, runDeriveRules, runDeriveTopics } from "./commands/derive.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
@@ -189,6 +189,22 @@ deriveCommand
       for (const topic of result.newTopics) {
         console.log(`  new: [${topic.id}] ${topic.label}`);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+deriveCommand
+  .command("rules")
+  .description("Induce one rule per topic from its qa_pairs, with citations and a support/consistency filter")
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      const result = await runDeriveRules(config);
+      console.log(
+        `Induced ${result.rules.length} rule(s): ${result.confirmedCount} confirmed, ` +
+          `${result.inconsistentCount} inconsistent, ${result.weakSignalCount} weak signal.`,
+      );
     } catch (error) {
       reportError(error);
     }
