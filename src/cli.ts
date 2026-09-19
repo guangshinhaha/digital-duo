@@ -29,6 +29,7 @@ import {
   runMirrorRulesList,
   type CalibrationProgress,
 } from "./commands/mirror.js";
+import { runCorrectionsApprove, runCorrectionsReject, runCorrectionsReview } from "./commands/corrections.js";
 import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
@@ -446,6 +447,78 @@ program
     try {
       const candidateId = runRecordEscalationAnswer(draftId, answer, config);
       console.log(`Queued standing-order candidate ${candidateId} from draft ${draftId}. It will be reviewed in the next batch.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The correction loop's batched review (docs/v1-tech-design.md §1.9, epic
+// e7, AR-9): everything #37 (an edited draft) and #34 (an answered
+// escalation) have queued, reviewed together rather than one ping per edit.
+const correctionsCommand = program
+  .command("corrections")
+  .description("Review what the correction loop has queued since the last review, and approve or reject it (#38)");
+
+correctionsCommand
+  .command("review")
+  .description(
+    "List every pending correction candidate, flagging any substance candidate that conflicts with an active rule (#38 AC1/AC4). " +
+      "Prints nothing at all when the queue is empty (#38 AC3)",
+  )
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const review = runCorrectionsReview(config);
+      if (review.candidates.length === 0) {
+        return;
+      }
+      for (const candidate of review.candidates) {
+        console.log(`[${candidate.id}] (${candidate.kind}, from ${candidate.source}) ${candidate.question}`);
+        if (candidate.draftText !== null) {
+          console.log(`  draft: ${candidate.draftText}`);
+        }
+        console.log(`  ${candidate.kind === "style" ? "sent" : "proposed"}: ${candidate.proposedText}`);
+      }
+      if (review.conflicts.length > 0) {
+        console.log("");
+        console.log(`Conflicts with an active rule (${review.conflicts.length}) — resolve before approving:`);
+        for (const { candidate, conflictingRule } of review.conflicts) {
+          console.log(`  [${candidate.id}] proposes: "${candidate.proposedText}"`);
+          console.log(`  [${conflictingRule.id}] active rule says: "${conflictingRule.text}"`);
+        }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+correctionsCommand
+  .command("approve")
+  .description("Approve a pending candidate: writes to duo/rules/ (substance) or duo/voice.md (style), then marks it approved (#38 AC1)")
+  .argument("<id>", "the candidate's id, from `duo corrections review`")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      const result = runCorrectionsApprove(id, config);
+      console.log(
+        result.kind === "style"
+          ? `Approved — appended to ${config.duoDir}/voice.md.`
+          : `Approved — wrote rule [${result.rule?.id}] to ${config.duoDir}/rules/${result.rule?.id}.md.`,
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+correctionsCommand
+  .command("reject")
+  .description("Reject a pending candidate; it is never re-proposed unchanged (#38 AC2)")
+  .argument("<id>", "the candidate's id, from `duo corrections review`")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      runCorrectionsReject(id, config);
+      console.log(`Rejected [${id}].`);
     } catch (error) {
       reportError(error);
     }
