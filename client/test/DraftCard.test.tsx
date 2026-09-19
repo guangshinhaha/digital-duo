@@ -82,6 +82,18 @@ describe("DraftCard — Send / Edit / Ignore (the correction loop's only input)"
     expect(JSON.parse((call![1] as RequestInit).body as string)).toMatchObject({ outcome: "edited", sentText: "Actually, ten days." });
   });
 
+  it("Send edited is disabled when the textarea is emptied, and stays disabled for whitespace-only text", () => {
+    renderWithClient(<DraftCard api={api} draft={draftRecord} />);
+    fireEvent.click(screen.getByText("Edit"));
+    const textarea = screen.getByRole("textbox");
+
+    fireEvent.change(textarea, { target: { value: "" } });
+    expect(screen.getByText("Send edited")).toBeDisabled();
+
+    fireEvent.change(textarea, { target: { value: "   " } });
+    expect(screen.getByText("Send edited")).toBeDisabled();
+  });
+
   it("Ignore posts the outcome as \"discarded\"", async () => {
     renderWithClient(<DraftCard api={api} draft={draftRecord} />);
     fireEvent.click(screen.getByText("Ignore"));
@@ -119,6 +131,12 @@ describe("DraftCard — Send / Edit / Ignore (the correction loop's only input)"
     await waitFor(() => expect(screen.getByTestId("answer-confirmation")).toBeInTheDocument());
     expect(screen.queryByPlaceholderText(/Answer it yourself/)).toBeNull();
     expect((fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter((c) => c[0] === "http://test/drafts/d2/answer")).toHaveLength(1);
+  });
+
+  it("Answer stays disabled for a whitespace-only answer", () => {
+    renderWithClient(<DraftCard api={api} draft={escalatedRecord} />);
+    fireEvent.change(screen.getByPlaceholderText(/Answer it yourself/), { target: { value: "   " } });
+    expect(screen.getByText("Answer")).toBeDisabled();
   });
 
   it("answering an escalation posts to /drafts/:id/answer", async () => {

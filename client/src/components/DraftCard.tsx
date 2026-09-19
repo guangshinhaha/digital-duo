@@ -104,8 +104,8 @@ export function DraftCard({ api, draft }: { api: DuoApiConfig; draft: DraftRecor
               />
               <button
                 className="rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-1 text-white disabled:opacity-40"
-                disabled={!answerText || answerEscalation.isPending}
-                onClick={() => answerEscalation.mutate({ draftId: draft.id, answer: answerText })}
+                disabled={!answerText.trim() || answerEscalation.isPending}
+                onClick={() => answerEscalation.mutate({ draftId: draft.id, answer: answerText.trim() })}
               >
                 Answer
               </button>
@@ -137,9 +137,9 @@ export function DraftCard({ api, draft }: { api: DuoApiConfig; draft: DraftRecor
         {editing ? (
           <>
             <button
-              className="rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-1 text-white"
-              disabled={recordOutcome.isPending}
-              onClick={() => recordOutcome.mutate({ draftId: draft.id, outcome: "edited", sentText: editedText })}
+              className="rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-1 text-white disabled:opacity-40"
+              disabled={!editedText.trim() || recordOutcome.isPending}
+              onClick={() => recordOutcome.mutate({ draftId: draft.id, outcome: "edited", sentText: editedText.trim() })}
             >
               Send edited
             </button>

@@ -150,6 +150,15 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       reply.code(400).send(errorBody("bad_request", `outcome must be one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
+    // An "edited" outcome with a blank sentText isn't a discarded edit —
+    // it's an empty string that classifyAndQueueEdit (corrections/classify.ts)
+    // would score as a near-zero-content "style" tweak (newContentRatio
+    // of nothing is 0), silently recording that the owner made a trivial
+    // wording change when they actually deleted the entire answer.
+    if (outcome === "edited" && sentText !== undefined && sentText.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "sentText cannot be empty for an \"edited\" outcome"));
+      return;
+    }
     try {
       const classifier = deps.inferenceProvider ? createLlmEditClassifier(deps.inferenceProvider) : undefined;
       const result = await recordDraftOutcomeAndClassify(
@@ -167,12 +176,13 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
   });
 
   app.post<{ Params: { id: string }; Body: { answer: string } }>("/drafts/:id/answer", async (request, reply) => {
-    if (!request.body.answer) {
+    const answer = request.body.answer?.trim();
+    if (!answer) {
       reply.code(400).send(errorBody("bad_request", "answer is required"));
       return;
     }
     try {
-      const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, request.params.id, request.body.answer);
+      const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, request.params.id, answer);
       return { candidateId };
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
