@@ -16,7 +16,9 @@ import type { ActionTier } from "./registry.js";
  * live push channel exists yet). `"escalated"` and `"execution_failed"`
  * are #58's T2 path: a reversible action that couldn't run autonomously
  * here (not yet granted, or not actually revertible in this context) or
- * that failed partway.
+ * that failed partway. `"awaiting_approval"` is #59's T3 path: a binding
+ * action always staged for the owner's one-tap approval, never run
+ * directly.
  */
 export const ACTION_ATTEMPT_OUTCOMES = [
   "refused_unregistered",
@@ -26,6 +28,7 @@ export const ACTION_ATTEMPT_OUTCOMES = [
   "t4_executed",
   "escalated",
   "execution_failed",
+  "awaiting_approval",
 ] as const;
 export type ActionAttemptOutcome = (typeof ACTION_ATTEMPT_OUTCOMES)[number];
 

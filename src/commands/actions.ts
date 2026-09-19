@@ -17,7 +17,17 @@ import {
   type PreparedArtifact,
   type PreparedArtifactKind,
 } from "../actions/preparation.js";
-import { listPendingActions, type PendingAction, type PendingActionStatus } from "../actions/approvals.js";
+import {
+  approvePendingAction,
+  expirePendingActions,
+  getApprovalStats,
+  listPendingActions,
+  retractApprovedAction,
+  type ApprovalStats,
+  type PendingAction,
+  type PendingActionStatus,
+} from "../actions/approvals.js";
+import { prepareBindingAction, type PrepareBindingActionInput } from "../actions/binding.js";
 import {
   listReversibleActions,
   performReversibleAction,
@@ -215,4 +225,50 @@ export function runActionsListPending(status: PendingActionStatus | undefined, c
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return listPendingActions(config.storePath, passphrase, status);
+}
+
+/** Implements `duo actions bind` (#59 AC1): stages a T3 action for the owner's approval. Nothing runs until a separate `duo actions approve` call. */
+export function runActionsBind(options: PrepareBindingActionInput, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingAction {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return prepareBindingAction(config.storePath, passphrase, options);
+}
+
+/**
+ * Implements `duo actions approve <id>` (#59 AC1/AC3). There is genuinely
+ * nothing to execute yet (implementing any specific action is out of
+ * scope, per #56), so this wiring's `execute` callback is a no-op
+ * placeholder — the mechanism (one-tap approval, exactly-once execution,
+ * expiry-checked inline) is real. The announcement restates the
+ * reasoning and, for a real commitment, what it committed to.
+ */
+export function runActionsApprove(id: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingAction {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const pending = listPendingActions(config.storePath, passphrase).find((item) => item.id === id);
+  const announcement = pending
+    ? `Approved by the owner on the duo's behalf: ${pending.reasoning}${pending.commitsTo ? ` Committed to: ${pending.commitsTo}.` : ""}`
+    : `Approved [${id}].`;
+  return approvePendingAction(config.storePath, passphrase, id, () => {}, announcement);
+}
+
+/** Implements `duo actions expire` (#59 AC2): sweeps every pending item past its window to "expired", executing nothing. */
+export function runActionsExpire(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingAction[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return expirePendingActions(config.storePath, passphrase);
+}
+
+/** Implements `duo actions retract <id>` (#59 AC3): retracts an approved commitment. */
+export function runActionsRetract(id: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingAction {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return retractApprovedAction(config.storePath, passphrase, id, () => {});
+}
+
+/** Implements `duo actions stats` (#59 AC4): approval volume and rate, so approval fatigue is visible rather than quietly ignored. */
+export function runActionsStats(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): ApprovalStats {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return getApprovalStats(config.storePath, passphrase);
 }

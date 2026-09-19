@@ -3,8 +3,11 @@ import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import {
+  runActionsApprove,
   runActionsAttempts,
+  runActionsBind,
   runActionsDiscard,
+  runActionsExpire,
   runActionsList,
   runActionsListDiscards,
   runActionsListPending,
@@ -13,6 +16,8 @@ import {
   runActionsPerform,
   runActionsPrepare,
   runActionsRegister,
+  runActionsRetract,
+  runActionsStats,
   runActionsT4Confirm,
   runActionsT4Pending,
   runActionsT4Request,
@@ -1530,6 +1535,94 @@ actionsCommand
       for (const item of items) {
         console.log(`[${item.id}] ${item.tier} (${item.status}) ${item.reasoning} — topic ${item.topicId}`);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// T3 binding internal actions (docs/concept.md §6, #59): every binding
+// action starts as draft-and-approve — no T3 action is autonomous on
+// first grant, and this codebase never lets a promoted trust-grid cell
+// skip the tap either (see src/actions/binding.ts's own doc comment).
+actionsCommand
+  .command("bind")
+  .description("Stage a T3 action for the owner's one-tap approval. Nothing runs until `duo actions approve` (#59 AC1)")
+  .requiredOption("--action <actionId>", "the T3-registered action's id")
+  .requiredOption("--topic <topicId>", "the topic this concerns")
+  .requiredOption("--reasoning <text>", "why the duo believes this should happen")
+  .option("--commits-to <text>", "what the owner is being committed to — a date, a deliverable (#59 AC3)")
+  .option("--expires-in-hours <n>", "hours before this expires unapproved (default 24, #59 AC2)", (value) => Number(value))
+  .action((options: { action: string; topic: string; reasoning: string; commitsTo?: string; expiresInHours?: number }) => {
+    const config = loadConfig();
+    try {
+      const pending = runActionsBind(
+        { actionId: options.action, topicId: options.topic, reasoning: options.reasoning, commitsTo: options.commitsTo, expiresInHours: options.expiresInHours },
+        config,
+      );
+      console.log(`Staged [${pending.id}] for approval (expires ${pending.expiresAt}). Nothing happens until \`duo actions approve ${pending.id}\`.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("approve")
+  .description("The owner's one-tap approval — the only way a pending T2/T3 action ever executes (#59 AC1/AC3)")
+  .argument("<id>", "the pending action's id")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      const approved = runActionsApprove(id, config);
+      console.log(approved.announcement);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("expire")
+  .description("Sweep every pending action past its window to expired, executing nothing (#59 AC2)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const expired = runActionsExpire(config);
+      if (expired.length === 0) {
+        console.log("Nothing expired.");
+        return;
+      }
+      for (const item of expired) {
+        console.log(`[${item.id}] expired unapproved: ${item.reasoning}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("retract")
+  .description("Retract an already-approved commitment (#59 AC3)")
+  .argument("<id>", "the approved action's id")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      const retracted = runActionsRetract(id, config);
+      console.log(`Retracted [${retracted.id}]: ${retracted.reasoning}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("stats")
+  .description("Approval volume and rate — so approval fatigue on a topic is visible, not quietly ignored (#59 AC4)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const stats = runActionsStats(config);
+      console.log(
+        `${stats.totalCreated} staged total — ${stats.pendingCount} pending, ${stats.approvedCount} approved, ` +
+          `${stats.expiredCount} expired, ${stats.retractedCount} retracted. Approval rate: ${(stats.approvalRate * 100).toFixed(0)}%.`,
+      );
     } catch (error) {
       reportError(error);
     }
