@@ -15,6 +15,37 @@ const DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text";
 // Official (Open) only").
 const DEFAULT_CLASSIFICATION_CEILING = "official_open";
 
+// #33's own acceptance criteria: "signal weights live in configuration,
+// not in code, so the eval harness can sweep them." Defaults reflect
+// v1-tech-design.md §1.8's ranking (self-consistency and retrieval
+// strength highest, recency medium, self-report lowest because it's
+// poorly calibrated) without summing to any particular total — scoreConfidence
+// normalizes by the weights' own sum, so a sweep can scale them freely.
+const DEFAULT_CONFIDENCE_WEIGHT_SELF_CONSISTENCY = 0.3;
+const DEFAULT_CONFIDENCE_WEIGHT_RETRIEVAL_STRENGTH = 0.3;
+const DEFAULT_CONFIDENCE_WEIGHT_RULE_HIT = 0.25;
+const DEFAULT_CONFIDENCE_WEIGHT_RECENCY = 0.1;
+const DEFAULT_CONFIDENCE_WEIGHT_SELF_REPORT = 0.05;
+// Below this composite score, the draft pipeline (#32/#34) suppresses the
+// draft in favor of an escalation (#33 AC2).
+const DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD = 0.55;
+// Fixed sample count for self-consistency (#33 AC checklist): generate
+// this many drafts and measure their agreement.
+const DEFAULT_CONFIDENCE_SELF_CONSISTENCY_SAMPLES = 3;
+// Exponential half-life for evidence-recency decay, in days. 180 matches
+// #69's shared-duo staleness threshold (isStale) — the same "material not
+// revisited in about six months starts to look old" judgment, reused here
+// rather than picking an unrelated number.
+const DEFAULT_CONFIDENCE_RECENCY_HALF_LIFE_DAYS = 180;
+
+function parseNumberEnv(raw: string | undefined, fallback: number): number {
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 export interface DuoConfig {
   /** Raw configured provider name, or undefined when DUO_PROVIDER is unset. */
   providerName: string | undefined;
@@ -31,6 +62,22 @@ export interface DuoConfig {
     model: string | undefined;
     /** Ollama embedding model name. Defaults to "nomic-embed-text". */
     embeddingModel: string;
+  };
+  /** #33: the draft pipeline's composite-confidence knobs, all configuration rather than code so the eval harness can sweep them. */
+  confidence: {
+    weights: {
+      selfConsistency: number;
+      retrievalStrength: number;
+      ruleHit: number;
+      recency: number;
+      selfReport: number;
+    };
+    /** Composite score below which a draft is suppressed in favor of an escalation. Defaults to 0.55. */
+    escalationThreshold: number;
+    /** Fixed self-consistency sample count. Defaults to 3. */
+    selfConsistencySamples: number;
+    /** Recency-decay half-life, in days. Defaults to 180. */
+    recencyHalfLifeDays: number;
   };
 }
 
@@ -51,6 +98,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
       model: env.DUO_OLLAMA_MODEL || undefined,
       embeddingModel: env.DUO_OLLAMA_EMBEDDING_MODEL || DEFAULT_OLLAMA_EMBEDDING_MODEL,
+    },
+    confidence: {
+      weights: {
+        selfConsistency: parseNumberEnv(env.DUO_CONFIDENCE_WEIGHT_SELF_CONSISTENCY, DEFAULT_CONFIDENCE_WEIGHT_SELF_CONSISTENCY),
+        retrievalStrength: parseNumberEnv(env.DUO_CONFIDENCE_WEIGHT_RETRIEVAL_STRENGTH, DEFAULT_CONFIDENCE_WEIGHT_RETRIEVAL_STRENGTH),
+        ruleHit: parseNumberEnv(env.DUO_CONFIDENCE_WEIGHT_RULE_HIT, DEFAULT_CONFIDENCE_WEIGHT_RULE_HIT),
+        recency: parseNumberEnv(env.DUO_CONFIDENCE_WEIGHT_RECENCY, DEFAULT_CONFIDENCE_WEIGHT_RECENCY),
+        selfReport: parseNumberEnv(env.DUO_CONFIDENCE_WEIGHT_SELF_REPORT, DEFAULT_CONFIDENCE_WEIGHT_SELF_REPORT),
+      },
+      escalationThreshold: parseNumberEnv(env.DUO_CONFIDENCE_ESCALATION_THRESHOLD, DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD),
+      selfConsistencySamples: parseNumberEnv(env.DUO_CONFIDENCE_SELF_CONSISTENCY_SAMPLES, DEFAULT_CONFIDENCE_SELF_CONSISTENCY_SAMPLES),
+      recencyHalfLifeDays: parseNumberEnv(env.DUO_CONFIDENCE_RECENCY_HALF_LIFE_DAYS, DEFAULT_CONFIDENCE_RECENCY_HALF_LIFE_DAYS),
     },
   };
 }
