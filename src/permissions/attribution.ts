@@ -18,7 +18,8 @@ export interface PublicAttributionDetail {
   readonly evidenceAgeDays: number | null;
 }
 
-function formatEvidenceAge(evidenceAgeDays: number | null): string {
+/** Exported for #47's proactive-offer surface too — the same "how stale is this" phrasing, stated on a private offer rather than a public answer, so there is exactly one place this wording lives. */
+export function formatEvidenceAge(evidenceAgeDays: number | null): string {
   if (evidenceAgeDays === null) {
     return "no dated evidence behind it";
   }
