@@ -429,11 +429,111 @@ ceremony on work that doesn't need it:
 
 **Wave W2 is now complete.** All three of its epics — `e3` (derivation, #23-#26), `e10`
 (permissions, #48-#51), and `e64` (shared-duos, #67-#71) — are merged, one at a time on `main`,
-per §1/§2's locked sequencing. The orchestrating session moves to wave W3 next: `e4` (mirror,
-starting at #27), `e5` (drafting, starting at #31), and `e11` (trust, starting at #52) run as
-three separate concurrent chains — real concurrency starts here, per §1's note that "real
-concurrency (separate worktrees, several `lfg` runs at once) becomes safe from W3, once epics
-touch more disjoint subsystems."
+per §1/§2's locked sequencing.
+
+**Wave W3 — real concurrency starts here.** Three chains ran as separate concurrent worktree
+agents, each fetching/rebasing onto `origin/main` before every issue and merging squash-clean;
+none touched this doc directly (three concurrent editors would race on one file), so the
+orchestrating session consolidated all three below after all three finished.
+
+- `e4` (mirror, #27→28→29→30): #27 PR [#113](https://github.com/guangshinhaha/digital-duo/pull/113)
+  `38e0f03` — `src/derivation/portrait.ts`, `duo mirror portrait`, sourced only from #23/#24's
+  output; below 10 pairs shows a plain "not enough history" message rather than a chart; "who
+  asks most" is reported as busiest conversation *threads*, explicitly labelled a stand-in since
+  `IngestRecord` carries no per-person asker identity. #28 PR
+  [#120](https://github.com/guangshinhaha/digital-duo/pull/120) `713501f` — `Rule` gains
+  `reviewStatus` (pending/approved/rejected) and `origin` (derived/owner_asserted), orthogonal to
+  derivation's own confidence tier and persisted across re-induction; `src/derivation/
+  rule-review.ts` (`approveRule`/`rejectRule`/`promoteRule`/`writeRuleByHand`/
+  `listRulesForReview`/`listActiveRules`), `duo mirror rules ...`. Review caught a real bug: the
+  review-write path called an already-`withDatabase`-wrapped helper from inside another open
+  `withDatabase(mutate:true)` callback — both decrypt to the same `.rw-tmp` file, so the inner
+  call would have clobbered it under the outer's open handle; fixed with a `readRuleEvidenceRows`
+  primitive for callers already holding a handle. #29 PR
+  [#123](https://github.com/guangshinhaha/digital-duo/pull/123) `3075b41` — extended #53's
+  `src/trust/refusals.ts` with the real writer (`upsertRefusal`/`confirmNoRefusals`/
+  `writeRefusalsFile`), an onboarding gate (`requireRefusalsDecision`), wired so `listActiveRules`
+  re-checks every approved rule against `duo/refusals.md` on *every* call, not just at approval
+  time — "the refusal wins" holds even for a refusal written after approval. Also reconciled two
+  epics' independently-written `refusals.md` parsers (`## heading` sections vs. bullet points)
+  onto the richer canonical format. #30 PR
+  [#126](https://github.com/guangshinhaha/digital-duo/pull/126) `c6d8f00` — `src/derivation/
+  calibration.ts`, `duo mirror calibrate`; reuses #32's real draft pipeline and #32's own
+  `recordDraftOutcome` rather than a parallel mechanism, gated behind #29's
+  `requireRefusalsDecision`. Honestly caveats that this "held-out" selection is a self-contained
+  approximation, not the real time-based train/held-out split (that's W4's `e6`). **577 tests at
+  the end of this chain.** Also landed one build-break hotfix mid-chain (PR
+  [#124](https://github.com/guangshinhaha/digital-duo/pull/124), merged before #30): concurrent
+  `e5` had merged #32 against an earlier `main`, before #28's new required `Rule` fields existed;
+  the non-conflicting merge landed anyway (`tsconfig` excludes `test/` from typecheck, so nothing
+  caught it at merge time) — fixed `src/drafting/context.ts`'s `findRuleHit` and two test
+  fixtures.
+
+- `e5` (drafting, #31→66→33→32→34 — dependency-corrected order, not numeric): #31 PR
+  [#115](https://github.com/guangshinhaha/digital-duo/pull/115) `f3a4ad6` — `src/drafting/
+  relevance-gate.ts` (pure `classifyMention`), `refusals.ts`, `gate.ts`/`gate-log.ts`; deliberately
+  *not* wired into `duo draft` yet — it's for a future Slack-mention entry point, not an
+  owner-typed CLI question. #66 PR
+  [#116](https://github.com/guangshinhaha/digital-duo/pull/116) `8c92556` —
+  `test/fixtures/synthetic-persona.ts` (an `owner.kind: "none"` duo per concept.md §12). Review
+  caught a real placement bug: the reusable "cannot be used on a Slack surface" guard was written
+  entirely under `test/`, which `tsconfig.json` excludes from the build — unreachable from real
+  production code; moved to `src/drafting/fixture-guard.ts`, keeping only fixture data under
+  `test/`. #33 PR [#118](https://github.com/guangshinhaha/digital-duo/pull/118) `f0c21b2` —
+  `src/drafting/confidence.ts` (`scoreConfidence` + the four component signals from
+  v1-tech-design.md §1.8), new `DUO_CONFIDENCE_*` config. #32 PR
+  [#122](https://github.com/guangshinhaha/digital-duo/pull/122) `f24d978` — `duo draft <question>`
+  / `duo draft-outcome`, `src/drafting/{context,generate,pipeline,draft-log}.ts` (**full path**,
+  `story` label). Multi-angle review found two real issues: `runSelfConsistencySampling` scored
+  identical samples as **zero** agreement when they embedded to a degenerate zero vector (fixed
+  with an exact-text-equality short-circuit), and two commands went beyond this issue's stated
+  acceptance criteria (trimmed). #34 PR
+  [#125](https://github.com/guangshinhaha/digital-duo/pull/125) `1ec0682` — refusal short-circuit
+  before any retrieval/generation, richer `explainEscalation` wording, `standing-order-
+  candidates.ts` + `duo draft-answer` (**full path**, `story` label). Rebased onto both `e4`'s and
+  a concurrent narrower hotfix's changes to the same break, resolving one real conflict in
+  `src/drafting/context.ts` in favor of the fuller fix, and updated this branch's fixtures to
+  #29's new canonical refusals-file format. **550 tests at the end of this chain.**
+
+- `e11` (trust, #52→53→54→55): #52 PR
+  [#114](https://github.com/guangshinhaha/digital-duo/pull/114) `c84f806` — `src/trust/grid.ts`,
+  the (topic × tier) autonomy grid keyed on #24's stable topic ids; every untouched or stale cell
+  resolves to `"ask"`, no default-allow path; `TRUST_TIERS` deliberately excludes T4 (never
+  autonomous, concept.md's own product principle). #53 PR
+  [#117](https://github.com/guangshinhaha/digital-duo/pull/117) `3967b24` — `src/trust/
+  grants.ts` (plain-English grant → topic match → apply/ambiguous/refuse), a new append-only
+  `trust_ledger` (DB-trigger-enforced like #51's `audit_log`, deliberately a separate table since
+  `audit_log`'s schema needs a classification value that has no meaning for a trust event) —
+  **full path**, `story` label; multi-angle review found no fixable issues. #54 PR
+  [#119](https://github.com/guangshinhaha/digital-duo/pull/119) `4a288af` — `src/trust/
+  promotion.ts`: clean-instance streak tracking, batched-digest offers (never a per-offer ping),
+  explicit accept/decline only (no timeout auto-promotes); declining raises the re-offer bar
+  rather than silencing forever. #55 PR
+  [#121](https://github.com/guangshinhaha/digital-duo/pull/121) `357e8df` — `src/trust/
+  demotion.ts`: a correction drops a cell one level and restarts its promotion counter, logged in
+  `trust_ledger`. Self-review caught a real bug before commit: the "cell already at the floor"
+  branch left the pending-offer decline gate untouched, so a correction on an already-`"ask"`
+  cell would have let stale pre-correction evidence still count toward a future promotion; fixed
+  to reset the streak/offer state in that branch too. **460 tests at the end of this chain.**
+
+**Cross-epic hotfix, found after all three chains reported in** (PR
+[#127](https://github.com/guangshinhaha/digital-duo/pull/127), squash `273ccee`): the `e4` chain's
+own agent flagged — but correctly left out of its own issues' scope — that `src/drafting/
+context.ts`'s `findRuleHit` (the *live* `duo draft` pipeline's rule-hit lookup) checked
+derivation status and #28's review status, but not #29's refusal-conflict check that
+`listActiveRules` (the Mirror's *read* path) already enforces. A refusal written after a rule's
+approval correctly suppressed it everywhere the Mirror shows it, but a live draft could still
+ground an answer on, and cite, that exact rule text — a real trust-boundary gap, fixed directly
+by the orchestrating session rather than left in `main`: `findRuleHit` now skips any candidate
+topic with a conflicting refusal via the same `findConflictingRefusal` check, falling through to
+the next matched topic. One regression test added. **578 tests, full suite green.**
+
+**Wave W3 is now complete.** All three epics — `e4` (mirror), `e5` (drafting), `e11` (trust) —
+are merged, plus the cross-epic refusal-check hotfix. `main` tip: `273ccee`.
+
+**Next: wave W4**, three concurrent chains (same worktree-per-chain pattern as W3): `e6` (eval,
+#35→36), `e7` (corrections, #37→38→39), `e12` (actions, #56→60→57→58→59). `e8` (Slack, #40→41→42)
+stays skipped — blocked on #15 (G2, Slack access) regardless of pacing policy, per §2/§4.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
