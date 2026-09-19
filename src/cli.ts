@@ -34,6 +34,7 @@ import { runEmbed } from "./commands/embed.js";
 import { runEvalGate, runEvalOffline } from "./commands/eval.js";
 import { assertPrecisionFloor } from "./eval/gate-eval.js";
 import { WOULD_HAVE_SENT_CAVEAT } from "./eval/offline-eval.js";
+import { runHandoverCut, runHandoverGenerate, runHandoverShare } from "./commands/handover.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import {
@@ -942,6 +943,78 @@ continuityCommand
     try {
       const result = await runConsultPredecessor(predecessorStorePath, predecessorDuoDir, predecessorName, question, config);
       console.log(result.text);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// #62's handover pack: assembled entirely from what #23/#24/#27/#28/#29/#32
+// already derived — recurring questions, standing orders with evidence,
+// refusals, thread activity, and open (unresolved) escalations. Reviewed
+// and cut before anything is shared (AC2); the draft lives in the store's
+// own gitignored data directory, never in the git-tracked duoDir, since an
+// unreviewed pack may still hold something personal or inappropriate.
+const handoverCommand = continuityCommand
+  .command("handover")
+  .description("A handover pack assembled from evidence — reviewed and cut before anything is shared");
+
+function printHandoverSummary(pack: ReturnType<typeof runHandoverGenerate>): void {
+  console.log(`Handover draft generated at ${pack.generatedAt}.`);
+  console.log(
+    `Recurring questions: ${pack.recurringQuestions.length} · Standing orders: ${pack.standingOrders.length} · ` +
+      `Refusals: ${pack.refusals.length} · Thread activity: ${pack.askerActivity.length} · Open threads: ${pack.openThreads.length}`,
+  );
+  if (pack.gaps.length > 0) {
+    console.log("What this pack could not cover:");
+    for (const gap of pack.gaps) {
+      console.log(`  - ${gap}`);
+    }
+  }
+  console.log('Review the draft, cut anything with `duo continuity handover cut <itemId>`, then `duo continuity handover share <outputPath>`.');
+}
+
+handoverCommand
+  .command("generate")
+  .description("Assemble (or refresh) the handover draft from current derived data, carrying forward any earlier cuts")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      printHandoverSummary(runHandoverGenerate(config));
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+handoverCommand
+  .command("cut")
+  .description("Mark one item excluded from the handover draft by its id — reversible by hand-editing the draft file back")
+  .argument("<itemId>", "the item id to exclude (as shown by `generate`, or in the draft file)")
+  .action((itemId: string) => {
+    const config = loadConfig();
+    try {
+      const pack = runHandoverCut(itemId, config);
+      console.log(`Cut "${itemId}" from the handover draft.`);
+      printHandoverSummary(pack);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+handoverCommand
+  .command("share")
+  .description("The one explicit act that produces a shareable document — renders the current draft, minus every cut item, to <outputPath>")
+  .argument("<outputPath>", "where to write the final handover document")
+  .action((outputPath: string) => {
+    const config = loadConfig();
+    try {
+      const summary = runHandoverShare(outputPath, config);
+      console.log(`Handover shared to ${summary.outputPath} at ${summary.sharedAt}.`);
+      console.log(
+        `Included: ${summary.includedCounts.recurringQuestions} recurring question(s), ` +
+          `${summary.includedCounts.standingOrders} standing order(s), ${summary.includedCounts.refusals} refusal(s), ` +
+          `${summary.includedCounts.askerActivity} thread(s), ${summary.includedCounts.openThreads} open thread(s). ` +
+          `Cut before sharing: ${summary.excludedCount}.`,
+      );
     } catch (error) {
       reportError(error);
     }
