@@ -33,6 +33,21 @@ function errorBody(code: string, message: string) {
   return { error: { code, message } };
 }
 
+/** Thrown to signal a 400 from inside a route body without duplicating the reply.code(400).send(...) dance at every call site — `registerRoutes` never lets this reach the client uncaught; every parse call site catches it explicitly (below). */
+class BadRequestError extends Error {}
+
+/** A positive integer query param, or `undefined` when omitted — throws `BadRequestError` for anything else (non-numeric, negative, NaN), so a malformed `?limit=abc` becomes a clean 400 rather than a NaN flowing into a SQL LIMIT binding and crashing as an unhandled 500 (node:sqlite rejects a NaN parameter with "datatype mismatch"). */
+function parsePositiveIntParam(name: string, raw: string | undefined): number | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed) || parsed < 0 || String(parsed) !== raw) {
+    throw new BadRequestError(`${name} must be a non-negative integer, got ${JSON.stringify(raw)}`);
+  }
+  return parsed;
+}
+
 /**
  * One shape for every error response (`client-tech-design.md` §1.5): a
  * domain error's own message is already written for a human, so this maps
@@ -67,10 +82,20 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       reply.code(400).send(errorBody("bad_request", `outcome must be "pending" or one of: ${DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
+    let parsedLimit: number | undefined;
+    try {
+      parsedLimit = parsePositiveIntParam("limit", limit);
+    } catch (error) {
+      if (!(error instanceof BadRequestError)) {
+        throw error;
+      }
+      reply.code(400).send(errorBody("bad_request", error.message));
+      return;
+    }
     const drafts = listDrafts(deps.storePath, deps.passphrase, {
       outcome: outcome as DraftOutcome | "pending" | undefined,
       before,
-      limit: limit !== undefined ? Number.parseInt(limit, 10) : undefined,
+      limit: parsedLimit,
     });
     return drafts;
   });

@@ -76,6 +76,37 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true });
   });
+
+  it("a token verified once is briefly trusted without re-checking the store, even after revocation — the documented, bounded staleness window that avoids a full store decrypt on every request", async () => {
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const first = await app.inject({ method: "GET", url: "/duos", headers: { authorization: `Bearer ${paired.token}` } });
+    expect(first.statusCode).toBe(200);
+
+    const { revokeDeviceToken } = await import("../src/serve/tokens.js");
+    revokeDeviceToken(storePath, PASSPHRASE, paired.id);
+
+    const second = await app.inject({ method: "GET", url: "/duos", headers: { authorization: `Bearer ${paired.token}` } });
+    expect(second.statusCode).toBe(200);
+  });
+
+  it("rate-limits auth failures after exactly RATE_LIMIT_MAX_FAILURES (10), not one more", async () => {
+    const responses = [];
+    for (let i = 0; i < 12; i += 1) {
+      responses.push(await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" } }));
+    }
+    const statuses = responses.map((r) => r.statusCode);
+    expect(statuses.slice(0, 10)).toEqual(Array(10).fill(401));
+    expect(statuses.slice(10)).toEqual([429, 429]);
+  });
+
+  it("a rate-limited response uses the rate_limited error code, not unauthorized", async () => {
+    for (let i = 0; i < 10; i += 1) {
+      await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" } });
+    }
+    const response = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" } });
+    expect(response.statusCode).toBe(429);
+    expect(response.json()).toMatchObject({ error: { code: "rate_limited" } });
+  });
 });
 
 describe("createServer — routes", () => {
@@ -131,6 +162,34 @@ describe("createServer — routes", () => {
   it("GET /drafts rejects an invalid outcome filter with 400", async () => {
     const response = await app.inject({ method: "GET", url: "/drafts?outcome=not-real", headers: authHeader });
     expect(response.statusCode).toBe(400);
+  });
+
+  it("GET /drafts rejects a non-numeric limit with 400 rather than crashing on a NaN SQL bind", async () => {
+    const response = await app.inject({ method: "GET", url: "/drafts?limit=abc", headers: authHeader });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("limit");
+  });
+
+  it("GET /drafts rejects a limit with trailing garbage (parseInt would otherwise silently truncate it)", async () => {
+    const response = await app.inject({ method: "GET", url: "/drafts?limit=5abc", headers: authHeader });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("GET /drafts accepts a valid numeric limit", async () => {
+    for (let i = 0; i < 3; i += 1) {
+      appendDraft(storePath, PASSPHRASE, {
+        question: `q${i}`,
+        threadContext: null,
+        draftText: "a",
+        escalated: false,
+        escalationReason: null,
+        confidenceScore: 0.7,
+        sources: [],
+      });
+    }
+    const response = await app.inject({ method: "GET", url: "/drafts?limit=2", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toHaveLength(2);
   });
 
   it("GET /drafts/:id 404s naming the id for an unknown draft", async () => {

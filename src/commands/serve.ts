@@ -5,8 +5,17 @@ import { assertServableHost } from "../serve/bind.js";
 import { resolvePassphraseForServing } from "../serve/passphrase.js";
 import { createServer, type ServeDeps } from "../serve/server.js";
 import { createDeviceToken, listDeviceTokens, revokeDeviceToken, type DeviceToken, type PairedDevice } from "../serve/tokens.js";
+import { DecryptionError } from "../store/crypto.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
-import { requireStoreExists } from "../store/store.js";
+import { requireStoreExists, withDatabase } from "../store/store.js";
+
+/** Thrown by `runServe` when the resolved passphrase doesn't decrypt the store — checked once at boot, before binding, so a typo'd `DUO_PASSPHRASE` fails loudly here instead of the daemon reporting "listening" and then 500ing every request forever (every route's first real store access would otherwise be the first place this surfaces). */
+export class ServePassphraseMismatchError extends Error {
+  constructor(storePath: string, cause: DecryptionError) {
+    super(`The passphrase for "${storePath}" is wrong: ${cause.message}`);
+    this.name = "ServePassphraseMismatchError";
+  }
+}
 
 export interface ServeOptions {
   readonly host: string | undefined;
@@ -29,6 +38,15 @@ export async function runServe(
   assertServableHost(options.host);
 
   const passphrase = await resolvePassphraseForServing(env);
+  try {
+    withDatabase(config.storePath, passphrase, false, () => {});
+  } catch (error) {
+    if (error instanceof DecryptionError) {
+      throw new ServePassphraseMismatchError(config.storePath, error);
+    }
+    throw error;
+  }
+
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
 

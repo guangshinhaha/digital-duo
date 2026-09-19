@@ -86,6 +86,17 @@ function reportError(error: unknown): void {
   process.exitCode = 1;
 }
 
+/** A Commander option parser for a numeric flag — Commander calls this itself while parsing argv, so throwing here (rather than letting a bare `Number.parseInt` silently produce NaN) is what turns `--limit abc` into a clean argv-parsing error instead of NaN reaching a SQL LIMIT binding downstream. */
+function parseIntegerOption(flag: string): (value: string) => number {
+  return (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`${flag} expects a number, got "${value}"`);
+    }
+    return parsed;
+  };
+}
+
 program
   .command("status")
   .description("Print the configured provider, store location, and whether the store exists")
@@ -101,7 +112,7 @@ program
       "existing store. Never falls back to reading the passphrase off disk, and refuses to bind every interface.",
   )
   .option("--host <host>", "the address to bind — a tailnet IP, or 127.0.0.1 for local-only. Never a wildcard.")
-  .option("--port <port>", "the port to bind", (value: string) => Number.parseInt(value, 10), 7717)
+  .option("--port <port>", "the port to bind", parseIntegerOption("--port"), 7717)
   .action(async (options: { host?: string; port: number }) => {
     const config = loadConfig();
     try {
@@ -656,7 +667,7 @@ draftsCommand
   .description("List drafts, oldest first — by default every one ever recorded")
   .option("--pending", "only drafts with no outcome recorded yet")
   .option("--outcome <outcome>", `only drafts with this outcome, one of: ${DRAFT_OUTCOMES.join(", ")}`)
-  .option("--limit <n>", "cap the number of rows returned", (value: string) => Number.parseInt(value, 10))
+  .option("--limit <n>", "cap the number of rows returned", parseIntegerOption("--limit"))
   .action((options: { pending?: boolean; outcome?: string; limit?: number }) => {
     const config = loadConfig();
     if (options.outcome !== undefined && !DRAFT_OUTCOMES.includes(options.outcome as (typeof DRAFT_OUTCOMES)[number])) {
@@ -1699,16 +1710,6 @@ actionsCommand
 const evalCommand = program
   .command("eval")
   .description("Offline evaluation: draft quality on held-out data (#35), and the relevance gate's precision/recall (#36)");
-
-function parseIntegerOption(flag: string): (value: string) => number {
-  return (value) => {
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      throw new Error(`${flag} expects a number, got "${value}"`);
-    }
-    return parsed;
-  };
-}
 
 evalCommand
   .command("offline")
