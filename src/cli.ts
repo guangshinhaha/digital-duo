@@ -73,7 +73,14 @@ program
     }
   });
 
-const importCommand = program.command("import").description("Import records from a source into the store");
+// The retention boundary, stated in the same words told to the team
+// (v1-tech-design.md §1.4): we keep questions put to you, we discard
+// everything else others said.
+const importCommand = program
+  .command("import")
+  .description(
+    "Import records from a source into the store. Retention boundary: we keep questions put to you, we discard everything else others said.",
+  );
 
 importCommand
   .command("claude")

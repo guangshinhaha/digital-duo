@@ -142,6 +142,20 @@ export function countRecords(storePath: string, passphrase: string): number {
   });
 }
 
+/**
+ * Every record in the store, unfiltered. Used by #21's phase B to read
+ * back everything phase A staged before applying the retention filter —
+ * this is a full enumeration, not a relevance search, so it doesn't go
+ * through FTS5.
+ */
+export function listRecords(storePath: string, passphrase: string): IngestRecord[] {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureRecordsSchema(db);
+    const rows = db.prepare(`SELECT * FROM records`).all() as unknown as RecordRow[];
+    return rows.map(rowToRecord);
+  });
+}
+
 export interface RankedRecord {
   record: IngestRecord;
   /** FTS5's bm25-derived rank; lower is more relevant. Ordering, not an absolute score. */

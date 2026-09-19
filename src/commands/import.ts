@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import type { DuoConfig } from "../config.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { MalformedTranscriptError, parsePastedTranscript } from "../ingest/adapters/paste.js";
-import { writeRecords } from "../ingest/record-store.js";
+import { ingestRecords } from "../ingest/two-phase.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -28,15 +28,23 @@ export interface ClaudeImportSummary {
   skipped: number;
 }
 
+/**
+ * Every import path runs its records through the two-phase pipeline
+ * (#21), even one like the Claude export adapter that never produces
+ * `author: "other"` or DM content: the retention boundary is a property
+ * of the *pipeline*, not something each adapter has to remember to
+ * enforce for itself. It's a no-op filter for this source today and a
+ * real one the moment a multi-party source (e.g. Slack) exists.
+ */
 export function runImportClaude(path: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): ClaudeImportSummary {
   const raw = readSourceFile(path, MalformedExportError);
   const { records, conversationCount, workRelevantConversationCount } = parseClaudeExport(raw);
 
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  const result = writeRecords(config.storePath, passphrase, records);
+  const outcome = ingestRecords(config.storePath, passphrase, records);
 
-  return { conversationCount, workRelevantConversationCount, written: result.written, skipped: result.skipped };
+  return { conversationCount, workRelevantConversationCount, written: outcome.written, skipped: outcome.alreadyPresent };
 }
 
 export interface PasteImportSummary {
@@ -55,7 +63,7 @@ export function runImportPaste(path: string, config: DuoConfig, env: NodeJS.Proc
 
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  const result = writeRecords(config.storePath, passphrase, records);
+  const outcome = ingestRecords(config.storePath, passphrase, records);
 
-  return { workRelevant: true, written: result.written, skipped: result.skipped };
+  return { workRelevant: true, written: outcome.written, skipped: outcome.alreadyPresent };
 }
