@@ -81,6 +81,31 @@ describe("duo permissions ask", () => {
   });
 });
 
+describe("duo permissions ask-public (#43)", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["permissions", "ask-public", "anything", "--as", "colleague"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("passes an unanswerable question on rather than posting anything, and logs it", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["permissions", "ask-public", "what is the vacation policy?", "--as", "colleague"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/passed it on/i);
+    expect(result.stderr).toMatch(/kept private/i);
+  });
+});
+
 describe("duo permissions audit", () => {
   it("refuses to run without an initialized store, naming duo init", async () => {
     const storePath = join(tempDir(), "data", "duo.db");

@@ -181,6 +181,116 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
   });
 });
 
+describe("gatherDraftContext — topic resolution for evidence (#43)", () => {
+  it("takes the topic from a rule hit when one exists", async () => {
+    const storePath = initStore();
+    const question = record({ kind: "question_to_me", author: "other", text: "a question about leave", threadId: "t-shared" });
+    const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "t-shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      putRule(
+        db,
+        {
+          id: "topic-leave",
+          topicId: "topic-leave",
+          text: "Standard leave is five days per quarter.",
+          status: "confirmed",
+          supportCount: 3,
+          consistency: 0.95,
+          createdAt: new Date().toISOString(),
+          lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "approved",
+          origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
+        },
+        pairs.map((pair) => pair.id),
+      );
+    });
+
+    const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(context.topicId).toBe("topic-leave");
+  });
+
+  it("falls back to the evidence's own qa_pairs topic when there is no rule at all", async () => {
+    const storePath = initStore();
+    const question = record({ kind: "question_to_me", author: "other", text: "a question about leave", threadId: "t-shared" });
+    const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "t-shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave-no-rule" })));
+
+    const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(context.ruleHit).toBeUndefined();
+    expect(context.topicId).toBe("topic-leave-no-rule");
+  });
+
+  it("is undefined when there is no evidence at all", async () => {
+    const storePath = initStore();
+    const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "nothing matches this", createFakeEmbeddingProvider());
+    expect(context.topicId).toBeUndefined();
+  });
+});
+
+describe("gatherDraftContext — an optional clearance ceiling filters candidates before anything else sees them (#43)", () => {
+  it("excludes a record above the ceiling from evidence, rule-hit lookup, and topic resolution alike", async () => {
+    const storePath = initStore();
+    const question = record({ kind: "question_to_me", author: "other", text: "a question about leave", threadId: "t-shared" });
+    const answer = record({ text: "RESTRICTED\nfive days per quarter, per the vacation policy", threadId: "t-shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+
+    const unfiltered = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(unfiltered.evidence.length).toBeGreaterThan(0);
+    expect(unfiltered.topicId).toBe("topic-leave");
+
+    const filtered = await gatherDraftContext(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      embeddingProvider,
+      undefined,
+      "official_open",
+    );
+    expect(filtered.evidence).toEqual([]);
+    expect(filtered.topicId).toBeUndefined();
+    expect(filtered.freshestEvidenceAgeDays).toBeNull();
+  });
+
+  it("admits a record at or below the ceiling unchanged", async () => {
+    const storePath = initStore();
+    const answer = record({ text: "OFFICIAL (OPEN)\nfive days per quarter, per the vacation policy" });
+    writeRecords(storePath, PASSPHRASE, [answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const filtered = await gatherDraftContext(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      embeddingProvider,
+      undefined,
+      "official_open",
+    );
+    expect(filtered.evidence.length).toBeGreaterThan(0);
+  });
+});
+
 describe("gatherDraftContext — freshest evidence age", () => {
   it("is null with no evidence, and a real number in days with some", async () => {
     const storePath = initStore();

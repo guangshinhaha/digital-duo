@@ -3,8 +3,10 @@ import { join } from "node:path";
 import type { EmbeddingProvider } from "../provider/types.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
+import type { ClassificationLevel } from "../ingest/record.js";
 import { ensureRecordsSchema } from "../ingest/record-store.js";
 import { ensureEmbeddingSchema, hybridSearch } from "../ingest/embeddings.js";
+import { isVisibleToClearance } from "../permissions/classification.js";
 import { ensureQaPairsSchema } from "../derivation/qa-pairs.js";
 import { ensureRulesSchema, readRuleRow, type Rule } from "../derivation/rules.js";
 import { findConflictingRefusal } from "../trust/refusals.js";
@@ -21,6 +23,16 @@ export interface DraftContext {
   readonly evidence: readonly DraftEvidenceItem[];
   /** The confirmed rule directly covering this question, if retrieval turned up evidence backing one — the "explicit rule hit" signal (v1-tech-design.md §1.8). */
   readonly ruleHit: Rule | undefined;
+  /**
+   * The topic id this question's evidence belongs to, if any — independent
+   * of `ruleHit`'s stricter confirmed+approved+non-refused filter, since a
+   * topic can hold a trust-grid autonomy grant (#53) without ever having a
+   * rule derived for it at all. `undefined` when there's no evidence, or
+   * evidence exists but was never assigned a topic (#24 hasn't run, or the
+   * pairs are too new). Public answering (#43) is this field's first real
+   * consumer — it's what gets checked against the T0 cell for the topic.
+   */
+  readonly topicId: string | undefined;
   /** Age, in days, of the freshest evidence item — null when there's no evidence at all. What #33's computeRecencyDecay decays, and what a caller states per its AC3. */
   readonly freshestEvidenceAgeDays: number | null;
   /** Raw text of duo/voice.md, or a plain "not enough data" placeholder when it doesn't exist yet — conditions generation, never invented. */
@@ -114,6 +126,36 @@ function findRuleHit(db: Database, recordIds: readonly string[], duoDir: string)
   return undefined;
 }
 
+/**
+ * The topic id evidence for this question belongs to (see `DraftContext.topicId`
+ * above). Prefers `ruleHit`'s own topic when one exists — already computed,
+ * and a rule hit is strong evidence of *which* topic — otherwise falls back
+ * to the most-cited topic among the retrieved evidence's own qa_pairs (a
+ * topic can exist, and hold a trust grant, with no rule ever derived for
+ * it). Ties broken by lowest topic id, for a deterministic result.
+ */
+function resolveEvidenceTopicId(db: Database, recordIds: readonly string[], ruleHit: Rule | undefined): string | undefined {
+  if (ruleHit) {
+    return ruleHit.topicId;
+  }
+  if (recordIds.length === 0) {
+    return undefined;
+  }
+  ensureQaPairsSchema(db);
+  const placeholders = recordIds.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`SELECT topic_id FROM qa_pairs WHERE answer_id IN (${placeholders}) AND topic_id IS NOT NULL`)
+    .all(...recordIds) as unknown as { topic_id: string }[];
+  if (rows.length === 0) {
+    return undefined;
+  }
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    counts.set(row.topic_id, (counts.get(row.topic_id) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+}
+
 function ageInDays(timestamp: string, now: Date): number | null {
   const then = new Date(timestamp).getTime();
   if (Number.isNaN(then)) {
@@ -132,9 +174,19 @@ function readVoiceText(duoDir: string): string {
 
 /**
  * Gathers everything the draft pipeline needs to generate and score a
- * draft, for the *owner's own* personal duo — unlike
- * src/permissions/retrieval.ts's retrieveForAsker, there is no asker or
- * clearance to resolve here: the owner sees everything in their own store.
+ * draft. For the *owner's own* personal duo (the default: `clearanceCeiling`
+ * omitted) there is no asker or clearance to resolve — unlike
+ * src/permissions/retrieval.ts's retrieveForAsker, the owner sees everything
+ * in their own store. `clearanceCeiling`, when given, filters retrieved
+ * candidates through #48's `isVisibleToClearance` *before* anything below
+ * this point (rule-hit lookup, topic resolution, evidence, confidence) ever
+ * sees them — the same "filtered before generation, not after" shape
+ * `retrieveForAsker` uses. Public answering (#43) is the one caller that
+ * passes it: colleagues are not the owner, so material above the public
+ * ceiling must never reach a publicly-postable draft, even though (per #43's
+ * own scope) *which* colleague is asking makes no difference to the filter
+ * applied — one uniform ceiling, not a per-asker one.
+ *
  * Real per-item cosine similarity is computed directly against the stored
  * vectors (rather than reusing hybridSearch's ordinal rank), which is what
  * lets #33's confidence scoring measure retrieval strength honestly.
@@ -146,8 +198,13 @@ export async function gatherDraftContext(
   question: string,
   embeddingProvider: EmbeddingProvider,
   limit = 5,
+  clearanceCeiling?: ClassificationLevel,
 ): Promise<DraftContext> {
   const hybrid = await hybridSearch(storePath, passphrase, question, embeddingProvider, limit);
+  const admissible =
+    clearanceCeiling === undefined
+      ? hybrid.results
+      : hybrid.results.filter((result) => isVisibleToClearance(result.record.classification, clearanceCeiling));
 
   let queryVector: readonly number[] | undefined;
   if (hybrid.usedEmbeddings) {
@@ -158,18 +215,20 @@ export async function gatherDraftContext(
     }
   }
 
-  const recordIds = hybrid.results.map((result) => result.record.id);
+  const recordIds = admissible.map((result) => result.record.id);
   const now = new Date();
 
-  const { vectors, ruleHit } = withDatabase(storePath, passphrase, false, (db) => {
+  const { vectors, ruleHit, topicId } = withDatabase(storePath, passphrase, false, (db) => {
     ensureRecordsSchema(db);
+    const hit = findRuleHit(db, recordIds, duoDir);
     return {
       vectors: queryVector ? readStoredVectors(db, recordIds, embeddingProvider.model) : new Map<string, number[]>(),
-      ruleHit: findRuleHit(db, recordIds, duoDir),
+      ruleHit: hit,
+      topicId: resolveEvidenceTopicId(db, recordIds, hit),
     };
   });
 
-  const evidence: DraftEvidenceItem[] = hybrid.results.map((result, index) => {
+  const evidence: DraftEvidenceItem[] = admissible.map((result, index) => {
     const stored = vectors.get(result.record.id);
     const similarity = queryVector && stored ? cosineSimilarity(queryVector, stored) : 1 / (1 + index);
     return { recordId: result.record.id, text: result.record.text, timestamp: result.record.timestamp, similarity };
@@ -181,6 +240,7 @@ export async function gatherDraftContext(
   return {
     evidence,
     ruleHit,
+    topicId,
     freshestEvidenceAgeDays,
     voiceText: readVoiceText(duoDir),
     usedEmbeddings: hybrid.usedEmbeddings,

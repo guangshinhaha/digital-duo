@@ -1,4 +1,5 @@
 import type { DuoConfig } from "../config.js";
+import type { ClassificationLevel } from "../ingest/record.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import {
   computeRecencyDecay,
@@ -21,6 +22,8 @@ export interface DraftAnswer {
   readonly text: string;
   readonly sources: readonly DraftSource[];
   readonly confidence: ConfidenceResult;
+  /** The topic this draft's evidence belongs to, if any (see DraftContext.topicId) — what public answering (#43) checks against the T0 trust cell before this draft may ever leave the owner's own eyes. */
+  readonly topicId: string | undefined;
 }
 
 export interface DraftEscalation {
@@ -85,6 +88,8 @@ export async function draftReply(
   embeddingProvider: EmbeddingProvider,
   inferenceProvider: InferenceProvider | undefined,
   confidenceConfig: DuoConfig["confidence"],
+  /** Passed straight through to `gatherDraftContext` — see that function's own doc comment. Omitted by every existing caller (the owner's own `duo draft`, the eval harness); public answering (#43) is the one caller that sets it. */
+  publicClearanceCeiling?: ClassificationLevel,
 ): Promise<DraftPipelineResult> {
   // Checked first, before any retrieval or generation: a refused subject
   // escalates "without reasoning about it" (#34 AC2) — there is no
@@ -106,7 +111,7 @@ export async function draftReply(
     return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
   }
 
-  const context = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider);
+  const context = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider, undefined, publicClearanceCeiling);
   const sources = buildSources(context);
 
   // Nothing to ground a draft in at all: no rule hit, no retrieved
@@ -192,5 +197,5 @@ export async function draftReply(
     confidenceScore: confidence.score,
     sources,
   });
-  return { kind: "draft", draftId, text, sources, confidence };
+  return { kind: "draft", draftId, text, sources, confidence, topicId: context.topicId };
 }

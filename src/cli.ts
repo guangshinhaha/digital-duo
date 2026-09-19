@@ -55,7 +55,7 @@ import {
   type CalibrationProgress,
 } from "./commands/mirror.js";
 import { runCorrectionsApprove, runCorrectionsReject, runCorrectionsReview } from "./commands/corrections.js";
-import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
+import { runAnswerPublicly, runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
@@ -339,6 +339,42 @@ permissionsCommand
       console.log(result.answer);
       if (result.declined) {
         console.error("(declined — nothing visible to this asker informed this answer)");
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+permissionsCommand
+  .command("ask-public")
+  .description(
+    "The graduation from private drafting (#43): draft privately as v1 always does, and post publicly only when the " +
+      "topic holds granted T0 autonomy, the evidence clears confidence, and nothing about it is refused",
+  )
+  .argument("<question>", "the question a colleague asked")
+  .requiredOption("--as <askerRef>", "who is asking, recorded for the log only — public answering does not differentiate per asker (#43's own out-of-scope note)")
+  .action(async (question: string, options: { as: string }) => {
+    const config = loadConfig();
+    try {
+      const outcome = await runAnswerPublicly(question, options.as, config);
+      switch (outcome.kind) {
+        case "answered":
+          console.log(outcome.text);
+          console.error(`(answered publicly — topic [${outcome.topicId}] is granted T0 autonomy; confidence ${outcome.confidence.score.toFixed(2)})`);
+          break;
+        case "passed_on":
+          console.log(outcome.message);
+          console.error(
+            `(kept private — draft id ${outcome.draftId}${outcome.topicId ? `, topic [${outcome.topicId}] not yet granted T0 autonomy` : ", no topic resolved"})`,
+          );
+          if (outcome.ownerNotice) {
+            console.error(`(owner-facing: ${outcome.ownerNotice})`);
+          }
+          break;
+        case "declined_refused":
+          console.log(outcome.message);
+          console.error(`(refused — draft id ${outcome.draftId})`);
+          break;
       }
     } catch (error) {
       reportError(error);
