@@ -38,3 +38,25 @@ export function resolveProvider(
   }
   return factory(config);
 }
+
+/**
+ * Resolves a provider for a best-effort LLM helper (adjudication,
+ * labeling, answering) — a missing/misconfigured provider (G1 is
+ * unresolved) degrades that helper to its deterministic fallback rather
+ * than failing the whole operation. Shared by every `duo derive *`
+ * command and `duo permissions ask` rather than each command re-deriving
+ * the same try/catch.
+ */
+export function tryResolveProvider(
+  config: DuoConfig,
+  registry: Record<string, ProviderFactory> = defaultRegistry,
+): InferenceProvider | undefined {
+  try {
+    return resolveProvider(config, registry);
+  } catch (error) {
+    if (error instanceof ProviderConfigError) {
+      return undefined;
+    }
+    throw error;
+  }
+}

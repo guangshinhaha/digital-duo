@@ -1,5 +1,8 @@
 import type { DuoConfig } from "../config.js";
+import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
+import { tryResolveProvider } from "../provider/registry.js";
 import { type EnforceCeilingOutcome, enforceClassificationCeiling, parseClassificationCeiling } from "../permissions/classification.js";
+import { answerForAsker, type AnswerForAskerResult } from "../permissions/answer.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -14,4 +17,18 @@ export function runEnforceCeiling(config: DuoConfig, env: NodeJS.ProcessEnv = pr
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const ceiling = parseClassificationCeiling(config.classificationCeiling);
   return enforceClassificationCeiling(config.storePath, passphrase, ceiling);
+}
+
+/** Implements `duo permissions ask <question> --as <askerId>` (#50): the first real consumer of #49's retrieveForAsker, tying resolution, permission-filtered retrieval, generation, and the audit log together. */
+export async function runAskAsAsker(
+  question: string,
+  askerRef: string,
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<AnswerForAskerResult> {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const embeddingProvider = createOllamaEmbeddingProvider(config);
+  const inferenceProvider = tryResolveProvider(config);
+  return answerForAsker(config.storePath, passphrase, config.duoDir, question, askerRef, embeddingProvider, inferenceProvider);
 }

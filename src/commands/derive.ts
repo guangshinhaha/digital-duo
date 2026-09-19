@@ -5,22 +5,9 @@ import { syncRulesFiles, type RuleSyncSummary } from "../derivation/rules-sync.j
 import { createLlmTopicLabeler, runTopicAssignment, type TopicAssignmentResult } from "../derivation/topics.js";
 import { createLlmRegisterDescriber, runVoiceProfile, type VoiceProfileResult } from "../derivation/voice.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
-import { ProviderConfigError } from "../provider/types.js";
-import { resolveProvider } from "../provider/registry.js";
+import { tryResolveProvider } from "../provider/registry.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
-
-/** Resolves an optional InferenceProvider for a best-effort LLM helper (adjudication, labeling): a missing/misconfigured provider (G1 is unresolved) degrades to the deterministic default rather than failing the whole derivation stage. */
-function tryResolveProvider(config: DuoConfig) {
-  try {
-    return resolveProvider(config);
-  } catch (error) {
-    if (error instanceof ProviderConfigError) {
-      return undefined;
-    }
-    throw error;
-  }
-}
 
 /**
  * Implements `duo derive pairs`. Adjudication is best-effort: if no

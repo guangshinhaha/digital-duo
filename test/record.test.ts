@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeRecordId, createRecord, InvalidRecordError, parseRecord, type RecordInput } from "../src/ingest/record.js";
+import { computeRecordId, createRecord, InvalidRecordError, parseRecord, stripMarkingLine, type RecordInput } from "../src/ingest/record.js";
 
 function sampleInput(overrides: Partial<RecordInput> = {}): RecordInput {
   return {
@@ -48,6 +48,25 @@ describe("createRecord", () => {
     const a = createRecord(sampleInput());
     const b = createRecord(sampleInput());
     expect(a.id).toBe(b.id);
+  });
+});
+
+describe("stripMarkingLine", () => {
+  it("removes a bare marking line, leaving the message intact", () => {
+    expect(stripMarkingLine({ text: "RESTRICTED\nthe actual message", classification: "restricted" })).toBe("the actual message");
+  });
+
+  it("leaves text untouched when the classification is unknown", () => {
+    expect(stripMarkingLine({ text: "no marking here", classification: "unknown" })).toBe("no marking here");
+  });
+
+  it("leaves text untouched when the marking shares its line with real content (the colon case)", () => {
+    const text = "Official (Open): fine to share";
+    expect(stripMarkingLine({ text, classification: "official_open" })).toBe(text);
+  });
+
+  it("leaves text untouched when there's no second line to fall back to", () => {
+    expect(stripMarkingLine({ text: "RESTRICTED", classification: "restricted" })).toBe("RESTRICTED");
   });
 });
 
