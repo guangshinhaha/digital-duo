@@ -3,10 +3,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadSharedDuoConfig } from "../src/shared-duo/config.js";
 import {
+  assertAuthoredKnowledgeOnly,
   assertHumanOwner,
   createSharedDuo,
   loadSharedDuo,
   parseSharedDuoDefinition,
+  SharedDuoKnowledgeError,
   SharedDuoOwnershipError,
 } from "../src/shared-duo/loader.js";
 import type { DuoDefinition } from "../src/duo/types.js";
@@ -77,6 +79,24 @@ describe("a configuration missing a human owner is refused (#67 AC2)", () => {
   it("parseSharedDuoDefinition still runs the general shape validation first", () => {
     const raw = { ...definition(), owner: { kind: "not-a-real-kind" } };
     expect(() => parseSharedDuoDefinition(raw)).toThrow(/definition\.owner\.kind/);
+  });
+});
+
+describe("a shared duo is grounded in authored-only knowledge (#68 AC3)", () => {
+  it("assertAuthoredKnowledgeOnly is a no-op when knowledge.kind is authored", () => {
+    expect(() => assertAuthoredKnowledgeOnly(definition())).not.toThrow();
+  });
+
+  it("assertAuthoredKnowledgeOnly throws SharedDuoKnowledgeError, naming the duo and kind, for a derived/personal store", () => {
+    const def = definition({ knowledge: { kind: "derived", storePath: "data/someones-personal-duo.db" } });
+    expect(() => assertAuthoredKnowledgeOnly(def)).toThrow(SharedDuoKnowledgeError);
+    expect(() => assertAuthoredKnowledgeOnly(def)).toThrow(/shared-duo/);
+    expect(() => assertAuthoredKnowledgeOnly(def)).toThrow(/"derived"/);
+  });
+
+  it("createSharedDuo refuses a persona file pointed at a real personal store, before anything is constructed", () => {
+    const def = definition({ knowledge: { kind: "derived", storePath: "data/someones-personal-duo.db" } });
+    expect(() => createSharedDuo(def)).toThrow(SharedDuoKnowledgeError);
   });
 });
 
