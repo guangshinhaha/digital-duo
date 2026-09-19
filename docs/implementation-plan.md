@@ -142,9 +142,24 @@ ceremony on work that doesn't need it:
   for occupying a low rank in the vector candidate list; fixed by filtering out
   zero-and-below-similarity matches before fusion. No two-phase retention boundary yet — that's
   #21, next.
+- #21 (PR [#85](https://github.com/guangshinhaha/digital-duo/pull/85), merged, squash commit
+  `a07b83a`) — lighter path: `src/ingest/two-phase.ts` (`ingestRecords`). Phase A stages every
+  record — including `author: "other"` text, needed for context — in its own transient encrypted
+  database (`import-<random>.staging.db`, in the data directory #17's `duo purge` already
+  sweeps); phase B copies only what survives the retention boundary into the retained store, then
+  deletes the staging file in a `finally`. `isRetainedAcrossBoundary` states the boundary in the
+  same words told to the team (v1-tech-design.md §1.4), now echoed in `duo import --help` too:
+  "we keep questions put to you, we discard everything else others said." DM opt-in is a separate
+  gate applied before that filter, reporting skipped-conversation counts. Retrofitted `duo import
+  claude`/`duo import paste` (#19) to route through this pipeline instead of writing directly —
+  a no-op filter for that source today, a real one once a multi-party source (Slack) exists. 144
+  tests. Self-review found no fixable issues. **Wave W1 (epic `e2`, ingest) is now complete**;
+  #22 stays skipped, blocked on #15 per the original plan.
 
-**Next:** #21 (W1, epic `e2` — ingest, last issue in this wave) — check its label before
-assuming which path applies.
+**Next:** #23 (W2, start of epic `e3` — derivation) — check its label before assuming which path
+applies. #23 begins wave W2, where `e3` (derivation), `e10` (permissions), and `e64`
+(shared-duos) run as parallel epics per §1, though concurrency stays sequential through W2 per
+§2's locked decision.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
