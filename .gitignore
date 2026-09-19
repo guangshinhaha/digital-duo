@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/
 shared-duo-runtime/
+duo-lifecycle-runtime/
 *.log
 .DS_Store
 .claude/

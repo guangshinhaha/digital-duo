@@ -35,6 +35,7 @@ import { runEvalGate, runEvalOffline } from "./commands/eval.js";
 import { assertPrecisionFloor } from "./eval/gate-eval.js";
 import { WOULD_HAVE_SENT_CAVEAT } from "./eval/offline-eval.js";
 import { runHandoverCut, runHandoverGenerate, runHandoverShare } from "./commands/handover.js";
+import { runArchive, runDeclareOrphaned, runEnd, runTransferConfirm, runTransferInitiate, runTransferList } from "./commands/lifecycle.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import {
@@ -943,6 +944,128 @@ continuityCommand
     try {
       const result = await runConsultPredecessor(predecessorStorePath, predecessorDuoDir, predecessorName, question, config);
       console.log(result.text);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// #63: every duo needs an end (docs/concept.md §11) — archival, transfer,
+// and deletion are all deliberate acts with a record, never inferred from
+// silence. An orphaned duo (no transfer or archival ever performed) fails
+// safe: `duo draft` and `duo continuity consult` both refuse it (see
+// src/continuity/lifecycle.ts's assertOwnerConsultable/
+// assertPredecessorConsultable, wired into commands/draft.ts and
+// commands/continuity.ts respectively).
+continuityCommand
+  .command("archive")
+  .description("Archive this duo with an explicit decision: stops answering in the present tense, revokes every autonomy grant, records who and when")
+  .argument("<decidedBy>", "who decided to archive this duo")
+  .action((decidedBy: string) => {
+    const config = loadConfig();
+    try {
+      const record = runArchive(decidedBy, config);
+      console.log(`Archived by ${record.archivedBy} on ${record.archivedAt}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+continuityCommand
+  .command("orphan")
+  .description("Record that this duo's owner has left with no transfer or archival ever performed — every consultation surface then fails safe")
+  .argument("<reportedBy>", "who is reporting this")
+  .argument("<reason>", "why this duo is being declared orphaned")
+  .action((reportedBy: string, reason: string) => {
+    const config = loadConfig();
+    try {
+      const record = runDeclareOrphaned(reportedBy, reason, config);
+      console.log(`Declared orphaned by ${record.orphanedBy} on ${record.orphanedAt}: ${record.orphanReason}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const transferCommand = continuityCommand
+  .command("transfer")
+  .description("A duo cannot be transferred without both the outgoing and receiving owner explicitly confirming — never by one party or an administrator alone");
+
+transferCommand
+  .command("initiate")
+  .description("Start a transfer request — neither party is confirmed yet, and nothing changes until both are")
+  .argument("<outgoingOwner>", "the current owner's name")
+  .argument("<receivingOwner>", "the new owner's name")
+  .action((outgoingOwner: string, receivingOwner: string) => {
+    const config = loadConfig();
+    try {
+      const request = runTransferInitiate(outgoingOwner, receivingOwner, config);
+      console.log(`Transfer "${request.id}" initiated: ${request.outgoingOwner} -> ${request.receivingOwner} (pending both confirmations).`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+transferCommand
+  .command("confirm")
+  .description("Confirm a pending transfer as one of its two named parties — completes only once both have confirmed")
+  .argument("<transferId>", "the transfer request's id")
+  .argument("<confirmingName>", "the name of the party confirming (must match the request's outgoing or receiving owner)")
+  .action((transferId: string, confirmingName: string) => {
+    const config = loadConfig();
+    try {
+      const request = runTransferConfirm(transferId, confirmingName, config);
+      console.log(
+        request.status === "completed"
+          ? `Transfer "${request.id}" completed on ${request.completedAt}: ${request.outgoingOwner} -> ${request.receivingOwner}.`
+          : `Transfer "${request.id}" confirmed by ${confirmingName}; still awaiting the other party.`,
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+transferCommand
+  .command("list")
+  .description("List every transfer request ever made for this duo")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const requests = runTransferList(config);
+      if (requests.length === 0) {
+        console.log("No transfer requests recorded.");
+        return;
+      }
+      for (const request of requests) {
+        console.log(
+          `${request.id}  ${request.outgoingOwner} -> ${request.receivingOwner}  ${request.status}` +
+            (request.status === "completed" ? ` (${request.completedAt})` : ""),
+        );
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+continuityCommand
+  .command("end")
+  .description("End this duo completely: the corpus, derived artifacts, and standing orders are all removed. Irreversible.")
+  .argument("<decidedBy>", "who decided to end this duo")
+  .option("--yes", "actually delete everything (without it, this only describes what would be deleted)")
+  .action((decidedBy: string, options: { yes?: boolean }) => {
+    const config = loadConfig();
+    try {
+      const result = runEnd(decidedBy, options.yes === true, config);
+      const total = result.storePaths.length + result.duoDirPaths.length;
+      if (total === 0) {
+        console.log("Nothing to end — no store and no derived output exist.");
+        return;
+      }
+      if (!result.confirmed) {
+        console.log(`Would delete ${result.storePaths.length} file(s) under "${result.storeDataDir}" and ${result.duoDirPaths.length} file(s) under "${result.duoDir}".`);
+        console.log("Re-run with --yes to actually delete everything. This cannot be undone.");
+        return;
+      }
+      console.log(`Ended by ${decidedBy}. Deleted ${result.storePaths.length} file(s) under "${result.storeDataDir}" and ${result.duoDirPaths.length} file(s) under "${result.duoDir}".`);
+      console.log("Nothing recoverable remains.");
     } catch (error) {
       reportError(error);
     }

@@ -24,6 +24,7 @@ describe("loadConfig", () => {
       gateLabelsPath: "eval/gate-labels.json",
       gatePrecisionFloor: 0.95,
     });
+    expect(config.lifecycleLogPath).toBe("duo-lifecycle-runtime/events.json");
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -47,6 +48,7 @@ describe("loadConfig", () => {
       DUO_EVAL_GATE_LABELS_PATH: "/tmp/labels.json",
       DUO_EVAL_GATE_PRECISION_FLOOR: "0.9",
       DUO_OWNER_NAME: "Priya Nair",
+      DUO_LIFECYCLE_LOG_PATH: "/tmp/lifecycle.json",
     });
     expect(config).toEqual({
       providerName: "ollama",
@@ -66,6 +68,7 @@ describe("loadConfig", () => {
         gateLabelsPath: "/tmp/labels.json",
         gatePrecisionFloor: 0.9,
       },
+      lifecycleLogPath: "/tmp/lifecycle.json",
     });
   });
 

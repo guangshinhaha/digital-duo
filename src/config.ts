@@ -57,6 +57,13 @@ const DEFAULT_EVAL_GATE_LABELS_PATH = "eval/gate-labels.json";
 // #36 AC: "the precision floor is stated as a number, not a sentiment" —
 // matches src/drafting/relevance-gate.ts's own stated target precision.
 const DEFAULT_EVAL_GATE_PRECISION_FLOOR = 0.95;
+// #63: a record of every archival/transfer/deletion, kept in its own
+// top-level directory — deliberately neither `data/` (the encrypted
+// store's directory, which `duo purge`/#63's own `endDuo` delete wholesale)
+// nor `duo/` (removed by that same `endDuo`) — the same "runtime data must
+// survive the thing it logs about being deleted" lesson #69 already
+// learned the hard way for the shared duo's usage log.
+const DEFAULT_LIFECYCLE_LOG_PATH = "duo-lifecycle-runtime/events.json";
 
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
@@ -110,6 +117,8 @@ export interface DuoConfig {
     /** #36: the stated precision floor a gate-eval run fails against. Defaults to 0.95, matching RELEVANCE_GATE_TARGET_PRECISION. */
     gatePrecisionFloor: number;
   };
+  /** #63: where the durable archival/transfer/deletion log lives. Defaults to "duo-lifecycle-runtime/events.json" — its own directory, outside anything `endDuo` or `duo purge` ever deletes. */
+  lifecycleLogPath: string;
 }
 
 /**
@@ -148,5 +157,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       gateLabelsPath: env.DUO_EVAL_GATE_LABELS_PATH || DEFAULT_EVAL_GATE_LABELS_PATH,
       gatePrecisionFloor: parseNumberEnv(env.DUO_EVAL_GATE_PRECISION_FLOOR, DEFAULT_EVAL_GATE_PRECISION_FLOOR),
     },
+    lifecycleLogPath: env.DUO_LIFECYCLE_LOG_PATH || DEFAULT_LIFECYCLE_LOG_PATH,
   };
 }

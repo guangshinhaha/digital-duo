@@ -1,6 +1,7 @@
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 import { readTopicsFile } from "../derivation/topics.js";
+import { appendLedgerEntry, ensureTrustLedgerSchema } from "./ledger.js";
 
 /**
  * `docs/concept.md` §6: "Trust is granted per (topic × tier)" — the grid
@@ -204,6 +205,43 @@ export interface GridRow {
   readonly level: AutonomyLevel;
   readonly source: TrustCellSource;
   readonly stale: boolean;
+}
+
+/**
+ * #63 AC1: archiving a duo revokes every autonomy grant, not just the ones
+ * a caller happens to name — every touched cell not already at the floor
+ * is dropped straight to `"ask"`, logged in `trust_ledger` with the
+ * `"revoked"` event type #56's action registry already established for
+ * exactly this "grant taken away outright" case. Streak/offer state is
+ * reset the same way a demotion resets it (`trust/demotion.ts`), so a
+ * later un-archival (were one ever built) starts from a clean slate rather
+ * than resuming mid-streak toward a promotion that predates the archival.
+ * Returns the count of cells actually changed, for the caller to report.
+ */
+export function revokeAllAutonomy(storePath: string, passphrase: string, reason: string): number {
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureTrustSchema(db);
+    ensureTrustLedgerSchema(db);
+    const now = new Date().toISOString();
+    let revoked = 0;
+    for (const cell of listCellRows(db)) {
+      if (cell.level === "ask") {
+        continue;
+      }
+      upsertCellRow(db, {
+        ...cell,
+        level: "ask",
+        cleanStreak: 0,
+        lastOfferStreak: null,
+        lastOfferStatus: null,
+        demotionAnnounced: true,
+        updatedAt: now,
+      });
+      appendLedgerEntry(db, { topicId: cell.topicId, tier: cell.tier, eventType: "revoked", detail: { reason } });
+      revoked += 1;
+    }
+    return revoked;
+  });
 }
 
 /** The owner-facing "open the grid" view (#53 AC4): every touched cell, its current level, whether it was earned or granted, and its topic's live label — or a stale flag when that topic no longer exists. */
