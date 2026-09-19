@@ -21,9 +21,13 @@ function duoDir(): string {
   return join(tempDir(), "duo");
 }
 
+// duo/refusals.md's one real format (../src/trust/refusals.ts, #53/#29):
+// "## <subject>" headings with a reason body. A plain placeholder reason
+// is enough here — these tests are about subject matching, not reasons.
 function writeRefusalsFile(dir: string, subjects: string[]): void {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "refusals.md"), `# Refusals\n\n${subjects.map((s) => `- ${s}`).join("\n")}\n`, "utf8");
+  const content = subjects.map((subject) => `## ${subject}\n\nreason\n`).join("\n");
+  writeFileSync(join(dir, "refusals.md"), `# Refusals\n\n${content}`, "utf8");
 }
 
 describe("classifyMention — a genuine question passes (AC1)", () => {
@@ -88,7 +92,7 @@ describe("readRefusalsFile", () => {
     expect(readRefusalsFile(duoDir())).toEqual([]);
   });
 
-  it("parses bullet lines, ignoring headings and prose", () => {
+  it("reads each ## heading in duo/refusals.md as a subject (delegating to the canonical parser, #29)", () => {
     const dir = duoDir();
     writeRefusalsFile(dir, ["compensation", "performance reviews"]);
     expect(readRefusalsFile(dir)).toEqual(["compensation", "performance reviews"]);
