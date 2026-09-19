@@ -118,8 +118,19 @@ ceremony on work that doesn't need it:
   string such as `nonexistent-term-xyz` threw `no such column: term` instead of returning no
   results; fixed by tokenizing the query and quoting each word as a literal phrase before it
   reaches `MATCH`. No adapter yet — that's #19, next.
+- #19 (PR [#81](https://github.com/guangshinhaha/digital-duo/pull/81), merged, squash commit
+  `77c1acf`) — lighter path: `src/ingest/adapters/claude-export.ts` and `.../paste.ts`
+  (`duo import claude <path>` / `duo import paste <path>`), both producing `IngestRecord`s with
+  `kind: "my_thinking"` and `author` distinguishing `me`/`assistant`; `src/ingest/
+  work-relevance.ts`, a deterministic keyword heuristic (documented as a v1 stand-in for the
+  LLM classification `v1-tech-design.md` §1.5 describes eventually) that filters non-work
+  conversations out before they become a record (AR-11). Scope decision, documented in the PR
+  and in `claude-export.ts`'s module comment: "Claude export archive" is the `conversations.json`
+  a Claude data export contains, not zip-container parsing — no zip library exists in this repo,
+  and adding one for a task-shaped issue was judged out of scope. 112 tests. Self-review found no
+  fixable issues beyond that scope decision. No embeddings/retrieval yet — that's #20, next.
 
-**Next:** #19 (W1, epic `e2` — ingest) — check its label before assuming which path applies.
+**Next:** #20 (W1, epic `e2` — ingest) — check its label before assuming which path applies.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
