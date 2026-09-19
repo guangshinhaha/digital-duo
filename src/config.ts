@@ -1,5 +1,9 @@
 const DEFAULT_STORE_PATH = "data/duo.db";
 const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
+// Embeddings run locally via Ollama unconditionally (v1-tech-design.md §1.2)
+// — unlike the completion model, this doesn't wait on G1, so it gets a real
+// default rather than requiring explicit configuration.
+const DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text";
 
 export interface DuoConfig {
   /** Raw configured provider name, or undefined when DUO_PROVIDER is unset. */
@@ -11,6 +15,8 @@ export interface DuoConfig {
     host: string;
     /** Ollama model name, or undefined when DUO_OLLAMA_MODEL is unset. */
     model: string | undefined;
+    /** Ollama embedding model name. Defaults to "nomic-embed-text". */
+    embeddingModel: string;
   };
 }
 
@@ -28,6 +34,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
     ollama: {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
       model: env.DUO_OLLAMA_MODEL || undefined,
+      embeddingModel: env.DUO_OLLAMA_EMBEDDING_MODEL || DEFAULT_OLLAMA_EMBEDDING_MODEL,
     },
   };
 }

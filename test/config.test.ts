@@ -9,6 +9,7 @@ describe("loadConfig", () => {
     expect(config.ollama.host).toBe("http://localhost:11434");
     expect(config.providerName).toBeUndefined();
     expect(config.ollama.model).toBeUndefined();
+    expect(config.ollama.embeddingModel).toBe("nomic-embed-text");
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -17,11 +18,12 @@ describe("loadConfig", () => {
       DUO_PROVIDER: "ollama",
       DUO_OLLAMA_HOST: "http://h:1",
       DUO_OLLAMA_MODEL: "llama3",
+      DUO_OLLAMA_EMBEDDING_MODEL: "custom-embed",
     });
     expect(config).toEqual({
       providerName: "ollama",
       storePath: "/tmp/x.db",
-      ollama: { host: "http://h:1", model: "llama3" },
+      ollama: { host: "http://h:1", model: "llama3", embeddingModel: "custom-embed" },
     });
   });
 
