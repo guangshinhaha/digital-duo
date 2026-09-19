@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCli } from "./helpers/run-cli.js";
@@ -73,6 +74,46 @@ describe("duo draft-outcome — the outcome of a draft is recorded (#32 AC3)", (
     const storePath = join(tempDir(), "data", "duo.db");
     await initStore(storePath, tempDir());
     const result = await runCli(["draft-outcome", "not-a-real-id", "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/not-a-real-id/);
+  });
+});
+
+describe("duo draft — a refused subject escalates citing the refusal (#34 AC2)", () => {
+  it("cites duo/refusals.md rather than drafting anything", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDir = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+    mkdirSync(duoDir, { recursive: true });
+    writeFileSync(join(duoDir, "refusals.md"), "- salary\n", "utf8");
+
+    const result = await runCli(["draft", "what is my salary"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDir } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/salary/);
+    expect(result.stderr).toMatch(/refused/);
+  });
+});
+
+describe("duo draft-answer — an escalation can be turned into a rule on the spot (#34 AC3)", () => {
+  it("queues a standing-order candidate from the owner's own answer", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const draftResult = await runCli(["draft", "what is the meaning of life"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    const idMatch = /draft id ([\w-]+)/.exec(draftResult.stderr);
+    expect(idMatch).not.toBeNull();
+    const draftId = idMatch![1];
+
+    const result = await runCli(["draft-answer", draftId, "42, obviously."], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/Queued standing-order candidate/);
+  });
+
+  it("fails loudly, naming the id, for a draft that doesn't exist", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["draft-answer", "not-a-real-id", "answer"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toMatch(/not-a-real-id/);
   });

@@ -3,6 +3,7 @@ import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-prov
 import { tryResolveProvider } from "../provider/registry.js";
 import { recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
 import { draftReply, type DraftPipelineResult } from "../drafting/pipeline.js";
+import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -25,4 +26,11 @@ export function runRecordDraftOutcome(draftId: string, outcome: DraftOutcome, co
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   recordDraftOutcome(config.storePath, passphrase, draftId, outcome);
+}
+
+/** Implements `duo draft-answer <draftId> <answer>` (#34 AC3): turns an escalation the owner knows the answer to into a queued standing-order candidate. */
+export function runRecordEscalationAnswer(draftId: string, answerText: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): string {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return queueStandingOrderCandidate(config.storePath, passphrase, draftId, answerText);
 }

@@ -6,7 +6,7 @@ import { withDatabase } from "../store/store.js";
 import { ensureRecordsSchema } from "../ingest/record-store.js";
 import { ensureEmbeddingSchema, hybridSearch } from "../ingest/embeddings.js";
 import { ensureQaPairsSchema } from "../derivation/qa-pairs.js";
-import { ensureRulesSchema, type Rule } from "../derivation/rules.js";
+import { ensureRulesSchema, readRuleRow, type Rule } from "../derivation/rules.js";
 
 /** One piece of past evidence the draft can cite — a retrieved record, with a real cosine similarity to the question (not just an ordinal rank). */
 export interface DraftEvidenceItem {
@@ -64,11 +64,17 @@ function readStoredVectors(db: Database, recordIds: readonly string[], model: st
 
 /**
  * Whether any of `recordIds` is the answer half of a qa_pair whose topic
- * has a `confirmed` rule — "a standing order directly covers this"
- * (v1-tech-design.md §1.8), grounded in retrieval that already turned up
- * supporting evidence, rather than a separate rule-text embedding lookup.
- * Deterministic among ties: the confirmed rule with the highest
- * consistency wins, then lowest id.
+ * has a rule that is both `confirmed` (derivation's confidence tier) and
+ * `approved` (#28: the owner's own review decision — "what makes a rule
+ * active, usable by a future drafting/answering pipeline"; this is that
+ * pipeline). A `confirmed`-but-`pending`-or-`rejected` rule is deliberately
+ * not a hit: the owner hasn't signed off on it, or explicitly disagreed
+ * with it, either way it isn't "a standing order" yet.
+ *
+ * Only the matching id is picked here; the row itself is re-read through
+ * readRuleRow so this stays correct as rules.ts's own row shape evolves,
+ * rather than duplicating its column list. Deterministic among ties: the
+ * matching rule with the highest consistency wins, then lowest id.
  */
 function findRuleHit(db: Database, recordIds: readonly string[]): Rule | undefined {
   ensureQaPairsSchema(db);
@@ -80,41 +86,16 @@ function findRuleHit(db: Database, recordIds: readonly string[]): Rule | undefin
   const rows = db
     .prepare(
       `
-      SELECT DISTINCT rules.*
+      SELECT DISTINCT rules.id
       FROM qa_pairs
-      JOIN rules ON rules.topic_id = qa_pairs.topic_id AND rules.status = 'confirmed'
+      JOIN rules ON rules.topic_id = qa_pairs.topic_id AND rules.status = 'confirmed' AND rules.review_status = 'approved'
       WHERE qa_pairs.answer_id IN (${placeholders})
       ORDER BY rules.consistency DESC, rules.id ASC
     `,
     )
-    .all(...recordIds) as unknown as {
-    id: string;
-    topic_id: string;
-    text: string;
-    status: string;
-    support_count: number;
-    consistency: number;
-    created_at: string;
-    last_confirmed_at: string | null;
-    review_status: string;
-    origin: string;
-  }[];
-  const row = rows[0];
-  if (!row) {
-    return undefined;
-  }
-  return {
-    id: row.id,
-    topicId: row.topic_id,
-    text: row.text,
-    status: row.status as Rule["status"],
-    supportCount: row.support_count,
-    consistency: row.consistency,
-    createdAt: row.created_at,
-    lastConfirmedAt: row.last_confirmed_at,
-    reviewStatus: row.review_status as Rule["reviewStatus"],
-    origin: row.origin as Rule["origin"],
-  };
+    .all(...recordIds) as unknown as { id: string }[];
+  const winningId = rows[0]?.id;
+  return winningId ? readRuleRow(db, winningId) : undefined;
 }
 
 function ageInDays(timestamp: string, now: Date): number | null {
