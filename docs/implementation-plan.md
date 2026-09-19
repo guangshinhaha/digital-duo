@@ -230,9 +230,29 @@ ceremony on work that doesn't need it:
   **Wave W2's epic `e3` (derivation) is now complete** — all of #23, #24, #25, #26 merged in
   order, one at a time on `main`.
 
-**Next:** #48 (wave W2, epic `e10` — permissions), which the orchestrating session runs as its
-own separate chain. Per §1/§2, `e10` and `e64` (shared-duos) still run strictly one at a time on
-`main` within wave W2, not concurrently with each other or with anything else.
+- #48 (PR [#95](https://github.com/guangshinhaha/digital-duo/pull/95), merged, squash commit
+  `575e665`) — lighter path: `src/ingest/record.ts` gains `CLASSIFICATION_LEVELS` (the GSCS-style
+  ordered tiers `official_open` < `official_closed` < `restricted` < `confidential` < `secret`)
+  and `RECORD_CLASSIFICATIONS` (those plus `"unknown"`); `IngestRecord.classification` is no
+  longer `string | null` — `detectClassification` reads a marking off a record's own first line
+  (anchored at the start, so "let's keep this confidential" in a message body is never mistaken
+  for a marking), defaulting to `"unknown"`, never to the most permissive value.
+  `src/permissions/classification.ts` (new directory, epic `e10`'s home): `isWithinCeiling`
+  (ingest-time gate; `"unknown"` exempt — always retained) and `isVisibleToClearance`
+  (answer-time gate for #49/#50 to build on; `"unknown"` is the *stricter* case there — it needs
+  the same clearance as the top defined level, since over-classifying when unsure is the safe
+  posture). `enforceClassificationCeiling` re-evaluates an existing corpus against a given
+  ceiling (AC3). `DUO_CLASSIFICATION_CEILING` config, defaulting to `"official_open"`; `duo
+  permissions enforce-ceiling` CLI command. Design decision, documented in the module: the
+  apparent tension between AC1 ("above ceiling never written") and AC2 ("unmarked material is
+  recorded") is resolved by treating ingest-time ceiling enforcement and answer-time clearance
+  visibility as two different gates — unknown material is exempt from the first, strictest under
+  the second. 209 tests. Self-review found no fixable issues. No asker resolution yet — that's
+  #49, next.
+
+**Next:** #49 (wave W2, epic `e10` — permissions). Per §1/§2, `e10` and `e64` (shared-duos) still
+run strictly one at a time on `main` within wave W2, not concurrently with each other or with
+anything else.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
