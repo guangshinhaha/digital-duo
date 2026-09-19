@@ -85,6 +85,39 @@ describe("recordDraftOutcome — the outcome is recorded against the draft (#32 
     const storePath = initStore();
     expect(() => recordDraftOutcome(storePath, PASSPHRASE, "nope", "sent")).toThrow(DraftNotFoundError);
   });
+
+  it("stores the sent text when supplied (#37: needed to diff draft vs sent at all)", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+    });
+
+    recordDraftOutcome(storePath, PASSPHRASE, id, "edited", "an edited sent version");
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.sentText).toBe("an edited sent version");
+  });
+
+  it("leaves sentText null when it isn't supplied", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+    });
+
+    recordDraftOutcome(storePath, PASSPHRASE, id, "sent");
+    expect(getDraft(storePath, PASSPHRASE, id)?.sentText).toBeNull();
+  });
 });
 
 describe("listDrafts", () => {

@@ -4,6 +4,7 @@ import { tryResolveProvider } from "../provider/registry.js";
 import { recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
 import { draftReply, type DraftPipelineResult } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
+import { classifyAndQueueEdit, createLlmEditClassifier, NoDraftTextError, type ClassifyAndQueueResult } from "../corrections/classify.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -21,11 +22,45 @@ export async function runDraft(
   return draftReply(config.storePath, passphrase, config.duoDir, question, threadContext, embeddingProvider, inferenceProvider, config.confidence);
 }
 
-/** Implements `duo draft-outcome <draftId> <sent|edited|discarded>` (#32 AC3). */
-export function runRecordDraftOutcome(draftId: string, outcome: DraftOutcome, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): void {
+/**
+ * Implements `duo draft-outcome <draftId> <sent|edited|discarded> [sentText]`
+ * (#32 AC3). When the outcome is "edited" and the owner supplied the text
+ * they actually sent, this also runs the correction loop's classification
+ * (#37, v1-tech-design.md §1.9) as an immediate side effect of recording
+ * the outcome — it only ever queues candidates, never writes to
+ * `duo/rules/` or `duo/voice.md` ("queue it; do not write immediately"),
+ * so running it eagerly here is safe.
+ */
+export async function runRecordDraftOutcome(
+  draftId: string,
+  outcome: DraftOutcome,
+  config: DuoConfig,
+  sentText?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ClassifyAndQueueResult | undefined> {
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  recordDraftOutcome(config.storePath, passphrase, draftId, outcome);
+  // Recorded first, unconditionally: whatever happens to classification
+  // below, the outcome itself (#32 AC3) must never be lost. classifyAndQueueEdit
+  // can only ever add to the queue, never touch this row, so there is
+  // nothing here for a later classification failure to roll back.
+  recordDraftOutcome(config.storePath, passphrase, draftId, outcome, sentText);
+  if (outcome !== "edited" || sentText === undefined) {
+    return undefined;
+  }
+  const provider = tryResolveProvider(config);
+  const classifier = provider ? createLlmEditClassifier(provider) : undefined;
+  try {
+    return await classifyAndQueueEdit(config.storePath, passphrase, draftId, sentText, classifier);
+  } catch (error) {
+    // An escalated draft has no draftText to diff against — classification
+    // genuinely doesn't apply, not a failure the caller should see as one
+    // (the outcome above is already durably recorded either way).
+    if (error instanceof NoDraftTextError) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 /** Implements `duo draft-answer <draftId> <answer>` (#34 AC3): turns an escalation the owner knows the answer to into a queued standing-order candidate. */
