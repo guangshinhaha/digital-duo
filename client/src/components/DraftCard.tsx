@@ -143,7 +143,16 @@ export function DraftCard({ api, draft }: { api: DuoApiConfig; draft: DraftRecor
             >
               Send edited
             </button>
-            <button className="rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1" onClick={() => setEditing(false)}>
+            <button
+              className="rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1"
+              onClick={() => {
+                // Discards the edit, not just the editing view — without
+                // resetting editedText, the abandoned text would silently
+                // reappear the next time Edit is clicked on this card.
+                setEditedText(draft.draftText ?? "");
+                setEditing(false);
+              }}
+            >
               Cancel
             </button>
           </>

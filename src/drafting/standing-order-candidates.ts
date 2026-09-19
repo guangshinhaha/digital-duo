@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import { DraftNotFoundError, getDraft } from "./draft-log.js";
+import { DraftNotFoundError, getDraft, recordDraftOutcome } from "./draft-log.js";
 
 /**
  * #34 AC3: "an escalation the owner knows the answer to" — answering it on
@@ -77,7 +77,7 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
 
   const id = randomUUID();
   const createdAt = new Date().toISOString();
-  return withDatabase(storePath, passphrase, true, (db) => {
+  const candidateId = withDatabase(storePath, passphrase, true, (db) => {
     ensureStandingOrderCandidateSchema(db);
     const existing = db.prepare(`SELECT id FROM standing_order_candidates WHERE draft_id = ?`).get(draftId) as { id: string } | undefined;
     if (existing) {
@@ -88,6 +88,17 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
     ).run(id, draftId, draft.question, answerText, createdAt);
     return id;
   });
+
+  // Only on the fresh-insert path (candidateId === id): the escalation now
+  // has a real terminal disposition, so it stops showing as "pending" in
+  // a client's Review queue (client-tech-design.md's Send/Edit/Ignore
+  // queue is meant to show what still needs the owner's attention, and an
+  // answered escalation no longer does). Skipped on the idempotent-repeat
+  // path since the outcome was already recorded the first time.
+  if (candidateId === id) {
+    recordDraftOutcome(storePath, passphrase, draftId, "escalation_answered", answerText);
+  }
+  return candidateId;
 }
 
 interface StandingOrderCandidateRow {

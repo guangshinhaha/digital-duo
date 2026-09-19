@@ -272,6 +272,26 @@ describe("createServer — routes", () => {
     expect(response.json()).toHaveProperty("candidateId");
   });
 
+  it("an escalation leaves the pending queue once answered, instead of showing forever", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+
+    const before = await app.inject({ method: "GET", url: "/drafts?outcome=pending", headers: authHeader });
+    expect(before.json().map((d: { id: string }) => d.id)).toContain(draftId);
+
+    await app.inject({ method: "POST", url: `/drafts/${draftId}/answer`, headers: authHeader, payload: { answer: "the answer" } });
+
+    const after = await app.inject({ method: "GET", url: "/drafts?outcome=pending", headers: authHeader });
+    expect(after.json().map((d: { id: string }) => d.id)).not.toContain(draftId);
+  });
+
   it("GET /review is empty on a fresh store", async () => {
     const response = await app.inject({ method: "GET", url: "/review", headers: authHeader });
     expect(response.statusCode).toBe(200);

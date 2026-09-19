@@ -51,7 +51,12 @@ export function Setup({ onConnect }: { onConnect: (config: DuoApiConfig) => void
             return;
           }
           setError(null);
-          onConnect({ baseUrl: normalized, token });
+          // Trimmed, unlike baseUrl was before this line existed to fix
+          // exactly this: a token copy-pasted from a terminal commonly
+          // picks up a trailing newline or space, which then silently
+          // fails every request's Authorization header with no indication
+          // whitespace was the cause.
+          onConnect({ baseUrl: normalized, token: token.trim() });
         }}
       >
         <h1 className="text-lg font-medium">Connect to your duo</h1>

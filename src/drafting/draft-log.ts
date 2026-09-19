@@ -10,7 +10,19 @@ export interface DraftSource {
   readonly label: string;
 }
 
-export const DRAFT_OUTCOMES = ["sent", "edited", "discarded"] as const;
+/**
+ * "escalation_answered" (added alongside `refused`/`escalationThreshold`):
+ * the owner answered an escalated draft on the spot (#34 AC3,
+ * `standing-order-candidates.ts`), which queues a standing-order
+ * candidate but was never recording an outcome — an escalation this
+ * happened to had no way to ever leave `outcome IS NULL` ("pending"),
+ * so a client's pending-review queue kept showing it forever, and
+ * re-showing the answer box on every reload invited a duplicate answer.
+ * Not set by hand via `duo draft-outcome` in the ordinary case (that
+ * command is for a *sent* draft's disposition) — `standing-order-
+ * candidates.ts` sets it automatically the moment an answer is queued.
+ */
+export const DRAFT_OUTCOMES = ["sent", "edited", "discarded", "escalation_answered"] as const;
 export type DraftOutcome = (typeof DRAFT_OUTCOMES)[number];
 
 /**

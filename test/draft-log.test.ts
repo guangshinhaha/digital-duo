@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
+import { DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD } from "../src/config.js";
 import { appendDraft, DraftNotFoundError, ensureDraftLogSchema, getDraft, listDrafts, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { createEncryptedStore, withDatabase, type Database } from "../src/store/store.js";
 
@@ -38,7 +39,7 @@ describe("appendDraft / getDraft", () => {
     expect(draft?.sources).toEqual([{ kind: "rule", id: "topic-leave", label: "standing order: five days" }]);
   });
 
-  it("defaults refused to false and escalationThreshold to 0.55 when the caller omits them", () => {
+  it("defaults refused to false and escalationThreshold to DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD when the caller omits them", () => {
     const storePath = initStore();
     const id = appendDraft(storePath, PASSPHRASE, {
       question: "q",
@@ -51,7 +52,22 @@ describe("appendDraft / getDraft", () => {
     });
     const draft = getDraft(storePath, PASSPHRASE, id);
     expect(draft?.refused).toBe(false);
-    expect(draft?.escalationThreshold).toBe(0.55);
+    expect(draft?.escalationThreshold).toBe(DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD);
+  });
+
+  it("the drafts table's own SQL-level DEFAULT for escalation_threshold matches DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD — catches the three hand-kept-in-sync 0.55 literals (config.ts, CREATE TABLE, ALTER TABLE) drifting apart, not just appendDraft's JS-level fallback", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      ensureDraftLogSchema(db);
+      // Bypasses appendDraft (and its own `?? DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD`
+      // fallback) entirely, so this exercises only the column's SQL-level
+      // DEFAULT — the literal in the CREATE TABLE/ALTER TABLE DDL.
+      db.prepare(
+        `INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at) VALUES ('sql-default-test', 'q', NULL, 'a', 0, NULL, 0.8, '[]', ?)`,
+      ).run(new Date().toISOString());
+    });
+    const draft = getDraft(storePath, PASSPHRASE, "sql-default-test");
+    expect(draft?.escalationThreshold).toBe(DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD);
   });
 
   it("round-trips a refused escalation with a non-default threshold", () => {
