@@ -99,8 +99,17 @@ ceremony on work that doesn't need it:
   `52a7181`) — lighter path: `src/duo/` (`Owner`, `KnowledgeSource`, `Duo` entity,
   `requireHumanOwner`, definition validation), 15 tests, zero code-review findings. Not yet
   wired into the CLI — nothing there reads an owner yet, so there was nothing to retrofit.
+- #17 (PR [#77](https://github.com/guangshinhaha/digital-duo/pull/77), merged, squash commit
+  `02f51c7`) — lighter path: `src/store/` (AES-256-GCM encryption at rest over a real
+  `node:sqlite` database, passphrase generation/persistence via a gitignored keyfile),
+  `duo init` and `duo purge --yes`/`duo purge` (describe-then-refuse without confirmation), 70
+  tests. One review finding, fixed before merge: a `DUO_STORE_PATH` with no directory component
+  made `dirname()` resolve to the cwd, so an unguarded `duo purge --yes` could delete the whole
+  project or home directory; added a guard (`assertSafeDataDir`) that refuses cwd/home/root as
+  the data directory before touching disk. No ingest pipeline yet — that's #18, next.
 
-**Next:** #17 (W0, closes out the wave) — check its label before assuming which path applies.
+**Next:** #18 (W1, start of epic `e2` — ingest) — check its label before assuming which path
+applies.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
