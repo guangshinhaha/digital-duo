@@ -56,3 +56,87 @@ describe("duo mirror portrait", () => {
     expect(thin.stdout).toMatch(/not enough history/i);
   });
 });
+
+describe("duo mirror rules", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["mirror", "rules", "list"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("explains that no rules were derived at all, on a freshly initialized store (AC4)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["mirror", "rules", "list"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/no rule has cleared/i);
+    expect(result.stdout).toMatch(/no rules were derived at all/i);
+    expect(result.stdout).toMatch(/duo mirror rules write/);
+  });
+
+  it("writes a rule by hand, shows its evidence (none), approves idempotently, then rejects it (AC4, AC1, AC2)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+
+    const write = await runCli(
+      ["mirror", "rules", "write", "--label", "Expense approvals", "--text", "I never approve expenses over $500 alone."],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath } },
+    );
+    expect(write.exitCode).toBe(0);
+    expect(write.stdout).toMatch(/owner-asserted, approved/i);
+    const idMatch = write.stdout.match(/\[([^\]]+)\]/);
+    expect(idMatch).not.toBeNull();
+    const ruleId = idMatch![1];
+
+    const show = await runCli(["mirror", "rules", "show", ruleId], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(show.exitCode).toBe(0);
+    expect(show.stdout).toMatch(/no cited exchanges/i);
+    expect(show.stdout).toMatch(/review: approved/i);
+
+    const approve = await runCli(["mirror", "rules", "approve", ruleId], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(approve.exitCode).toBe(0);
+    expect(approve.stdout).toMatch(/approved/i);
+
+    const reject = await runCli(["mirror", "rules", "reject", ruleId], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(reject.exitCode).toBe(0);
+    expect(reject.stdout).toMatch(/rejected/i);
+  });
+
+  it("refuses to promote a rule that isn't a weak signal, and to approve/show an unknown rule, with a non-zero exit", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+
+    const write = await runCli(
+      ["mirror", "rules", "write", "--label", "Some topic", "--text", "some rule"],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath } },
+    );
+    const ruleId = write.stdout.match(/\[([^\]]+)\]/)![1];
+
+    const promote = await runCli(["mirror", "rules", "promote", ruleId], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(promote.exitCode).not.toBe(0);
+    expect(promote.stderr).toMatch(/weak_signal/);
+
+    const unknown = await runCli(["mirror", "rules", "approve", "no-such-rule"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(unknown.exitCode).not.toBe(0);
+    expect(unknown.stderr).toMatch(/no rule with id/i);
+  });
+});

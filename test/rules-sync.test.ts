@@ -133,6 +133,8 @@ describe("syncRulesFiles — a malformed hand-edit is reported, not silently dro
       consistency: 0.9,
       createdAt: "2026-01-01T00:00:00.000Z",
       lastConfirmedAt: null,
+      reviewStatus: "pending" as const,
+      origin: "derived" as const,
       text: "some rule text",
     };
 
@@ -190,5 +192,58 @@ describe("duo/rules/*.md is one file per rule with YAML frontmatter", () => {
     expect(content).toMatch(/evidence:\n(\s+- ".+"\n)+/);
     expect(content).toMatch(/created_at: ".+"/);
     expect(content).toContain("five days per quarter, vacation policy");
+  });
+});
+
+describe("duo/rules/*.md carries the owner's review decision (#28)", () => {
+  it("writes review_status and origin, defaulting to pending/derived for a freshly induced rule", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedConfirmedRule(storePath, "topic-leave");
+    syncRulesFiles(storePath, PASSPHRASE, dir);
+
+    const content = readFileSync(ruleFile("topic-leave"), "utf8");
+    expect(content).toMatch(/review_status: pending/);
+    expect(content).toMatch(/origin: derived/);
+  });
+
+  it("parses a pre-#28 file with neither field, defaulting to pending/derived rather than failing", () => {
+    const base = {
+      id: "topic-x",
+      topicId: "topic-x",
+      status: "confirmed" as const,
+      supportCount: 3,
+      consistency: 0.9,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastConfirmedAt: null,
+      reviewStatus: "pending" as const,
+      origin: "derived" as const,
+      text: "some rule text",
+    };
+    const legacyContent = serializeRuleFile(base, [])
+      .replace(/review_status: pending\n/, "")
+      .replace(/origin: derived\n/, "");
+    const { rule } = parseRuleFile("f", legacyContent);
+    expect(rule.reviewStatus).toBe("pending");
+    expect(rule.origin).toBe("derived");
+  });
+
+  it("rejects an invalid review_status or origin value", () => {
+    const base = {
+      id: "topic-x",
+      topicId: "topic-x",
+      status: "confirmed" as const,
+      supportCount: 3,
+      consistency: 0.9,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastConfirmedAt: null,
+      reviewStatus: "pending" as const,
+      origin: "derived" as const,
+      text: "some rule text",
+    };
+    expect(() =>
+      parseRuleFile("f", serializeRuleFile(base, []).replace("review_status: pending", "review_status: bogus")),
+    ).toThrow(/review_status/i);
+    expect(() => parseRuleFile("f", serializeRuleFile(base, []).replace("origin: derived", "origin: bogus"))).toThrow(/origin/i);
   });
 });

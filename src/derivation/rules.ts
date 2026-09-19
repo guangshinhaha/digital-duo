@@ -23,6 +23,28 @@ import { ensureQaPairsSchema } from "./qa-pairs.js";
 export const RULE_STATUSES = ["confirmed", "inconsistent", "weak_signal"] as const;
 export type RuleStatus = (typeof RULE_STATUSES)[number];
 
+/**
+ * The owner's own review decision (#28) — orthogonal to `status` above.
+ * `status` is derivation's confidence tier; `reviewStatus` is whether the
+ * *owner* has looked at the evidence and signed off. A freshly (re-)induced
+ * rule always starts/stays `pending` until the owner acts on it; `approved`
+ * is what makes a rule "active" (usable by a future drafting/answering
+ * pipeline); `rejected` means the owner disagreed and it must never
+ * silently become active again, including across a later re-induction run
+ * that recomputes its derivation `status` from new evidence (AC2).
+ */
+export const RULE_REVIEW_STATUSES = ["pending", "approved", "rejected"] as const;
+export type RuleReviewStatus = (typeof RULE_REVIEW_STATUSES)[number];
+
+/**
+ * `derived` is the normal case: induction proposed this rule, with
+ * evidence. `owner_asserted` is #28 AC3 — a weak signal promoted by hand,
+ * or a rule written from scratch with no supporting evidence at all —
+ * recorded as the owner's own claim, not something the corpus backed.
+ */
+export const RULE_ORIGINS = ["derived", "owner_asserted"] as const;
+export type RuleOrigin = (typeof RULE_ORIGINS)[number];
+
 export interface Rule {
   readonly id: string;
   readonly topicId: string;
@@ -34,6 +56,10 @@ export interface Rule {
   readonly createdAt: string;
   /** Set (to "now") every time this rule is recomputed as `confirmed`; null if it never has been. */
   readonly lastConfirmedAt: string | null;
+  /** The owner's review decision (#28). Defaults to "pending" for a rule that has never been reviewed. */
+  readonly reviewStatus: RuleReviewStatus;
+  /** Whether induction proposed this rule or the owner asserted it by hand (#28 AC3). */
+  readonly origin: RuleOrigin;
 }
 
 /** Below this many supporting pairs, a topic can never become `confirmed` regardless of consistency — it's a `weak_signal` instead (AC3). */
@@ -51,7 +77,9 @@ export function ensureRulesSchema(db: Database): void {
       support_count INTEGER NOT NULL,
       consistency REAL NOT NULL,
       created_at TEXT NOT NULL,
-      last_confirmed_at TEXT
+      last_confirmed_at TEXT,
+      review_status TEXT NOT NULL DEFAULT 'pending',
+      origin TEXT NOT NULL DEFAULT 'derived'
     ) STRICT
   `);
   db.exec(`
@@ -230,7 +258,7 @@ export async function runRuleInduction(
   });
 
   const now = new Date().toISOString();
-  const computed: { rule: Omit<Rule, "createdAt" | "lastConfirmedAt">; evidencePairIds: string[] }[] = [];
+  const computed: { rule: Omit<Rule, "createdAt" | "lastConfirmedAt" | "reviewStatus" | "origin">; evidencePairIds: string[] }[] = [];
 
   for (const [topicId, pairs] of byTopic) {
     const consistency = averagePairwiseSimilarity(pairs.map((pair) => pair.vector));
@@ -264,7 +292,13 @@ export async function runRuleInduction(
       const existing = readRuleRow(db, rule.id);
       const createdAt = existing?.createdAt ?? now;
       const lastConfirmedAt = rule.status === "confirmed" ? now : existing?.lastConfirmedAt ?? null;
-      const finalRule: Rule = { ...rule, createdAt, lastConfirmedAt };
+      // #28 AC2: the owner's review decision (and whether it was owner-
+      // asserted) survives a re-induction run untouched — only the
+      // derivation-computed fields above (status/text/support/consistency)
+      // are ever recomputed from fresh evidence.
+      const reviewStatus = existing?.reviewStatus ?? "pending";
+      const origin = existing?.origin ?? "derived";
+      const finalRule: Rule = { ...rule, createdAt, lastConfirmedAt, reviewStatus, origin };
       putRule(db, finalRule, evidencePairIds);
       finalRules.push(finalRule);
     }
@@ -288,6 +322,8 @@ interface RuleRow {
   consistency: number;
   created_at: string;
   last_confirmed_at: string | null;
+  review_status: string;
+  origin: string;
 }
 
 function rowToRule(row: RuleRow): Rule {
@@ -300,6 +336,8 @@ function rowToRule(row: RuleRow): Rule {
     consistency: row.consistency,
     createdAt: row.created_at,
     lastConfirmedAt: row.last_confirmed_at,
+    reviewStatus: row.review_status as RuleReviewStatus,
+    origin: row.origin as RuleOrigin,
   };
 }
 
@@ -315,13 +353,25 @@ export function putRule(db: Database, rule: Rule, evidencePairIds: readonly stri
   ensureRulesSchema(db);
   db.prepare(
     `
-    INSERT INTO rules (id, topic_id, text, status, support_count, consistency, created_at, last_confirmed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO rules (id, topic_id, text, status, support_count, consistency, created_at, last_confirmed_at, review_status, origin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       topic_id = excluded.topic_id, text = excluded.text, status = excluded.status, support_count = excluded.support_count,
-      consistency = excluded.consistency, created_at = excluded.created_at, last_confirmed_at = excluded.last_confirmed_at
+      consistency = excluded.consistency, created_at = excluded.created_at, last_confirmed_at = excluded.last_confirmed_at,
+      review_status = excluded.review_status, origin = excluded.origin
   `,
-  ).run(rule.id, rule.topicId, rule.text, rule.status, rule.supportCount, rule.consistency, rule.createdAt, rule.lastConfirmedAt);
+  ).run(
+    rule.id,
+    rule.topicId,
+    rule.text,
+    rule.status,
+    rule.supportCount,
+    rule.consistency,
+    rule.createdAt,
+    rule.lastConfirmedAt,
+    rule.reviewStatus,
+    rule.origin,
+  );
 
   db.prepare(`DELETE FROM rule_evidence WHERE rule_id = ?`).run(rule.id);
   const insertEvidence = db.prepare(`INSERT INTO rule_evidence (rule_id, qa_pair_id) VALUES (?, ?)`);
@@ -345,13 +395,18 @@ export function listRules(storePath: string, passphrase: string): Rule[] {
   });
 }
 
+/** Reads one rule's evidence on an already-open handle — the db-level primitive `listRuleEvidence` wraps, and what a caller that already holds an open `db` (e.g. #28's rule-review, mutating within its own `withDatabase`) must use instead of nesting a second top-level call over the same store file. */
+export function readRuleEvidenceRows(db: Database, ruleId: string): string[] {
+  ensureRulesSchema(db);
+  const rows = db.prepare(`SELECT qa_pair_id FROM rule_evidence WHERE rule_id = ?`).all(ruleId) as unknown as {
+    qa_pair_id: string;
+  }[];
+  return rows.map((row) => row.qa_pair_id);
+}
+
 /** The qa_pair ids a rule cites — "every rule carries at least one rule_evidence row" (AC4) is what a caller checks this against. */
 export function listRuleEvidence(storePath: string, passphrase: string, ruleId: string): string[] {
   return withDatabase(storePath, passphrase, false, (db) => {
-    ensureRulesSchema(db);
-    const rows = db.prepare(`SELECT qa_pair_id FROM rule_evidence WHERE rule_id = ?`).all(ruleId) as unknown as {
-      qa_pair_id: string;
-    }[];
-    return rows.map((row) => row.qa_pair_id);
+    return readRuleEvidenceRows(db, ruleId);
   });
 }
