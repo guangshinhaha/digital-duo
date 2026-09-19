@@ -1,0 +1,45 @@
+import type { DuoConfig } from "../config.js";
+import { grantAutonomy, type GrantOutcome } from "../trust/grants.js";
+import { isTrustTier, listGrid, type GridRow, type TrustTier } from "../trust/grid.js";
+import { resolveOrCreatePassphrase } from "../store/passphrase.js";
+import { requireStoreExists } from "../store/store.js";
+
+export class InvalidTrustTierError extends Error {
+  constructor(value: string) {
+    super(`"${value}" is not a valid trust tier — expected one of T0, T1, T2, T3.`);
+    this.name = "InvalidTrustTierError";
+  }
+}
+
+/** Shared by both `trust grant` and (once #54/#55 land) other trust subcommands that take a tier on the command line — one place validates the raw string against the type, since commander itself only ever hands this a string. */
+export function parseTrustTier(value: string): TrustTier {
+  if (!isTrustTier(value)) {
+    throw new InvalidTrustTierError(value);
+  }
+  return value;
+}
+
+/** Implements `duo trust grid` (#53 AC4): every touched cell, its level, and whether it was earned or granted. */
+export function runTrustGrid(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): GridRow[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listGrid(config.storePath, passphrase, config.duoDir);
+}
+
+export interface RunTrustGrantOptions {
+  readonly tier: string;
+  readonly topicId?: string;
+}
+
+/** Implements `duo trust grant <text> --tier <T0-T3> [--topic <id>]` (#53 AC1/AC2/AC3): applies immediately unless ambiguous (owner re-runs with --topic) or it conflicts with a written refusal. */
+export function runTrustGrant(
+  scopeText: string,
+  options: RunTrustGrantOptions,
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): GrantOutcome {
+  const tier = parseTrustTier(options.tier);
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return grantAutonomy(config.storePath, passphrase, config.duoDir, { scopeText, tier, topicId: options.topicId });
+}

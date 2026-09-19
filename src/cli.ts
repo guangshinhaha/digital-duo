@@ -12,6 +12,7 @@ import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
 import { runStatus } from "./commands/status.js";
+import { runTrustGrant, runTrustGrid } from "./commands/trust.js";
 
 const program = new Command();
 
@@ -408,6 +409,75 @@ sharedCommand
         for (const gap of report.gaps) {
           console.log(`  ${gap.count}x  ${gap.question}`);
         }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The trust grid (docs/concept.md §6, epic e11): autonomy granted per
+// (topic × tier), never globally. #52 shipped the grid model itself; #53
+// is the first way an owner can move a cell — a written, plain-English
+// grant, refused outright if it would exceed a standing duo/refusals.md
+// entry.
+const trustCommand = program.command("trust").description("The autonomy grid: per-topic, per-tier trust, earned or granted");
+
+trustCommand
+  .command("grid")
+  .description("List every touched cell: its current level, and whether it was earned or granted")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const rows = runTrustGrid(config);
+      if (rows.length === 0) {
+        console.log("No cell has moved yet — every topic is still at the default 'ask'.");
+        return;
+      }
+      for (const row of rows) {
+        const label = row.stale ? "(stale — topic no longer exists)" : row.topicLabel ?? row.topicId;
+        console.log(`[${row.topicId}] ${row.tier}  ${row.level} (${row.source})  ${label}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+trustCommand
+  .command("grant")
+  .description(
+    "Grant autonomy on a topic in plain words. Applies immediately unless the scope is ambiguous " +
+      "(re-run with --topic once you see the candidates) or it conflicts with duo/refusals.md",
+  )
+  .argument("<scopeText>", "plain-English description of what's being granted, e.g. \"deploy access questions\"")
+  .requiredOption("--tier <tier>", "T0, T1, T2, or T3")
+  .option("--topic <topicId>", "grant exactly this topic id, skipping matching entirely (how an ambiguous match is confirmed)")
+  .action((scopeText: string, options: { tier: string; topic?: string }) => {
+    const config = loadConfig();
+    try {
+      const outcome = runTrustGrant(scopeText, { tier: options.tier, topicId: options.topic }, config);
+      switch (outcome.status) {
+        case "applied":
+          console.log(`Granted ${outcome.tier} autonomy on "${outcome.topicLabel}" (${outcome.topicId}). It acts on its own from here.`);
+          break;
+        case "ambiguous":
+          console.log("That could refer to more than one topic. Re-run with --topic to confirm which one:");
+          for (const candidate of outcome.candidates) {
+            console.log(`  [${candidate.topicId}] ${candidate.label}`);
+          }
+          process.exitCode = 1;
+          break;
+        case "no_match":
+          console.log("No topic matched that description. Check duo/topics.json, or pass --topic directly.");
+          process.exitCode = 1;
+          break;
+        case "topic_not_found":
+          console.error(`No topic with id "${outcome.topicId}" in duo/topics.json.`);
+          process.exitCode = 1;
+          break;
+        case "refused":
+          console.error(`Refused: "${outcome.refusal.heading}" is a standing refusal. ${outcome.refusal.reason}`);
+          process.exitCode = 1;
+          break;
       }
     } catch (error) {
       reportError(error);
