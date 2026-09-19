@@ -1,5 +1,23 @@
 import type { DuoConfig } from "../config.js";
+import {
+  buildCalibrationSummary,
+  findIncompleteCalibrationSession,
+  findLatestCalibrationSession,
+  listCalibrationJudgements,
+  nextUnjudgedItem,
+  recordCalibrationJudgement,
+  startOrResumeCalibration,
+  type CalibrationItem,
+  type CalibrationJudgement,
+  type CalibrationJudgementRecord,
+  type CalibrationSession,
+  type CalibrationSummary,
+  type RecordJudgementResult,
+  type StartCalibrationResult,
+} from "../derivation/calibration.js";
 import { buildInterruptionPortrait, type InterruptionPortrait } from "../derivation/portrait.js";
+import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
+import { tryResolveProvider } from "../provider/registry.js";
 import {
   approveRule,
   describeRuleWithEvidence,
@@ -102,4 +120,75 @@ export function runMirrorRefusalAdd(heading: string, reason: string, config: Duo
 /** Implements `duo mirror refusals confirm-none` (#29 AC2). */
 export function runMirrorRefusalConfirmNone(config: DuoConfig): void {
   confirmNoRefusals(config.duoDir);
+}
+
+/** Implements `duo mirror calibrate` (#30): starts a session, or resumes/reports on an in-progress one — never both starts fresh and shows an existing one in the same call. */
+export async function runMirrorCalibrateStart(
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<StartCalibrationResult> {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const embeddingProvider = createOllamaEmbeddingProvider(config);
+  const inferenceProvider = tryResolveProvider(config);
+  return startOrResumeCalibration(config.storePath, passphrase, config.duoDir, embeddingProvider, inferenceProvider, config.confidence);
+}
+
+export interface CalibrationProgress {
+  readonly sessionId: string;
+  readonly judgedCount: number;
+  readonly totalCount: number;
+  readonly completed: boolean;
+  readonly next: CalibrationItem | undefined;
+}
+
+function progressOf(session: CalibrationSession, judgements: readonly CalibrationJudgementRecord[]): CalibrationProgress {
+  return {
+    sessionId: session.id,
+    judgedCount: judgements.length,
+    totalCount: session.items.length,
+    completed: session.completedAt !== null,
+    next: nextUnjudgedItem(session, judgements),
+  };
+}
+
+/** Implements showing where the current session stands and what to judge next — the no-argument `duo mirror calibrate` output once a session already exists. Throws when there is no incomplete session to show (the caller should start one first). */
+export function runMirrorCalibrateProgress(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): CalibrationProgress {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const session = findIncompleteCalibrationSession(config.storePath, passphrase);
+  if (!session) {
+    throw new Error("No calibration session in progress. Run `duo mirror calibrate` to start one.");
+  }
+  const judgements = listCalibrationJudgements(config.storePath, passphrase, session.id);
+  return progressOf(session, judgements);
+}
+
+/** Implements `duo mirror calibrate judge <qaPairId> --approve|--reject|--edit <text>` (#30 AC1) — always against the one currently-incomplete session. */
+export function runMirrorCalibrateJudge(
+  qaPairId: string,
+  judgement: CalibrationJudgement,
+  editedText: string | undefined,
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): RecordJudgementResult {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const session = findIncompleteCalibrationSession(config.storePath, passphrase);
+  if (!session) {
+    throw new Error("No calibration session in progress. Run `duo mirror calibrate` to start one.");
+  }
+  return recordCalibrationJudgement(config.storePath, passphrase, session.id, qaPairId, judgement, editedText);
+}
+
+/** Implements `duo mirror calibrate summary` (#30 AC2): reports the agreement rate plainly, with every mismatch, never smoothed over. Resolves the most recently created session, in progress or just finished. */
+export function runMirrorCalibrateSummary(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): CalibrationSummary {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const session = findLatestCalibrationSession(config.storePath, passphrase);
+  if (!session) {
+    throw new Error("No calibration session exists yet. Run `duo mirror calibrate` to start one.");
+  }
+  const judgements = listCalibrationJudgements(config.storePath, passphrase, session.id);
+  return buildCalibrationSummary(session, judgements);
 }
