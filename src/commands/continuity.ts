@@ -1,4 +1,5 @@
 import type { DuoConfig } from "../config.js";
+import { assertPredecessorConsultable } from "../continuity/lifecycle.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
 import { consultPredecessorDuo, type PredecessorConsultation } from "../continuity/predecessor.js";
@@ -22,6 +23,10 @@ export async function runConsultPredecessor(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<PredecessorConsultation> {
   requireStoreExists(predecessorStorePath);
+  // #63 AC4: even this historical-record surface refuses once the
+  // predecessor's own duo has been declared orphaned — there is nobody
+  // left accountable to frame the historical answer around at all.
+  assertPredecessorConsultable(predecessorDuoDir);
   const passphrase = resolveOrCreatePassphrase(predecessorStorePath, env);
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);

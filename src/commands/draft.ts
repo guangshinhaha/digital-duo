@@ -1,4 +1,5 @@
 import type { DuoConfig } from "../config.js";
+import { assertOwnerConsultable } from "../continuity/lifecycle.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
 import { listDrafts, type DraftOutcome, type DraftRecord, type ListDraftsOptions } from "../drafting/draft-log.js";
@@ -16,6 +17,11 @@ export async function runDraft(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<DraftPipelineResult> {
   requireStoreExists(config.storePath);
+  // #63 AC1/AC4: an archived or orphaned duo refuses to draft a new,
+  // present-tense answer at all — checked first, before any retrieval or
+  // generation, the same "escalate/refuse without reasoning about it"
+  // placement #34's refusal check uses.
+  assertOwnerConsultable(config.duoDir);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
