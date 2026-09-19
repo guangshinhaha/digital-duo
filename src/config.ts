@@ -38,6 +38,11 @@ const DEFAULT_CONFIDENCE_SELF_CONSISTENCY_SAMPLES = 3;
 // rather than picking an unrelated number.
 const DEFAULT_CONFIDENCE_RECENCY_HALF_LIFE_DAYS = 180;
 
+// #35: v1-tech-design.md §1.10 says "hold out the most recent 6-8 weeks";
+// 42 days (6 weeks) is the conservative end of that range, since a longer
+// window is safer against AR-7 leakage than a shorter one.
+const DEFAULT_EVAL_HOLDOUT_DAYS = 42;
+
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
     return fallback;
@@ -79,6 +84,11 @@ export interface DuoConfig {
     /** Recency-decay half-life, in days. Defaults to 180. */
     recencyHalfLifeDays: number;
   };
+  /** #35: the offline evaluation harness's own knobs, all configuration for the same reason #33's confidence weights are — an eval harness needs to sweep them without a code change. */
+  eval: {
+    /** The time-based split's held-out window, in days, applied *before* derivation runs (AR-7). Defaults to 42 (6 weeks). Recorded alongside every offline-eval score. */
+    holdoutDays: number;
+  };
 }
 
 /**
@@ -110,6 +120,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       escalationThreshold: parseNumberEnv(env.DUO_CONFIDENCE_ESCALATION_THRESHOLD, DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD),
       selfConsistencySamples: parseNumberEnv(env.DUO_CONFIDENCE_SELF_CONSISTENCY_SAMPLES, DEFAULT_CONFIDENCE_SELF_CONSISTENCY_SAMPLES),
       recencyHalfLifeDays: parseNumberEnv(env.DUO_CONFIDENCE_RECENCY_HALF_LIFE_DAYS, DEFAULT_CONFIDENCE_RECENCY_HALF_LIFE_DAYS),
+    },
+    eval: {
+      holdoutDays: parseNumberEnv(env.DUO_EVAL_HOLDOUT_DAYS, DEFAULT_EVAL_HOLDOUT_DAYS),
     },
   };
 }
