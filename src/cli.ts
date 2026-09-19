@@ -6,7 +6,7 @@ import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeri
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
-import { runAskAsAsker, runEnforceCeiling } from "./commands/permissions.js";
+import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runStatus } from "./commands/status.js";
@@ -288,6 +288,41 @@ permissionsCommand
       console.log(result.answer);
       if (result.declined) {
         console.error("(declined — nothing visible to this asker informed this answer)");
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+permissionsCommand
+  .command("audit")
+  .description(
+    "List every audit log entry (oldest first), or show one entry in full with --id — every answer, given or declined, is reconstructible (#51)",
+  )
+  .option("--id <id>", "show one entry's full reconstruction (question, asker, records, confidence, ceiling, exact text sent)")
+  .action((options: { id?: string }) => {
+    const config = loadConfig();
+    try {
+      if (options.id) {
+        const entry = runShowAuditEntry(options.id, config);
+        if (!entry) {
+          console.error(`No audit entry with id "${options.id}"`);
+          process.exitCode = 1;
+          return;
+        }
+        console.log(JSON.stringify(entry, null, 2));
+        return;
+      }
+      const entries = runListAuditEntries(config);
+      if (entries.length === 0) {
+        console.log("No audit entries yet.");
+        return;
+      }
+      for (const entry of entries) {
+        console.log(
+          `[${entry.id}] ${entry.createdAt} asker=${entry.askerRef} clearance=${entry.clearanceApplied} ` +
+            `confidence=${entry.confidence} declined=${entry.declined} question="${entry.question}"`,
+        );
       }
     } catch (error) {
       reportError(error);

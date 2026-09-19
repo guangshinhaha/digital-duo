@@ -8,29 +8,8 @@ import { embedRecords } from "../src/ingest/embeddings.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import { answerForAsker, DECLINE_MESSAGE } from "../src/permissions/answer.js";
-import { createEncryptedStore, withDatabase } from "../src/store/store.js";
-
-/**
- * #50 doesn't expose a read API over audit_log yet — that's #51's job
- * (the owner-facing "open the audit log" reconstruction view). This reads
- * the raw rows directly, exactly what #50's own acceptance criteria need
- * verified, without building out that read surface early.
- */
-interface RawAuditRow {
-  id: string;
-  asker_ref: string;
-  clearance_applied: string;
-  records_used: string;
-  records_excluded: string;
-  declined: number;
-  answer_text: string;
-}
-
-function readAuditRows(storePath: string, passphrase: string): RawAuditRow[] {
-  return withDatabase(storePath, passphrase, false, (db) => {
-    return db.prepare(`SELECT * FROM audit_log`).all() as unknown as RawAuditRow[];
-  });
-}
+import { getAuditEntry, listAuditEntries } from "../src/permissions/audit.js";
+import { createEncryptedStore } from "../src/store/store.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -91,8 +70,7 @@ describe("answerForAsker — the same question, different askers, different answ
     expect(juniorResult.answer).not.toBe(seniorResult.answer);
     expect(juniorResult.auditEntryId).not.toBe(seniorResult.auditEntryId);
 
-    const rows = readAuditRows(storePath, PASSPHRASE);
-    expect(rows).toHaveLength(2);
+    expect(listAuditEntries(storePath, PASSPHRASE)).toHaveLength(2);
   });
 });
 
@@ -164,27 +142,42 @@ describe("answerForAsker — every answer records the policy path that produced 
     await embedRecords(storePath, PASSPHRASE, embeddingProvider);
 
     const result = await answerForAsker(storePath, PASSPHRASE, dir, "budget deadline invoice", "low", embeddingProvider);
-    const row = readAuditRows(storePath, PASSPHRASE).find((r) => r.id === result.auditEntryId);
+    const entry = getAuditEntry(storePath, PASSPHRASE, result.auditEntryId);
 
-    expect(row).toBeDefined();
-    expect(row?.asker_ref).toBe("low");
-    expect(row?.clearance_applied).toBe("official_open");
-    expect(JSON.parse(row?.records_used ?? "[]")).toEqual([openRecord.id]);
-    expect(JSON.parse(row?.records_excluded ?? "[]")).toEqual([
-      { id: restrictedRecord.id, classification: "secret", reason: "above_clearance" },
-    ]);
-    expect(row?.declined).toBe(0);
+    expect(entry).toBeDefined();
+    expect(entry?.askerRef).toBe("low");
+    expect(entry?.clearanceApplied).toBe("official_open");
+    expect(entry?.recordsUsed).toEqual([openRecord.id]);
+    expect(entry?.recordsExcluded).toEqual([{ id: restrictedRecord.id, classification: "secret", reason: "above_clearance" }]);
+    expect(entry?.declined).toBe(false);
+    expect(entry?.confidence).toBe("high");
+    expect(entry?.rulesUsed).toEqual([]);
   });
 
-  it("logs a declined answer as fully as a given one", async () => {
+  it("logs a declined answer as fully as a given one, with confidence 'low'", async () => {
     const storePath = initStore();
     const dir = duoDir();
     writeDirectory(dir, [{ id: "low", name: "Low", clearance: "official_open" }]);
 
     const result = await answerForAsker(storePath, PASSPHRASE, dir, "anything at all", "low", createFakeEmbeddingProvider());
-    const row = readAuditRows(storePath, PASSPHRASE).find((r) => r.id === result.auditEntryId);
+    const entry = getAuditEntry(storePath, PASSPHRASE, result.auditEntryId);
 
-    expect(row?.declined).toBe(1);
-    expect(row?.answer_text).toBe(DECLINE_MESSAGE);
+    expect(entry?.declined).toBe(true);
+    expect(entry?.answerText).toBe(DECLINE_MESSAGE);
+    expect(entry?.confidence).toBe("low");
+  });
+
+  it("survives a rules change or re-derivation untouched (#51 AC: append-only) — audit_log is a separate table the derive pipeline never touches", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    writeDirectory(dir, [{ id: "low", name: "Low", clearance: "official_open" }]);
+
+    const result = await answerForAsker(storePath, PASSPHRASE, dir, "anything at all", "low", createFakeEmbeddingProvider());
+
+    const { runPairExtraction } = await import("../src/derivation/qa-pairs.js");
+    await runPairExtraction(storePath, PASSPHRASE);
+
+    expect(getAuditEntry(storePath, PASSPHRASE, result.auditEntryId)).toBeDefined();
+    expect(getAuditEntry(storePath, PASSPHRASE, result.auditEntryId)?.answerText).toBe(DECLINE_MESSAGE);
   });
 });
