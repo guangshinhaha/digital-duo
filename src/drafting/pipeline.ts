@@ -26,6 +26,8 @@ export interface DraftAnswer {
   readonly topicId: string | undefined;
   /** Age, in days, of the freshest supporting evidence (see DraftContext.freshestEvidenceAgeDays) — null when there's no evidence at all. Public answering (#44 AC1) states this on every public answer, so the reader sees staleness before trusting it. */
   readonly evidenceAgeDays: number | null;
+  /** The freshest supporting evidence's own timestamp (see DraftContext.freshestEvidenceTimestamp) — null exactly when `evidenceAgeDays` is null. A predecessor-duo consultation (#61) states this as the date its answer is "as of". */
+  readonly evidenceTimestamp: string | null;
 }
 
 export interface DraftEscalation {
@@ -199,5 +201,14 @@ export async function draftReply(
     confidenceScore: confidence.score,
     sources,
   });
-  return { kind: "draft", draftId, text, sources, confidence, topicId: context.topicId, evidenceAgeDays: context.freshestEvidenceAgeDays };
+  return {
+    kind: "draft",
+    draftId,
+    text,
+    sources,
+    confidence,
+    topicId: context.topicId,
+    evidenceAgeDays: context.freshestEvidenceAgeDays,
+    evidenceTimestamp: context.freshestEvidenceTimestamp,
+  };
 }

@@ -54,6 +54,7 @@ import {
   runMirrorRulesList,
   type CalibrationProgress,
 } from "./commands/mirror.js";
+import { runConsultPredecessor } from "./commands/continuity.js";
 import { runCorrectionsApprove, runCorrectionsReject, runCorrectionsReview } from "./commands/corrections.js";
 import { runEscalationsCheck, runEscalationsDigest, runEscalationsHistory, runEscalationsRate } from "./commands/escalations.js";
 import { runMentionsListMuted, runMentionsMute, runMentionsOffer, runMentionsUnmute } from "./commands/mentions.js";
@@ -915,6 +916,32 @@ sharedCommand
           console.log(`  ${gap.count}x  ${gap.question}`);
         }
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// Continuity (docs/concept.md §4/§12, epic e13): a duo that outlives a
+// posting is a genuinely new object — "consult my predecessor," never
+// "consult me" as if its owner still spoke for the role. #61 is the first
+// piece: asking a predecessor's own duo, reframed as a stated-date
+// historical record rather than a live answer.
+const continuityCommand = program
+  .command("continuity")
+  .description("A duo that has outlived its owner's posting: consulted as a historical record, never as though current");
+
+continuityCommand
+  .command("consult")
+  .description("Ask a predecessor's own duo something — answered as a historical record as of a stated date, never as though current")
+  .argument("<predecessorStorePath>", "path to the predecessor's own encrypted store")
+  .argument("<predecessorDuoDir>", "path to the predecessor's own derived-output directory")
+  .argument("<predecessorName>", "the predecessor's name, stated in every answer")
+  .argument("<question>", "the question to ask")
+  .action(async (predecessorStorePath: string, predecessorDuoDir: string, predecessorName: string, question: string) => {
+    const config = loadConfig();
+    try {
+      const result = await runConsultPredecessor(predecessorStorePath, predecessorDuoDir, predecessorName, question, config);
+      console.log(result.text);
     } catch (error) {
       reportError(error);
     }
