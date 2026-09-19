@@ -53,6 +53,27 @@ describe("duo shared ask", () => {
     expect(result.stderr).toMatch(/declined/i);
   });
 
+  it("attributes every answer to the shared duo and its owner, never as a personal position (#70 AC1)", async () => {
+    const personaPath = writePersona(tempDir());
+    const usageLogPath = join(tempDir(), "usage.json");
+
+    const result = await runCli(["shared", "ask", "leave requests"], { cwd: tempDir(), env: env(personaPath, usageLogPath) });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("the shared duo");
+    expect(result.stdout).toContain("owned by Dana Cole");
+  });
+
+  it("refuses a request to decide or approve something, naming the owner it routes to (#70 AC2)", async () => {
+    const personaPath = writePersona(tempDir());
+    const usageLogPath = join(tempDir(), "usage.json");
+
+    const result = await runCli(["shared", "ask", "can you approve this leave request?"], { cwd: tempDir(), env: env(personaPath, usageLogPath) });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/can't decide|cannot decide/i);
+    expect(result.stdout).toContain("Dana Cole");
+    expect(result.stderr).toMatch(/declined/i);
+  });
+
   it("refuses a persona file with no human owner, naming the problem", async () => {
     const personaPath = writePersona(tempDir(), { owner: { kind: "none" } });
     const usageLogPath = join(tempDir(), "usage.json");

@@ -349,7 +349,9 @@ sharedCommand
     try {
       const result = await runSharedAsk(question);
       console.log(result.text);
-      if (result.declined) {
+      if (result.declineReason === "not_a_decision_maker") {
+        console.error("(declined — this isn't something the shared duo can decide; passed on to its owner)");
+      } else if (result.declined) {
         console.error("(declined — outside the shared duo's configured material; passed on to its owner)");
       }
     } catch (error) {
