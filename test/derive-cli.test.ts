@@ -93,3 +93,51 @@ describe("duo derive rules", () => {
     expect(result.stdout).toMatch(/induced 0 rule/i);
   });
 });
+
+describe("duo derive sync", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["derive", "sync"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("reports zero synced and zero deleted on an empty, initialized store", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDir = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["derive", "sync"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDir } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/synced 0 rule file\(s\), removed 0 deleted rule\(s\)/i);
+  });
+});
+
+describe("duo derive voice", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["derive", "voice"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("writes duo/voice.md from an empty store without contacting Ollama, then refuses to overwrite it", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDir = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+
+    const first = await runCli(["derive", "voice"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDir, DUO_OLLAMA_HOST: UNROUTABLE_HOST },
+    });
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toMatch(/wrote duo\/voice\.md/i);
+
+    const second = await runCli(["derive", "voice"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDir, DUO_OLLAMA_HOST: UNROUTABLE_HOST },
+    });
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toMatch(/already exists/i);
+  });
+});

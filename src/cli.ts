@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
-import { runDerivePairs, runDeriveRules, runDeriveTopics } from "./commands/derive.js";
+import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
@@ -204,6 +204,42 @@ deriveCommand
       console.log(
         `Induced ${result.rules.length} rule(s): ${result.confirmedCount} confirmed, ` +
           `${result.inconsistentCount} inconsistent, ${result.weakSignalCount} weak signal.`,
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+deriveCommand
+  .command("sync")
+  .description("Reconcile duo/rules/*.md with the store: hand-edits to the files win")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const result = runDeriveSync(config);
+      console.log(
+        `Synced ${result.synced.length} rule file(s), removed ${result.deleted.length} deleted rule(s) from the store.`,
+      );
+      for (const problem of result.malformed) {
+        console.error(`  malformed, left in place: ${problem.file} — ${problem.reason}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+deriveCommand
+  .command("voice")
+  .description("Compute the voice profile and write duo/voice.md")
+  .option("--force", "overwrite an existing duo/voice.md")
+  .action(async (options: { force?: boolean }) => {
+    const config = loadConfig();
+    try {
+      const result = await runDeriveVoice(config, Boolean(options.force));
+      console.log(
+        result.written
+          ? `Wrote duo/voice.md from ${result.stats.sampleSize} sample(s).`
+          : "duo/voice.md already exists; re-run with --force to overwrite it.",
       );
     } catch (error) {
       reportError(error);
