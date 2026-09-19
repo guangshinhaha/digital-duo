@@ -2,6 +2,8 @@ import type { DuoConfig } from "../config.js";
 import { grantAutonomy, type GrantOutcome } from "../trust/grants.js";
 import { isTrustTier, listGrid, type GridRow, type TrustCell, type TrustTier } from "../trust/grid.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers, type PromotionOffer } from "../trust/promotion.js";
+import { applyCorrection, type DemotionResult } from "../trust/demotion.js";
+import { listLedgerEntries, type TrustLedgerEntry } from "../trust/ledger.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -66,4 +68,30 @@ export function runTrustPromote(
   return decision === "accept"
     ? acceptPromotionOffer(config.storePath, passphrase, topicId, tier)
     : declinePromotionOffer(config.storePath, passphrase, topicId, tier);
+}
+
+/** Implements `duo trust correct <topicId> <tier> --reason <text>` (#55 AC1/AC3): a correction demotes the cell at once and restarts its promotion counter. */
+export function runTrustCorrect(
+  topicId: string,
+  tierValue: string,
+  reason: string,
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): DemotionResult {
+  const tier = parseTrustTier(tierValue);
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return applyCorrection(config.storePath, passphrase, { topicId, tier, correctionRef: reason });
+}
+
+/** Implements `duo trust ledger [--topic <id> --tier <tier>]` (#55 "also true when done": every demotion — and every other trust event — is reconstructible). */
+export function runTrustLedger(
+  config: DuoConfig,
+  options: { topic?: string; tier?: string } = {},
+  env: NodeJS.ProcessEnv = process.env,
+): TrustLedgerEntry[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const filter = options.topic && options.tier ? { topicId: options.topic, tier: parseTrustTier(options.tier) } : undefined;
+  return listLedgerEntries(config.storePath, passphrase, filter);
 }
