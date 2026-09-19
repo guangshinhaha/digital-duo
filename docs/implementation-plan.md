@@ -329,9 +329,29 @@ ceremony on work that doesn't need it:
   second by re-basing onto `origin/main` before any commit landed. No answering, citation, or
   attribution logic yet — that's #68, next.
 
-**Next:** #68 (wave W2, epic `e64` — shared-duos): ground the shared duo in published material
-only. Per §1/§2, `e10` and `e64` ran strictly one at a time on `main` within wave W2, not
-concurrently with each other or with anything else — `e64` continues alone.
+- #68 (PR [#105](https://github.com/guangshinhaha/digital-duo/pull/105), merged, squash commit
+  `518c1e6`) — lighter path: `src/shared-duo/loader.ts` gains `assertAuthoredKnowledgeOnly`,
+  refusing a persona file at load time — naming the duo and the offending kind — unless
+  `knowledge.kind === "authored"`. The only `KnowledgeSource` implementation that can ever touch
+  an encrypted personal store is `DerivedKnowledgeSource` (#65's `src/duo/knowledge.ts`, resolved
+  from `knowledge.kind: "derived"` + a `storePath`); refusing that kind means a misconfigured
+  persona file can never construct one for a shared duo, which is the store boundary #68 AC3 asks
+  for, enforced by construction rather than a prompt instruction. `src/shared-duo/answer.ts`:
+  `answerSharedDuo` — extractive-only over `duo.knowledge`, quoting matching documents verbatim
+  and returning them as citations, or declining and naming the human owner to escalate to when
+  nothing matches; no inference provider anywhere in the module, so there is no step that could
+  generalise or infer a position a source doesn't state (the issue's own out-of-scope item). 274
+  tests (8 new): a dynamic test creates a real encrypted personal store with a secret record and
+  shows the shared duo's answer never surfaces it (and the personal store itself is left
+  untouched), plus a source-level check that neither `answer.ts` nor `loader.ts` imports anything
+  from `src/store/`. Self-review found one fixable issue before commit: that structural
+  "no store import" test's regex matched the word `withDatabase` inside its own doc comment
+  explaining the boundary, not an actual import — tightened to match only a real import/call
+  pattern. No answering CLI, citation dates, or usage tracking yet — that's #69, next.
+
+**Next:** #69 (wave W2, epic `e64` — shared-duos), story-labeled: ask the team's shared duo a
+question, full `lfg` path per §4. Per §1/§2, `e10` and `e64` ran strictly one at a time on `main`
+within wave W2, not concurrently with each other or with anything else — `e64` continues alone.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
