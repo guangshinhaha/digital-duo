@@ -7,6 +7,7 @@ import { ensureRecordsSchema } from "../ingest/record-store.js";
 import { ensureEmbeddingSchema, hybridSearch } from "../ingest/embeddings.js";
 import { ensureQaPairsSchema } from "../derivation/qa-pairs.js";
 import { ensureRulesSchema, readRuleRow, type Rule } from "../derivation/rules.js";
+import { findConflictingRefusal } from "../trust/refusals.js";
 
 /** One piece of past evidence the draft can cite — a retrieved record, with a real cosine similarity to the question (not just an ordinal rank). */
 export interface DraftEvidenceItem {
@@ -71,12 +72,22 @@ function readStoredVectors(db: Database, recordIds: readonly string[], model: st
  * not a hit: the owner hasn't signed off on it, or explicitly disagreed
  * with it, either way it isn't "a standing order" yet.
  *
+ * Also excludes a topic with a conflicting refusal, same as
+ * rule-review.ts's listActiveRules — "the refusal wins", re-checked on
+ * every call rather than only at approval time (#29 AC3). Without this, a
+ * refusal written after approval would suppress a rule everywhere the
+ * Mirror shows it but still let a live `duo draft` answer ground itself
+ * on that exact rule text.
+ *
  * Only the matching id is picked here; the row itself is re-read through
  * readRuleRow so this stays correct as rules.ts's own row shape evolves,
  * rather than duplicating its column list. Deterministic among ties: the
- * matching rule with the highest consistency wins, then lowest id.
+ * matching rule with the highest consistency wins, then lowest id — but a
+ * refused candidate is skipped in favor of the next one down that
+ * ordering, rather than declaring no hit outright when a different
+ * matched topic is still active.
  */
-function findRuleHit(db: Database, recordIds: readonly string[]): Rule | undefined {
+function findRuleHit(db: Database, recordIds: readonly string[], duoDir: string): Rule | undefined {
   ensureQaPairsSchema(db);
   ensureRulesSchema(db);
   if (recordIds.length === 0) {
@@ -94,8 +105,13 @@ function findRuleHit(db: Database, recordIds: readonly string[]): Rule | undefin
     `,
     )
     .all(...recordIds) as unknown as { id: string }[];
-  const winningId = rows[0]?.id;
-  return winningId ? readRuleRow(db, winningId) : undefined;
+  for (const row of rows) {
+    const rule = readRuleRow(db, row.id);
+    if (rule && findConflictingRefusal(duoDir, rule.topicId) === undefined) {
+      return rule;
+    }
+  }
+  return undefined;
 }
 
 function ageInDays(timestamp: string, now: Date): number | null {
@@ -149,7 +165,7 @@ export async function gatherDraftContext(
     ensureRecordsSchema(db);
     return {
       vectors: queryVector ? readStoredVectors(db, recordIds, embeddingProvider.model) : new Map<string, number[]>(),
-      ruleHit: findRuleHit(db, recordIds),
+      ruleHit: findRuleHit(db, recordIds, duoDir),
     };
   });
 
