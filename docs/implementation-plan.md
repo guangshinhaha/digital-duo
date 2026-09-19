@@ -156,10 +156,25 @@ ceremony on work that doesn't need it:
   tests. Self-review found no fixable issues. **Wave W1 (epic `e2`, ingest) is now complete**;
   #22 stays skipped, blocked on #15 per the original plan.
 
-**Next:** #23 (W2, start of epic `e3` — derivation) — check its label before assuming which path
-applies. #23 begins wave W2, where `e3` (derivation), `e10` (permissions), and `e64`
-(shared-duos) run as parallel epics per §1, though concurrency stays sequential through W2 per
-§2's locked decision.
+- #23 (PR [#87](https://github.com/guangshinhaha/digital-duo/pull/87), merged, squash commit
+  `658062f`) — lighter path: `src/derivation/qa-pairs.ts` (`extractQaPairs`, pure/no-DB) walks
+  each thread in timestamp order, collapsing multiple owner turns on one question into a single
+  pair via the last substantive answer (so multi-turn exchanges don't fragment). A second
+  unanswered question arriving before the first is resolved has no deterministic answer —
+  `IngestRecord` carries no per-person asker identity — so it's routed to an optional
+  `Adjudicate` hook (`createLlmAdjudicator` wraps any `InferenceProvider`), falling back to the
+  safe `"new_question"` default on any failure or when unconfigured; both the ambiguous and
+  adjudicated counts are returned so the rate is visible. `qa_pairs` table, idempotent by
+  content-hashed id; `topic_id` starts `null` for #24 to fill in. New `duo derive` command
+  group, starting with `duo derive pairs`, degrading gracefully without a configured provider
+  (same shape as #20's `hybridSearch`). 158 tests. Self-review found no fixable issues beyond a
+  minor readability cleanup (an async IIFE simplified to a plain `if`) made before commit. No
+  topic assignment yet — that's #24, next.
+
+**Next:** #24 (W2, epic `e3` — topic assignment with stable identifiers) — check its label before
+assuming which path applies. #23 begins wave W2, where `e3` (derivation), `e10` (permissions),
+and `e64` (shared-duos) run as parallel epics per §1, though concurrency stays sequential through
+W2 per §2's locked decision.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
