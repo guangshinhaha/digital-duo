@@ -13,7 +13,10 @@ import type { ActionTier } from "./registry.js";
  * ("an attempt to bypass is refused and recorded... the owner is notified" —
  * this log, readable via `duo actions attempts`, is that notification
  * surface, the same "durable, owner-reviewable" idiom #69/#71 used where no
- * live push channel exists yet).
+ * live push channel exists yet). `"escalated"` and `"execution_failed"`
+ * are #58's T2 path: a reversible action that couldn't run autonomously
+ * here (not yet granted, or not actually revertible in this context) or
+ * that failed partway.
  */
 export const ACTION_ATTEMPT_OUTCOMES = [
   "refused_unregistered",
@@ -21,6 +24,8 @@ export const ACTION_ATTEMPT_OUTCOMES = [
   "requires_human_confirmation",
   "refused_t4_bypass",
   "t4_executed",
+  "escalated",
+  "execution_failed",
 ] as const;
 export type ActionAttemptOutcome = (typeof ACTION_ATTEMPT_OUTCOMES)[number];
 
