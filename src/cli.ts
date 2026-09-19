@@ -56,6 +56,7 @@ import {
 } from "./commands/mirror.js";
 import { runCorrectionsApprove, runCorrectionsReject, runCorrectionsReview } from "./commands/corrections.js";
 import { runEscalationsCheck, runEscalationsDigest, runEscalationsHistory, runEscalationsRate } from "./commands/escalations.js";
+import { runMentionsListMuted, runMentionsMute, runMentionsOffer, runMentionsUnmute } from "./commands/mentions.js";
 import {
   runAnswerPublicly,
   runAskAsAsker,
@@ -738,6 +739,98 @@ escalationsCommand
           ? "No escalations classified yet."
           : `${rate.urgent}/${rate.total} escalation(s) classified urgent (${(rate.rate * 100).toFixed(1)}%).`,
       );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// Proactive offers on a mention (docs/concept.md §10, #47): "the duo
+// should watch threads where its owner is mentioned and proactively offer
+// a draft — to the owner only." #31's relevance gate was built for exactly
+// this entry point; a live Slack mention (epic e8) stays blocked, so
+// `offer` takes a hand-supplied stand-in for one, same as `duo draft`
+// stands in for a real Slack DM everywhere else in this codebase.
+const mentionsCommand = program
+  .command("mentions")
+  .description("Proactive private offers when the owner is mentioned, gated by relevance and per-channel mutes (#47)");
+
+mentionsCommand
+  .command("offer")
+  .description(
+    "Offer a draft for a hand-supplied mention, as a live Slack mention (epic e8, blocked) eventually would. " +
+      "Muted (per --channel), gate-declined, and no-draft outcomes are all reported, never silently dropped",
+  )
+  .argument("<text>", "the mention's text")
+  .option("--from <name>", "who mentioned the owner")
+  .option("--channel <channel>", "which channel this arrived in — checked against the mute list (#47 AC3)")
+  .option("--thread-context <text>", "prior messages in the same thread, if any")
+  .action(async (text: string, options: { from?: string; channel?: string; threadContext?: string }) => {
+    const config = loadConfig();
+    try {
+      const outcome = await runMentionsOffer(text, options, config);
+      switch (outcome.kind) {
+        case "muted":
+          console.log(`Muted — no offer made (channel "${outcome.channel}").`);
+          break;
+        case "gate_declined":
+          console.log(`Gate declined (${outcome.reason}) — no offer made.`);
+          break;
+        case "no_draft":
+          console.log(`No draft to offer: ${outcome.reason}`);
+          console.error(`(draft id ${outcome.draftId})`);
+          break;
+        case "offer":
+          console.log(outcome.text);
+          console.log("");
+          console.log(`Confidence: ${outcome.confidence.score.toFixed(2)} (draft id ${outcome.draftId})`);
+          console.error(`(offered privately — one action to post it: \`duo draft-outcome ${outcome.draftId} sent\`)`);
+          break;
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+mentionsCommand
+  .command("mute")
+  .description("Mute proactive offers from a channel (#47 AC3) — reversible with `duo mentions unmute`")
+  .argument("<channel>", "the channel to mute")
+  .action((channel: string) => {
+    const config = loadConfig();
+    try {
+      const channels = runMentionsMute(channel, config);
+      console.log(`Muted "${channel}". Currently muted: ${channels.join(", ") || "(none)"}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+mentionsCommand
+  .command("unmute")
+  .description("Unmute a previously-muted channel (#47 AC3)")
+  .argument("<channel>", "the channel to unmute")
+  .action((channel: string) => {
+    const config = loadConfig();
+    try {
+      const result = runMentionsUnmute(channel, config);
+      console.log(
+        result.wasMuted
+          ? `Unmuted "${channel}". Currently muted: ${result.channels.join(", ") || "(none)"}.`
+          : `"${channel}" was not muted.`,
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+mentionsCommand
+  .command("muted")
+  .description("List every currently-muted channel (#47 AC3: \"the setting is visible\")")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const channels = runMentionsListMuted(config);
+      console.log(channels.length === 0 ? "No channel is muted." : channels.join("\n"));
     } catch (error) {
       reportError(error);
     }

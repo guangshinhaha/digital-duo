@@ -2,10 +2,14 @@ import { appendGateDecision, type GateDecisionEntry } from "./gate-log.js";
 import { classifyMention, type GateVerdict } from "./relevance-gate.js";
 import { readRefusalsFile } from "./refusals.js";
 
-/** An inbound message directed at the owner — a Slack mention once epic e8 ships, hand-supplied in the meantime (e.g. by a test or `duo derive`'s eventual eval harness). */
+/** An inbound message directed at the owner — a Slack mention once epic e8 ships, hand-supplied in the meantime (e.g. by a test, `duo derive`'s eval harness, or #47's proactive-offer surface). */
 export interface Mention {
   readonly text: string;
   readonly from?: string;
+  /** Which channel/thread this arrived in — #47's own addition, for the per-channel mute setting; unused by the gate itself, which classifies text alone. */
+  readonly channel?: string;
+  /** Prior messages in the same thread, if any — the same optional context `duo draft` accepts via piped stdin (#32 AC4), here for a mention arriving mid-conversation. */
+  readonly threadContext?: string | null;
 }
 
 export interface GateOutcome extends GateVerdict {
