@@ -67,6 +67,7 @@ import {
   runShowAuditEntry,
 } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
+import { runRoleDuoSeed, runRoleDuoWithdraw } from "./commands/role-duo.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
 import { runStatus } from "./commands/status.js";
@@ -914,6 +915,68 @@ sharedCommand
           console.log(`  ${gap.count}x  ${gap.question}`);
         }
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// Role duos (docs/concept.md §12, epic e13): seeded from the real decisions
+// of everyone who has held a post, not one person's corpus — a hand-authored
+// definition file names the holders; #72 is the seeding step itself.
+const roleDuoCommand = program
+  .command("role-duo")
+  .description("A duo for a role — seeded from the standing orders of everyone who has held the post, with consent");
+
+function printRoleDuoSeed(seed: ReturnType<typeof runRoleDuoSeed>): void {
+  console.log(`Role duo "${seed.roleName}" (${seed.roleId}) seeded at ${seed.seededAt}`);
+  console.log(seed.basisStatement);
+  console.log(`Current holder: ${seed.currentHolderId}`);
+  if (seed.standingOrders.length === 0) {
+    console.log("No standing orders yet.");
+  } else {
+    console.log(`Standing orders (${seed.standingOrders.length}):`);
+    for (const order of seed.standingOrders) {
+      console.log(`  [${order.topicLabel}] ${order.text}`);
+      console.log(`    — established by ${order.holderName} on ${order.establishedAt}`);
+    }
+  }
+  if (seed.conflicts.length > 0) {
+    console.log(`Conflicts (${seed.conflicts.length}) — not synthesised into one rule, the current holder resolves them:`);
+    for (const conflict of seed.conflicts) {
+      console.log(`  [${conflict.topicLabel}]`);
+      for (const position of conflict.positions) {
+        console.log(`    - ${position.holderName} (${position.establishedAt}): ${position.text}`);
+      }
+    }
+  }
+  if (seed.excludedHolders.length > 0) {
+    console.log(`Excluded holders (${seed.excludedHolders.length}):`);
+    for (const excluded of seed.excludedHolders) {
+      console.log(`  ${excluded.holderName}: ${excluded.reason}`);
+    }
+  }
+}
+
+roleDuoCommand
+  .command("seed")
+  .description("Seed (or re-seed) a role duo from its definition file's consenting holders' active rules")
+  .argument("<definitionPath>", "path to the role duo's hand-authored definition JSON file")
+  .action((definitionPath: string) => {
+    try {
+      printRoleDuoSeed(runRoleDuoSeed(definitionPath));
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+roleDuoCommand
+  .command("withdraw")
+  .description("Record a holder's withdrawal of consent and re-seed immediately, removing their material and any rule resting only on it")
+  .argument("<definitionPath>", "path to the role duo's definition JSON file")
+  .argument("<holderId>", "the holder withdrawing consent")
+  .action((definitionPath: string, holderId: string) => {
+    try {
+      printRoleDuoSeed(runRoleDuoWithdraw(definitionPath, holderId));
     } catch (error) {
       reportError(error);
     }
