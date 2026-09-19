@@ -18,7 +18,11 @@ describe("loadConfig", () => {
       selfConsistencySamples: 3,
       recencyHalfLifeDays: 180,
     });
-    expect(config.eval).toEqual({ holdoutDays: 42 });
+    expect(config.eval).toEqual({
+      holdoutDays: 42,
+      gateLabelsPath: "eval/gate-labels.json",
+      gatePrecisionFloor: 0.95,
+    });
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -39,6 +43,8 @@ describe("loadConfig", () => {
       DUO_CONFIDENCE_SELF_CONSISTENCY_SAMPLES: "5",
       DUO_CONFIDENCE_RECENCY_HALF_LIFE_DAYS: "90",
       DUO_EVAL_HOLDOUT_DAYS: "21",
+      DUO_EVAL_GATE_LABELS_PATH: "/tmp/labels.json",
+      DUO_EVAL_GATE_PRECISION_FLOOR: "0.9",
     });
     expect(config).toEqual({
       providerName: "ollama",
@@ -52,7 +58,11 @@ describe("loadConfig", () => {
         selfConsistencySamples: 5,
         recencyHalfLifeDays: 90,
       },
-      eval: { holdoutDays: 21 },
+      eval: {
+        holdoutDays: 21,
+        gateLabelsPath: "/tmp/labels.json",
+        gatePrecisionFloor: 0.9,
+      },
     });
   });
 

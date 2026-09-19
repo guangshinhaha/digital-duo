@@ -42,6 +42,14 @@ const DEFAULT_CONFIDENCE_RECENCY_HALF_LIFE_DAYS = 180;
 // 42 days (6 weeks) is the conservative end of that range, since a longer
 // window is safer against AR-7 leakage than a shorter one.
 const DEFAULT_EVAL_HOLDOUT_DAYS = 42;
+// #36: the hand-labelled relevance-gate corpus, checked into the repo like
+// duo/directory.json and shared-duo/persona.json — its own top-level
+// directory since it's neither the encrypted store (data/) nor the
+// derived, git-versioned duo output (duo/), but a fixed evaluation fixture.
+const DEFAULT_EVAL_GATE_LABELS_PATH = "eval/gate-labels.json";
+// #36 AC: "the precision floor is stated as a number, not a sentiment" —
+// matches src/drafting/relevance-gate.ts's own stated target precision.
+const DEFAULT_EVAL_GATE_PRECISION_FLOOR = 0.95;
 
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
@@ -84,10 +92,14 @@ export interface DuoConfig {
     /** Recency-decay half-life, in days. Defaults to 180. */
     recencyHalfLifeDays: number;
   };
-  /** #35: the offline evaluation harness's own knobs, all configuration for the same reason #33's confidence weights are — an eval harness needs to sweep them without a code change. */
+  /** #35/#36: the offline evaluation harness's own knobs, all configuration for the same reason #33's confidence weights are — an eval harness needs to sweep them without a code change. */
   eval: {
-    /** The time-based split's held-out window, in days, applied *before* derivation runs (AR-7). Defaults to 42 (6 weeks). Recorded alongside every offline-eval score. */
+    /** #35: the time-based split's held-out window, in days, applied *before* derivation runs (AR-7). Defaults to 42 (6 weeks). Recorded alongside every offline-eval score. */
     holdoutDays: number;
+    /** #36: path to the hand-labelled relevance-gate mention set. Defaults to "eval/gate-labels.json". */
+    gateLabelsPath: string;
+    /** #36: the stated precision floor a gate-eval run fails against. Defaults to 0.95, matching RELEVANCE_GATE_TARGET_PRECISION. */
+    gatePrecisionFloor: number;
   };
 }
 
@@ -123,6 +135,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
     },
     eval: {
       holdoutDays: parseNumberEnv(env.DUO_EVAL_HOLDOUT_DAYS, DEFAULT_EVAL_HOLDOUT_DAYS),
+      gateLabelsPath: env.DUO_EVAL_GATE_LABELS_PATH || DEFAULT_EVAL_GATE_LABELS_PATH,
+      gatePrecisionFloor: parseNumberEnv(env.DUO_EVAL_GATE_PRECISION_FLOOR, DEFAULT_EVAL_GATE_PRECISION_FLOOR),
     },
   };
 }

@@ -21,7 +21,8 @@ import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./co
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
-import { runEvalOffline } from "./commands/eval.js";
+import { runEvalGate, runEvalOffline } from "./commands/eval.js";
+import { assertPrecisionFloor } from "./eval/gate-eval.js";
 import { WOULD_HAVE_SENT_CAVEAT } from "./eval/offline-eval.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
@@ -1191,7 +1192,9 @@ actionsCommand
 
 // The offline evaluation harness (v1-tech-design.md §1.10, epic e6):
 // draft quality on a real time-based held-out split (#35).
-const evalCommand = program.command("eval").description("Offline evaluation: draft quality on a real time-based held-out split");
+const evalCommand = program
+  .command("eval")
+  .description("Offline evaluation: draft quality on held-out data (#35), and the relevance gate's precision/recall (#36)");
 
 function parseIntegerOption(flag: string): (value: string) => number {
   return (value) => {
@@ -1234,6 +1237,33 @@ evalCommand
       if (report.humanReviewSample.length > 0) {
         console.log(`Spot-check these by hand: ${report.humanReviewSample.join(", ")}`);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+evalCommand
+  .command("gate")
+  .description("Score the real relevance gate against the hand-labelled mention set in eval/gate-labels.json (#36)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const report = runEvalGate(config);
+      console.log(`${report.total} labelled mention(s): precision ${report.precision.toFixed(3)}, recall ${report.recall.toFixed(3)}.`);
+      console.log(
+        `TP ${report.truePositives} / FP ${report.falsePositives} / TN ${report.trueNegatives} / FN ${report.falseNegatives}.`,
+      );
+      console.log("Coverage by mention type:");
+      for (const [mentionType, count] of Object.entries(report.coverageByMentionType).sort()) {
+        console.log(`  ${mentionType}: ${count}`);
+      }
+      if (report.underrepresentedMentionTypes.length > 0) {
+        console.log(
+          `Under-represented (fewer than the labelled set can score reliably): ${report.underrepresentedMentionTypes.join(", ")}`,
+        );
+      }
+      assertPrecisionFloor(report, config.eval.gatePrecisionFloor);
+      console.log(`Precision floor (${config.eval.gatePrecisionFloor}) met.`);
     } catch (error) {
       reportError(error);
     }
