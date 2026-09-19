@@ -5,6 +5,8 @@ import { type EnforceCeilingOutcome, enforceClassificationCeiling, parseClassifi
 import { answerForAsker, type AnswerForAskerResult } from "../permissions/answer.js";
 import { type AuditEntry, getAuditEntry, listAuditEntries } from "../permissions/audit.js";
 import { answerPublicly, type PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { listPublicAnswerLogEntries, type PublicAnswerLogEntry } from "../permissions/public-answer-log.js";
+import { correctPublicAnswer, type CorrectPublicAnswerResult } from "../permissions/public-correction.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -65,6 +67,34 @@ export async function runAnswerPublicly(
     config.confidence,
     config.ownerName,
   );
+}
+
+/**
+ * Implements `duo permissions correct <entryId> <correctedText> [--thread-gone]`
+ * (#45): corrects a public answer already logged, demoting its topic's T0
+ * autonomy immediately and reporting whether the correction could be
+ * posted back in the original thread. `--thread-gone` is how the owner
+ * tells the CLI what it has no way to check itself (there is no live
+ * channel integration yet, epic `e8` stays blocked) — see
+ * `correctPublicAnswer`'s own doc comment.
+ */
+export function runCorrectPublicAnswer(
+  entryId: string,
+  correctedText: string,
+  threadStillExists: boolean,
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): CorrectPublicAnswerResult {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return correctPublicAnswer(config.storePath, passphrase, config.duoDir, entryId, correctedText, config.ownerName, threadStillExists);
+}
+
+/** Implements `duo permissions log` (#43/#45): every public-answer-log entry, oldest first — how the owner finds an entry id to correct. */
+export function runListPublicAnswerLogEntries(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PublicAnswerLogEntry[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listPublicAnswerLogEntries(config.storePath, passphrase);
 }
 
 /** Implements `duo permissions audit` (#51 AC1): every audit entry, oldest first — the owner's full list to scan or pipe. */
