@@ -67,6 +67,58 @@ function removeIfExists(path: string): void {
   }
 }
 
+/** A real, open `node:sqlite` database handle — the type `loadSqlite()` produces. */
+export type Database = InstanceType<typeof import("node:sqlite").DatabaseSync>;
+
+/** Thrown when an ingest/records operation runs against a store `duo init` hasn't created yet. */
+export class StoreNotInitializedError extends Error {
+  constructor(storePath: string) {
+    super(`No store exists at "${storePath}". Run \`duo init\` first.`);
+    this.name = "StoreNotInitializedError";
+  }
+}
+
+/**
+ * Opens the encrypted store as a real SQLite database for the duration of
+ * `fn`: decrypts it to a sibling temp plaintext file, opens that, runs
+ * `fn`, and — only when `mutate` is true and `fn` returns without throwing
+ * — re-encrypts the result back over `storePath`. The temp plaintext file
+ * and any SQLite journal/WAL side files are always removed, even when `fn`
+ * throws, so a failure mid-write never leaves plaintext on disk *and* never
+ * persists a partial write: the re-encrypt step only runs after `fn` has
+ * already returned successfully. This is the shared primitive #18's
+ * records store (and #21's staging/retained phases) build on, rather than
+ * each re-deriving the decrypt-to-temp-file dance store.test.ts exercises
+ * directly via decryptAndOpen.
+ */
+export function withDatabase<T>(storePath: string, passphrase: string, mutate: boolean, fn: (db: Database) => T): T {
+  if (!existsSync(storePath)) {
+    throw new StoreNotInitializedError(storePath);
+  }
+  const plainPath = `${storePath}.rw-tmp`;
+  removeIfExists(plainPath);
+  writeFileSync(plainPath, decrypt(readFileSync(storePath), passphrase));
+  try {
+    const { DatabaseSync } = loadSqlite();
+    const db = new DatabaseSync(plainPath);
+    let result: T;
+    try {
+      result = fn(db);
+    } finally {
+      db.close();
+    }
+    if (mutate) {
+      writeFileSync(storePath, encrypt(readFileSync(plainPath), passphrase), { mode: 0o600 });
+    }
+    return result;
+  } finally {
+    removeIfExists(plainPath);
+    removeIfExists(`${plainPath}-journal`);
+    removeIfExists(`${plainPath}-wal`);
+    removeIfExists(`${plainPath}-shm`);
+  }
+}
+
 /**
  * Creates a real SQLite database, then encrypts its bytes at rest under
  * `passphrase` and writes only the ciphertext to `storePath` — so a file
