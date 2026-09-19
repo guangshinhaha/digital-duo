@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import { DraftNotFoundError, getDraft, recordDraftOutcome } from "./draft-log.js";
+import { DraftNotFoundError, ensureDraftLogSchema, getDraft } from "./draft-log.js";
 
 /**
  * #34 AC3: "an escalation the owner knows the answer to" — answering it on
@@ -77,7 +77,18 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
 
   const id = randomUUID();
   const createdAt = new Date().toISOString();
-  const candidateId = withDatabase(storePath, passphrase, true, (db) => {
+  // Both writes — the candidate row and the draft's outcome — happen on
+  // the same open `db` handle, inside this one `withDatabase` call, so
+  // they persist or fail together. An earlier version made these two
+  // separate `withDatabase` calls: each one independently decrypts,
+  // mutates, and re-encrypts the whole store, so a crash between them
+  // left a queued candidate whose draft never got marked
+  // "escalation_answered" — permanently stuck "pending", the exact bug
+  // this outcome exists to fix. The idempotency check below means a
+  // resumed/retried call after such a crash still can't recover (it
+  // finds the candidate and returns early, as intended for a genuine
+  // repeat), which is exactly why this must not be able to happen at all.
+  return withDatabase(storePath, passphrase, true, (db) => {
     ensureStandingOrderCandidateSchema(db);
     const existing = db.prepare(`SELECT id FROM standing_order_candidates WHERE draft_id = ?`).get(draftId) as { id: string } | undefined;
     if (existing) {
@@ -86,19 +97,18 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
     db.prepare(
       `INSERT INTO standing_order_candidates (id, draft_id, question, answer_text, status, created_at, reviewed_at) VALUES (?, ?, ?, ?, 'pending', ?, NULL)`,
     ).run(id, draftId, draft.question, answerText, createdAt);
+
+    // Inlined rather than calling recordDraftOutcome: that function is
+    // typed to SettableDraftOutcome specifically so escalation_answered
+    // can never reach it from any other caller (see its own doc comment).
+    ensureDraftLogSchema(db);
+    db.prepare(`UPDATE drafts SET outcome = 'escalation_answered', outcome_recorded_at = ?, sent_text = ? WHERE id = ?`).run(
+      createdAt,
+      answerText,
+      draftId,
+    );
     return id;
   });
-
-  // Only on the fresh-insert path (candidateId === id): the escalation now
-  // has a real terminal disposition, so it stops showing as "pending" in
-  // a client's Review queue (client-tech-design.md's Send/Edit/Ignore
-  // queue is meant to show what still needs the owner's attention, and an
-  // answered escalation no longer does). Skipped on the idempotent-repeat
-  // path since the outcome was already recorded the first time.
-  if (candidateId === id) {
-    recordDraftOutcome(storePath, passphrase, draftId, "escalation_answered", answerText);
-  }
-  return candidateId;
 }
 
 interface StandingOrderCandidateRow {

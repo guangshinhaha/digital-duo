@@ -50,13 +50,21 @@ export function Setup({ onConnect }: { onConnect: (config: DuoApiConfig) => void
             setError(`"${baseUrlInput}" doesn't look like a valid address — try something like 100.64.1.5:7717`);
             return;
           }
-          setError(null);
           // Trimmed, unlike baseUrl was before this line existed to fix
           // exactly this: a token copy-pasted from a terminal commonly
           // picks up a trailing newline or space, which then silently
           // fails every request's Authorization header with no indication
-          // whitespace was the cause.
-          onConnect({ baseUrl: normalized, token: token.trim() });
+          // whitespace was the cause. Checked here too, not just in the
+          // button's `disabled` below — a whitespace-only paste makes
+          // `token` a non-empty string, so `disabled={!token}` alone
+          // would let the form submit with an empty trimmed token.
+          const trimmedToken = token.trim();
+          if (!trimmedToken) {
+            setError("Paste the token `duo pair new` printed — it looks empty.");
+            return;
+          }
+          setError(null);
+          onConnect({ baseUrl: normalized, token: trimmedToken });
         }}
       >
         <h1 className="text-lg font-medium">Connect to your duo</h1>
@@ -88,7 +96,7 @@ export function Setup({ onConnect }: { onConnect: (config: DuoApiConfig) => void
             {error}
           </p>
         )}
-        <button className="mt-2 rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-2 text-white" type="submit" disabled={!token || !baseUrlInput}>
+        <button className="mt-2 rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-2 text-white" type="submit" disabled={!token.trim() || !baseUrlInput}>
           Connect
         </button>
       </form>

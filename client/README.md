@@ -24,7 +24,7 @@ in this pass).
 
 ```
 npm install
-npm run dev      # proxies /api to DUO_SERVE_URL (default http://127.0.0.1:7717)
+npm run dev      # pair against a real `duo serve` instance from the Setup screen — no dev proxy
 npm run build    # tsc -b && vite build
 npm test
 npm run lint

@@ -33,4 +33,25 @@ describe("Setup — daemon address validation", () => {
     expect(onConnect).not.toHaveBeenCalled();
     expect(screen.getByTestId("setup-error")).toBeInTheDocument();
   });
+
+  it("trims the token, and never connects with an empty (or whitespace-only) one", () => {
+    const onConnect = vi.fn();
+    render(<Setup onConnect={onConnect} />);
+    fireEvent.change(screen.getByPlaceholderText("100.64.1.5:7717"), { target: { value: "100.64.1.5:7717" } });
+    fireEvent.change(screen.getByRole("textbox", { name: /token/i }), { target: { value: "tok\n" } });
+    fireEvent.click(screen.getByText("Connect"));
+
+    expect(onConnect).toHaveBeenCalledWith({ baseUrl: "http://100.64.1.5:7717", token: "tok" });
+  });
+
+  it("a whitespace-only token keeps Connect disabled, and never calls onConnect if submitted anyway", () => {
+    const onConnect = vi.fn();
+    render(<Setup onConnect={onConnect} />);
+    fireEvent.change(screen.getByPlaceholderText("100.64.1.5:7717"), { target: { value: "100.64.1.5:7717" } });
+    fireEvent.change(screen.getByRole("textbox", { name: /token/i }), { target: { value: "   " } });
+
+    expect(screen.getByText("Connect")).toBeDisabled();
+    fireEvent.click(screen.getByText("Connect"));
+    expect(onConnect).not.toHaveBeenCalled();
+  });
 });

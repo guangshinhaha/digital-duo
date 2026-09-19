@@ -31,7 +31,7 @@ import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnsw
 import { runList } from "./commands/list.js";
 import { runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
-import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
+import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
 import { runEvalGate, runEvalOffline } from "./commands/eval.js";
 import { assertPrecisionFloor } from "./eval/gate-eval.js";
@@ -619,16 +619,19 @@ program
       "For \"edited\", pass the text you actually sent to also classify the edit and queue a correction candidate (#37)",
   )
   .argument("<draftId>", "the draft id printed by `duo draft`")
-  .argument("<outcome>", `one of: ${DRAFT_OUTCOMES.join(", ")}`)
+  .argument("<outcome>", `one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`)
   .argument("[sentText]", "the text actually sent — required to classify an \"edited\" outcome, ignored otherwise")
   .action(async (draftId: string, outcome: string, sentText: string | undefined) => {
     const config = loadConfig();
-    if (!DRAFT_OUTCOMES.includes(outcome as (typeof DRAFT_OUTCOMES)[number])) {
-      reportError(new Error(`outcome must be one of: ${DRAFT_OUTCOMES.join(", ")}`));
+    // SETTABLE_DRAFT_OUTCOMES, not the full DRAFT_OUTCOMES: escalation_answered
+    // is set only by standing-order-candidates.ts's own atomic write, never
+    // by hand here — see SettableDraftOutcome's doc comment.
+    if (!SETTABLE_DRAFT_OUTCOMES.includes(outcome as (typeof SETTABLE_DRAFT_OUTCOMES)[number])) {
+      reportError(new Error(`outcome must be one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
     try {
-      const result = await runRecordDraftOutcome(draftId, outcome as (typeof DRAFT_OUTCOMES)[number], config, sentText);
+      const result = await runRecordDraftOutcome(draftId, outcome as (typeof SETTABLE_DRAFT_OUTCOMES)[number], config, sentText);
       console.log(`Recorded draft ${draftId} as ${outcome}.`);
       if (result) {
         console.log(

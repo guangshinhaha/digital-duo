@@ -1,5 +1,5 @@
 import type { InferenceProvider } from "../provider/types.js";
-import { DraftNotFoundError, getDraft, recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
+import { DraftNotFoundError, getDraft, recordDraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { contentWords, levenshteinDistance, normalizeWhitespace } from "./text-similarity.js";
 import { queueCorrectionCandidates, type CorrectionCandidateKind } from "./queue.js";
 
@@ -204,7 +204,7 @@ export async function recordDraftOutcomeAndClassify(
   storePath: string,
   passphrase: string,
   draftId: string,
-  outcome: DraftOutcome,
+  outcome: SettableDraftOutcome,
   sentText: string | undefined,
   classifier?: EditClassifier,
 ): Promise<ClassifyAndQueueResult | undefined> {

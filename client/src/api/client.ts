@@ -6,9 +6,16 @@ export class ApiRequestError extends Error {
   readonly status: number;
 
   constructor(status: number, body: ApiError | undefined) {
-    super(body?.error.message ?? `Request failed with status ${status}`);
+    // `body?.error?.`, not `body?.error.` — `body` is only ever cast to
+    // `ApiError` (`apiRequest` below does `as ApiError`, an unchecked
+    // assertion, not real validation), so a non-2xx response whose JSON
+    // doesn't actually follow the {error:{code,message}} contract — an
+    // infra 502, or any endpoint that predates it — would otherwise throw
+    // a raw TypeError reading `.message` off `undefined` from inside this
+    // very constructor, before an ApiRequestError even exists to report.
+    super(body?.error?.message ?? `Request failed with status ${status}`);
     this.name = "ApiRequestError";
-    this.code = body?.error.code ?? "unknown";
+    this.code = body?.error?.code ?? "unknown";
     this.status = status;
   }
 }

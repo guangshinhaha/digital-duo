@@ -4,7 +4,7 @@ import { createLlmEditClassifier, recordDraftOutcomeAndClassify } from "../corre
 import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
-import { getDraft, listDrafts, DRAFT_OUTCOMES, type DraftOutcome } from "../drafting/draft-log.js";
+import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
@@ -141,13 +141,24 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
 
   app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string } }>("/drafts/:id/outcome", async (request, reply) => {
     const { outcome, sentText } = request.body;
-    if (!DRAFT_OUTCOMES.includes(outcome as DraftOutcome)) {
-      reply.code(400).send(errorBody("bad_request", `outcome must be one of: ${DRAFT_OUTCOMES.join(", ")}`));
+    // SETTABLE_DRAFT_OUTCOMES, not the full DRAFT_OUTCOMES: this is the
+    // generic outcome-setting route, and escalation_answered must only
+    // ever be written by standing-order-candidates.ts's own atomic call —
+    // never by a caller here, for any draft, escalated or not.
+    if (!SETTABLE_DRAFT_OUTCOMES.includes(outcome as SettableDraftOutcome)) {
+      reply.code(400).send(errorBody("bad_request", `outcome must be one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
     try {
       const classifier = deps.inferenceProvider ? createLlmEditClassifier(deps.inferenceProvider) : undefined;
-      const result = await recordDraftOutcomeAndClassify(deps.storePath, deps.passphrase, request.params.id, outcome as DraftOutcome, sentText, classifier);
+      const result = await recordDraftOutcomeAndClassify(
+        deps.storePath,
+        deps.passphrase,
+        request.params.id,
+        outcome as SettableDraftOutcome,
+        sentText,
+        classifier,
+      );
       return result ?? {};
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));

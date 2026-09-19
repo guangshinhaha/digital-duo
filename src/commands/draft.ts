@@ -1,7 +1,7 @@
 import type { DuoConfig } from "../config.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
-import { listDrafts, type DraftOutcome, type DraftRecord, type ListDraftsOptions } from "../drafting/draft-log.js";
+import { listDrafts, type DraftRecord, type ListDraftsOptions, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { draftReply, type DraftPipelineResult } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { createLlmEditClassifier, recordDraftOutcomeAndClassify, type ClassifyAndQueueResult } from "../corrections/classify.js";
@@ -36,7 +36,7 @@ export async function runDraft(
  */
 export async function runRecordDraftOutcome(
   draftId: string,
-  outcome: DraftOutcome,
+  outcome: SettableDraftOutcome,
   config: DuoConfig,
   sentText?: string,
   env: NodeJS.ProcessEnv = process.env,

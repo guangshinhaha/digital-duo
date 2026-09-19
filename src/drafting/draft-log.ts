@@ -11,18 +11,30 @@ export interface DraftSource {
 }
 
 /**
- * "escalation_answered" (added alongside `refused`/`escalationThreshold`):
- * the owner answered an escalated draft on the spot (#34 AC3,
- * `standing-order-candidates.ts`), which queues a standing-order
- * candidate but was never recording an outcome — an escalation this
- * happened to had no way to ever leave `outcome IS NULL` ("pending"),
- * so a client's pending-review queue kept showing it forever, and
- * re-showing the answer box on every reload invited a duplicate answer.
- * Not set by hand via `duo draft-outcome` in the ordinary case (that
- * command is for a *sent* draft's disposition) — `standing-order-
- * candidates.ts` sets it automatically the moment an answer is queued.
+ * The outcomes the *owner* can explicitly set — via `duo draft-outcome`
+ * or `POST /drafts/:id/outcome` — for a draft the pipeline was confident
+ * enough to answer. Deliberately does not include `escalation_answered`
+ * (below): that value must only ever be set by
+ * `standing-order-candidates.ts`'s own internal call, atomically with the
+ * candidate it records, never by a caller of the generic outcome route —
+ * an earlier version of this fix added it here instead and a caller could
+ * mark any draft (escalated or not, regardless of whether a candidate
+ * was ever queued) "answered" with no candidate to back it up.
  */
-export const DRAFT_OUTCOMES = ["sent", "edited", "discarded", "escalation_answered"] as const;
+export const SETTABLE_DRAFT_OUTCOMES = ["sent", "edited", "discarded"] as const;
+export type SettableDraftOutcome = (typeof SETTABLE_DRAFT_OUTCOMES)[number];
+
+/**
+ * Every value `outcome` can hold once written, including
+ * `escalation_answered` — set only by `standing-order-candidates.ts`,
+ * atomically with the standing-order candidate it records, the moment
+ * the owner answers an escalated draft (#34 AC3). Before this existed, an
+ * answered escalation had no way to ever leave `outcome IS NULL`
+ * ("pending"), so a client's Review queue kept showing it forever, and
+ * reloading re-showed the answer box (client-side "already answered"
+ * state doesn't survive a remount), inviting a duplicate answer.
+ */
+export const DRAFT_OUTCOMES = [...SETTABLE_DRAFT_OUTCOMES, "escalation_answered"] as const;
 export type DraftOutcome = (typeof DRAFT_OUTCOMES)[number];
 
 /**
@@ -182,12 +194,18 @@ export class DraftNotFoundError extends Error {
  * record the outcome keep working unchanged) but is what #37's
  * classification needs to run at all: an "edited" outcome recorded without
  * it simply produces no correction candidate, rather than failing the call.
+ *
+ * Typed to `SettableDraftOutcome`, not the full `DraftOutcome`, so
+ * `escalation_answered` can never reach this function — `queueStandingOrderCandidate`
+ * (`standing-order-candidates.ts`) writes that value itself, directly and
+ * atomically alongside the candidate row it records, on its own already-open
+ * database handle rather than through a second call here.
  */
 export function recordDraftOutcome(
   storePath: string,
   passphrase: string,
   draftId: string,
-  outcome: DraftOutcome,
+  outcome: SettableDraftOutcome,
   sentText?: string,
 ): void {
   withDatabase(storePath, passphrase, true, (db) => {

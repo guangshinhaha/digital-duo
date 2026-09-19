@@ -3,7 +3,7 @@ import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import { recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
+import { recordDraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { getRecord } from "../ingest/record-store.js";
 import { requireRefusalsDecision } from "../trust/refusals.js";
@@ -290,7 +290,7 @@ export class CalibrationItemNotFoundError extends Error {
 /** Thrown for a judgement that doesn't make sense for its item — editing an escalation (there is no draft text to edit) or supplying edited text for a non-"edited" judgement. */
 export class InvalidCalibrationJudgementError extends Error {}
 
-function outcomeForJudgement(judgement: CalibrationJudgement): DraftOutcome {
+function outcomeForJudgement(judgement: CalibrationJudgement): SettableDraftOutcome {
   switch (judgement) {
     case "approved":
       return "sent";
