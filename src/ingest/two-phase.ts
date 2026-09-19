@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { DEFAULT_CLASSIFICATION_CEILING, isWithinCeiling } from "../permissions/classification.js";
 import { createEncryptedStore, dataDirFor } from "../store/store.js";
-import type { IngestRecord } from "./record.js";
+import type { ClassificationLevel, IngestRecord } from "./record.js";
 import { listRecords, writeRecords } from "./record-store.js";
 
 /**
@@ -39,6 +40,15 @@ export function isRetainedAcrossBoundary(record: IngestRecord): boolean {
 export interface IngestOptions {
   /** Explicit opt-in required before any direct-message record is retained (import-adapters.md §5: "never ingest DMs unless explicitly opted in, per conversation"). Defaults to false. */
   includeDMs?: boolean;
+  /**
+   * The classification ceiling enforced in phase B (#48 AC1): material
+   * above it is staged in phase A — so `staged`/`discardedAboveCeiling`
+   * still give a full picture of what came in — but never copied into the
+   * retained store. Defaults to DEFAULT_CLASSIFICATION_CEILING when a
+   * caller doesn't pass one explicitly; a real call site (duo import)
+   * always passes the configured, policy-set ceiling instead.
+   */
+  ceiling?: ClassificationLevel;
 }
 
 export interface IngestOutcome {
@@ -52,6 +62,8 @@ export interface IngestOutcome {
   skippedDmConversations: number;
   /** Non-DM records phase A staged but phase B discarded: someone else's text that wasn't a question addressed to the owner. */
   discardedOtherText: number;
+  /** Records phase A staged but phase B discarded because their classification sits above the configured ceiling (#48 AC1) — never written to the retained store at all. */
+  discardedAboveCeiling: number;
 }
 
 /**
@@ -97,7 +109,11 @@ export function ingestRecords(
     const retained = afterDmFilter.filter(isRetainedAcrossBoundary);
     const discardedOtherText = afterDmFilter.length - retained.length;
 
-    const writeResult = writeRecords(storePath, passphrase, retained);
+    const ceiling = options.ceiling ?? DEFAULT_CLASSIFICATION_CEILING;
+    const withinCeiling = retained.filter((record) => isWithinCeiling(record.classification, ceiling));
+    const discardedAboveCeiling = retained.length - withinCeiling.length;
+
+    const writeResult = writeRecords(storePath, passphrase, withinCeiling);
 
     return {
       staged: staged.length,
@@ -105,6 +121,7 @@ export function ingestRecords(
       alreadyPresent: writeResult.skipped,
       skippedDmConversations,
       discardedOtherText,
+      discardedAboveCeiling,
     };
   } finally {
     deleteStagingFile(stagingPath);

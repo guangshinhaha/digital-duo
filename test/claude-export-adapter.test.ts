@@ -24,7 +24,7 @@ describe("parseClaudeExport — an export becomes records", () => {
     expect(human.threadId).toBe(assistant.threadId);
     expect(human.source).toBe("claude-export");
     expect(human.audience).toBe("private");
-    expect(human.classification).toBeNull();
+    expect(human.classification).toBe("unknown");
     expect(human.topics).toEqual([]);
   });
 
