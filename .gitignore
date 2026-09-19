@@ -5,3 +5,4 @@ shared-duo-runtime/
 *.log
 .DS_Store
 .claude/
+*.tsbuildinfo
