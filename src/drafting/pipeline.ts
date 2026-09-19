@@ -24,6 +24,8 @@ export interface DraftAnswer {
   readonly confidence: ConfidenceResult;
   /** The topic this draft's evidence belongs to, if any (see DraftContext.topicId) — what public answering (#43) checks against the T0 trust cell before this draft may ever leave the owner's own eyes. */
   readonly topicId: string | undefined;
+  /** Age, in days, of the freshest supporting evidence (see DraftContext.freshestEvidenceAgeDays) — null when there's no evidence at all. Public answering (#44 AC1) states this on every public answer, so the reader sees staleness before trusting it. */
+  readonly evidenceAgeDays: number | null;
 }
 
 export interface DraftEscalation {
@@ -197,5 +199,5 @@ export async function draftReply(
     confidenceScore: confidence.score,
     sources,
   });
-  return { kind: "draft", draftId, text, sources, confidence, topicId: context.topicId };
+  return { kind: "draft", draftId, text, sources, confidence, topicId: context.topicId, evidenceAgeDays: context.freshestEvidenceAgeDays };
 }

@@ -104,6 +104,23 @@ describe("duo permissions ask-public (#43)", () => {
     expect(result.stdout.trim()).toMatch(/passed it on/i);
     expect(result.stderr).toMatch(/kept private/i);
   });
+
+  it("labels every answer with the configured owner name — there is no way to configure it away (#44 AC2)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const defaultResult = await runCli(["permissions", "ask-public", "what is the vacation policy?", "--as", "colleague"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(defaultResult.stdout).toMatch(/the owner's duo/i);
+
+    const namedResult = await runCli(["permissions", "ask-public", "what is the vacation policy?", "--as", "colleague"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_OWNER_NAME: "Priya Nair" },
+    });
+    expect(namedResult.stdout).toContain("Priya Nair");
+  });
 });
 
 describe("duo permissions audit", () => {
