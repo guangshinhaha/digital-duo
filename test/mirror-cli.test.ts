@@ -210,3 +210,69 @@ describe("duo mirror refusals", () => {
     expect(list.stdout).toMatch(/Never speak for me on this/);
   });
 });
+
+describe("duo mirror calibrate", () => {
+  it("refuses to run without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["mirror", "calibrate"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("refuses to start before a refusals decision has been recorded (#30 AC2, tying into #29's gate)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["mirror", "calibrate"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/no decision about refusals/i);
+  });
+
+  it("reports insufficient history on an empty store once refusals have been decided", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+    const confirm = await runCli(["mirror", "refusals", "confirm-none"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+    expect(confirm.exitCode).toBe(0);
+
+    const result = await runCli(["mirror", "calibrate"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/not enough held-out history/i);
+  });
+
+  it("refuses to judge or summarize when no calibration session exists yet", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+    await runCli(["mirror", "refusals", "confirm-none"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+
+    const judge = await runCli(["mirror", "calibrate", "judge", "some-id", "--approve"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(judge.exitCode).not.toBe(0);
+    expect(judge.stderr).toMatch(/no calibration session/i);
+
+    const summary = await runCli(["mirror", "calibrate", "summary"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(summary.exitCode).not.toBe(0);
+    expect(summary.stderr).toMatch(/no calibration session/i);
+  });
+
+  it("rejects a judge call missing exactly one of --approve/--reject/--edit", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const duoDirPath = join(tempDir(), "duo");
+    await initStore(storePath, tempDir());
+    await runCli(["mirror", "refusals", "confirm-none"], { cwd: tempDir(), env: { DUO_DIR: duoDirPath } });
+
+    const result = await runCli(["mirror", "calibrate", "judge", "some-id"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_DIR: duoDirPath },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/exactly one of --approve, --reject, or --edit/i);
+  });
+});

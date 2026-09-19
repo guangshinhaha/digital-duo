@@ -5,11 +5,16 @@ import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
+import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import {
+  runMirrorCalibrateJudge,
+  runMirrorCalibrateProgress,
+  runMirrorCalibrateStart,
+  runMirrorCalibrateSummary,
   runMirrorPortrait,
   runMirrorRefusalAdd,
   runMirrorRefusalConfirmNone,
@@ -21,6 +26,7 @@ import {
   runMirrorRuleShow,
   runMirrorRuleWrite,
   runMirrorRulesList,
+  type CalibrationProgress,
 } from "./commands/mirror.js";
 import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
@@ -923,6 +929,125 @@ refusalsCommand
     try {
       runMirrorRefusalConfirmNone(config);
       console.log(`Recorded: no refusals. Written to ${config.duoDir}/refusals.md.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// Calibration (#30, docs/concept.md §7 step 4): the Mirror's last screen —
+// comparing the duo's real draft pipeline (#32's draftReply) against a
+// dozen of the owner's own past answers, and deciding whether to keep
+// going. Gated behind #29's requireRefusalsDecision ("finish onboarding").
+const calibrateCommand = mirrorCommand
+  .command("calibrate")
+  .description("Compare the duo's proposed answers against your real past ones on a handful of held-out questions (#30)");
+
+function renderCalibrationItem(item: CalibrationItem): void {
+  console.log(`Next: [${item.qaPairId}]`);
+  console.log(`  Question:              ${item.questionText}`);
+  console.log(`  Your real answer:      ${item.realAnswerText}`);
+  console.log(
+    item.escalated
+      ? `  Duo would escalate:    ${item.escalationReason}`
+      : `  Duo's proposed answer: ${item.proposedText}`,
+  );
+  console.log("");
+  console.log(
+    `  duo mirror calibrate judge ${item.qaPairId} --approve|--reject${item.escalated ? "" : ' --edit "<your corrected text>"'}`,
+  );
+}
+
+function renderCalibrationStatus(progress: CalibrationProgress): void {
+  console.log(`Session [${progress.sessionId}]: ${progress.judgedCount}/${progress.totalCount} judged.`);
+  if (progress.completed) {
+    console.log("All judged. Run `duo mirror calibrate summary` to see how it went.");
+    return;
+  }
+  console.log("");
+  renderCalibrationItem(progress.next!);
+}
+
+calibrateCommand
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      const started = await runMirrorCalibrateStart(config);
+      if (started.status === "insufficient_history") {
+        console.log(
+          `Not enough held-out history to calibrate: found ${started.available} question(s), wanted ${started.wanted}. ` +
+            "Import more sources and run `duo derive pairs` again.",
+        );
+        return;
+      }
+      console.log(started.status === "started" ? "Started a new calibration session." : "Resuming your calibration session.");
+      console.log(HELD_OUT_CAVEAT);
+      console.log("");
+      const progress = runMirrorCalibrateProgress(config);
+      renderCalibrationStatus(progress);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+calibrateCommand
+  .command("judge")
+  .description("Judge the current session's next item — approve, reject, or edit the duo's proposed answer (#30 AC1)")
+  .argument("<qaPairId>", "the item's qa_pair id, from `duo mirror calibrate`")
+  .option("--approve", "the duo's answer (or escalation) was right")
+  .option("--reject", "the duo's answer (or escalation) was wrong")
+  .option("--edit <text>", "the duo's answer needed a correction — supply the corrected text")
+  .action((qaPairId: string, options: { approve?: boolean; reject?: boolean; edit?: string }) => {
+    const config = loadConfig();
+    try {
+      const chosen = [options.approve && "approved", options.reject && "rejected", options.edit !== undefined && "edited"].filter(
+        Boolean,
+      );
+      if (chosen.length !== 1) {
+        console.error("Specify exactly one of --approve, --reject, or --edit <text>.");
+        process.exitCode = 1;
+        return;
+      }
+      const judgement = chosen[0] as "approved" | "rejected" | "edited";
+      const result = runMirrorCalibrateJudge(qaPairId, judgement, options.edit, config);
+      console.log(`Recorded: ${judgement}. ${result.judgedCount}/${result.totalCount} judged.`);
+      if (result.session.completedAt !== null) {
+        console.log("All judged. Run `duo mirror calibrate summary` to see how it went.");
+      } else {
+        console.log("Run `duo mirror calibrate` to see the next item.");
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+calibrateCommand
+  .command("summary")
+  .description("Report the calibration run honestly: the agreement rate and every rejected/edited item, never smoothed over (#30 AC2)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const summary = runMirrorCalibrateSummary(config);
+      console.log(
+        `${summary.judgedCount}/${summary.totalItems} judged: ${summary.approvedCount} approved, ` +
+          `${summary.rejectedCount} rejected, ${summary.editedCount} edited.`,
+      );
+      console.log(`Agreement rate: ${(summary.agreementRate * 100).toFixed(0)}%`);
+      if (summary.lowAgreement) {
+        console.log("This is a low agreement rate — the duo is getting a real share of these wrong, not just rounding error.");
+      }
+      if (summary.mismatches.length > 0) {
+        console.log("");
+        console.log("What it's getting wrong:");
+        for (const mismatch of summary.mismatches) {
+          console.log(`  [${mismatch.qaPairId}] (${mismatch.judgement})`);
+          console.log(`    Question:  ${mismatch.questionText}`);
+          console.log(`    Real:      ${mismatch.realAnswerText}`);
+          console.log(`    Proposed:  ${mismatch.escalated ? "(escalated instead of answering)" : mismatch.proposedText}`);
+          if (mismatch.editedText) {
+            console.log(`    Corrected: ${mismatch.editedText}`);
+          }
+        }
+      }
     } catch (error) {
       reportError(error);
     }
