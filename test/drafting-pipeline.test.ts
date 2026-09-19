@@ -67,6 +67,8 @@ async function seedConfirmedRule(storePath: string): Promise<void> {
         consistency: 0.95,
         createdAt: new Date().toISOString(),
         lastConfirmedAt: new Date().toISOString(),
+        reviewStatus: "approved",
+        origin: "derived",
       },
       pairs.map((pair) => pair.id),
     );

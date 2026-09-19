@@ -96,6 +96,8 @@ function findRuleHit(db: Database, recordIds: readonly string[]): Rule | undefin
     consistency: number;
     created_at: string;
     last_confirmed_at: string | null;
+    review_status: string;
+    origin: string;
   }[];
   const row = rows[0];
   if (!row) {
@@ -110,6 +112,8 @@ function findRuleHit(db: Database, recordIds: readonly string[]): Rule | undefin
     consistency: row.consistency,
     createdAt: row.created_at,
     lastConfirmedAt: row.last_confirmed_at,
+    reviewStatus: row.review_status as Rule["reviewStatus"],
+    origin: row.origin as Rule["origin"],
   };
 }
 
