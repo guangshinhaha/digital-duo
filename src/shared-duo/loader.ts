@@ -3,6 +3,7 @@ import { Duo } from "../duo/entity.js";
 import { parseDuoDefinition } from "../duo/loader.js";
 import type { DuoDefinition } from "../duo/types.js";
 import { loadSharedDuoConfig } from "./config.js";
+import { parsePublishedDocument } from "./documents.js";
 
 /**
  * Thrown when a shared duo's persona file names no human owner, or names
@@ -68,16 +69,35 @@ export function assertAuthoredKnowledgeOnly(definition: DuoDefinition): void {
 }
 
 /**
+ * Validates that every one of a shared duo's authored documents carries
+ * the "<Title> (updated YYYY-MM-DD): <body>" prefix #69's citation/staleness
+ * work (src/shared-duo/documents.ts) depends on — checked once at load
+ * time, naming the offending document, rather than the first citation
+ * failing deep inside answerSharedDuo. Only reachable after
+ * assertAuthoredKnowledgeOnly has already confirmed `knowledge.documents`
+ * exists.
+ */
+export function assertDocumentsAreWellFormed(definition: DuoDefinition): void {
+  if (definition.knowledge.kind !== "authored") {
+    return;
+  }
+  for (const document of definition.knowledge.documents) {
+    parsePublishedDocument(document);
+  }
+}
+
+/**
  * Validates a raw, already-parsed value against the shared-duo shape: the
- * general DuoDefinition shape, plus the two constraints above (a human
- * owner, and authored-only knowledge). Takes `unknown` for the same reason
- * parseDuoDefinition does — a definition can come from JSON on disk or a
- * literal object in a test.
+ * general DuoDefinition shape, plus the constraints above (a human owner,
+ * authored-only knowledge, and well-formed documents). Takes `unknown` for
+ * the same reason parseDuoDefinition does — a definition can come from
+ * JSON on disk or a literal object in a test.
  */
 export function parseSharedDuoDefinition(value: unknown): DuoDefinition {
   const definition = parseDuoDefinition(value);
   assertHumanOwner(definition);
   assertAuthoredKnowledgeOnly(definition);
+  assertDocumentsAreWellFormed(definition);
   return definition;
 }
 

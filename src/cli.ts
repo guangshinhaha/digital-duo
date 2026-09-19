@@ -9,6 +9,7 @@ import { runInit } from "./commands/init.js";
 import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
+import { runSharedAsk, runSharedGaps } from "./commands/shared.js";
 import { runStatus } from "./commands/status.js";
 
 const program = new Command();
@@ -323,6 +324,51 @@ permissionsCommand
           `[${entry.id}] ${entry.createdAt} asker=${entry.askerRef} clearance=${entry.clearanceApplied} ` +
             `confidence=${entry.confidence} declined=${entry.declined} question="${entry.question}"`,
         );
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The team's one shared duo (concept.md §12, epic e64): document-grounded,
+// no personal corpus, no code path that writes its persona file. #67/#68
+// shipped the definition/grounding; #69 is the first thing anyone can
+// actually ask it.
+const sharedCommand = program
+  .command("shared")
+  .description("The team's one shared duo — grounded in shared-duo/persona.json's published material only");
+
+sharedCommand
+  .command("ask")
+  .description(
+    "Ask the shared duo a question. Answers cite the configured published material and its date; " +
+      "an out-of-scope question is declined and named to the owner to escalate to",
+  )
+  .argument("<question>", "the question to ask")
+  .action(async (question: string) => {
+    try {
+      const result = await runSharedAsk(question);
+      console.log(result.text);
+      if (result.declined) {
+        console.error("(declined — outside the shared duo's configured material; passed on to its owner)");
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+sharedCommand
+  .command("gaps")
+  .description("List out-of-scope questions the shared duo has been asked, most-repeated first — the gaps in its material (#69 AC4)")
+  .action(() => {
+    try {
+      const gaps = runSharedGaps();
+      if (gaps.length === 0) {
+        console.log("No out-of-scope questions recorded yet.");
+        return;
+      }
+      for (const gap of gaps) {
+        console.log(`${gap.count}x  ${gap.question}`);
       }
     } catch (error) {
       reportError(error);
