@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { appendDraft, DraftNotFoundError } from "../src/drafting/draft-log.js";
-import { listStandingOrderCandidates, NotAnEscalationError, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
+import { DraftIsRefusedError, listStandingOrderCandidates, NotAnEscalationError, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -75,6 +75,23 @@ describe("queueStandingOrderCandidate — an escalation can be turned into a rul
   it("fails loudly for an unknown draft id", () => {
     const storePath = initStore();
     expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, "nope", "answer")).toThrow(DraftNotFoundError);
+  });
+
+  it("refuses to queue a candidate for a refused escalation — the owner's refusal is a boundary, not something an answer can override", () => {
+    const storePath = initStore();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "this subject is refused",
+      confidenceScore: 0,
+      sources: [],
+      refused: true,
+    });
+
+    expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an override answer")).toThrow(DraftIsRefusedError);
+    expect(listStandingOrderCandidates(storePath, PASSPHRASE)).toHaveLength(0);
   });
 });
 

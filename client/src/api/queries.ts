@@ -11,6 +11,7 @@ import type {
   InterruptionPortrait,
   Rule,
   RuleReviewListing,
+  SettableDraftOutcome,
 } from "./types.js";
 
 /**
@@ -85,7 +86,7 @@ export function useCreateDraft(api: DuoApiConfig) {
 export function useRecordOutcome(api: DuoApiConfig) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ draftId, outcome, sentText }: { draftId: string; outcome: DraftOutcome; sentText?: string }) =>
+    mutationFn: ({ draftId, outcome, sentText }: { draftId: string; outcome: SettableDraftOutcome; sentText?: string }) =>
       apiRequest(api, `/drafts/${draftId}/outcome`, { method: "POST", body: JSON.stringify({ outcome, sentText }) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["drafts"] });
@@ -99,9 +100,12 @@ export function useAnswerEscalation(api: DuoApiConfig) {
   return useMutation({
     mutationFn: ({ draftId, answer }: { draftId: string; answer: string }) =>
       apiRequest<{ candidateId: string }>(api, `/drafts/${draftId}/answer`, { method: "POST", body: JSON.stringify({ answer }) }),
+    // Only ["drafts"] — this writes to standing_order_candidates, not the
+    // correction_candidates table queryKeys.review actually serves
+    // (GET /review), so invalidating it here would only ever fire a
+    // network request whose result can never change from this mutation.
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["drafts"] });
-      queryClient.invalidateQueries({ queryKey: queryKeys.review });
     },
   });
 }

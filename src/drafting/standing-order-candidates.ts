@@ -49,6 +49,25 @@ export class NotAnEscalationError extends Error {
 }
 
 /**
+ * Thrown when the owner tries to answer a *refused* escalation.
+ * `client-tech-design.md` §1.6: a refusal "is a boundary the owner set"
+ * and only a non-refused, low-confidence escalation invites an answer —
+ * the client's own UI already hides the answer box for one
+ * (`DraftCard.tsx`), but that's a UI convenience, not the enforcement.
+ * Without this check, a direct call here (a different client, a bug, a
+ * raw API request) could turn a subject the owner deliberately refused
+ * to speak on into a standing-order candidate and, eventually, a rule
+ * the duo answers with automatically — silently overriding the refusal
+ * the whole feature exists to hold.
+ */
+export class DraftIsRefusedError extends Error {
+  constructor(draftId: string) {
+    super(`Draft "${draftId}" is a refused escalation — the owner set that boundary; it cannot be answered into a standing-order candidate`);
+    this.name = "DraftIsRefusedError";
+  }
+}
+
+/**
  * Queues a standing-order candidate from the owner's own answer to an
  * escalated draft. Looks the draft up first — by id, not by trusting the
  * caller's own copy of its question — both to get the exact original
@@ -73,6 +92,9 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
   }
   if (!draft.escalated) {
     throw new NotAnEscalationError(draftId);
+  }
+  if (draft.refused) {
+    throw new DraftIsRefusedError(draftId);
   }
 
   const id = randomUUID();

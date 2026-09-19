@@ -19,7 +19,15 @@ export interface DraftSource {
   label: string;
 }
 
-export const DRAFT_OUTCOMES = ["sent", "edited", "discarded"] as const;
+// Mirrors the daemon's own split (src/drafting/draft-log.ts):
+// SETTABLE_DRAFT_OUTCOMES is what this client may POST to
+// /drafts/:id/outcome; DRAFT_OUTCOMES adds "escalation_answered", which
+// the daemon writes itself the moment an escalation is answered and this
+// client only ever reads back, never sets.
+export const SETTABLE_DRAFT_OUTCOMES = ["sent", "edited", "discarded"] as const;
+export type SettableDraftOutcome = (typeof SETTABLE_DRAFT_OUTCOMES)[number];
+
+export const DRAFT_OUTCOMES = [...SETTABLE_DRAFT_OUTCOMES, "escalation_answered"] as const;
 export type DraftOutcome = (typeof DRAFT_OUTCOMES)[number];
 
 export interface ConfidenceResult {

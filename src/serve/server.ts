@@ -64,6 +64,7 @@ function statusForError(error: Error): number {
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
+    case "DraftIsRefusedError":
       return 409;
     default:
       return 500;

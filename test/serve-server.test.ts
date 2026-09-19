@@ -292,6 +292,27 @@ describe("createServer — routes", () => {
     expect(after.json().map((d: { id: string }) => d.id)).not.toContain(draftId);
   });
 
+  it("POST /drafts/:id/answer refuses a refused escalation with 409, not a queued candidate", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "this subject is refused",
+      confidenceScore: 0,
+      sources: [],
+      refused: true,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/answer`,
+      headers: authHeader,
+      payload: { answer: "an override answer" },
+    });
+    expect(response.statusCode).toBe(409);
+  });
+
   it("GET /review is empty on a fresh store", async () => {
     const response = await app.inject({ method: "GET", url: "/review", headers: authHeader });
     expect(response.statusCode).toBe(200);
