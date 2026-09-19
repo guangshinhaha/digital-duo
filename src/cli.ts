@@ -2,7 +2,19 @@
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
-import { runActionsAttempts, runActionsList, runActionsRegister, runActionsT4Confirm, runActionsT4Pending, runActionsT4Request } from "./commands/actions.js";
+import {
+  runActionsAttempts,
+  runActionsDiscard,
+  runActionsList,
+  runActionsListDiscards,
+  runActionsListPrepared,
+  runActionsPrepare,
+  runActionsRegister,
+  runActionsT4Confirm,
+  runActionsT4Pending,
+  runActionsT4Request,
+} from "./commands/actions.js";
+import { PREPARED_ARTIFACT_KINDS } from "./actions/preparation.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
@@ -1316,6 +1328,83 @@ t4Command
     try {
       const request = runActionsT4Confirm(requestId, config);
       console.log(`Confirmed and executed T4 request [${request.id}] at ${request.executedAt}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// T1 private preparation (docs/concept.md §6, #57): drafts, documents, and
+// staged tickets visible only to the owner, never submitted anywhere by
+// this codebase.
+actionsCommand
+  .command("prepare")
+  .description("Prepare a draft, document, or staged ticket visible only to the owner (#57 AC1)")
+  .requiredOption("--kind <kind>", `one of: ${PREPARED_ARTIFACT_KINDS.join(", ")}`)
+  .requiredOption("--title <text>", "a short title for the prepared artifact")
+  .requiredOption("--content <text>", "the artifact's content")
+  .option("--topic <topicId>", "the topic this preparation concerns (defaults to \"general\")")
+  .action((options: { kind: string; title: string; content: string; topic?: string }) => {
+    const config = loadConfig();
+    if (!(PREPARED_ARTIFACT_KINDS as readonly string[]).includes(options.kind)) {
+      reportError(new Error(`--kind must be one of: ${PREPARED_ARTIFACT_KINDS.join(", ")}`));
+      return;
+    }
+    try {
+      const artifact = runActionsPrepare({ kind: options.kind as (typeof PREPARED_ARTIFACT_KINDS)[number], topic: options.topic, title: options.title, content: options.content }, config);
+      console.log(`Prepared [${artifact.id}] (${artifact.kind}): ${artifact.title}. Visible only to you — nothing has been submitted anywhere.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("prepared")
+  .description("List every prepared artifact currently sitting — visible only to the owner")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const artifacts = runActionsListPrepared(config);
+      if (artifacts.length === 0) {
+        console.log("Nothing prepared yet.");
+        return;
+      }
+      for (const artifact of artifacts) {
+        console.log(`[${artifact.id}] (${artifact.kind}, topic ${artifact.topicId}) ${artifact.title}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("discard")
+  .description("Discard a prepared artifact entirely — removed, with the discard itself recorded as a signal (#57 AC3)")
+  .argument("<id>", "the prepared artifact's id")
+  .option("--note <text>", "why it wasn't wanted")
+  .action((id: string, options: { note?: string }) => {
+    const config = loadConfig();
+    try {
+      runActionsDiscard(id, options.note, config);
+      console.log(`Discarded [${id}]. Nothing recoverable remains; the discard itself is recorded.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("discards")
+  .description("List every discard signal recorded — what was prepared but never wanted")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const signals = runActionsListDiscards(config);
+      if (signals.length === 0) {
+        console.log("No discard recorded yet.");
+        return;
+      }
+      for (const signal of signals) {
+        console.log(`[${signal.id}] ${signal.discardedAt} (${signal.kind}) ${signal.title}${signal.note ? ` — ${signal.note}` : ""}`);
+      }
     } catch (error) {
       reportError(error);
     }

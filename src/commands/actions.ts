@@ -8,9 +8,20 @@ import {
   type RegisterActionResult,
   type RegisteredAction,
 } from "../actions/registry.js";
+import {
+  discardArtifact,
+  listDiscardSignals,
+  listPreparedArtifacts,
+  prepareArtifact,
+  type PreparationDiscardSignal,
+  type PreparedArtifact,
+  type PreparedArtifactKind,
+} from "../actions/preparation.js";
 import { confirmAndExecuteT4Request, createT4Request, listPendingT4Requests, type PendingT4Request } from "../actions/t4-guard.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
+
+const DEFAULT_PREPARATION_TOPIC_ID = "general";
 
 export class InvalidActionAudienceError extends Error {
   constructor(value: string) {
@@ -113,4 +124,41 @@ export function runActionsT4Confirm(requestId: string, config: DuoConfig, env: N
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return confirmAndExecuteT4Request(config.storePath, passphrase, requestId, () => {});
+}
+
+/** Implements `duo actions prepare` (#57 AC1): prepares a draft/document/ticket visible only to the owner. */
+export function runActionsPrepare(
+  options: { kind: PreparedArtifactKind; topic?: string; title: string; content: string },
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): PreparedArtifact {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return prepareArtifact(config.storePath, passphrase, config.duoDir, {
+    kind: options.kind,
+    topicId: options.topic ?? DEFAULT_PREPARATION_TOPIC_ID,
+    title: options.title,
+    content: options.content,
+  });
+}
+
+/** Implements `duo actions prepared` — every prepared artifact currently sitting only the owner can see. */
+export function runActionsListPrepared(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PreparedArtifact[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listPreparedArtifacts(config.storePath, passphrase);
+}
+
+/** Implements `duo actions discard <id>` (#57 AC3): removes a prepared artifact entirely, recording the discard as a signal. */
+export function runActionsDiscard(id: string, note: string | undefined, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PreparationDiscardSignal {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return discardArtifact(config.storePath, passphrase, id, note);
+}
+
+/** Implements `duo actions discards` — every discard signal recorded, the training-signal read on what was never wanted. */
+export function runActionsListDiscards(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PreparationDiscardSignal[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listDiscardSignals(config.storePath, passphrase);
 }
