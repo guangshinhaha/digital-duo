@@ -129,8 +129,22 @@ ceremony on work that doesn't need it:
   a Claude data export contains, not zip-container parsing — no zip library exists in this repo,
   and adding one for a task-shaped issue was judged out of scope. 112 tests. Self-review found no
   fixable issues beyond that scope decision. No embeddings/retrieval yet — that's #20, next.
+- #20 (PR [#83](https://github.com/guangshinhaha/digital-duo/pull/83), merged, squash commit
+  `4b81915`) — lighter path: `EmbeddingProvider` + `OllamaEmbeddingProvider` (`/api/embeddings`,
+  mirroring the completion provider's client), unconditional local embeddings with a real default
+  model (`nomic-embed-text`) since there's no G1 gate to wait on. `src/ingest/embeddings.ts`:
+  `embedRecords()` (backfills a vector per record, tagged with model+dimensions so a model change
+  triggers a re-embed) and `hybridSearch()` (FTS5 fused with cosine similarity via reciprocal rank
+  fusion). `duo embed` / `duo search <query>`. Scope decision: no `sqlite-vec` — brute-force
+  cosine over a plain table, enough at a personal corpus's scale, no native extension dependency.
+  134 tests. One review finding, fixed before merge: RRF scores by rank position only, so a
+  record with *zero* real similarity to the query was still getting a small "free" boost merely
+  for occupying a low rank in the vector candidate list; fixed by filtering out
+  zero-and-below-similarity matches before fusion. No two-phase retention boundary yet — that's
+  #21, next.
 
-**Next:** #20 (W1, epic `e2` — ingest) — check its label before assuming which path applies.
+**Next:** #21 (W1, epic `e2` — ingest, last issue in this wave) — check its label before
+assuming which path applies.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
