@@ -12,7 +12,7 @@ import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
 import { runStatus } from "./commands/status.js";
-import { runTrustGrant, runTrustGrid } from "./commands/trust.js";
+import { runTrustGrant, runTrustGrid, runTrustPromote, runTrustPromotions } from "./commands/trust.js";
 
 const program = new Command();
 
@@ -479,6 +479,55 @@ trustCommand
           process.exitCode = 1;
           break;
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+trustCommand
+  .command("promotions")
+  .description("List every cell currently offered a promotion, with the evidence behind it — the batched digest (#54), never individual pings")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const offers = runTrustPromotions(config);
+      if (offers.length === 0) {
+        console.log("No promotion offers pending.");
+        return;
+      }
+      for (const offer of offers) {
+        console.log(
+          `[${offer.topicId}] ${offer.tier}  ${offer.currentLevel} -> ${offer.offeredLevel}  ` +
+            `(${offer.cleanStreak} clean instance(s))  ${offer.topicLabel ?? "(unlabeled)"}`,
+        );
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+trustCommand
+  .command("promote")
+  .description("Accept or decline a pending promotion offer for one cell — nothing promotes without this explicit call (#54 AC3)")
+  .argument("<topicId>", "the topic id, as shown by `duo trust promotions`")
+  .argument("<tier>", "T0, T1, T2, or T3")
+  .option("--accept", "accept the offer: the cell moves up one level")
+  .option("--decline", "decline the offer: the cell stays, and re-offering waits for a materially higher bar (#54 AC2)")
+  .action((topicId: string, tier: string, options: { accept?: boolean; decline?: boolean }) => {
+    const config = loadConfig();
+    try {
+      if (Boolean(options.accept) === Boolean(options.decline)) {
+        console.error("Specify exactly one of --accept or --decline.");
+        process.exitCode = 1;
+        return;
+      }
+      const decision = options.accept ? "accept" : "decline";
+      const cell = runTrustPromote(topicId, tier, decision, config);
+      console.log(
+        decision === "accept"
+          ? `Promoted [${topicId}] ${tier} to ${cell.level}.`
+          : `Declined. [${topicId}] ${tier} stays at ${cell.level}; it won't be offered again until well past this point.`,
+      );
     } catch (error) {
       reportError(error);
     }
