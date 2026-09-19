@@ -14,8 +14,12 @@ import { parseRecord } from "./record.js";
  * deleted in this store, so there's no rowid-sync trigger machinery to keep
  * consistent — a plain duplicate is the simpler correct choice at this
  * corpus scale.
+ *
+ * Exported (not just called internally) so #20's embeddings module can
+ * ensure the `records` table exists before querying it — a store that has
+ * never had a record written to it has no `records` table yet either.
  */
-function ensureSchema(db: Database): void {
+export function ensureRecordsSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS records (
       id TEXT PRIMARY KEY,
@@ -86,7 +90,7 @@ export function writeRecords(storePath: string, passphrase: string, records: rea
   const parsed = records.map((record) => parseRecord(record));
 
   return withDatabase(storePath, passphrase, true, (db) => {
-    ensureSchema(db);
+    ensureRecordsSchema(db);
     const insertRecord = db.prepare(`
       INSERT OR IGNORE INTO records (id, source, source_ref, kind, author, text, timestamp, thread_id, audience, classification, topics)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -123,7 +127,7 @@ export function writeRecords(storePath: string, passphrase: string, records: rea
 /** Retrieves a single record by id, or undefined if no record with that id exists. */
 export function getRecord(storePath: string, passphrase: string, id: string): IngestRecord | undefined {
   return withDatabase(storePath, passphrase, false, (db) => {
-    ensureSchema(db);
+    ensureRecordsSchema(db);
     const row = db.prepare(`SELECT * FROM records WHERE id = ?`).get(id) as RecordRow | undefined;
     return row ? rowToRecord(row) : undefined;
   });
@@ -132,7 +136,7 @@ export function getRecord(storePath: string, passphrase: string, id: string): In
 /** Total record count in the store. */
 export function countRecords(storePath: string, passphrase: string): number {
   return withDatabase(storePath, passphrase, false, (db) => {
-    ensureSchema(db);
+    ensureRecordsSchema(db);
     const row = db.prepare(`SELECT COUNT(*) AS count FROM records`).get() as { count: number };
     return row.count;
   });
@@ -166,13 +170,13 @@ function toMatchQuery(query: string): string {
 /**
  * Full-text search over `text` via the FTS5 index, best matches first. An
  * empty corpus (no records table rows) returns an empty array rather than
- * erroring — `ensureSchema` creates the table/index on demand, so searching
- * a store that has never had a record written to it is a normal case, not
- * a failure.
+ * erroring — `ensureRecordsSchema` creates the table/index on demand, so
+ * searching a store that has never had a record written to it is a normal
+ * case, not a failure.
  */
 export function searchRecords(storePath: string, passphrase: string, query: string, limit = 20): RankedRecord[] {
   return withDatabase(storePath, passphrase, false, (db) => {
-    ensureSchema(db);
+    ensureRecordsSchema(db);
     const rows = db
       .prepare(
         `

@@ -2,9 +2,11 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
+import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
 import { runPurge } from "./commands/purge.js";
+import { runSearch } from "./commands/search.js";
 import { runStatus } from "./commands/status.js";
 
 const program = new Command();
@@ -103,6 +105,42 @@ importCommand
         return;
       }
       console.log(`Imported ${summary.written} record(s) (${summary.skipped} already present).`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+program
+  .command("embed")
+  .description("Compute local Ollama embeddings for every record that doesn't have a current one")
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      const result = await runEmbed(config);
+      console.log(`Embedded ${result.embedded} record(s) (${result.total} total in the store).`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+program
+  .command("search")
+  .description("Hybrid full-text + embedding search over the store")
+  .argument("<query>", "the search query")
+  .action(async (query: string) => {
+    const config = loadConfig();
+    try {
+      const outcome = await runSearch(query, config);
+      if (outcome.warning) {
+        console.error(outcome.warning);
+      }
+      if (outcome.results.length === 0) {
+        console.log("No matching records.");
+        return;
+      }
+      for (const { record } of outcome.results) {
+        console.log(`[${record.id.slice(0, 8)}] (${record.author}) ${record.text}`);
+      }
     } catch (error) {
       reportError(error);
     }

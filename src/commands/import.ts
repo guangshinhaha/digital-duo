@@ -1,10 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import type { DuoConfig } from "../config.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { MalformedTranscriptError, parsePastedTranscript } from "../ingest/adapters/paste.js";
 import { writeRecords } from "../ingest/record-store.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
-import { StoreNotInitializedError } from "../store/store.js";
+import { requireStoreExists } from "../store/store.js";
 
 /**
  * Reads `path` as UTF-8, wrapping a filesystem failure (missing file, no
@@ -21,18 +21,6 @@ function readSourceFile<E extends Error>(path: string, ErrorType: new (message: 
   }
 }
 
-/**
- * Every import command needs the store to already exist (`duo init`
- * first) before it resolves or generates a passphrase — checking this
- * first avoids the side effect of generating and persisting a brand-new
- * passphrase file for a store that doesn't exist yet, only to then fail.
- */
-function requireInitializedStore(storePath: string): void {
-  if (!existsSync(storePath)) {
-    throw new StoreNotInitializedError(storePath);
-  }
-}
-
 export interface ClaudeImportSummary {
   conversationCount: number;
   workRelevantConversationCount: number;
@@ -44,7 +32,7 @@ export function runImportClaude(path: string, config: DuoConfig, env: NodeJS.Pro
   const raw = readSourceFile(path, MalformedExportError);
   const { records, conversationCount, workRelevantConversationCount } = parseClaudeExport(raw);
 
-  requireInitializedStore(config.storePath);
+  requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const result = writeRecords(config.storePath, passphrase, records);
 
@@ -65,7 +53,7 @@ export function runImportPaste(path: string, config: DuoConfig, env: NodeJS.Proc
     return { workRelevant: false, written: 0, skipped: 0 };
   }
 
-  requireInitializedStore(config.storePath);
+  requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const result = writeRecords(config.storePath, passphrase, records);
 

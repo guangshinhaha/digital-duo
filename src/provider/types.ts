@@ -11,6 +11,22 @@ export interface InferenceProvider {
 }
 
 /**
+ * The interface every embedding call goes through. Separate from
+ * InferenceProvider: embeddings return a vector, not a text completion,
+ * and — unlike completion, which waits on G1 — embeddings run locally via
+ * Ollama unconditionally (v1-tech-design.md §1.2), so there is exactly one
+ * implementation and it needs no registry to swap between alternatives.
+ */
+export interface EmbeddingProvider {
+  /** The provider's name, e.g. "ollama". */
+  readonly name: string;
+  /** The specific embedding model in use, e.g. "nomic-embed-text" — recorded alongside every vector so a model change is detectable rather than silently mixing embedding spaces. */
+  readonly model: string;
+  /** Embeds a single piece of text and returns its vector. */
+  embed(text: string): Promise<readonly number[]>;
+}
+
+/**
  * Thrown whenever a command that needs inference cannot proceed because a
  * provider is not configured, or a configured provider is missing a
  * required setting. The message always names the specific missing key so

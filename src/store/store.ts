@@ -79,6 +79,21 @@ export class StoreNotInitializedError extends Error {
 }
 
 /**
+ * Throws StoreNotInitializedError unless a store already exists at
+ * `storePath` — the same check `withDatabase` makes internally, exposed so
+ * a caller (an import/embed/search command) can fail before any other
+ * side effect runs. In particular, this must run *before*
+ * `resolveOrCreatePassphrase`, which would otherwise generate and persist
+ * a brand-new passphrase file for a store that doesn't exist yet, only to
+ * then fail anyway.
+ */
+export function requireStoreExists(storePath: string): void {
+  if (!existsSync(storePath)) {
+    throw new StoreNotInitializedError(storePath);
+  }
+}
+
+/**
  * Opens the encrypted store as a real SQLite database for the duration of
  * `fn`: decrypts it to a sibling temp plaintext file, opens that, runs
  * `fn`, and — only when `mutate` is true and `fn` returns without throwing
@@ -92,9 +107,7 @@ export class StoreNotInitializedError extends Error {
  * directly via decryptAndOpen.
  */
 export function withDatabase<T>(storePath: string, passphrase: string, mutate: boolean, fn: (db: Database) => T): T {
-  if (!existsSync(storePath)) {
-    throw new StoreNotInitializedError(storePath);
-  }
+  requireStoreExists(storePath);
   const plainPath = `${storePath}.rw-tmp`;
   removeIfExists(plainPath);
   writeFileSync(plainPath, decrypt(readFileSync(storePath), passphrase));
