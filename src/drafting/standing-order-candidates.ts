@@ -12,13 +12,18 @@ import { DraftNotFoundError, getDraft } from "./draft-log.js";
  * the landing place it's meant to consume, the same "build the surface
  * ahead of its first real consumer" precedent as #48-#51's audit log.
  */
+/** #38: the batched review approves or rejects a candidate, same as #37's own correction_candidates. */
+export const STANDING_ORDER_CANDIDATE_STATUSES = ["pending", "approved", "rejected"] as const;
+export type StandingOrderCandidateStatus = (typeof STANDING_ORDER_CANDIDATE_STATUSES)[number];
+
 export interface StandingOrderCandidate {
   readonly id: string;
   readonly draftId: string;
   readonly question: string;
   readonly answerText: string;
-  readonly status: "pending";
+  readonly status: StandingOrderCandidateStatus;
   readonly createdAt: string;
+  readonly reviewedAt: string | null;
 }
 
 export function ensureStandingOrderCandidateSchema(db: Database): void {
@@ -29,7 +34,8 @@ export function ensureStandingOrderCandidateSchema(db: Database): void {
       question TEXT NOT NULL,
       answer_text TEXT NOT NULL,
       status TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      reviewed_at TEXT
     ) STRICT
   `);
 }
@@ -64,7 +70,7 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
   withDatabase(storePath, passphrase, true, (db) => {
     ensureStandingOrderCandidateSchema(db);
     db.prepare(
-      `INSERT INTO standing_order_candidates (id, draft_id, question, answer_text, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)`,
+      `INSERT INTO standing_order_candidates (id, draft_id, question, answer_text, status, created_at, reviewed_at) VALUES (?, ?, ?, ?, 'pending', ?, NULL)`,
     ).run(id, draftId, draft.question, answerText, createdAt);
   });
   return id;
@@ -77,6 +83,7 @@ interface StandingOrderCandidateRow {
   answer_text: string;
   status: string;
   created_at: string;
+  reviewed_at: string | null;
 }
 
 function rowToCandidate(row: StandingOrderCandidateRow): StandingOrderCandidate {
@@ -85,16 +92,45 @@ function rowToCandidate(row: StandingOrderCandidateRow): StandingOrderCandidate 
     draftId: row.draft_id,
     question: row.question,
     answerText: row.answer_text,
-    status: row.status as "pending",
+    status: row.status as StandingOrderCandidateStatus,
     createdAt: row.created_at,
+    reviewedAt: row.reviewed_at,
   };
 }
 
-/** Every queued candidate, oldest first — what the (not-yet-built) weekly batched review will read. */
+/** Every queued candidate, oldest first — what #38's batched review reads. */
 export function listStandingOrderCandidates(storePath: string, passphrase: string): StandingOrderCandidate[] {
   return withDatabase(storePath, passphrase, false, (db) => {
     ensureStandingOrderCandidateSchema(db);
     const rows = db.prepare(`SELECT * FROM standing_order_candidates ORDER BY created_at, id`).all() as unknown as StandingOrderCandidateRow[];
     return rows.map(rowToCandidate);
   });
+}
+
+/** Thrown by requirePendingStandingOrderCandidate when no row with the given id exists in this table — the caller (#38's review) tries #37's correction_candidates next before giving up. */
+export class StandingOrderCandidateNotFoundError extends Error {
+  constructor(id: string) {
+    super(`No standing-order candidate with id "${id}"`);
+    this.name = "StandingOrderCandidateNotFoundError";
+  }
+}
+
+/** Reads one candidate on an already-open handle, requiring it to still be pending — mirrors #37's queue.ts requirePendingCandidate for the same review precondition. */
+export function requirePendingStandingOrderCandidate(db: Database, id: string): StandingOrderCandidate {
+  ensureStandingOrderCandidateSchema(db);
+  const row = db.prepare(`SELECT * FROM standing_order_candidates WHERE id = ?`).get(id) as StandingOrderCandidateRow | undefined;
+  if (!row) {
+    throw new StandingOrderCandidateNotFoundError(id);
+  }
+  const candidate = rowToCandidate(row);
+  if (candidate.status !== "pending") {
+    throw new Error(`Standing-order candidate "${id}" was already reviewed (status: "${candidate.status}")`);
+  }
+  return candidate;
+}
+
+/** Marks a standing-order candidate approved or rejected on an already-open handle — called only after any file write the decision implies has already succeeded. */
+export function setStandingOrderCandidateStatus(db: Database, id: string, status: "approved" | "rejected"): void {
+  ensureStandingOrderCandidateSchema(db);
+  db.prepare(`UPDATE standing_order_candidates SET status = ?, reviewed_at = ? WHERE id = ?`).run(status, new Date().toISOString(), id);
 }
