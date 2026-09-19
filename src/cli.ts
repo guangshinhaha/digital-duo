@@ -27,7 +27,9 @@ import { PENDING_ACTION_STATUSES } from "./actions/approvals.js";
 import { PREPARED_ARTIFACT_KINDS } from "./actions/preparation.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
-import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
+import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
+import { runList } from "./commands/list.js";
+import { runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
@@ -85,12 +87,92 @@ function reportError(error: unknown): void {
   process.exitCode = 1;
 }
 
+/** A Commander option parser for a numeric flag — Commander calls this itself while parsing argv, so throwing here (rather than letting a bare `Number.parseInt` silently produce NaN) is what turns `--limit abc` into a clean argv-parsing error instead of NaN reaching a SQL LIMIT binding downstream. */
+function parseIntegerOption(flag: string): (value: string) => number {
+  return (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`${flag} expects a number, got "${value}"`);
+    }
+    return parsed;
+  };
+}
+
 program
   .command("status")
   .description("Print the configured provider, store location, and whether the store exists")
   .action(() => {
     const config = loadConfig();
     console.log(runStatus(config));
+  });
+
+program
+  .command("serve")
+  .description(
+    "Run the Mac/phone client daemon (client-tech-design.md §1.3): a passphrase-in-memory HTTP API over the " +
+      "existing store. Never falls back to reading the passphrase off disk, and refuses to bind every interface.",
+  )
+  .option("--host <host>", "the address to bind — a tailnet IP, or 127.0.0.1 for local-only. Never a wildcard.")
+  .option("--port <port>", "the port to bind", parseIntegerOption("--port"), 7717)
+  .action(async (options: { host?: string; port: number }) => {
+    const config = loadConfig();
+    try {
+      const { address } = await runServe({ host: options.host, port: options.port }, config);
+      console.error(`duo serve listening on ${address}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const pairCommand = program.command("pair").description("Pair a device (Mac app, phone) with this duo's daemon (client-tech-design.md Part 2)");
+
+pairCommand
+  .command("new")
+  .description("Mint a device token and print it once — copy it to the device now, it is never shown again")
+  .argument("<name>", "a name for the device, e.g. \"iPhone\"")
+  .action((name: string) => {
+    const config = loadConfig();
+    try {
+      const paired = runPair(name, config);
+      console.log(`Device "${paired.name}" paired (id ${paired.id}). Token (copy this now, it will not be shown again):`);
+      console.log(paired.token);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+pairCommand
+  .command("list")
+  .description("List every paired device, whether currently valid, and when it was last seen")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const devices = runPairList(config);
+      if (devices.length === 0) {
+        console.log("No paired devices.");
+        return;
+      }
+      for (const device of devices) {
+        const status = device.revokedAt ? `revoked ${device.revokedAt}` : `last seen ${device.lastSeenAt ?? "never"}`;
+        console.log(`[${device.id}] ${device.name} — ${status}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+pairCommand
+  .command("revoke")
+  .description("Revoke a device immediately — losing a phone means revoking one token, never re-keying the store")
+  .argument("<id>", "the device id, from `duo pair list`")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      runPairRevoke(id, config);
+      console.log(`Device ${id} revoked.`);
+    } catch (error) {
+      reportError(error);
+    }
   });
 
 program
@@ -574,6 +656,52 @@ program
     try {
       const candidateId = runRecordEscalationAnswer(draftId, answer, config);
       console.log(`Queued standing-order candidate ${candidateId} from draft ${draftId}. It will be reviewed in the next batch.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const draftsCommand = program.command("drafts").description("List drafts (client-tech-design.md G-a: the Review surface's read side)");
+
+draftsCommand
+  .command("list")
+  .description("List drafts, oldest first — by default every one ever recorded")
+  .option("--pending", "only drafts with no outcome recorded yet")
+  .option("--outcome <outcome>", `only drafts with this outcome, one of: ${DRAFT_OUTCOMES.join(", ")}`)
+  .option("--limit <n>", "cap the number of rows returned", parseIntegerOption("--limit"))
+  .action((options: { pending?: boolean; outcome?: string; limit?: number }) => {
+    const config = loadConfig();
+    if (options.outcome !== undefined && !DRAFT_OUTCOMES.includes(options.outcome as (typeof DRAFT_OUTCOMES)[number])) {
+      reportError(new Error(`--outcome must be one of: ${DRAFT_OUTCOMES.join(", ")}`));
+      return;
+    }
+    try {
+      const drafts = runDraftsList(config, {
+        outcome: options.pending ? "pending" : (options.outcome as (typeof DRAFT_OUTCOMES)[number] | undefined),
+        limit: options.limit,
+      });
+      if (drafts.length === 0) {
+        console.log("No drafts.");
+        return;
+      }
+      for (const draft of drafts) {
+        const status = draft.escalated ? "escalated" : draft.outcome ? `outcome=${draft.outcome}` : "pending";
+        console.log(`[${draft.id}] ${draft.createdAt} ${status} confidence=${draft.confidenceScore.toFixed(2)} question="${draft.question}"`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+program
+  .command("list")
+  .description("List every duo this process can currently reach — your personal duo, plus the shared duo if one is configured")
+  .action(() => {
+    try {
+      const duos = runList();
+      for (const duo of duos) {
+        console.log(duo.kind === "personal" ? "personal  (this duo — duo ask / duo draft)" : `shared    owner=${duo.ownerName} (${duo.ownerId})  (duo shared ask)`);
+      }
     } catch (error) {
       reportError(error);
     }
@@ -1655,16 +1783,6 @@ actionsCommand
 const evalCommand = program
   .command("eval")
   .description("Offline evaluation: draft quality on held-out data (#35), and the relevance gate's precision/recall (#36)");
-
-function parseIntegerOption(flag: string): (value: string) => number {
-  return (value) => {
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      throw new Error(`${flag} expects a number, got "${value}"`);
-    }
-    return parsed;
-  };
-}
 
 evalCommand
   .command("offline")

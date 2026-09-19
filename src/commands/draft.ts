@@ -1,10 +1,10 @@
 import type { DuoConfig } from "../config.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
-import { recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
+import { listDrafts, type DraftOutcome, type DraftRecord, type ListDraftsOptions } from "../drafting/draft-log.js";
 import { draftReply, type DraftPipelineResult } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
-import { classifyAndQueueEdit, createLlmEditClassifier, NoDraftTextError, type ClassifyAndQueueResult } from "../corrections/classify.js";
+import { createLlmEditClassifier, recordDraftOutcomeAndClassify, type ClassifyAndQueueResult } from "../corrections/classify.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -29,7 +29,10 @@ export async function runDraft(
  * (#37, v1-tech-design.md §1.9) as an immediate side effect of recording
  * the outcome — it only ever queues candidates, never writes to
  * `duo/rules/` or `duo/voice.md` ("queue it; do not write immediately"),
- * so running it eagerly here is safe.
+ * so running it eagerly here is safe. The orchestration itself lives in
+ * `recordDraftOutcomeAndClassify` (corrections/classify.ts), parameterized
+ * on an explicit passphrase rather than one resolved here — this function's
+ * whole job is resolving that passphrase and the provider from `config`.
  */
 export async function runRecordDraftOutcome(
   draftId: string,
@@ -40,27 +43,9 @@ export async function runRecordDraftOutcome(
 ): Promise<ClassifyAndQueueResult | undefined> {
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  // Recorded first, unconditionally: whatever happens to classification
-  // below, the outcome itself (#32 AC3) must never be lost. classifyAndQueueEdit
-  // can only ever add to the queue, never touch this row, so there is
-  // nothing here for a later classification failure to roll back.
-  recordDraftOutcome(config.storePath, passphrase, draftId, outcome, sentText);
-  if (outcome !== "edited" || sentText === undefined) {
-    return undefined;
-  }
   const provider = tryResolveProvider(config);
   const classifier = provider ? createLlmEditClassifier(provider) : undefined;
-  try {
-    return await classifyAndQueueEdit(config.storePath, passphrase, draftId, sentText, classifier);
-  } catch (error) {
-    // An escalated draft has no draftText to diff against — classification
-    // genuinely doesn't apply, not a failure the caller should see as one
-    // (the outcome above is already durably recorded either way).
-    if (error instanceof NoDraftTextError) {
-      return undefined;
-    }
-    throw error;
-  }
+  return recordDraftOutcomeAndClassify(config.storePath, passphrase, draftId, outcome, sentText, classifier);
 }
 
 /** Implements `duo draft-answer <draftId> <answer>` (#34 AC3): turns an escalation the owner knows the answer to into a queued standing-order candidate. */
@@ -68,4 +53,16 @@ export function runRecordEscalationAnswer(draftId: string, answerText: string, c
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return queueStandingOrderCandidate(config.storePath, passphrase, draftId, answerText);
+}
+
+/**
+ * Implements `duo drafts list [--pending] [--outcome <outcome>] [--limit <n>]`
+ * — the gap `client-tech-design.md` G-a names: `listDrafts` was exported
+ * and tested but reachable from no CLI command, and the Review surface's
+ * whole read side is built on it.
+ */
+export function runDraftsList(config: DuoConfig, options: ListDraftsOptions = {}, env: NodeJS.ProcessEnv = process.env): DraftRecord[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listDrafts(config.storePath, passphrase, options);
 }

@@ -149,4 +149,97 @@ describe("listDrafts", () => {
     const storePath = initStore();
     expect(listDrafts(storePath, PASSPHRASE)).toEqual([]);
   });
+
+  it("filters to pending (undispositioned) drafts only, oldest first", () => {
+    const storePath = initStore();
+    const pending = appendDraft(storePath, PASSPHRASE, {
+      question: "still pending",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    const dispositioned = appendDraft(storePath, PASSPHRASE, {
+      question: "already handled",
+      threadContext: null,
+      draftText: "b",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    recordDraftOutcome(storePath, PASSPHRASE, dispositioned, "sent", undefined);
+
+    expect(listDrafts(storePath, PASSPHRASE, { outcome: "pending" }).map((draft) => draft.id)).toEqual([pending]);
+  });
+
+  it("filters to a concrete outcome", () => {
+    const storePath = initStore();
+    const sent = appendDraft(storePath, PASSPHRASE, {
+      question: "q1",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    const discarded = appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: "b",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    recordDraftOutcome(storePath, PASSPHRASE, sent, "sent", undefined);
+    recordDraftOutcome(storePath, PASSPHRASE, discarded, "discarded", undefined);
+
+    expect(listDrafts(storePath, PASSPHRASE, { outcome: "sent" }).map((draft) => draft.id)).toEqual([sent]);
+  });
+
+  it("caps results with limit", () => {
+    const storePath = initStore();
+    for (let i = 0; i < 3; i += 1) {
+      appendDraft(storePath, PASSPHRASE, {
+        question: `q${i}`,
+        threadContext: null,
+        draftText: "a",
+        escalated: false,
+        escalationReason: null,
+        confidenceScore: 0.7,
+        sources: [],
+      });
+    }
+    expect(listDrafts(storePath, PASSPHRASE, { limit: 2 })).toHaveLength(2);
+  });
+
+  it("excludes drafts created at or after the before cursor", () => {
+    const storePath = initStore();
+    const first = appendDraft(storePath, PASSPHRASE, {
+      question: "q1",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    const firstDraft = getDraft(storePath, PASSPHRASE, first);
+    appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: "b",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+
+    const cutoff = new Date(new Date(firstDraft!.createdAt).getTime() + 1).toISOString();
+    expect(listDrafts(storePath, PASSPHRASE, { before: cutoff }).map((draft) => draft.id)).toEqual([first]);
+  });
 });

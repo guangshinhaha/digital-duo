@@ -171,11 +171,42 @@ export function getDraft(storePath: string, passphrase: string, draftId: string)
   });
 }
 
-/** Every draft, oldest first. */
-export function listDrafts(storePath: string, passphrase: string): DraftRecord[] {
+export interface ListDraftsOptions {
+  /** `"pending"` = never dispositioned (`outcome IS NULL`) — what a Review surface wants, so an untouched draft is never lost in the full log. A concrete `DraftOutcome` narrows to that outcome only. Omit for every draft, matching the original unfiltered behaviour. */
+  readonly outcome?: DraftOutcome | "pending";
+  /** Only drafts created strictly before this ISO timestamp — paging backward through history once the current page has been read. */
+  readonly before?: string;
+  /** Caps the number of rows returned. Omit for no cap. */
+  readonly limit?: number;
+}
+
+/**
+ * Every draft, oldest first, optionally filtered and paged. Filtering
+ * happens in SQL, not after the fact in JS — a `duo serve` Review surface
+ * polling for `{ outcome: "pending" }` must not pull the entire draft log
+ * over the wire on every poll (`client-tech-design.md` G-b).
+ */
+export function listDrafts(storePath: string, passphrase: string, options: ListDraftsOptions = {}): DraftRecord[] {
   return withDatabase(storePath, passphrase, false, (db) => {
     ensureDraftLogSchema(db);
-    const rows = db.prepare(`SELECT * FROM drafts ORDER BY created_at, id`).all() as unknown as DraftRow[];
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (options.outcome === "pending") {
+      clauses.push("outcome IS NULL");
+    } else if (options.outcome !== undefined) {
+      clauses.push("outcome = ?");
+      params.push(options.outcome);
+    }
+    if (options.before !== undefined) {
+      clauses.push("created_at < ?");
+      params.push(options.before);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const limitClause = options.limit !== undefined ? "LIMIT ?" : "";
+    if (options.limit !== undefined) {
+      params.push(options.limit);
+    }
+    const rows = db.prepare(`SELECT * FROM drafts ${where} ORDER BY created_at, id ${limitClause}`).all(...params) as unknown as DraftRow[];
     return rows.map(rowToDraft);
   });
 }

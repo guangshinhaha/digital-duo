@@ -1,5 +1,5 @@
 import type { InferenceProvider } from "../provider/types.js";
-import { DraftNotFoundError, getDraft } from "../drafting/draft-log.js";
+import { DraftNotFoundError, getDraft, recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
 import { contentWords, levenshteinDistance, normalizeWhitespace } from "./text-similarity.js";
 import { queueCorrectionCandidates, type CorrectionCandidateKind } from "./queue.js";
 
@@ -182,4 +182,42 @@ export async function classifyAndQueueEdit(
   );
   const queuedKinds = kinds.filter((_kind, index) => results[index].queued);
   return { classification, queuedKinds };
+}
+
+/**
+ * The full "record an outcome" orchestration (#32 AC3 + #37), with an
+ * explicit passphrase rather than one resolved from `config`/`env` — the
+ * shape `client-tech-design.md` §1.2 calls for, so `duo serve` can call
+ * this directly with the passphrase it already holds in memory instead of
+ * going through `resolveOrCreatePassphrase`'s disk fallback.
+ *
+ * Records the outcome unconditionally first: whatever happens to
+ * classification below, the outcome itself must never be lost.
+ * `classifyAndQueueEdit` can only ever add to the queue, never touch that
+ * row, so there is nothing here for a later classification failure to roll
+ * back. An escalated draft has no `draftText` to diff against —
+ * `NoDraftTextError` is swallowed rather than surfaced, since
+ * classification genuinely doesn't apply there, not a failure the caller
+ * should see as one.
+ */
+export async function recordDraftOutcomeAndClassify(
+  storePath: string,
+  passphrase: string,
+  draftId: string,
+  outcome: DraftOutcome,
+  sentText: string | undefined,
+  classifier?: EditClassifier,
+): Promise<ClassifyAndQueueResult | undefined> {
+  recordDraftOutcome(storePath, passphrase, draftId, outcome, sentText);
+  if (outcome !== "edited" || sentText === undefined) {
+    return undefined;
+  }
+  try {
+    return await classifyAndQueueEdit(storePath, passphrase, draftId, sentText, classifier);
+  } catch (error) {
+    if (error instanceof NoDraftTextError) {
+      return undefined;
+    }
+    throw error;
+  }
 }
