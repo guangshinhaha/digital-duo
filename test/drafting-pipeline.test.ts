@@ -70,6 +70,9 @@ async function seedConfirmedRule(storePath: string): Promise<void> {
         lastConfirmedAt: new Date().toISOString(),
         reviewStatus: "approved",
         origin: "derived",
+        supersededByRuleId: null,
+        correctionDraftId: null,
+        correctionQuestion: null,
       },
       pairs.map((pair) => pair.id),
     );

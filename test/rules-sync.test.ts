@@ -135,6 +135,9 @@ describe("syncRulesFiles — a malformed hand-edit is reported, not silently dro
       lastConfirmedAt: null,
       reviewStatus: "pending" as const,
       origin: "derived" as const,
+      supersededByRuleId: null,
+      correctionDraftId: null,
+      correctionQuestion: null,
       text: "some rule text",
     };
 
@@ -218,6 +221,9 @@ describe("duo/rules/*.md carries the owner's review decision (#28)", () => {
       lastConfirmedAt: null,
       reviewStatus: "pending" as const,
       origin: "derived" as const,
+      supersededByRuleId: null,
+      correctionDraftId: null,
+      correctionQuestion: null,
       text: "some rule text",
     };
     const legacyContent = serializeRuleFile(base, [])
@@ -239,6 +245,9 @@ describe("duo/rules/*.md carries the owner's review decision (#28)", () => {
       lastConfirmedAt: null,
       reviewStatus: "pending" as const,
       origin: "derived" as const,
+      supersededByRuleId: null,
+      correctionDraftId: null,
+      correctionQuestion: null,
       text: "some rule text",
     };
     expect(() =>

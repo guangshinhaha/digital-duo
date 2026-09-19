@@ -12,7 +12,7 @@ import {
   rejectCandidate,
   ReviewCandidateNotFoundError,
 } from "../src/corrections/review.js";
-import { writeRuleByHand } from "../src/derivation/rule-review.js";
+import { listActiveRules, writeRuleByHand } from "../src/derivation/rule-review.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -203,6 +203,30 @@ describe("conflict detection (#38 AC4: a candidate contradicting an active rule 
     expect(() => approveCandidate(storePath, PASSPHRASE, duoDir(), candidate.id)).toThrow(CandidateConflictError);
     // Refused, not partially applied: the candidate is still pending afterward.
     expect(listPendingReview(storePath, PASSPHRASE, duoDir()).candidates).toHaveLength(1);
+  });
+
+  it("approves with --supersedes-equivalent option, retiring the old rule instead of leaving both active (#39 AC3)", () => {
+    const storePath = initStore();
+    const oldRule = writeRuleByHand(storePath, PASSPHRASE, duoDir(), "office hours", "office hours are nine to five, monday to friday");
+
+    const draftId = seedDraft(storePath, "what are the office hours?", "office hours are flexible this month");
+    queueCorrectionCandidate(storePath, PASSPHRASE, {
+      kind: "substance",
+      draftId,
+      question: "what are the office hours?",
+      draftText: "office hours are flexible this month",
+      sentText: "office hours are now ten to six every weekday",
+    });
+    const [candidate] = listPendingReview(storePath, PASSPHRASE, duoDir()).candidates;
+
+    const result = approveCandidate(storePath, PASSPHRASE, duoDir(), candidate.id, { supersedesRuleId: oldRule.id });
+    expect(result.rule?.text).toBe("office hours are now ten to six every weekday");
+    expect(result.rule?.correctionDraftId).toBe(draftId);
+    expect(result.rule?.correctionQuestion).toBe("what are the office hours?");
+
+    const activeRules = listActiveRules(storePath, PASSPHRASE, duoDir());
+    expect(activeRules.map((r) => r.id)).toEqual([result.rule?.id]);
+    expect(activeRules.map((r) => r.id)).not.toContain(oldRule.id);
   });
 
   it("does not flag a substance candidate unrelated to any active rule", () => {

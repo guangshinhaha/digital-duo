@@ -92,6 +92,9 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
           lastConfirmedAt: new Date().toISOString(),
           reviewStatus: "approved",
           origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
         },
         pairs.map((pair) => pair.id),
       );
@@ -126,6 +129,9 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
           lastConfirmedAt: new Date().toISOString(),
           reviewStatus: "pending", // the owner hasn't signed off on this yet
           origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
         },
         pairs.map((pair) => pair.id),
       );
@@ -160,6 +166,9 @@ describe("gatherDraftContext — the explicit rule-hit signal", () => {
           lastConfirmedAt: new Date().toISOString(),
           reviewStatus: "approved",
           origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
         },
         pairs.map((pair) => pair.id),
       );

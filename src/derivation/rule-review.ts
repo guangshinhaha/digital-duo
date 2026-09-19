@@ -5,7 +5,7 @@ import { withDatabase } from "../store/store.js";
 import { getRecord } from "../ingest/record-store.js";
 import { listQaPairs } from "./qa-pairs.js";
 import { serializeRuleFile } from "./rules-sync.js";
-import { listRuleEvidence, listRules, putRule, readRuleEvidenceRows, readRuleRow, type Rule } from "./rules.js";
+import { listRuleEvidence, listRules, putRule, readRuleEvidenceRows, readRuleRow, type Rule, type RuleReviewStatus } from "./rules.js";
 import { readTopicsFile, writeTopicsFile, type Topic } from "./topics.js";
 import { findConflictingRefusal, findRefusalByHeading, type Refusal } from "../trust/refusals.js";
 
@@ -194,8 +194,129 @@ export function writeRuleByHand(storePath: string, passphrase: string, duoDir: s
     lastConfirmedAt: now,
     reviewStatus: "approved",
     origin: "owner_asserted",
+    supersededByRuleId: null,
+    correctionDraftId: null,
+    correctionQuestion: null,
   };
   return saveReviewedRule(storePath, passphrase, duoDir, rule);
+}
+
+/** Thrown by writeCorrectionRule when asked to supersede a rule that isn't currently active — superseding only makes sense against a rule that *is* active; anything else (already superseded, rejected, still pending) has nothing for the correction to replace. */
+export class NotActiveRuleError extends Error {
+  constructor(ruleId: string, reviewStatus: RuleReviewStatus) {
+    super(`Rule "${ruleId}" is not currently active (review status: "${reviewStatus}") — there is nothing to supersede`);
+    this.name = "NotActiveRuleError";
+  }
+}
+
+/**
+ * Thrown when a filesystem write this function needs (a new rule's file,
+ * or the file of the rule it supersedes) fails — #39 AC2: "it fails with a
+ * clear message, the store and files remain consistent with each other,
+ * and the candidate stays queued." Nothing here ever reaches the database:
+ * every file write below happens before the one `withDatabase` call this
+ * function makes, so a failure here always leaves the store exactly as it
+ * was.
+ */
+export class CorrectionWriteError extends Error {
+  constructor(path: string, cause: unknown) {
+    super(`Could not write "${path}": ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "CorrectionWriteError";
+  }
+}
+
+/**
+ * #39: writes a rule from an approved correction candidate — a
+ * `writeRuleByHand` with two things layered on: provenance
+ * (`correctionDraftId`/`correctionQuestion`, AC1's "a reference to the
+ * draft and question that prompted it") and, when `supersedesRuleId` is
+ * given, retiring the rule it replaces (AC3) instead of leaving both
+ * active.
+ *
+ * File writes happen before any database write, and in one batch — if any
+ * of them fails (CorrectionWriteError), nothing here has touched the store
+ * yet, so the caller's own candidate-approval bookkeeping (#38's
+ * approveCandidate) never marks the candidate approved either.
+ */
+export function writeCorrectionRule(
+  storePath: string,
+  passphrase: string,
+  duoDir: string,
+  label: string,
+  text: string,
+  draftId: string,
+  question: string,
+  supersedesRuleId?: string,
+): Rule {
+  const trimmedLabel = label.trim();
+  const trimmedText = text.trim();
+  if (trimmedLabel.length === 0) {
+    throw new InvalidReviewActionError("A correction rule needs a non-empty topic label.");
+  }
+  if (trimmedText.length === 0) {
+    throw new InvalidReviewActionError("A correction rule needs non-empty text.");
+  }
+  const labelConflict = findRefusalByHeading(duoDir, trimmedLabel);
+  if (labelConflict) {
+    throw new RefusalConflictError(trimmedLabel, labelConflict);
+  }
+
+  let supersededRule: Rule | undefined;
+  if (supersedesRuleId !== undefined) {
+    supersededRule = requireRule(storePath, passphrase, supersedesRuleId);
+    if (supersededRule.reviewStatus !== "approved") {
+      throw new NotActiveRuleError(supersededRule.id, supersededRule.reviewStatus);
+    }
+  }
+
+  const topics = readTopicsFile(duoDir);
+  const now = new Date().toISOString();
+  const topic: Topic = { id: `topic-${randomUUID()}`, label: trimmedLabel, createdAt: now };
+
+  const rule: Rule = {
+    id: topic.id,
+    topicId: topic.id,
+    text: trimmedText,
+    status: "confirmed",
+    supportCount: 0,
+    consistency: 1,
+    createdAt: now,
+    lastConfirmedAt: now,
+    reviewStatus: "approved",
+    origin: "owner_asserted",
+    supersededByRuleId: null,
+    correctionDraftId: draftId,
+    correctionQuestion: question,
+  };
+  const updatedSupersededRule: Rule | undefined = supersededRule
+    ? { ...supersededRule, reviewStatus: "superseded", supersededByRuleId: rule.id }
+    : undefined;
+
+  // Every file write first, and in full, before any database write below —
+  // see CorrectionWriteError's own doc comment for why.
+  const rulesDirPath = join(duoDir, "rules");
+  try {
+    mkdirSync(rulesDirPath, { recursive: true });
+    writeFileSync(join(rulesDirPath, `${rule.id}.md`), serializeRuleFile(rule, []));
+    if (updatedSupersededRule) {
+      writeFileSync(
+        join(rulesDirPath, `${updatedSupersededRule.id}.md`),
+        serializeRuleFile(updatedSupersededRule, listRuleEvidence(storePath, passphrase, updatedSupersededRule.id)),
+      );
+    }
+    writeTopicsFile(duoDir, [...topics, topic]);
+  } catch (error) {
+    throw new CorrectionWriteError(rulesDirPath, error);
+  }
+
+  withDatabase(storePath, passphrase, true, (db) => {
+    putRule(db, rule, []);
+    if (updatedSupersededRule) {
+      putRule(db, updatedSupersededRule, readRuleEvidenceRows(db, updatedSupersededRule.id));
+    }
+  });
+
+  return rule;
 }
 
 /** One cited exchange behind a rule — the question and answer text #28 AC1 asks the owner to be able to follow. */

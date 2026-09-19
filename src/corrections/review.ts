@@ -8,7 +8,7 @@ import {
   StandingOrderCandidateNotFoundError,
   type StandingOrderCandidate,
 } from "../drafting/standing-order-candidates.js";
-import { listActiveRules, writeRuleByHand } from "../derivation/rule-review.js";
+import { listActiveRules, writeCorrectionRule } from "../derivation/rule-review.js";
 import type { Rule } from "../derivation/rules.js";
 import {
   CorrectionCandidateNotFoundError,
@@ -242,15 +242,35 @@ export interface ApproveCandidateResult {
   readonly rule: Rule | undefined;
 }
 
+export interface ApproveCandidateOptions {
+  /**
+   * #39 AC3: the id of the active rule this substance candidate replaces.
+   * Required to approve a candidate `findConflictingActiveRule` flags —
+   * without it, approval is refused (CandidateConflictError) rather than
+   * silently accumulating two contradictory rules (#38 AC4). Honored even
+   * when no conflict was auto-detected: the lexical heuristic is
+   * approximate, and the owner may know two rules conflict when it didn't
+   * catch that.
+   */
+  readonly supersedesRuleId?: string;
+}
+
 /**
- * #38 AC1: approving writes the change to `duo/rules/` (substance) or
- * `duo/voice.md` (style), with provenance, and only then marks the
- * candidate approved. A substance candidate that conflicts with an active
- * rule is refused (CandidateConflictError) rather than silently
- * accumulating two contradictory rules (AC4) — #39 adds the actual
- * resolution path.
+ * #38 AC1 / #39 AC1/AC3: approving writes the change to `duo/rules/`
+ * (substance) or `duo/voice.md` (style), with provenance, and only then
+ * marks the candidate approved. A substance candidate that conflicts with
+ * an active rule is refused (CandidateConflictError) unless
+ * `options.supersedesRuleId` names the rule it replaces, in which case that
+ * rule is retired (marked `superseded`, pointing at its replacement)
+ * instead of left active alongside the new one.
  */
-export function approveCandidate(storePath: string, passphrase: string, duoDir: string, id: string): ApproveCandidateResult {
+export function approveCandidate(
+  storePath: string,
+  passphrase: string,
+  duoDir: string,
+  id: string,
+  options: ApproveCandidateOptions = {},
+): ApproveCandidateResult {
   const { candidate, source } = requirePendingReviewCandidate(storePath, passphrase, id);
 
   if (candidate.kind === "style") {
@@ -262,13 +282,24 @@ export function approveCandidate(storePath: string, passphrase: string, duoDir: 
     return { kind: "style", rule: undefined };
   }
 
-  const activeRules = listActiveRules(storePath, passphrase, duoDir);
-  const conflict = findConflictingActiveRule(candidate, activeRules);
-  if (conflict) {
-    throw new CandidateConflictError(candidate, conflict);
+  if (options.supersedesRuleId === undefined) {
+    const activeRules = listActiveRules(storePath, passphrase, duoDir);
+    const conflict = findConflictingActiveRule(candidate, activeRules);
+    if (conflict) {
+      throw new CandidateConflictError(candidate, conflict);
+    }
   }
 
-  const rule = writeRuleByHand(storePath, passphrase, duoDir, candidate.question, candidate.proposedText);
+  const rule = writeCorrectionRule(
+    storePath,
+    passphrase,
+    duoDir,
+    candidate.question,
+    candidate.proposedText,
+    candidate.draftId,
+    candidate.question,
+    options.supersedesRuleId,
+  );
   withDatabase(storePath, passphrase, true, (db) => {
     if (source === "draft_edit") {
       requirePendingCandidate(db, id);

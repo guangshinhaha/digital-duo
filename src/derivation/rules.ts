@@ -33,7 +33,16 @@ export type RuleStatus = (typeof RULE_STATUSES)[number];
  * silently become active again, including across a later re-induction run
  * that recomputes its derivation `status` from new evidence (AC2).
  */
-export const RULE_REVIEW_STATUSES = ["pending", "approved", "rejected"] as const;
+/**
+ * `superseded` (#39 AC3) is the one review status the owner never sets
+ * directly (approve/reject/promote never produce it) — it's set only by a
+ * correction that replaces this rule, alongside `supersededByRuleId`
+ * pointing at what replaced it. Preserved across re-induction exactly like
+ * `rejected` already is: derivation may keep recomputing this row's
+ * text/support/consistency as new evidence arrives, but it never becomes
+ * active again on its own.
+ */
+export const RULE_REVIEW_STATUSES = ["pending", "approved", "rejected", "superseded"] as const;
 export type RuleReviewStatus = (typeof RULE_REVIEW_STATUSES)[number];
 
 /**
@@ -60,6 +69,12 @@ export interface Rule {
   readonly reviewStatus: RuleReviewStatus;
   /** Whether induction proposed this rule or the owner asserted it by hand (#28 AC3). */
   readonly origin: RuleOrigin;
+  /** #39 AC3: set alongside reviewStatus: "superseded" — the rule (and file) that replaced this one. Null otherwise. */
+  readonly supersededByRuleId: string | null;
+  /** #39 AC1: provenance for a rule written from a correction — the draft it came from. Null for a derived rule or one written by hand outside the correction flow. */
+  readonly correctionDraftId: string | null;
+  /** #39 AC1: the question that prompted the correction this rule came from. Null alongside correctionDraftId. */
+  readonly correctionQuestion: string | null;
 }
 
 /** Below this many supporting pairs, a topic can never become `confirmed` regardless of consistency — it's a `weak_signal` instead (AC3). */
@@ -79,7 +94,10 @@ export function ensureRulesSchema(db: Database): void {
       created_at TEXT NOT NULL,
       last_confirmed_at TEXT,
       review_status TEXT NOT NULL DEFAULT 'pending',
-      origin TEXT NOT NULL DEFAULT 'derived'
+      origin TEXT NOT NULL DEFAULT 'derived',
+      superseded_by_rule_id TEXT,
+      correction_draft_id TEXT,
+      correction_question TEXT
     ) STRICT
   `);
   db.exec(`
@@ -258,7 +276,10 @@ export async function runRuleInduction(
   });
 
   const now = new Date().toISOString();
-  const computed: { rule: Omit<Rule, "createdAt" | "lastConfirmedAt" | "reviewStatus" | "origin">; evidencePairIds: string[] }[] = [];
+  const computed: {
+    rule: Omit<Rule, "createdAt" | "lastConfirmedAt" | "reviewStatus" | "origin" | "supersededByRuleId" | "correctionDraftId" | "correctionQuestion">;
+    evidencePairIds: string[];
+  }[] = [];
 
   for (const [topicId, pairs] of byTopic) {
     const consistency = averagePairwiseSimilarity(pairs.map((pair) => pair.vector));
@@ -298,7 +319,25 @@ export async function runRuleInduction(
       // are ever recomputed from fresh evidence.
       const reviewStatus = existing?.reviewStatus ?? "pending";
       const origin = existing?.origin ?? "derived";
-      const finalRule: Rule = { ...rule, createdAt, lastConfirmedAt, reviewStatus, origin };
+      // #39: a correction-originated rule always has its own new topic id
+      // (see writeCorrectionRule in rule-review.ts), so induction — which
+      // only ever writes id === topicId rows — never collides with one.
+      // These are preserved purely so re-induction on this same topic id
+      // (the *superseded* rule's own row, if it still has qa_pairs) can
+      // never silently clear a pointer induction knows nothing about.
+      const supersededByRuleId = existing?.supersededByRuleId ?? null;
+      const correctionDraftId = existing?.correctionDraftId ?? null;
+      const correctionQuestion = existing?.correctionQuestion ?? null;
+      const finalRule: Rule = {
+        ...rule,
+        createdAt,
+        lastConfirmedAt,
+        reviewStatus,
+        origin,
+        supersededByRuleId,
+        correctionDraftId,
+        correctionQuestion,
+      };
       putRule(db, finalRule, evidencePairIds);
       finalRules.push(finalRule);
     }
@@ -324,6 +363,9 @@ interface RuleRow {
   last_confirmed_at: string | null;
   review_status: string;
   origin: string;
+  superseded_by_rule_id: string | null;
+  correction_draft_id: string | null;
+  correction_question: string | null;
 }
 
 function rowToRule(row: RuleRow): Rule {
@@ -338,6 +380,9 @@ function rowToRule(row: RuleRow): Rule {
     lastConfirmedAt: row.last_confirmed_at,
     reviewStatus: row.review_status as RuleReviewStatus,
     origin: row.origin as RuleOrigin,
+    supersededByRuleId: row.superseded_by_rule_id,
+    correctionDraftId: row.correction_draft_id,
+    correctionQuestion: row.correction_question,
   };
 }
 
@@ -353,12 +398,14 @@ export function putRule(db: Database, rule: Rule, evidencePairIds: readonly stri
   ensureRulesSchema(db);
   db.prepare(
     `
-    INSERT INTO rules (id, topic_id, text, status, support_count, consistency, created_at, last_confirmed_at, review_status, origin)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO rules (id, topic_id, text, status, support_count, consistency, created_at, last_confirmed_at, review_status, origin, superseded_by_rule_id, correction_draft_id, correction_question)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       topic_id = excluded.topic_id, text = excluded.text, status = excluded.status, support_count = excluded.support_count,
       consistency = excluded.consistency, created_at = excluded.created_at, last_confirmed_at = excluded.last_confirmed_at,
-      review_status = excluded.review_status, origin = excluded.origin
+      review_status = excluded.review_status, origin = excluded.origin,
+      superseded_by_rule_id = excluded.superseded_by_rule_id, correction_draft_id = excluded.correction_draft_id,
+      correction_question = excluded.correction_question
   `,
   ).run(
     rule.id,
@@ -371,6 +418,9 @@ export function putRule(db: Database, rule: Rule, evidencePairIds: readonly stri
     rule.lastConfirmedAt,
     rule.reviewStatus,
     rule.origin,
+    rule.supersededByRuleId,
+    rule.correctionDraftId,
+    rule.correctionQuestion,
   );
 
   db.prepare(`DELETE FROM rule_evidence WHERE rule_id = ?`).run(rule.id);
