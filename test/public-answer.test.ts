@@ -21,6 +21,7 @@ import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
 const CONFIDENCE_CONFIG = loadConfig({}).confidence;
+const OWNER_NAME = "Dana Cole";
 
 function initStore(): string {
   const storePath = join(tempDir(), "data", "duo.db");
@@ -105,11 +106,12 @@ describe("answerPublicly — a granted topic is answered directly (#43 AC1)", ()
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
+      OWNER_NAME,
     );
 
     expect(outcome.kind).toBe("answered");
     if (outcome.kind !== "answered") throw new Error("expected an answered outcome");
-    expect(outcome.text).toBe("Five days per quarter, per policy.");
+    expect(outcome.text).toContain("Five days per quarter, per policy.");
     expect(outcome.topicId).toBe("topic-leave");
     expect(outcome.sources.length).toBeGreaterThan(0);
 
@@ -136,11 +138,12 @@ describe("answerPublicly — an ungranted topic is not answered (#43 AC2)", () =
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
+      OWNER_NAME,
     );
 
     expect(outcome.kind).toBe("passed_on");
     if (outcome.kind !== "passed_on") throw new Error("expected a passed_on outcome");
-    expect(outcome.message).toBe(PUBLIC_PASSED_ON_MESSAGE);
+    expect(outcome.message).toContain(PUBLIC_PASSED_ON_MESSAGE);
     expect(outcome.message).not.toMatch(/five days/i);
     expect(outcome.topicId).toBe("topic-leave");
 
@@ -152,7 +155,7 @@ describe("answerPublicly — an ungranted topic is not answered (#43 AC2)", () =
     const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
     expect(logged).toHaveLength(1);
     expect(logged[0].outcome).toBe("passed_on");
-    expect(logged[0].text).toBe(PUBLIC_PASSED_ON_MESSAGE);
+    expect(logged[0].text).toBe(outcome.message);
   });
 });
 
@@ -174,11 +177,12 @@ describe("answerPublicly — a refused subject is declined visibly (#43 AC3)", (
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
+      OWNER_NAME,
     );
 
     expect(outcome.kind).toBe("declined_refused");
     if (outcome.kind !== "declined_refused") throw new Error("expected a declined_refused outcome");
-    expect(outcome.message).toBe(PUBLIC_REFUSAL_MESSAGE);
+    expect(outcome.message).toContain(PUBLIC_REFUSAL_MESSAGE);
     expect(outcome.message).not.toMatch(/five days/i);
     expect(outcome.message).not.toMatch(/under review/i);
 
@@ -226,11 +230,12 @@ describe("answerPublicly — low confidence escalates instead of hedging (#43 AC
       embeddingProvider,
       disagreeingProvider,
       CONFIDENCE_CONFIG,
+      OWNER_NAME,
     );
 
     expect(outcome.kind).toBe("passed_on");
     if (outcome.kind !== "passed_on") throw new Error("expected a passed_on outcome");
-    expect(outcome.message).toBe(PUBLIC_PASSED_ON_MESSAGE);
+    expect(outcome.message).toContain(PUBLIC_PASSED_ON_MESSAGE);
   });
 });
 
@@ -251,6 +256,7 @@ describe("answerPublicly — never exposes unmarked ('unknown') material, even t
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
+      OWNER_NAME,
     );
 
     // The owner's own private `duo draft` would answer this confidently
@@ -259,5 +265,103 @@ describe("answerPublicly — never exposes unmarked ('unknown') material, even t
     expect(outcome.kind).toBe("passed_on");
     if (outcome.kind !== "passed_on") throw new Error("expected a passed_on outcome");
     expect(outcome.message).not.toMatch(/five days/i);
+  });
+});
+
+describe("answerPublicly — every public answer is labelled, never as the owner (#44 AC1)", () => {
+  it("attributes an actual answer to the owner's duo, states confidence and evidence age, and links each source to its origin", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      "colleague-6",
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+
+    if (outcome.kind !== "answered") throw new Error("expected an answered outcome");
+    expect(outcome.text).toContain(OWNER_NAME);
+    expect(outcome.text).toMatch(/duo/i);
+    // Attributed to the duo speaking, not phrased as the owner speaking in the first person.
+    expect(outcome.text).not.toMatch(new RegExp(`^I am ${OWNER_NAME}`, "i"));
+    expect(outcome.text).toContain(`Confidence: ${outcome.confidence.score.toFixed(2)}`);
+    // A rule (the owner's own standing order) and a retrieved past exchange are both named, and told apart.
+    expect(outcome.text).toMatch(/owner's own standing order/);
+    expect(outcome.text).toMatch(/retrieved past exchange/);
+
+    // The exact same labelled text is what got logged — there is no
+    // unlabelled version of this answer anywhere.
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged[0].text).toBe(outcome.text);
+  });
+
+  it("labels a passed-on message and a refusal too, without stating confidence or evidence age for either", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    // Ungranted — passed_on path.
+    const passedOn = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      "colleague-7",
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+    if (passedOn.kind !== "passed_on") throw new Error("expected a passed_on outcome");
+    expect(passedOn.message).toContain(OWNER_NAME);
+    expect(passedOn.message).not.toMatch(/confidence/i);
+
+    writeRefusalsFile(dir, [{ heading: "vacation", reason: "under review" }]);
+    const refused = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      "colleague-8",
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+    if (refused.kind !== "declined_refused") throw new Error("expected a declined_refused outcome");
+    expect(refused.message).toContain(OWNER_NAME);
+    expect(refused.message).not.toMatch(/confidence/i);
+  });
+
+  it("names a different owner when configured with a different one — attribution is data, not a fixed string", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      "colleague-9",
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      "Priya Nair",
+    );
+    if (outcome.kind !== "answered") throw new Error("expected an answered outcome");
+    expect(outcome.text).toContain("Priya Nair");
+    expect(outcome.text).not.toContain(OWNER_NAME);
   });
 });

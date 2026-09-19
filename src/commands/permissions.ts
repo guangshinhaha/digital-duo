@@ -54,7 +54,17 @@ export async function runAnswerPublicly(
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
-  return answerPublicly(config.storePath, passphrase, config.duoDir, question, askerRef, embeddingProvider, inferenceProvider, config.confidence);
+  return answerPublicly(
+    config.storePath,
+    passphrase,
+    config.duoDir,
+    question,
+    askerRef,
+    embeddingProvider,
+    inferenceProvider,
+    config.confidence,
+    config.ownerName,
+  );
 }
 
 /** Implements `duo permissions audit` (#51 AC1): every audit entry, oldest first — the owner's full list to scan or pipe. */

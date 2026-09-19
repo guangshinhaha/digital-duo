@@ -12,6 +12,7 @@ describe("loadConfig", () => {
     expect(config.ollama.model).toBeUndefined();
     expect(config.ollama.embeddingModel).toBe("nomic-embed-text");
     expect(config.classificationCeiling).toBe("official_open");
+    expect(config.ownerName).toBe("the owner");
     expect(config.confidence).toEqual({
       weights: { selfConsistency: 0.3, retrievalStrength: 0.3, ruleHit: 0.25, recency: 0.1, selfReport: 0.05 },
       escalationThreshold: 0.55,
@@ -45,12 +46,14 @@ describe("loadConfig", () => {
       DUO_EVAL_HOLDOUT_DAYS: "21",
       DUO_EVAL_GATE_LABELS_PATH: "/tmp/labels.json",
       DUO_EVAL_GATE_PRECISION_FLOOR: "0.9",
+      DUO_OWNER_NAME: "Priya Nair",
     });
     expect(config).toEqual({
       providerName: "ollama",
       storePath: "/tmp/x.db",
       classificationCeiling: "secret",
       duoDir: "/tmp/duo-out",
+      ownerName: "Priya Nair",
       ollama: { host: "http://h:1", model: "llama3", embeddingModel: "custom-embed" },
       confidence: {
         weights: { selfConsistency: 0.4, retrievalStrength: 0.2, ruleHit: 0.2, recency: 0.15, selfReport: 0.05 },

@@ -42,6 +42,13 @@ const DEFAULT_CONFIDENCE_RECENCY_HALF_LIFE_DAYS = 180;
 // 42 days (6 weeks) is the conservative end of that range, since a longer
 // window is safer against AR-7 leakage than a shorter one.
 const DEFAULT_EVAL_HOLDOUT_DAYS = 42;
+// #44: what a public answer names itself owned by — "attributed to the
+// owner's duo... not to the owner" (AC1) still needs *some* name for whose
+// duo it is. A generic, honest default rather than inventing a real one:
+// nothing upstream of this config (v1-spec.md's checked-in-file convention)
+// carries the owner's actual name for the *personal* duo the way
+// shared-duo/persona.json does for the shared one.
+const DEFAULT_OWNER_NAME = "the owner";
 // #36: the hand-labelled relevance-gate corpus, checked into the repo like
 // duo/directory.json and shared-duo/persona.json — its own top-level
 // directory since it's neither the encrypted store (data/) nor the
@@ -68,6 +75,8 @@ export interface DuoConfig {
   classificationCeiling: string;
   /** Directory for human-readable, git-versioned derived output (topics.json, rules/*.md, voice.md). Defaults to "duo". Never encrypted, never purged by `duo purge`. */
   duoDir: string;
+  /** #44: the name a public answer attributes itself to being owned by. Defaults to "the owner" — not a suppression knob (there is no config that removes attribution entirely, only what name it carries). */
+  ownerName: string;
   ollama: {
     /** Ollama HTTP host. Defaults to "http://localhost:11434". */
     host: string;
@@ -116,6 +125,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
     storePath: env.DUO_STORE_PATH || DEFAULT_STORE_PATH,
     classificationCeiling: env.DUO_CLASSIFICATION_CEILING || DEFAULT_CLASSIFICATION_CEILING,
     duoDir: env.DUO_DIR || DEFAULT_DUO_DIR,
+    ownerName: env.DUO_OWNER_NAME || DEFAULT_OWNER_NAME,
     ollama: {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
       model: env.DUO_OLLAMA_MODEL || undefined,

@@ -5,6 +5,7 @@ import type { DraftSource } from "../drafting/draft-log.js";
 import type { ConfidenceResult } from "../drafting/confidence.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { resolveAutonomyForAnswering } from "../trust/demotion.js";
+import { withPublicAttribution } from "./attribution.js";
 import { appendPublicAnswerLogEntry } from "./public-answer-log.js";
 
 /**
@@ -38,10 +39,13 @@ export interface PublicAnswered {
   readonly kind: "answered";
   readonly draftId: string;
   readonly logEntryId: string;
+  /** The full text posted publicly — the generated answer, its sources, and its attribution (#44 AC1/AC3), already composed; there is nothing left for a caller to append. */
   readonly text: string;
   readonly sources: readonly DraftSource[];
   readonly confidence: ConfidenceResult;
   readonly topicId: string;
+  /** Age, in days, of the freshest evidence behind this answer — null when none carried a usable timestamp. Also stated in `text` itself (#44 AC1); exposed here too for a caller that wants it structured. */
+  readonly evidenceAgeDays: number | null;
 }
 
 export interface PublicPassedOn {
@@ -94,6 +98,13 @@ export type PublicAnswerOutcome = PublicAnswered | PublicPassedOn | PublicDeclin
  * Any of those failing means the draft stays exactly what #32 already made
  * it — visible only to the owner — and the asker is told their question has
  * been passed on, worded per which case applied.
+ *
+ * Every one of the three return paths is composed through `withPublicAttribution`
+ * before it is logged or returned (#44 AC1/AC2/AC3) — labelled as the
+ * owner's duo speaking, never the owner, with confidence and evidence age
+ * stated for an actual answer, and each source named as either the owner's
+ * own standing order or merely retrieved. There is no parameter here, and
+ * nothing read from configuration, that skips this step for any outcome.
  */
 export async function answerPublicly(
   storePath: string,
@@ -104,6 +115,7 @@ export async function answerPublicly(
   embeddingProvider: EmbeddingProvider,
   inferenceProvider: InferenceProvider | undefined,
   confidenceConfig: DuoConfig["confidence"],
+  ownerName: string,
 ): Promise<PublicAnswerOutcome> {
   const pipelineResult = await draftReply(
     storePath,
@@ -119,7 +131,7 @@ export async function answerPublicly(
 
   if (pipelineResult.kind === "escalation") {
     const outcome = pipelineResult.refused ? "declined_refused" : "passed_on";
-    const message = pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE;
+    const message = withPublicAttribution(pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
       askerRef,
@@ -145,39 +157,45 @@ export async function answerPublicly(
   // explicitly here means the "answered" path past this point never has to
   // assume that invariant silently holds.
   if (autonomy.level !== "auto" || topicId === undefined) {
+    const message = withPublicAttribution(PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
       askerRef,
       topicId: topicId ?? null,
       outcome: "passed_on",
-      text: PUBLIC_PASSED_ON_MESSAGE,
+      text: message,
       draftId: pipelineResult.draftId,
     });
     return {
       kind: "passed_on",
       draftId: pipelineResult.draftId,
       logEntryId,
-      message: PUBLIC_PASSED_ON_MESSAGE,
+      message,
       topicId,
       ownerNotice: autonomy.demotionNotice,
     };
   }
 
+  const text = withPublicAttribution(pipelineResult.text, ownerName, pipelineResult.sources, {
+    confidence: pipelineResult.confidence.score,
+    evidenceAgeDays: pipelineResult.evidenceAgeDays,
+  });
   const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
     question,
     askerRef,
     topicId,
     outcome: "answered",
-    text: pipelineResult.text,
+    text,
     draftId: pipelineResult.draftId,
   });
   return {
     kind: "answered",
     draftId: pipelineResult.draftId,
     logEntryId,
-    text: pipelineResult.text,
+    text,
     sources: pipelineResult.sources,
     confidence: pipelineResult.confidence,
     topicId,
+    evidenceAgeDays: pipelineResult.evidenceAgeDays,
   };
 }
