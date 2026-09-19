@@ -25,7 +25,7 @@ function record(overrides: Record<string, unknown> = {}): Record<string, unknown
     timestamp: "2026-01-01T00:00:00.000Z",
     threadId: "thread-1",
     audience: "channel",
-    classification: null,
+    classification: "unknown",
     topics: [],
     ...overrides,
   };
@@ -42,14 +42,14 @@ describe("records operations require an initialized store", () => {
 });
 
 describe("writeRecords / getRecord — records are stored and retrievable", () => {
-  it("writes a batch and retrieves each by id with every field intact, including classification as unset", () => {
+  it("writes a batch and retrieves each by id with every field intact, including classification as unknown", () => {
     const storePath = initStore();
     const written = writeRecords(storePath, PASSPHRASE, [record({ id: "rec-1" }), record({ id: "rec-2", text: "a second question" })]);
     expect(written).toEqual({ written: 2, skipped: 0 });
 
     const fetched = getRecord(storePath, PASSPHRASE, "rec-1");
     expect(fetched).toEqual(record({ id: "rec-1" }));
-    expect(fetched?.classification).toBeNull();
+    expect(fetched?.classification).toBe("unknown");
   });
 
   it("returns undefined for an id that was never written", () => {

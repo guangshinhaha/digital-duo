@@ -1,6 +1,6 @@
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import type { IngestRecord, RecordAudience, RecordAuthor, RecordKind } from "./record.js";
+import type { IngestRecord, RecordAudience, RecordAuthor, RecordClassification, RecordKind } from "./record.js";
 import { parseRecord } from "./record.js";
 
 /**
@@ -48,7 +48,7 @@ interface RecordRow {
   timestamp: string;
   thread_id: string | null;
   audience: string;
-  classification: string | null;
+  classification: string;
   topics: string;
 }
 
@@ -63,7 +63,7 @@ function rowToRecord(row: RecordRow): IngestRecord {
     timestamp: row.timestamp,
     threadId: row.thread_id,
     audience: row.audience as RecordAudience,
-    classification: row.classification,
+    classification: row.classification as RecordClassification,
     topics: JSON.parse(row.topics) as string[],
   };
 }
@@ -153,6 +153,47 @@ export function listRecords(storePath: string, passphrase: string): IngestRecord
     ensureRecordsSchema(db);
     const rows = db.prepare(`SELECT * FROM records`).all() as unknown as RecordRow[];
     return rows.map(rowToRecord);
+  });
+}
+
+export interface DeleteRecordsResult {
+  /** Records actually removed — ids in `ids` that didn't exist are simply not counted, not an error. */
+  removed: number;
+}
+
+/**
+ * Removes records by id from both `records` and its FTS5 shadow, and best-
+ * effort from `record_embeddings` (a store that has never run `duo embed`
+ * has no such table yet, which is not a failure here — deleting from a
+ * table that was never created is a no-op, not an error). Generic by
+ * design: #48's ceiling re-evaluation (src/permissions/classification.ts)
+ * is its first caller, but nothing here is classification-specific.
+ */
+export function deleteRecords(storePath: string, passphrase: string, ids: readonly string[]): DeleteRecordsResult {
+  if (ids.length === 0) {
+    return { removed: 0 };
+  }
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureRecordsSchema(db);
+    const deleteRecord = db.prepare(`DELETE FROM records WHERE id = ?`);
+    const deleteFts = db.prepare(`DELETE FROM records_fts WHERE id = ?`);
+    let removed = 0;
+    for (const id of ids) {
+      const result = deleteRecord.run(id);
+      if (result.changes > 0) {
+        deleteFts.run(id);
+        removed += 1;
+      }
+    }
+    try {
+      const deleteEmbedding = db.prepare(`DELETE FROM record_embeddings WHERE record_id = ?`);
+      for (const id of ids) {
+        deleteEmbedding.run(id);
+      }
+    } catch {
+      // record_embeddings doesn't exist in this store yet — nothing to clean up.
+    }
+    return { removed };
   });
 }
 

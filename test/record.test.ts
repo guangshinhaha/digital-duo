@@ -16,11 +16,22 @@ function sampleInput(overrides: Partial<RecordInput> = {}): RecordInput {
 }
 
 describe("createRecord", () => {
-  it("fills id, classification (unset), and topics (empty) from adapter input", () => {
+  it("fills id, classification (unknown absent a marking), and topics (empty) from adapter input", () => {
     const record = createRecord(sampleInput());
-    expect(record.classification).toBeNull();
+    expect(record.classification).toBe("unknown");
     expect(record.topics).toEqual([]);
     expect(record.id).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("captures a classification marking off the record's first line, per level", () => {
+    expect(createRecord(sampleInput({ text: "RESTRICTED\nthe rest of the message" })).classification).toBe("restricted");
+    expect(createRecord(sampleInput({ text: "[CONFIDENTIAL]: budget figures below" })).classification).toBe("confidential");
+    expect(createRecord(sampleInput({ text: "Official (Open): fine to share" })).classification).toBe("official_open");
+    expect(createRecord(sampleInput({ text: "secret:" })).classification).toBe("secret");
+  });
+
+  it("never mistakes a colloquial mention of a level for a marking", () => {
+    expect(createRecord(sampleInput({ text: "let's keep this confidential between us" })).classification).toBe("unknown");
   });
 
   it("is deterministic: the same input always yields the same id", () => {

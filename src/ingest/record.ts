@@ -12,6 +12,28 @@ export const RECORD_AUDIENCES = ["private", "dm", "channel", "public"] as const;
 export type RecordAudience = (typeof RECORD_AUDIENCES)[number];
 
 /**
+ * The Singapore GSCS tiers this repo's classification model is built on
+ * (concept.md §5, v1-tech-design.md §2's "Official (Open)" reference),
+ * ordered ascending by sensitivity. #48 reads these off source material; it
+ * never assigns or invents them (out of scope: "the duo respects
+ * classification, it does not decide it").
+ */
+export const CLASSIFICATION_LEVELS = ["official_open", "official_closed", "restricted", "confidential", "secret"] as const;
+export type ClassificationLevel = (typeof CLASSIFICATION_LEVELS)[number];
+
+/**
+ * What a record's `classification` field may hold: one of the marked
+ * levels above, or `"unknown"` when no marking was found. `"unknown"` is
+ * deliberately not a sixth level in the ordered hierarchy — it's a
+ * separate state with its own rule (see detectClassification and
+ * src/permissions/classification.ts's isVisibleToClearance): #48's AC is
+ * explicit that unmarked material must never default to the most
+ * permissive value.
+ */
+export const RECORD_CLASSIFICATIONS = [...CLASSIFICATION_LEVELS, "unknown"] as const;
+export type RecordClassification = (typeof RECORD_CLASSIFICATIONS)[number];
+
+/**
  * The normalisation layer's one shape (import-adapters.md §2): every
  * adapter maps its source to this and stops, so derivation never has to
  * know which source a record came from. Named `IngestRecord`, not `Record`
@@ -28,8 +50,8 @@ export interface IngestRecord {
   readonly timestamp: string;
   readonly threadId: string | null;
   readonly audience: RecordAudience;
-  /** Unset by default — field present, logic deferred to the phase-2 permission model. */
-  readonly classification: string | null;
+  /** Captured at ingest (#48) by reading a marking off the record's own text — never assigned. "unknown" when no marking is found, not defaulted to the most permissive level. */
+  readonly classification: RecordClassification;
   /** Always derived downstream; never read from a source. Empty at ingest time. */
   readonly topics: readonly string[];
 }
@@ -76,6 +98,45 @@ function asOneOf<T extends string>(value: unknown, options: readonly T[], field:
   return value as T;
 }
 
+const MARKING_LABELS: Readonly<Record<string, ClassificationLevel>> = {
+  "official (open)": "official_open",
+  "official(open)": "official_open",
+  "official open": "official_open",
+  "official (closed)": "official_closed",
+  "official(closed)": "official_closed",
+  "official closed": "official_closed",
+  restricted: "restricted",
+  confidential: "confidential",
+  secret: "secret",
+};
+
+/**
+ * Reads a classification marking off a record's own first line — the
+ * conventional place a GSCS marking appears on a document or message
+ * (concept.md §5). Deliberately only the first line, and deliberately
+ * anchored at its start: matching the word "confidential" anywhere in a
+ * message body would flag ordinary colloquial use ("let's keep this
+ * confidential") as a real marking, which is a worse failure than missing
+ * one. A marking may still be followed by the message itself on the same
+ * line after a colon ("Restricted: see below") — only the part before the
+ * first colon is checked in that case; with no colon, the whole first line
+ * must match exactly, since there's no delimiter separating a marking from
+ * trailing prose. No recognisable marking means `"unknown"` — never a
+ * default to `"official_open"`, the most permissive value (#48 AC2).
+ */
+export function detectClassification(text: string): RecordClassification {
+  const firstLine = (text.split("\n", 1)[0] ?? "").trim();
+  const colonIndex = firstLine.indexOf(":");
+  const candidate = colonIndex === -1 ? firstLine : firstLine.slice(0, colonIndex);
+  const normalized = candidate
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+  return MARKING_LABELS[normalized] ?? "unknown";
+}
+
 function asStringArray(value: unknown, field: string): readonly string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     fail(field, `expected an array of strings, got ${JSON.stringify(value)}`);
@@ -105,7 +166,7 @@ export function parseRecord(value: unknown): IngestRecord {
     timestamp: asNonEmptyString(raw.timestamp, "timestamp"),
     threadId: asNullableString(raw.threadId, "threadId"),
     audience: asOneOf(raw.audience, RECORD_AUDIENCES, "audience"),
-    classification: asNullableString(raw.classification ?? null, "classification"),
+    classification: asOneOf(raw.classification, RECORD_CLASSIFICATIONS, "classification"),
     topics: raw.topics === undefined ? [] : asStringArray(raw.topics, "topics"),
   };
 }
@@ -126,7 +187,7 @@ export function computeRecordId(input: RecordInput): string {
     .digest("hex");
 }
 
-/** Builds a fully-formed IngestRecord from adapter input: fills id (content-hashed), classification (unset), and topics (empty at ingest). */
+/** Builds a fully-formed IngestRecord from adapter input: fills id (content-hashed), classification (detected off `input.text`, "unknown" absent a marking — #48), and topics (empty at ingest). */
 export function createRecord(input: RecordInput): IngestRecord {
-  return { ...input, id: computeRecordId(input), classification: null, topics: [] };
+  return { ...input, id: computeRecordId(input), classification: detectClassification(input.text), topics: [] };
 }

@@ -8,12 +8,20 @@ const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 // — unlike the completion model, this doesn't wait on G1, so it gets a real
 // default rather than requiring explicit configuration.
 const DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text";
+// The classification ceiling is policy-set, not owner-set (#48 AC: "set by
+// configuration under policy control, not by the owner in the UI"), and
+// defaults to the most conservative real-world default rather than the
+// most permissive (v1-tech-design.md §2: a pilot corpus is "probably ...
+// Official (Open) only").
+const DEFAULT_CLASSIFICATION_CEILING = "official_open";
 
 export interface DuoConfig {
   /** Raw configured provider name, or undefined when DUO_PROVIDER is unset. */
   providerName: string | undefined;
   /** Path to the local store file. Defaults to "data/duo.db". */
   storePath: string;
+  /** Raw configured classification ceiling (DUO_CLASSIFICATION_CEILING). Defaults to "official_open". Validated at the point of use (parseClassificationCeiling), same pattern as providerName — a bad value is a usage-time error, not a load-time one, so `duo status` can always report it raw. */
+  classificationCeiling: string;
   /** Directory for human-readable, git-versioned derived output (topics.json, rules/*.md, voice.md). Defaults to "duo". Never encrypted, never purged by `duo purge`. */
   duoDir: string;
   ollama: {
@@ -37,6 +45,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
   return {
     providerName: env.DUO_PROVIDER || undefined,
     storePath: env.DUO_STORE_PATH || DEFAULT_STORE_PATH,
+    classificationCeiling: env.DUO_CLASSIFICATION_CEILING || DEFAULT_CLASSIFICATION_CEILING,
     duoDir: env.DUO_DIR || DEFAULT_DUO_DIR,
     ollama: {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,

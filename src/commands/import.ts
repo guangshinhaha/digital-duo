@@ -3,6 +3,7 @@ import type { DuoConfig } from "../config.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { MalformedTranscriptError, parsePastedTranscript } from "../ingest/adapters/paste.js";
 import { ingestRecords } from "../ingest/two-phase.js";
+import { parseClassificationCeiling } from "../permissions/classification.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -26,6 +27,7 @@ export interface ClaudeImportSummary {
   workRelevantConversationCount: number;
   written: number;
   skipped: number;
+  discardedAboveCeiling: number;
 }
 
 /**
@@ -42,15 +44,23 @@ export function runImportClaude(path: string, config: DuoConfig, env: NodeJS.Pro
 
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  const outcome = ingestRecords(config.storePath, passphrase, records);
+  const ceiling = parseClassificationCeiling(config.classificationCeiling);
+  const outcome = ingestRecords(config.storePath, passphrase, records, { ceiling });
 
-  return { conversationCount, workRelevantConversationCount, written: outcome.written, skipped: outcome.alreadyPresent };
+  return {
+    conversationCount,
+    workRelevantConversationCount,
+    written: outcome.written,
+    skipped: outcome.alreadyPresent,
+    discardedAboveCeiling: outcome.discardedAboveCeiling,
+  };
 }
 
 export interface PasteImportSummary {
   workRelevant: boolean;
   written: number;
   skipped: number;
+  discardedAboveCeiling: number;
 }
 
 export function runImportPaste(path: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PasteImportSummary {
@@ -58,12 +68,13 @@ export function runImportPaste(path: string, config: DuoConfig, env: NodeJS.Proc
   const { records, workRelevant } = parsePastedTranscript(raw);
 
   if (!workRelevant) {
-    return { workRelevant: false, written: 0, skipped: 0 };
+    return { workRelevant: false, written: 0, skipped: 0, discardedAboveCeiling: 0 };
   }
 
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  const outcome = ingestRecords(config.storePath, passphrase, records);
+  const ceiling = parseClassificationCeiling(config.classificationCeiling);
+  const outcome = ingestRecords(config.storePath, passphrase, records, { ceiling });
 
-  return { workRelevant: true, written: outcome.written, skipped: outcome.alreadyPresent };
+  return { workRelevant: true, written: outcome.written, skipped: outcome.alreadyPresent, discardedAboveCeiling: outcome.discardedAboveCeiling };
 }

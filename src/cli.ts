@@ -6,6 +6,7 @@ import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeri
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
+import { runEnforceCeiling } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runStatus } from "./commands/status.js";
@@ -92,7 +93,8 @@ importCommand
     try {
       const summary = runImportClaude(path, config);
       console.log(
-        `Imported ${summary.written} record(s) (${summary.skipped} already present) from ` +
+        `Imported ${summary.written} record(s) (${summary.skipped} already present, ` +
+          `${summary.discardedAboveCeiling} above the classification ceiling) from ` +
           `${summary.workRelevantConversationCount}/${summary.conversationCount} work-relevant conversation(s).`,
       );
     } catch (error) {
@@ -112,7 +114,10 @@ importCommand
         console.log("Transcript judged not work-relevant; nothing imported.");
         return;
       }
-      console.log(`Imported ${summary.written} record(s) (${summary.skipped} already present).`);
+      console.log(
+        `Imported ${summary.written} record(s) (${summary.skipped} already present, ` +
+          `${summary.discardedAboveCeiling} above the classification ceiling).`,
+      );
     } catch (error) {
       reportError(error);
     }
@@ -240,6 +245,28 @@ deriveCommand
         result.written
           ? `Wrote duo/voice.md from ${result.stats.sampleSize} sample(s).`
           : "duo/voice.md already exists; re-run with --force to overwrite it.",
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The permission model (docs/concept.md §5, epic e10): classification
+// capture/ceiling enforcement lands with #48; asker resolution, permission-
+// scoped answering, and the audit log land across #49-#51.
+const permissionsCommand = program.command("permissions").description("Classification, asker permissions, and the audit log");
+
+permissionsCommand
+  .command("enforce-ceiling")
+  .description("Re-evaluate the store against the currently configured classification ceiling, removing anything above it")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const result = runEnforceCeiling(config);
+      console.log(
+        result.removed === 0
+          ? "No records sit above the configured ceiling; nothing removed."
+          : `Removed ${result.removed} record(s) above the configured ceiling.`,
       );
     } catch (error) {
       reportError(error);

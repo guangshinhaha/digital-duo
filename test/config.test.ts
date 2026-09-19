@@ -11,6 +11,7 @@ describe("loadConfig", () => {
     expect(config.providerName).toBeUndefined();
     expect(config.ollama.model).toBeUndefined();
     expect(config.ollama.embeddingModel).toBe("nomic-embed-text");
+    expect(config.classificationCeiling).toBe("official_open");
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -21,10 +22,12 @@ describe("loadConfig", () => {
       DUO_OLLAMA_HOST: "http://h:1",
       DUO_OLLAMA_MODEL: "llama3",
       DUO_OLLAMA_EMBEDDING_MODEL: "custom-embed",
+      DUO_CLASSIFICATION_CEILING: "secret",
     });
     expect(config).toEqual({
       providerName: "ollama",
       storePath: "/tmp/x.db",
+      classificationCeiling: "secret",
       duoDir: "/tmp/duo-out",
       ollama: { host: "http://h:1", model: "llama3", embeddingModel: "custom-embed" },
     });
