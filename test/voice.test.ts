@@ -81,6 +81,24 @@ describe("runVoiceProfile", () => {
     expect(readFileSync(path, "utf8")).not.toContain("Hand-edited voice notes");
   });
 
+  it("carries an existing '## Corrections' section forward across a force overwrite, instead of discarding it (#37-39's log)", async () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [record({ text: "five days per quarter" })]);
+    await runVoiceProfile(storePath, PASSPHRASE, duoDir());
+
+    const { writeFileSync } = await import("node:fs");
+    const path = join(duoDir(), "voice.md");
+    const correctionEntry = '- (2026-01-01T00:00:00.000Z) draft "a" -> sent "b" (question: "q", draft d1)';
+    writeFileSync(path, `# Voice profile\n\nsome stats\n\n## Corrections\n\n${correctionEntry}\n`);
+
+    const withForce = await runVoiceProfile(storePath, PASSPHRASE, duoDir(), { force: true });
+    expect(withForce.written).toBe(true);
+    const content = readFileSync(path, "utf8");
+    expect(content).toContain("## Corrections");
+    expect(content).toContain(correctionEntry);
+    expect(content).toMatch(/^# Voice profile/); // the fresh statistical/register content still leads the file
+  });
+
   it("uses a supplied register describer when given", async () => {
     const storePath = initStore();
     writeRecords(storePath, PASSPHRASE, [record({ text: "five days per quarter" })]);
