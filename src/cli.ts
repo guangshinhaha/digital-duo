@@ -7,13 +7,18 @@ import {
   runActionsDiscard,
   runActionsList,
   runActionsListDiscards,
+  runActionsListPending,
   runActionsListPrepared,
+  runActionsListReversible,
+  runActionsPerform,
   runActionsPrepare,
   runActionsRegister,
   runActionsT4Confirm,
   runActionsT4Pending,
   runActionsT4Request,
+  runActionsUndo,
 } from "./commands/actions.js";
+import { PENDING_ACTION_STATUSES } from "./actions/approvals.js";
 import { PREPARED_ARTIFACT_KINDS } from "./actions/preparation.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
@@ -1439,6 +1444,91 @@ actionsCommand
       }
       for (const signal of signals) {
         console.log(`[${signal.id}] ${signal.discardedAt} (${signal.kind}) ${signal.title}${signal.note ? ` — ${signal.note}` : ""}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// T2 reversible internal actions (docs/concept.md §6, #58): the small
+// mechanical things run without asking once granted, always announced,
+// always undoable — a target that turns out not to be revertible here
+// escalates as T3 instead of running unrecoverably.
+actionsCommand
+  .command("perform")
+  .description("Run a granted T2 action if it's genuinely reversible here; escalates instead of running otherwise (#58 AC1/AC3)")
+  .requiredOption("--action <actionId>", "the T2-registered action's id")
+  .requiredOption("--topic <topicId>", "the topic this concerns")
+  .requiredOption("--description <text>", "what this action does, in plain words")
+  .option("--not-revertible", "this specific target cannot actually be undone here — escalates as T3 instead of running (#58 AC3)")
+  .action((options: { action: string; topic: string; description: string; notRevertible?: boolean }) => {
+    const config = loadConfig();
+    try {
+      const outcome = runActionsPerform(options, config);
+      if (outcome.status === "performed") {
+        console.log(outcome.announcement);
+      } else if (outcome.status === "escalated") {
+        console.log(`${outcome.reason} Pending action [${outcome.pendingAction.id}] awaits the owner.`);
+      } else {
+        console.error(`Failed: ${outcome.error}. Recorded as [${outcome.record.id}]; nothing partial was left in place, and this is escalated to you.`);
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("undo")
+  .description("Undo an active reversible action, restoring the prior state completely (#58 AC2)")
+  .argument("<id>", "the reversible action's id, printed by `duo actions perform`")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      const record = runActionsUndo(id, config);
+      console.log(`Reverted [${record.id}]: ${record.description}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("reversible")
+  .description("List every reversible action performed, and whether it's still active, reverted, or failed")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const records = runActionsListReversible(config);
+      if (records.length === 0) {
+        console.log("No reversible action performed yet.");
+        return;
+      }
+      for (const record of records) {
+        console.log(`[${record.id}] (${record.status}) ${record.description}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("pending")
+  .description("List every action escalated to the owner — a T2 that couldn't run autonomously, or a T3 draft-and-approve item")
+  .option("--status <status>", `narrow to one status: ${PENDING_ACTION_STATUSES.join(", ")}`)
+  .action((options: { status?: string }) => {
+    const config = loadConfig();
+    if (options.status && !(PENDING_ACTION_STATUSES as readonly string[]).includes(options.status)) {
+      reportError(new Error(`--status must be one of: ${PENDING_ACTION_STATUSES.join(", ")}`));
+      return;
+    }
+    try {
+      const items = runActionsListPending(options.status as (typeof PENDING_ACTION_STATUSES)[number] | undefined, config);
+      if (items.length === 0) {
+        console.log("Nothing pending.");
+        return;
+      }
+      for (const item of items) {
+        console.log(`[${item.id}] ${item.tier} (${item.status}) ${item.reasoning} — topic ${item.topicId}`);
       }
     } catch (error) {
       reportError(error);

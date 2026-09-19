@@ -17,6 +17,14 @@ import {
   type PreparedArtifact,
   type PreparedArtifactKind,
 } from "../actions/preparation.js";
+import { listPendingActions, type PendingAction, type PendingActionStatus } from "../actions/approvals.js";
+import {
+  listReversibleActions,
+  performReversibleAction,
+  undoReversibleAction,
+  type PerformReversibleOutcome,
+  type ReversibleActionRecord,
+} from "../actions/reversible.js";
 import { confirmAndExecuteT4Request, createT4Request, listPendingT4Requests, type PendingT4Request } from "../actions/t4-guard.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
@@ -161,4 +169,50 @@ export function runActionsListDiscards(config: DuoConfig, env: NodeJS.ProcessEnv
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return listDiscardSignals(config.storePath, passphrase);
+}
+
+/**
+ * Implements `duo actions perform` (#58 AC1/AC3/AC4). There is genuinely
+ * nothing to perform/roll-back yet (implementing any specific action is
+ * out of scope, per #56), so this wiring's `perform`/`rollbackPartial`
+ * callbacks are no-op placeholders for whatever a future connector
+ * supplies — the mechanism this exercises (registry gate, autonomy gate,
+ * revertibility gate, escalate-or-run, undo) is real.
+ */
+export function runActionsPerform(
+  options: { action: string; topic: string; description: string; notRevertible?: boolean },
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): PerformReversibleOutcome {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return performReversibleAction(config.storePath, passphrase, config.duoDir, {
+    actionId: options.action,
+    topicId: options.topic,
+    description: options.description,
+    canRevertHere: !options.notRevertible,
+    perform: () => {},
+    rollbackPartial: () => {},
+  });
+}
+
+/** Implements `duo actions undo <id>` (#58 AC2): restores the prior state completely and records the reversal. */
+export function runActionsUndo(id: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): ReversibleActionRecord {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return undoReversibleAction(config.storePath, passphrase, id, () => {});
+}
+
+/** Implements `duo actions reversible` — every reversible action performed, and whether it's still active, reverted, or failed. */
+export function runActionsListReversible(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): ReversibleActionRecord[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listReversibleActions(config.storePath, passphrase);
+}
+
+/** Implements `duo actions pending [--status <status>]` — every action escalated to the owner (a T2 that couldn't run autonomously, or any T3 draft-and-approve item), oldest first. */
+export function runActionsListPending(status: PendingActionStatus | undefined, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PendingAction[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listPendingActions(config.storePath, passphrase, status);
 }
