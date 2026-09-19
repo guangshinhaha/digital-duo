@@ -109,6 +109,13 @@ export function serializeRuleFile(rule: Rule, evidence: readonly string[]): stri
     // itself and durable across the next `duo derive sync` ("files win").
     `review_status: ${rule.reviewStatus}`,
     `origin: ${rule.origin}`,
+    // #39: null for every rule except a correction's — written out
+    // explicitly (rather than omitted) so a superseded rule's file visibly
+    // says so to anyone reading `duo/rules/` directly (AC3), not just to
+    // code that queries the DB.
+    `superseded_by: ${yamlScalar(rule.supersededByRuleId)}`,
+    `correction_draft_id: ${yamlScalar(rule.correctionDraftId)}`,
+    `correction_question: ${yamlScalar(rule.correctionQuestion)}`,
     evidenceBlock,
   ].join("\n");
   return `---\n${frontmatter}\n---\n\n${rule.text}\n`;
@@ -169,6 +176,9 @@ export function parseRuleFile(filePath: string, content: string): ParsedRuleFile
   const lastConfirmedAtRaw = fields.get("last_confirmed_at");
   const reviewStatusRaw = fields.get("review_status");
   const originRaw = fields.get("origin");
+  const supersededByRaw = fields.get("superseded_by");
+  const correctionDraftIdRaw = fields.get("correction_draft_id");
+  const correctionQuestionRaw = fields.get("correction_question");
 
   if (!id) {
     throw new MalformedRuleFileError(filePath, 'missing required field "id"');
@@ -218,6 +228,12 @@ export function parseRuleFile(filePath: string, content: string): ParsedRuleFile
       lastConfirmedAt: lastConfirmedAtRaw === undefined || lastConfirmedAtRaw === "null" ? null : lastConfirmedAtRaw,
       reviewStatus: (reviewStatusRaw as RuleReviewStatus | undefined) ?? "pending",
       origin: (originRaw as RuleOrigin | undefined) ?? "derived",
+      // #39: absent (a file written before #39, or a hand-edit that never
+      // touches these) and the literal word "null" both mean null — same
+      // convention as last_confirmed_at above.
+      supersededByRuleId: supersededByRaw === undefined || supersededByRaw === "null" ? null : supersededByRaw,
+      correctionDraftId: correctionDraftIdRaw === undefined || correctionDraftIdRaw === "null" ? null : correctionDraftIdRaw,
+      correctionQuestion: correctionQuestionRaw === undefined || correctionQuestionRaw === "null" ? null : correctionQuestionRaw,
       text: body,
     },
     evidence,

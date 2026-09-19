@@ -481,10 +481,11 @@ correctionsCommand
       }
       if (review.conflicts.length > 0) {
         console.log("");
-        console.log(`Conflicts with an active rule (${review.conflicts.length}) — resolve before approving:`);
+        console.log(`Conflicts with an active rule (${review.conflicts.length}) — choose one before approving:`);
         for (const { candidate, conflictingRule } of review.conflicts) {
           console.log(`  [${candidate.id}] proposes: "${candidate.proposedText}"`);
           console.log(`  [${conflictingRule.id}] active rule says: "${conflictingRule.text}"`);
+          console.log(`  duo corrections approve ${candidate.id} --supersedes ${conflictingRule.id}   (retires [${conflictingRule.id}])`);
         }
       }
     } catch (error) {
@@ -494,12 +495,16 @@ correctionsCommand
 
 correctionsCommand
   .command("approve")
-  .description("Approve a pending candidate: writes to duo/rules/ (substance) or duo/voice.md (style), then marks it approved (#38 AC1)")
+  .description(
+    "Approve a pending candidate: writes to duo/rules/ (substance) or duo/voice.md (style), then marks it approved (#38 AC1). " +
+      "A substance candidate flagged as conflicting with an active rule needs --supersedes <ruleId> naming which rule it replaces (#39 AC3)",
+  )
   .argument("<id>", "the candidate's id, from `duo corrections review`")
-  .action((id: string) => {
+  .option("--supersedes <ruleId>", "the active rule this candidate replaces — retires it (marked superseded) instead of leaving both active")
+  .action((id: string, options: { supersedes?: string }) => {
     const config = loadConfig();
     try {
-      const result = runCorrectionsApprove(id, config);
+      const result = runCorrectionsApprove(id, config, { supersedesRuleId: options.supersedes });
       console.log(
         result.kind === "style"
           ? `Approved — appended to ${config.duoDir}/voice.md.`

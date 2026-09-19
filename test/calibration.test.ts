@@ -81,6 +81,9 @@ async function seedApprovedRule(storePath: string, topicId: string, ruleText: st
         lastConfirmedAt: new Date().toISOString(),
         reviewStatus: "approved",
         origin: "derived",
+        supersededByRuleId: null,
+        correctionDraftId: null,
+        correctionQuestion: null,
       },
       [],
     );

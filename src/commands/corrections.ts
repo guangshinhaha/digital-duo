@@ -1,5 +1,12 @@
 import type { DuoConfig } from "../config.js";
-import { approveCandidate, listPendingReview, rejectCandidate, type ApproveCandidateResult, type PendingReview } from "../corrections/review.js";
+import {
+  approveCandidate,
+  listPendingReview,
+  rejectCandidate,
+  type ApproveCandidateOptions,
+  type ApproveCandidateResult,
+  type PendingReview,
+} from "../corrections/review.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -10,11 +17,16 @@ export function runCorrectionsReview(config: DuoConfig, env: NodeJS.ProcessEnv =
   return listPendingReview(config.storePath, passphrase, config.duoDir);
 }
 
-/** Implements `duo corrections approve <id>` (#38 AC1). */
-export function runCorrectionsApprove(id: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): ApproveCandidateResult {
+/** Implements `duo corrections approve <id> [--supersedes <ruleId>]` (#38 AC1, #39 AC3). */
+export function runCorrectionsApprove(
+  id: string,
+  config: DuoConfig,
+  options: ApproveCandidateOptions = {},
+  env: NodeJS.ProcessEnv = process.env,
+): ApproveCandidateResult {
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  return approveCandidate(config.storePath, passphrase, config.duoDir, id);
+  return approveCandidate(config.storePath, passphrase, config.duoDir, id, options);
 }
 
 /** Implements `duo corrections reject <id>` (#38 AC2). */
