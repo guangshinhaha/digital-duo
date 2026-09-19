@@ -15,7 +15,7 @@ import type { TrustTier } from "./grid.js";
  * This ledger is the trust epic's own audit trail, purpose-built for its
  * own event shape.
  */
-export const TRUST_LEDGER_EVENT_TYPES = ["instance", "granted", "promotion_accepted", "promotion_declined", "demoted"] as const;
+export const TRUST_LEDGER_EVENT_TYPES = ["instance", "granted", "promotion_accepted", "promotion_declined", "demoted", "revoked"] as const;
 export type TrustLedgerEventType = (typeof TRUST_LEDGER_EVENT_TYPES)[number];
 
 export interface TrustLedgerEntry {

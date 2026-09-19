@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
+import { runActionsAttempts, runActionsList, runActionsRegister } from "./commands/actions.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
@@ -1047,6 +1048,81 @@ calibrateCommand
             console.log(`    Corrected: ${mismatch.editedText}`);
           }
         }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The action registry (docs/concept.md §6, epic e12): every tool the duo
+// can reach is registered with its risk shape, and its tier is resolved
+// from that — never asserted directly. #56 is this choke point; #57-#60
+// are the tier-specific modules that route through it.
+const actionsCommand = program
+  .command("actions")
+  .description("The action registry: every tool the duo can reach, its derived tier, and every attempt to use one");
+
+actionsCommand
+  .command("register")
+  .description("Register (or re-register) an action with its risk shape. A tier rise on re-registration revokes any grid cell no longer covering it (#56 AC3)")
+  .argument("<actionId>", "a stable id for this action")
+  .requiredOption("--description <text>", "what this action does")
+  .requiredOption("--reversible <true|false>", "whether the effect can be fully undone")
+  .requiredOption("--obligates <true|false>", "whether it binds the owner to future work")
+  .requiredOption("--audience <audience>", "none, owner, internal, or external")
+  .requiredOption("--topics <ids>", "comma-separated topic ids this action can be exercised within")
+  .action((actionId: string, options: { description: string; reversible: string; obligates: string; audience: string; topics: string }) => {
+    const config = loadConfig();
+    try {
+      const result = runActionsRegister(
+        actionId,
+        { description: options.description, reversible: options.reversible, obligates: options.obligates, audience: options.audience, topics: options.topics },
+        config,
+      );
+      console.log(`Registered [${result.action.id}] at ${result.action.tier}${result.tierChanged ? ` (was ${result.previousTier})` : ""}.`);
+      if (result.lapsedGrants.length > 0) {
+        console.log(`${result.lapsedGrants.length} grant(s) lapsed, since the risk rose past what they covered:`);
+        for (const grant of result.lapsedGrants) {
+          console.log(`  [${grant.topicId}] ${grant.tier}: ${grant.previousLevel} -> ask`);
+        }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("list")
+  .description("List every registered action and its derived tier")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const actions = runActionsList(config);
+      if (actions.length === 0) {
+        console.log("No action is registered yet.");
+        return;
+      }
+      for (const action of actions) {
+        console.log(`[${action.id}] ${action.tier}  ${action.description} (topics: ${action.topicIds.join(", ") || "none"})`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+actionsCommand
+  .command("attempts")
+  .description("List every attempt to use an action, refused or resolved (#56 AC2, #60 AC3's owner-notified surface)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const attempts = runActionsAttempts(config);
+      if (attempts.length === 0) {
+        console.log("No action attempt recorded yet.");
+        return;
+      }
+      for (const attempt of attempts) {
+        console.log(`[${attempt.id}] ${attempt.createdAt} ${attempt.actionId} tier=${attempt.tier ?? "-"} ${attempt.outcome}`);
       }
     } catch (error) {
       reportError(error);
