@@ -6,3 +6,4 @@ duo-lifecycle-runtime/
 *.log
 .DS_Store
 .claude/
+*.tsbuildinfo

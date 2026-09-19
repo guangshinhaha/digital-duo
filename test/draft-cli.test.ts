@@ -165,6 +165,18 @@ describe("duo draft-outcome edited <sentText> — classifies the edit and queues
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/trivial/);
   });
+
+  it("rejects a whitespace-only sentText for \"edited\" — the daemon route's blank-edit guard also covers this CLI entry point (they share recordDraftOutcomeAndClassify)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const draftId = seedConfidentDraft(storePath, "is that right?", "Yes, that's correct.");
+
+    const result = await runCli(["draft-outcome", draftId, "edited", "   "], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/blank/i);
+  });
 });
 
 describe("duo draft — a refused subject escalates citing the refusal (#34 AC2)", () => {

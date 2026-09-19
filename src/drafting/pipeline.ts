@@ -111,6 +111,8 @@ export async function draftReply(
       escalationReason: reason,
       confidenceScore: 0,
       sources: [],
+      refused: true,
+      escalationThreshold: confidenceConfig.escalationThreshold,
     });
     return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
   }
@@ -139,6 +141,8 @@ export async function draftReply(
       escalationReason: reason,
       confidenceScore: 0,
       sources,
+      refused: false,
+      escalationThreshold: confidenceConfig.escalationThreshold,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence: undefined };
   }
@@ -187,6 +191,8 @@ export async function draftReply(
       escalationReason: reason,
       confidenceScore: confidence.score,
       sources,
+      refused: false,
+      escalationThreshold: confidenceConfig.escalationThreshold,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence };
   }
@@ -200,6 +206,8 @@ export async function draftReply(
     escalationReason: null,
     confidenceScore: confidence.score,
     sources,
+    refused: false,
+    escalationThreshold: confidenceConfig.escalationThreshold,
   });
   return {
     kind: "draft",

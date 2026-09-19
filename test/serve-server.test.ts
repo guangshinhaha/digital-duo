@@ -251,6 +251,29 @@ describe("createServer — routes", () => {
     expect(response.statusCode).toBe(404);
   });
 
+  it("POST /drafts/:id/outcome rejects a whitespace-only sentText for \"edited\" with 400, rather than classifying an emptied draft as a trivial style tweak", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "original draft text",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "edited", sentText: "   " },
+    });
+    expect(response.statusCode).toBe(400);
+
+    const stored = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(stored.json().outcome).toBeNull();
+  });
+
   it("POST /drafts/:id/answer queues a standing-order candidate for an escalated draft", async () => {
     const draftId = appendDraft(storePath, PASSPHRASE, {
       question: "q",
@@ -270,6 +293,67 @@ describe("createServer — routes", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toHaveProperty("candidateId");
+  });
+
+  it("an escalation leaves the pending queue once answered, instead of showing forever", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+
+    const before = await app.inject({ method: "GET", url: "/drafts?outcome=pending", headers: authHeader });
+    expect(before.json().map((d: { id: string }) => d.id)).toContain(draftId);
+
+    await app.inject({ method: "POST", url: `/drafts/${draftId}/answer`, headers: authHeader, payload: { answer: "the answer" } });
+
+    const after = await app.inject({ method: "GET", url: "/drafts?outcome=pending", headers: authHeader });
+    expect(after.json().map((d: { id: string }) => d.id)).not.toContain(draftId);
+  });
+
+  it("POST /drafts/:id/answer refuses a refused escalation with 409, not a queued candidate", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "this subject is refused",
+      confidenceScore: 0,
+      sources: [],
+      refused: true,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/answer`,
+      headers: authHeader,
+      payload: { answer: "an override answer" },
+    });
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("POST /drafts/:id/answer rejects a whitespace-only answer with 400, not a junk queued candidate", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/answer`,
+      headers: authHeader,
+      payload: { answer: "   " },
+    });
+    expect(response.statusCode).toBe(400);
   });
 
   it("GET /review is empty on a fresh store", async () => {

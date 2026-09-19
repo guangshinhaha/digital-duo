@@ -214,6 +214,29 @@ describe("draftReply — every call writes exactly one draft-log row", () => {
 
     expect(listDrafts(storePath, PASSPHRASE)).toHaveLength(2);
   });
+
+  it("persists refused: false and the configured threshold on a successful (non-escalated) draft", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const embeddingProvider = createFakeEmbeddingProvider();
+
+    const result = await draftReply(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", null, embeddingProvider, undefined, CONFIDENCE_CONFIG);
+    expect(result.kind).toBe("draft");
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.refused).toBe(false);
+    expect(stored?.escalationThreshold).toBe(CONFIDENCE_CONFIG.escalationThreshold);
+  });
+
+  it("persists refused: false and the configured threshold on a no-evidence escalation", async () => {
+    const storePath = initStore();
+    const embeddingProvider = createFakeEmbeddingProvider();
+
+    const result = await draftReply(storePath, PASSPHRASE, duoDir(), "what is the meaning of life", null, embeddingProvider, undefined, CONFIDENCE_CONFIG);
+    expect(result.kind).toBe("escalation");
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.refused).toBe(false);
+    expect(stored?.escalationThreshold).toBe(CONFIDENCE_CONFIG.escalationThreshold);
+  });
 });
 
 describe("draftReply — a thread of context can be supplied (#32 AC4)", () => {
@@ -279,6 +302,14 @@ describe("draftReply — a refused subject escalates without reasoning about it 
     expect(result.refused).toBe(true);
     expect(result.reason).toContain("vacation");
     expect(result.reason).toContain("duo/refusals.md");
+
+    // Persisted, not just returned — a client reading it back later (e.g.
+    // duo serve's GET /drafts) must be able to tell "won't" from "can't"
+    // without parsing escalationReason's text (client-tech-design.md's own
+    // rationale for why this is a stored field, not a client-side guess).
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.refused).toBe(true);
+    expect(stored?.escalationThreshold).toBe(CONFIDENCE_CONFIG.escalationThreshold);
   });
 
   it("never calls retrieval or the inference provider at all for a refused question", async () => {

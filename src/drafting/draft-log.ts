@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD } from "../config.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 
@@ -9,7 +10,31 @@ export interface DraftSource {
   readonly label: string;
 }
 
-export const DRAFT_OUTCOMES = ["sent", "edited", "discarded"] as const;
+/**
+ * The outcomes the *owner* can explicitly set — via `duo draft-outcome`
+ * or `POST /drafts/:id/outcome` — for a draft the pipeline was confident
+ * enough to answer. Deliberately does not include `escalation_answered`
+ * (below): that value must only ever be set by
+ * `standing-order-candidates.ts`'s own internal call, atomically with the
+ * candidate it records, never by a caller of the generic outcome route —
+ * an earlier version of this fix added it here instead and a caller could
+ * mark any draft (escalated or not, regardless of whether a candidate
+ * was ever queued) "answered" with no candidate to back it up.
+ */
+export const SETTABLE_DRAFT_OUTCOMES = ["sent", "edited", "discarded"] as const;
+export type SettableDraftOutcome = (typeof SETTABLE_DRAFT_OUTCOMES)[number];
+
+/**
+ * Every value `outcome` can hold once written, including
+ * `escalation_answered` — set only by `standing-order-candidates.ts`,
+ * atomically with the standing-order candidate it records, the moment
+ * the owner answers an escalated draft (#34 AC3). Before this existed, an
+ * answered escalation had no way to ever leave `outcome IS NULL`
+ * ("pending"), so a client's Review queue kept showing it forever, and
+ * reloading re-showed the answer box (client-side "already answered"
+ * state doesn't survive a remount), inviting a duplicate answer.
+ */
+export const DRAFT_OUTCOMES = [...SETTABLE_DRAFT_OUTCOMES, "escalation_answered"] as const;
 export type DraftOutcome = (typeof DRAFT_OUTCOMES)[number];
 
 /**
@@ -40,7 +65,45 @@ export interface DraftRecord {
    * recorded before this field existed.
    */
   readonly sentText: string | null;
+  /**
+   * True for a refused-subject escalation (#34 AC2), false for every
+   * other escalation and for a non-escalated draft. Persisted rather than
+   * reconstructed from `escalationReason`'s text, because that text is
+   * meant for a human to read, not for a caller to pattern-match — a
+   * future rewording of the refusal message must never silently change
+   * whether a client thinks a question was refused or just uncertain.
+   * Defaults to `false` for any draft recorded before this field existed.
+   */
+  readonly refused: boolean;
+  /**
+   * The composite-confidence escalation threshold in effect when this
+   * draft was generated (`DuoConfig["confidence"].escalationThreshold`)
+   * — persisted so a client can render a confidence indicator (e.g. a
+   * hairline) against the threshold that was actually applied, rather
+   * than a hardcoded guess that drifts the moment the threshold is
+   * reconfigured. Defaults to the shipped default (0.55) for any draft
+   * recorded before this field existed.
+   */
+  readonly escalationThreshold: number;
 }
+
+/**
+ * Columns added to `drafts` after its first release, each with the
+ * default a pre-existing row should read as. `CREATE TABLE IF NOT
+ * EXISTS` is a no-op against a table that already exists — it does
+ * nothing to add a column to a `drafts` table created by an
+ * already-running `duo serve` or an earlier `duo draft` call, so a
+ * bare schema-string change here would throw "table drafts has no
+ * column named …" on the very next `appendDraft` against that
+ * pre-existing store. `ensureDraftLogSchema` below applies these via
+ * `ALTER TABLE … ADD COLUMN` against any table that predates them,
+ * checked with `PRAGMA table_info` so this stays a no-op once a store
+ * is already current.
+ */
+const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: string }[] = [
+  { column: "refused", ddl: "ALTER TABLE drafts ADD COLUMN refused INTEGER NOT NULL DEFAULT 0" },
+  { column: "escalation_threshold", ddl: "ALTER TABLE drafts ADD COLUMN escalation_threshold REAL NOT NULL DEFAULT 0.55" },
+];
 
 export function ensureDraftLogSchema(db: Database): void {
   db.exec(`
@@ -56,9 +119,22 @@ export function ensureDraftLogSchema(db: Database): void {
       created_at TEXT NOT NULL,
       outcome TEXT,
       outcome_recorded_at TEXT,
-      sent_text TEXT
+      sent_text TEXT,
+      refused INTEGER NOT NULL DEFAULT 0,
+      -- Keep in sync with DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD (config.ts)
+      -- — a SQL DDL literal can't reference a TS constant directly.
+      escalation_threshold REAL NOT NULL DEFAULT 0.55
     ) STRICT
   `);
+
+  const existingColumns = new Set(
+    (db.prepare(`PRAGMA table_info(drafts)`).all() as unknown as { name: string }[]).map((row) => row.name),
+  );
+  for (const migration of DRAFT_LOG_MIGRATIONS) {
+    if (!existingColumns.has(migration.column)) {
+      db.exec(migration.ddl);
+    }
+  }
 }
 
 export interface AppendDraftInput {
@@ -69,6 +145,10 @@ export interface AppendDraftInput {
   readonly escalationReason: string | null;
   readonly confidenceScore: number;
   readonly sources: readonly DraftSource[];
+  /** See `DraftRecord.refused`'s doc comment. `false` for a non-escalated draft. Optional — defaults to `false`, the correct value for every caller that isn't drafting/pipeline.ts's refused-subject path. */
+  readonly refused?: boolean;
+  /** See `DraftRecord.escalationThreshold`'s doc comment — the threshold in effect for this call. Optional — defaults to `DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD` (config.ts) for a caller that isn't threading a real `DuoConfig["confidence"]` through. */
+  readonly escalationThreshold?: number;
 }
 
 /** Appends one draft (answered or escalated) and returns its id. */
@@ -79,8 +159,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
     ensureDraftLogSchema(db);
     db.prepare(
       `
-      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
     `,
     ).run(
       id,
@@ -92,6 +172,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
       input.confidenceScore,
       JSON.stringify(input.sources),
       createdAt,
+      input.refused ? 1 : 0,
+      input.escalationThreshold ?? DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD,
     );
   });
   return id;
@@ -112,12 +194,18 @@ export class DraftNotFoundError extends Error {
  * record the outcome keep working unchanged) but is what #37's
  * classification needs to run at all: an "edited" outcome recorded without
  * it simply produces no correction candidate, rather than failing the call.
+ *
+ * Typed to `SettableDraftOutcome`, not the full `DraftOutcome`, so
+ * `escalation_answered` can never reach this function — `queueStandingOrderCandidate`
+ * (`standing-order-candidates.ts`) writes that value itself, directly and
+ * atomically alongside the candidate row it records, on its own already-open
+ * database handle rather than through a second call here.
  */
 export function recordDraftOutcome(
   storePath: string,
   passphrase: string,
   draftId: string,
-  outcome: DraftOutcome,
+  outcome: SettableDraftOutcome,
   sentText?: string,
 ): void {
   withDatabase(storePath, passphrase, true, (db) => {
@@ -144,6 +232,8 @@ interface DraftRow {
   outcome: string | null;
   outcome_recorded_at: string | null;
   sent_text: string | null;
+  refused: number;
+  escalation_threshold: number;
 }
 
 function rowToDraft(row: DraftRow): DraftRecord {
@@ -160,6 +250,8 @@ function rowToDraft(row: DraftRow): DraftRecord {
     outcome: row.outcome as DraftOutcome | null,
     outcomeRecordedAt: row.outcome_recorded_at,
     sentText: row.sent_text,
+    refused: row.refused === 1,
+    escalationThreshold: row.escalation_threshold,
   };
 }
 

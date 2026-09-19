@@ -1,5 +1,5 @@
 import type { InferenceProvider } from "../provider/types.js";
-import { DraftNotFoundError, getDraft, recordDraftOutcome, type DraftOutcome } from "../drafting/draft-log.js";
+import { DraftNotFoundError, getDraft, recordDraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { contentWords, levenshteinDistance, normalizeWhitespace } from "./text-similarity.js";
 import { queueCorrectionCandidates, type CorrectionCandidateKind } from "./queue.js";
 
@@ -148,6 +148,24 @@ export interface ClassifyAndQueueResult {
 }
 
 /**
+ * Thrown by `recordDraftOutcomeAndClassify` for an "edited" outcome whose
+ * `sentText` is blank or whitespace-only. Checked here, once, rather than
+ * separately in each caller (the daemon's HTTP route, `duo draft-outcome`):
+ * an empty `sentText` scores as near-zero content in
+ * `defaultEditClassifier`'s `newContentRatio` and gets classified as a
+ * trivial "style" tweak — silently recording that the owner made a
+ * wording change when they actually deleted the entire answer, and
+ * corrupting the correction loop's training data either way this was
+ * reached.
+ */
+export class BlankEditError extends Error {
+  constructor(draftId: string) {
+    super(`Draft "${draftId}": an "edited" outcome needs real text, not a blank or whitespace-only sentText`);
+    this.name = "BlankEditError";
+  }
+}
+
+/**
  * The orchestration entry point (#37): looks the draft up by id, classifies
  * the edit, and queues whatever candidates the classification implies.
  * Never writes to `duo/rules/` or `duo/voice.md` itself — that's #38's
@@ -204,10 +222,13 @@ export async function recordDraftOutcomeAndClassify(
   storePath: string,
   passphrase: string,
   draftId: string,
-  outcome: DraftOutcome,
+  outcome: SettableDraftOutcome,
   sentText: string | undefined,
   classifier?: EditClassifier,
 ): Promise<ClassifyAndQueueResult | undefined> {
+  if (outcome === "edited" && sentText !== undefined && sentText.trim().length === 0) {
+    throw new BlankEditError(draftId);
+  }
   recordDraftOutcome(storePath, passphrase, draftId, outcome, sentText);
   if (outcome !== "edited" || sentText === undefined) {
     return undefined;

@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { appendDraft, DraftNotFoundError } from "../src/drafting/draft-log.js";
-import { listStandingOrderCandidates, NotAnEscalationError, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
+import { DraftIsRefusedError, listStandingOrderCandidates, NotAnEscalationError, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -44,6 +44,19 @@ describe("queueStandingOrderCandidate — an escalation can be turned into a rul
     });
   });
 
+  it("is idempotent: a second call against the same draft returns the same id and queues nothing new (a client remount re-submitting must never duplicate)", () => {
+    const storePath = initStore();
+    const draftId = seedEscalatedDraft(storePath);
+
+    const first = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "Bonuses are 5% of salary.");
+    const second = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "A different answer, same draft.");
+
+    expect(second).toBe(first);
+    const candidates = listStandingOrderCandidates(storePath, PASSPHRASE);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].answerText).toBe("Bonuses are 5% of salary.");
+  });
+
   it("refuses to queue a candidate against a draft that was never escalated", () => {
     const storePath = initStore();
     const draftId = appendDraft(storePath, PASSPHRASE, {
@@ -62,6 +75,23 @@ describe("queueStandingOrderCandidate — an escalation can be turned into a rul
   it("fails loudly for an unknown draft id", () => {
     const storePath = initStore();
     expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, "nope", "answer")).toThrow(DraftNotFoundError);
+  });
+
+  it("refuses to queue a candidate for a refused escalation — the owner's refusal is a boundary, not something an answer can override", () => {
+    const storePath = initStore();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "this subject is refused",
+      confidenceScore: 0,
+      sources: [],
+      refused: true,
+    });
+
+    expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an override answer")).toThrow(DraftIsRefusedError);
+    expect(listStandingOrderCandidates(storePath, PASSPHRASE)).toHaveLength(0);
   });
 });
 

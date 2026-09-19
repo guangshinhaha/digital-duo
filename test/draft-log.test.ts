@@ -1,8 +1,9 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
-import { appendDraft, DraftNotFoundError, getDraft, listDrafts, recordDraftOutcome } from "../src/drafting/draft-log.js";
-import { createEncryptedStore } from "../src/store/store.js";
+import { DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD } from "../src/config.js";
+import { appendDraft, DraftNotFoundError, ensureDraftLogSchema, getDraft, listDrafts, recordDraftOutcome } from "../src/drafting/draft-log.js";
+import { createEncryptedStore, withDatabase, type Database } from "../src/store/store.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -36,6 +37,55 @@ describe("appendDraft / getDraft", () => {
       outcome: null,
     });
     expect(draft?.sources).toEqual([{ kind: "rule", id: "topic-leave", label: "standing order: five days" }]);
+  });
+
+  it("defaults refused to false and escalationThreshold to DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD when the caller omits them", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.refused).toBe(false);
+    expect(draft?.escalationThreshold).toBe(DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD);
+  });
+
+  it("the drafts table's own SQL-level DEFAULT for escalation_threshold matches DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD — catches the three hand-kept-in-sync 0.55 literals (config.ts, CREATE TABLE, ALTER TABLE) drifting apart, not just appendDraft's JS-level fallback", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      ensureDraftLogSchema(db);
+      // Bypasses appendDraft (and its own `?? DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD`
+      // fallback) entirely, so this exercises only the column's SQL-level
+      // DEFAULT — the literal in the CREATE TABLE/ALTER TABLE DDL.
+      db.prepare(
+        `INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at) VALUES ('sql-default-test', 'q', NULL, 'a', 0, NULL, 0.8, '[]', ?)`,
+      ).run(new Date().toISOString());
+    });
+    const draft = getDraft(storePath, PASSPHRASE, "sql-default-test");
+    expect(draft?.escalationThreshold).toBe(DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD);
+  });
+
+  it("round-trips a refused escalation with a non-default threshold", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "refused subject",
+      confidenceScore: 0,
+      sources: [],
+      refused: true,
+      escalationThreshold: 0.7,
+    });
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.refused).toBe(true);
+    expect(draft?.escalationThreshold).toBe(0.7);
   });
 
   it("round-trips an escalated entry with a null draftText", () => {
@@ -241,5 +291,59 @@ describe("listDrafts", () => {
 
     const cutoff = new Date(new Date(firstDraft!.createdAt).getTime() + 1).toISOString();
     expect(listDrafts(storePath, PASSPHRASE, { before: cutoff }).map((draft) => draft.id)).toEqual([first]);
+  });
+});
+
+describe("ensureDraftLogSchema — migrating a pre-existing drafts table", () => {
+  /** The exact 12-column shape `drafts` had before `refused`/`escalation_threshold` existed — reproduces a real `duo serve`/`duo draft` store that ran before this change, since `CREATE TABLE IF NOT EXISTS` alone is a no-op against a table that already exists. */
+  function createPreMigrationDraftsTable(db: Database): void {
+    db.exec(`
+      CREATE TABLE drafts (
+        id TEXT PRIMARY KEY,
+        question TEXT NOT NULL,
+        thread_context TEXT,
+        draft_text TEXT,
+        escalated INTEGER NOT NULL,
+        escalation_reason TEXT,
+        confidence_score REAL NOT NULL,
+        sources TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        outcome TEXT,
+        outcome_recorded_at TEXT,
+        sent_text TEXT
+      ) STRICT
+    `);
+  }
+
+  it("adds the missing columns to a table created before they existed, rather than throwing on the next append", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      createPreMigrationDraftsTable(db);
+    });
+
+    // Before the fix this threw: "table drafts has no column named refused"
+    // — CREATE TABLE IF NOT EXISTS never alters a table that already exists.
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.refused).toBe(false);
+    expect(draft?.escalationThreshold).toBe(0.55);
+  });
+
+  it("running the migration twice is a no-op, not an error", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      createPreMigrationDraftsTable(db);
+      ensureDraftLogSchema(db);
+      expect(() => ensureDraftLogSchema(db)).not.toThrow();
+    });
   });
 });

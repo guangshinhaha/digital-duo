@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import { DraftNotFoundError, getDraft } from "./draft-log.js";
+import { DraftNotFoundError, ensureDraftLogSchema, getDraft } from "./draft-log.js";
 
 /**
  * #34 AC3: "an escalation the owner knows the answer to" — answering it on
@@ -49,12 +49,41 @@ export class NotAnEscalationError extends Error {
 }
 
 /**
+ * Thrown when the owner tries to answer a *refused* escalation.
+ * `client-tech-design.md` §1.6: a refusal "is a boundary the owner set"
+ * and only a non-refused, low-confidence escalation invites an answer —
+ * the client's own UI already hides the answer box for one
+ * (`DraftCard.tsx`), but that's a UI convenience, not the enforcement.
+ * Without this check, a direct call here (a different client, a bug, a
+ * raw API request) could turn a subject the owner deliberately refused
+ * to speak on into a standing-order candidate and, eventually, a rule
+ * the duo answers with automatically — silently overriding the refusal
+ * the whole feature exists to hold.
+ */
+export class DraftIsRefusedError extends Error {
+  constructor(draftId: string) {
+    super(`Draft "${draftId}" is a refused escalation — the owner set that boundary; it cannot be answered into a standing-order candidate`);
+    this.name = "DraftIsRefusedError";
+  }
+}
+
+/**
  * Queues a standing-order candidate from the owner's own answer to an
  * escalated draft. Looks the draft up first — by id, not by trusting the
  * caller's own copy of its question — both to get the exact original
  * question text and to enforce that only an escalation (never a draft
  * the pipeline was confident enough to answer) can be turned into one of
  * these.
+ */
+/**
+ * Idempotent by `draftId`: an escalation can only ever be "answered" once
+ * in the sense this table records, so a second call against the same
+ * draft (a retried request, a client remounting and re-showing an answer
+ * box that hasn't caught up with a just-recorded outcome) returns the
+ * already-queued candidate's id rather than inserting a duplicate. Same
+ * dedup shape `corrections/queue.ts`'s `queueCorrectionCandidate` already
+ * uses for the same reason. The *text* of a resubmission is ignored on a
+ * repeat call — the first answer queued is the one of record.
  */
 export function queueStandingOrderCandidate(storePath: string, passphrase: string, draftId: string, answerText: string): string {
   const draft = getDraft(storePath, passphrase, draftId);
@@ -64,16 +93,44 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
   if (!draft.escalated) {
     throw new NotAnEscalationError(draftId);
   }
+  if (draft.refused) {
+    throw new DraftIsRefusedError(draftId);
+  }
 
   const id = randomUUID();
   const createdAt = new Date().toISOString();
-  withDatabase(storePath, passphrase, true, (db) => {
+  // Both writes — the candidate row and the draft's outcome — happen on
+  // the same open `db` handle, inside this one `withDatabase` call, so
+  // they persist or fail together. An earlier version made these two
+  // separate `withDatabase` calls: each one independently decrypts,
+  // mutates, and re-encrypts the whole store, so a crash between them
+  // left a queued candidate whose draft never got marked
+  // "escalation_answered" — permanently stuck "pending", the exact bug
+  // this outcome exists to fix. The idempotency check below means a
+  // resumed/retried call after such a crash still can't recover (it
+  // finds the candidate and returns early, as intended for a genuine
+  // repeat), which is exactly why this must not be able to happen at all.
+  return withDatabase(storePath, passphrase, true, (db) => {
     ensureStandingOrderCandidateSchema(db);
+    const existing = db.prepare(`SELECT id FROM standing_order_candidates WHERE draft_id = ?`).get(draftId) as { id: string } | undefined;
+    if (existing) {
+      return existing.id;
+    }
     db.prepare(
       `INSERT INTO standing_order_candidates (id, draft_id, question, answer_text, status, created_at, reviewed_at) VALUES (?, ?, ?, ?, 'pending', ?, NULL)`,
     ).run(id, draftId, draft.question, answerText, createdAt);
+
+    // Inlined rather than calling recordDraftOutcome: that function is
+    // typed to SettableDraftOutcome specifically so escalation_answered
+    // can never reach it from any other caller (see its own doc comment).
+    ensureDraftLogSchema(db);
+    db.prepare(`UPDATE drafts SET outcome = 'escalation_answered', outcome_recorded_at = ?, sent_text = ? WHERE id = ?`).run(
+      createdAt,
+      answerText,
+      draftId,
+    );
+    return id;
   });
-  return id;
 }
 
 interface StandingOrderCandidateRow {
