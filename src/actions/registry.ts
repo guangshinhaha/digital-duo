@@ -131,7 +131,14 @@ export function ensureActionRegistrySchema(db: Database): void {
   `);
 }
 
-function getActionRow(db: Database, actionId: string): RegisteredAction | undefined {
+/**
+ * The raw, db-taking primitive — exported so a caller that already holds
+ * an open handle (e.g. #60's `t4-guard.ts`, which must check an action's
+ * registration inside its own transaction) can read a row without opening
+ * a second `withDatabase` against the same file. The exact fix #28 needed
+ * for the same class of bug, applied here from the start.
+ */
+export function getActionRow(db: Database, actionId: string): RegisteredAction | undefined {
   const row = db.prepare(`SELECT * FROM action_registry WHERE id = ?`).get(actionId) as ActionRow | undefined;
   return row ? rowToAction(row) : undefined;
 }

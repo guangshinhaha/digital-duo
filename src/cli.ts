@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
-import { runActionsAttempts, runActionsList, runActionsRegister } from "./commands/actions.js";
+import { runActionsAttempts, runActionsList, runActionsRegister, runActionsT4Confirm, runActionsT4Pending, runActionsT4Request } from "./commands/actions.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
@@ -1208,6 +1208,62 @@ actionsCommand
       for (const attempt of attempts) {
         console.log(`[${attempt.id}] ${attempt.createdAt} ${attempt.actionId} tier=${attempt.tier ?? "-"} ${attempt.outcome}`);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// T4 (docs/concept.md §6, #60): never autonomous, a product principle, not
+// a limitation. Every T4 action goes through this staged request/confirm
+// sequence — there is no configuration or flag that skips it.
+const t4Command = actionsCommand
+  .command("t4")
+  .description("T4 actions never run without an explicit, separate human confirmation — no setting bypasses this (#60)");
+
+t4Command
+  .command("request")
+  .description("Stage a T4 request. Nothing executes until a separate `duo actions t4 confirm` call")
+  .argument("<actionId>", "the T4-classified action's id, as registered")
+  .requiredOption("--topic <topicId>", "the topic this request concerns")
+  .requiredOption("--reasoning <text>", "why the duo believes this should happen")
+  .action((actionId: string, options: { topic: string; reasoning: string }) => {
+    const config = loadConfig();
+    try {
+      const request = runActionsT4Request(actionId, options, config);
+      console.log(`Staged T4 request [${request.id}] for "${actionId}". Run \`duo actions t4 confirm ${request.id}\` to execute it — nothing has happened yet.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+t4Command
+  .command("pending")
+  .description("List every T4 request awaiting the owner's explicit confirmation")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const pending = runActionsT4Pending(config);
+      if (pending.length === 0) {
+        console.log("No T4 request is pending.");
+        return;
+      }
+      for (const request of pending) {
+        console.log(`[${request.id}] ${request.createdAt} ${request.actionId} (topic ${request.topicId}): ${request.reasoning}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+t4Command
+  .command("confirm")
+  .description("The owner's explicit, at-the-moment-of-execution confirmation — the only way a T4 action ever runs (#60 AC1)")
+  .argument("<requestId>", "the request id printed by `duo actions t4 request`")
+  .action((requestId: string) => {
+    const config = loadConfig();
+    try {
+      const request = runActionsT4Confirm(requestId, config);
+      console.log(`Confirmed and executed T4 request [${request.id}] at ${request.executedAt}.`);
     } catch (error) {
       reportError(error);
     }
