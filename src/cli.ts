@@ -29,6 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
+import { runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
@@ -91,6 +92,75 @@ program
   .action(() => {
     const config = loadConfig();
     console.log(runStatus(config));
+  });
+
+program
+  .command("serve")
+  .description(
+    "Run the Mac/phone client daemon (client-tech-design.md §1.3): a passphrase-in-memory HTTP API over the " +
+      "existing store. Never falls back to reading the passphrase off disk, and refuses to bind every interface.",
+  )
+  .option("--host <host>", "the address to bind — a tailnet IP, or 127.0.0.1 for local-only. Never a wildcard.")
+  .option("--port <port>", "the port to bind", (value: string) => Number.parseInt(value, 10), 7717)
+  .action(async (options: { host?: string; port: number }) => {
+    const config = loadConfig();
+    try {
+      const { address } = await runServe({ host: options.host, port: options.port }, config);
+      console.error(`duo serve listening on ${address}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const pairCommand = program.command("pair").description("Pair a device (Mac app, phone) with this duo's daemon (client-tech-design.md Part 2)");
+
+pairCommand
+  .command("new")
+  .description("Mint a device token and print it once — copy it to the device now, it is never shown again")
+  .argument("<name>", "a name for the device, e.g. \"iPhone\"")
+  .action((name: string) => {
+    const config = loadConfig();
+    try {
+      const paired = runPair(name, config);
+      console.log(`Device "${paired.name}" paired (id ${paired.id}). Token (copy this now, it will not be shown again):`);
+      console.log(paired.token);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+pairCommand
+  .command("list")
+  .description("List every paired device, whether currently valid, and when it was last seen")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const devices = runPairList(config);
+      if (devices.length === 0) {
+        console.log("No paired devices.");
+        return;
+      }
+      for (const device of devices) {
+        const status = device.revokedAt ? `revoked ${device.revokedAt}` : `last seen ${device.lastSeenAt ?? "never"}`;
+        console.log(`[${device.id}] ${device.name} — ${status}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+pairCommand
+  .command("revoke")
+  .description("Revoke a device immediately — losing a phone means revoking one token, never re-keying the store")
+  .argument("<id>", "the device id, from `duo pair list`")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      runPairRevoke(id, config);
+      console.log(`Device ${id} revoked.`);
+    } catch (error) {
+      reportError(error);
+    }
   });
 
 program
