@@ -6,6 +6,7 @@ import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeri
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
+import { runMirrorPortrait } from "./commands/mirror.js";
 import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
@@ -407,6 +408,56 @@ sharedCommand
         for (const gap of report.gaps) {
           console.log(`  ${gap.count}x  ${gap.question}`);
         }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The Mirror (docs/concept.md §7, epic e4): the owner's own onboarding and
+// review surface over #23-#26's derived output. #27 ships the opening
+// portrait; later issues in this epic add rule review, refusals, and
+// calibration.
+const mirrorCommand = program.command("mirror").description("Review and approve what your duo has learned about you");
+
+const PORTRAIT_BAR_WIDTH = 24;
+
+/** A proportional bar with a floor of one character for anything nonzero — AC3: a small topic must stay visible, never collapse to an invisible sliver next to a dominant one. */
+function renderBar(share: number): string {
+  const width = Math.max(1, Math.round(share * PORTRAIT_BAR_WIDTH));
+  return "#".repeat(Math.min(width, PORTRAIT_BAR_WIDTH));
+}
+
+function formatPercent(share: number): string {
+  return `${(share * 100).toFixed(1)}%`;
+}
+
+mirrorCommand
+  .command("portrait")
+  .description("Show the interruption portrait: volume, topic distribution, busiest threads, and the period covered")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const portrait = runMirrorPortrait(config);
+      if (portrait.tooThin) {
+        console.log(
+          `Not enough history to characterise yet: found only ${portrait.totalQuestions} question(s) ` +
+            `(want at least ${portrait.minimumQuestionsToCharacterize}). Import another source with ` +
+            `\`duo import claude\` or \`duo import paste\`, then run \`duo derive pairs\` and \`duo derive topics\` again.`,
+        );
+        return;
+      }
+      console.log(`${portrait.totalQuestions} question(s) put to you, from ${portrait.periodStart} to ${portrait.periodEnd}.`);
+      console.log(`Top 5 topics hold ${formatPercent(portrait.topFiveShare)} of all questions.`);
+      console.log("");
+      console.log("Topics (most-asked first):");
+      for (const topic of portrait.topicBreakdown) {
+        console.log(`  ${renderBar(topic.share).padEnd(PORTRAIT_BAR_WIDTH)} ${formatPercent(topic.share).padStart(6)} (${topic.count})  ${topic.label}`);
+      }
+      console.log("");
+      console.log("Busiest threads (no per-person asker identity yet — grouped by conversation thread):");
+      for (const thread of portrait.busiestThreads) {
+        console.log(`  ${formatPercent(thread.share).padStart(6)} (${thread.count})  ${thread.threadId}`);
       }
     } catch (error) {
       reportError(error);
