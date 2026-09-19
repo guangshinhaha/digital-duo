@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { InferenceProvider } from "../provider/types.js";
 import { withDatabase } from "../store/store.js";
@@ -133,13 +133,37 @@ export interface VoiceProfileResult {
   readonly register: string;
 }
 
+// Must match src/corrections/review.ts's own CORRECTIONS_HEADING constant —
+// that module owns writing the section, this module only has to recognize
+// and preserve it when `force` overwrites the rest of the file.
+const CORRECTIONS_HEADING = "## Corrections";
+
+/**
+ * The "## Corrections" section, verbatim, if `path`'s current content has
+ * one — so a `force` rewrite can carry it forward. #38/#39 append durable,
+ * provenance-carrying correction entries there; voice.ts's own overwrite
+ * has no way to reconstruct that log, so it must preserve rather than
+ * discard it.
+ */
+function readExistingCorrectionsSection(path: string): string | undefined {
+  if (!existsSync(path)) {
+    return undefined;
+  }
+  const existing = readFileSync(path, "utf8");
+  const index = existing.indexOf(CORRECTIONS_HEADING);
+  return index === -1 ? undefined : existing.slice(index).trimEnd();
+}
+
 /**
  * Computes the voice profile and writes it to `duo/voice.md`. Unlike the
  * rules sync, this never merges a hand-edit back in — voice.md has no
  * database projection anything else reads, so there's nothing to
  * reconcile. Instead it simply refuses to clobber an existing file unless
  * `force` is set (AC4: "readable prose the owner can edit directly" — an
- * edit that vanishes on the next derivation run wouldn't be).
+ * edit that vanishes on the next derivation run wouldn't be). When `force`
+ * does overwrite, an existing "## Corrections" section (#38/#39) is carried
+ * forward rather than silently discarded — it's a separate, append-only log
+ * this function doesn't own and has no way to recompute.
  */
 export async function runVoiceProfile(
   storePath: string,
@@ -163,7 +187,11 @@ export async function runVoiceProfile(
     return { written: false, stats, register };
   }
 
+  const preservedCorrections = readExistingCorrectionsSection(path);
+  const markdown = renderVoiceMarkdown(stats, register);
+  const content = preservedCorrections ? `${markdown.trimEnd()}\n\n${preservedCorrections}\n` : markdown;
+
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, renderVoiceMarkdown(stats, register), "utf8");
+  writeFileSync(path, content, "utf8");
   return { written: true, stats, register };
 }
