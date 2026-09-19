@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+shared-duo-runtime/
 *.log
 .DS_Store
 .claude/

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { loadSharedDuoConfig } from "../src/shared-duo/config.js";
 import {
   assertAuthoredKnowledgeOnly,
+  assertDocumentsAreWellFormed,
   assertHumanOwner,
   createSharedDuo,
   loadSharedDuo,
@@ -11,8 +12,11 @@ import {
   SharedDuoKnowledgeError,
   SharedDuoOwnershipError,
 } from "../src/shared-duo/loader.js";
+import { MalformedPublishedDocumentError } from "../src/shared-duo/documents.js";
 import type { DuoDefinition } from "../src/duo/types.js";
 import { useTempDir } from "./helpers/temp-dir.js";
+
+const LEAVE_POLICY_DOC = "Leave policy (updated 2026-06-01): 14 days a year, pro-rated for new starters.";
 
 function definition(overrides: Partial<DuoDefinition> = {}): DuoDefinition {
   return {
@@ -21,18 +25,26 @@ function definition(overrides: Partial<DuoDefinition> = {}): DuoDefinition {
     persona: { voice: "plain, procedural, cites its sources" },
     standingOrders: ["answer only from the configured documents"],
     refusals: ["does not decide anything on the team's behalf"],
-    knowledge: { kind: "authored", documents: ["leave policy: 14 days"] },
+    knowledge: { kind: "authored", documents: [LEAVE_POLICY_DOC] },
     ...overrides,
   };
 }
 
 describe("loadSharedDuoConfig", () => {
-  it("defaults to shared-duo/persona.json", () => {
-    expect(loadSharedDuoConfig({}).personaPath).toBe("shared-duo/persona.json");
+  it("defaults to shared-duo/persona.json and shared-duo-runtime/usage.json", () => {
+    const config = loadSharedDuoConfig({});
+    expect(config.personaPath).toBe("shared-duo/persona.json");
+    expect(config.usageLogPath).toBe("shared-duo-runtime/usage.json");
   });
 
-  it("honours DUO_SHARED_PERSONA_PATH", () => {
-    expect(loadSharedDuoConfig({ DUO_SHARED_PERSONA_PATH: "/tmp/other.json" }).personaPath).toBe("/tmp/other.json");
+  it("honours DUO_SHARED_PERSONA_PATH and DUO_SHARED_USAGE_LOG_PATH independently", () => {
+    const config = loadSharedDuoConfig({ DUO_SHARED_PERSONA_PATH: "/tmp/other.json", DUO_SHARED_USAGE_LOG_PATH: "/tmp/usage.json" });
+    expect(config.personaPath).toBe("/tmp/other.json");
+    expect(config.usageLogPath).toBe("/tmp/usage.json");
+  });
+
+  it("the default usage log path is never inside data/ — a personal `duo purge` must never delete it", () => {
+    expect(loadSharedDuoConfig({}).usageLogPath.startsWith("data/")).toBe(false);
   });
 });
 
@@ -46,11 +58,12 @@ describe("a duo loads from its configuration file (#67 AC1)", () => {
   });
 
   it("answers only from the documents named in its own configuration, and nothing else", async () => {
+    const unrelatedDoc = "Parking (updated 2026-01-01): no reserved bays.";
     const duo = createSharedDuo(
-      definition({ knowledge: { kind: "authored", documents: ["leave policy: 14 days", "unrelated note"] } }),
+      definition({ knowledge: { kind: "authored", documents: [LEAVE_POLICY_DOC, unrelatedDoc] } }),
     );
     const results = await duo.knowledge.retrieve("leave policy");
-    expect(results).toEqual([{ text: "leave policy: 14 days", source: "authored" }]);
+    expect(results).toEqual([{ text: LEAVE_POLICY_DOC, source: "authored" }]);
   });
 });
 
@@ -97,6 +110,28 @@ describe("a shared duo is grounded in authored-only knowledge (#68 AC3)", () => 
   it("createSharedDuo refuses a persona file pointed at a real personal store, before anything is constructed", () => {
     const def = definition({ knowledge: { kind: "derived", storePath: "data/someones-personal-duo.db" } });
     expect(() => createSharedDuo(def)).toThrow(SharedDuoKnowledgeError);
+  });
+});
+
+describe("a shared duo's documents carry a title and update date (#69)", () => {
+  it("assertDocumentsAreWellFormed is a no-op for a well-formed document", () => {
+    expect(() => assertDocumentsAreWellFormed(definition())).not.toThrow();
+  });
+
+  it("assertDocumentsAreWellFormed throws MalformedPublishedDocumentError, naming the offending string, when a document has no title/date prefix", () => {
+    const def = definition({ knowledge: { kind: "authored", documents: ["just some text with no prefix"] } });
+    expect(() => assertDocumentsAreWellFormed(def)).toThrow(MalformedPublishedDocumentError);
+    expect(() => assertDocumentsAreWellFormed(def)).toThrow(/just some text with no prefix/);
+  });
+
+  it("createSharedDuo refuses a persona file with a malformed document before constructing anything", () => {
+    const def = definition({ knowledge: { kind: "authored", documents: ["no prefix here"] } });
+    expect(() => createSharedDuo(def)).toThrow(MalformedPublishedDocumentError);
+  });
+
+  it("is a no-op (nothing to check) when knowledge isn't authored — assertAuthoredKnowledgeOnly already rejects that case first", () => {
+    const def = definition({ knowledge: { kind: "derived", storePath: "data/x.db" } });
+    expect(() => assertDocumentsAreWellFormed(def)).not.toThrow();
   });
 });
 
