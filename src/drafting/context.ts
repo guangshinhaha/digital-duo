@@ -35,6 +35,8 @@ export interface DraftContext {
   readonly topicId: string | undefined;
   /** Age, in days, of the freshest evidence item — null when there's no evidence at all. What #33's computeRecencyDecay decays, and what a caller states per its AC3. */
   readonly freshestEvidenceAgeDays: number | null;
+  /** The freshest evidence item's own timestamp (an ISO string), alongside its age — null exactly when `freshestEvidenceAgeDays` is null. A predecessor-duo consultation (#61 AC1) needs the actual date to state "as of", not only how old it is. */
+  readonly freshestEvidenceTimestamp: string | null;
   /** Raw text of duo/voice.md, or a plain "not enough data" placeholder when it doesn't exist yet — conditions generation, never invented. */
   readonly voiceText: string;
   readonly usedEmbeddings: boolean;
@@ -234,14 +236,18 @@ export async function gatherDraftContext(
     return { recordId: result.record.id, text: result.record.text, timestamp: result.record.timestamp, similarity };
   });
 
-  const ages = evidence.map((item) => ageInDays(item.timestamp, now)).filter((age): age is number => age !== null);
-  const freshestEvidenceAgeDays = ages.length > 0 ? Math.min(...ages) : null;
+  const dated = evidence
+    .map((item) => ({ timestamp: item.timestamp, age: ageInDays(item.timestamp, now) }))
+    .filter((item): item is { timestamp: string; age: number } => item.age !== null)
+    .sort((a, b) => a.age - b.age);
+  const freshest = dated[0];
 
   return {
     evidence,
     ruleHit,
     topicId,
-    freshestEvidenceAgeDays,
+    freshestEvidenceAgeDays: freshest?.age ?? null,
+    freshestEvidenceTimestamp: freshest?.timestamp ?? null,
     voiceText: readVoiceText(duoDir),
     usedEmbeddings: hybrid.usedEmbeddings,
     warning: hybrid.warning,
