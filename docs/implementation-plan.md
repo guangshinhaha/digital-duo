@@ -402,11 +402,38 @@ ceremony on work that doesn't need it:
   negative case in `decision-guard`'s own tests. No usage-report/abandonment-tracking CLI yet —
   that's #71, next and last of this chain.
 
-**Next:** #71 (wave W2, epic `e64` — shared-duos), task-labeled, lighter path per §4: measure
-whether the shared duo is actually used — the last issue of this chain. Once merged, wave W2 is
-complete (all three epics — `e3`, `e10`, `e64` — done in order), and the orchestrating session
-moves to wave W3, where real parallelism starts (per the resume note this PR also writes once
-#71 lands).
+- #71 (PR [#111](https://github.com/guangshinhaha/digital-duo/pull/111), merged, squash commit
+  `4a28e72`) — lighter path: `src/shared-duo/usage-log.ts`'s `SharedDuoUsageEntry` gains
+  `askerId`, recorded via a new `duo shared ask --as <askerId>` option (defaulting to
+  `"anonymous"`) — never resolved against a directory or used to filter an answer, since a
+  shared duo does no per-asker permissioning at all (v1-spec.md §3); it exists solely so usage
+  can be measured by who, not just how many. `src/shared-duo/usage-report.ts`
+  (`buildUsageReport`): total questions, distinct/repeat askers (case-insensitively normalized,
+  same convention #69's `unresolvedQuestionGaps` uses for questions), answer/escalation rate (0,
+  never `NaN`, when unused), a **weekly trend** rather than one aggregate (AC1), **abandonment**
+  — active use followed by `ABANDONED_AFTER_DAYS` (14) days of silence flagged with the exact
+  date it happened rather than smoothed into a period average (AC2) — and **gaps**, reusing
+  #69's `unresolvedQuestionGaps` exactly (AC3). The report's `summary` is exactly `"The shared
+  duo is not being used."` when the log is empty, in those words (AC4). `duo shared usage` CLI
+  command. 351 tests (13 new). Self-review found one real inconsistency fixed before commit:
+  asker-id counting was case-sensitive, unlike the question grouping it's modeled on — `"Alice"`
+  and `"alice"` across two asks would have counted as two distinct askers instead of one repeat
+  asker; normalized the same way, with a regression test. **Wave W2's epic `e64` (shared-duos)
+  is now complete** — all of #67, #68, #69, #70, #71 merged in order, one at a time on `main`.
+  The Phase 1.5 bridge duo (concept.md §12) now: loads from a checked-in, human-owned
+  configuration file (#67); is grounded in published material only, structurally unable to
+  reach a personal store (#68); answers a team member's question with cited, dated sources, or
+  escalates by name (#69); is unmistakably attributed and refuses to be treated as a decision
+  (#70); and reports its own honest usage, including the finding that nobody is using it, if
+  that's what's true (#71).
+
+**Wave W2 is now complete.** All three of its epics — `e3` (derivation, #23-#26), `e10`
+(permissions, #48-#51), and `e64` (shared-duos, #67-#71) — are merged, one at a time on `main`,
+per §1/§2's locked sequencing. The orchestrating session moves to wave W3 next: `e4` (mirror,
+starting at #27), `e5` (drafting, starting at #31), and `e11` (trust, starting at #52) run as
+three separate concurrent chains — real concurrency starts here, per §1's note that "real
+concurrency (separate worktrees, several `lfg` runs at once) becomes safe from W3, once epics
+touch more disjoint subsystems."
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
