@@ -19,9 +19,13 @@ import { withDatabase } from "../store/store.js";
  * `correctsEntryId` exists now (unused by #43 itself) so #45's "retract and
  * correct an answer in the same thread" needs no schema migration to start
  * writing corrections here, the same "field present, logic deferred" idiom
- * used throughout this codebase (e.g. #50's `rulesUsed`).
+ * used throughout this codebase (e.g. #50's `rulesUsed`). `"corrected"` is
+ * #45's own addition to the outcome vocabulary: a correction is recorded as
+ * a brand-new entry (with `correctsEntryId` pointing at the one it
+ * corrects) rather than by touching the original — the same
+ * append-only-correction shape #51's `appendCorrection` uses for `audit_log`.
  */
-export const PUBLIC_ANSWER_OUTCOMES = ["answered", "passed_on", "declined_refused"] as const;
+export const PUBLIC_ANSWER_OUTCOMES = ["answered", "passed_on", "declined_refused", "corrected"] as const;
 export type PublicAnswerOutcomeKind = (typeof PUBLIC_ANSWER_OUTCOMES)[number];
 
 export interface PublicAnswerLogEntryInput {

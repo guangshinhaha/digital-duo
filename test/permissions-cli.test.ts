@@ -123,6 +123,60 @@ describe("duo permissions ask-public (#43)", () => {
   });
 });
 
+describe("duo permissions log / correct (#45)", () => {
+  it("refuses to correct without an initialized store, naming duo init", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const result = await runCli(["permissions", "correct", "some-id", "corrected text"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/duo init/);
+  });
+
+  it("reports no entries yet on a fresh store", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+    const result = await runCli(["permissions", "log"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/no public-answer-log entries/i);
+  });
+
+  it("reports an unknown entry id clearly and exits non-zero", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+    const result = await runCli(["permissions", "correct", "not-a-real-id", "corrected text"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/no public-answer-log entry/i);
+  });
+
+  it("lists a passed-on exchange in the log, and refuses to correct it since it never asserted an answer", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    await runCli(["permissions", "ask-public", "what is the vacation policy?", "--as", "colleague"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+
+    const logResult = await runCli(["permissions", "log"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(logResult.exitCode).toBe(0);
+    expect(logResult.stdout).toMatch(/outcome=passed_on/);
+    const idMatch = logResult.stdout.match(/\[([0-9a-f-]{36})\]/);
+    expect(idMatch).not.toBeNull();
+
+    const correctResult = await runCli(["permissions", "correct", idMatch![1], "corrected text"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(correctResult.exitCode).not.toBe(0);
+    expect(correctResult.stderr).toMatch(/not.*"answered"/i);
+  });
+});
+
 describe("duo permissions audit", () => {
   it("refuses to run without an initialized store, naming duo init", async () => {
     const storePath = join(tempDir(), "data", "duo.db");

@@ -55,7 +55,15 @@ import {
   type CalibrationProgress,
 } from "./commands/mirror.js";
 import { runCorrectionsApprove, runCorrectionsReject, runCorrectionsReview } from "./commands/corrections.js";
-import { runAnswerPublicly, runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
+import {
+  runAnswerPublicly,
+  runAskAsAsker,
+  runCorrectPublicAnswer,
+  runEnforceCeiling,
+  runListAuditEntries,
+  runListPublicAnswerLogEntries,
+  runShowAuditEntry,
+} from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
@@ -360,7 +368,10 @@ permissionsCommand
       switch (outcome.kind) {
         case "answered":
           console.log(outcome.text);
-          console.error(`(answered publicly — topic [${outcome.topicId}] is granted T0 autonomy; confidence ${outcome.confidence.score.toFixed(2)})`);
+          console.error(
+            `(answered publicly — log id ${outcome.logEntryId}, topic [${outcome.topicId}] is granted T0 autonomy; ` +
+              `confidence ${outcome.confidence.score.toFixed(2)}; correct it later with \`duo permissions correct ${outcome.logEntryId} <correctedText>\`)`,
+          );
           break;
         case "passed_on":
           console.log(outcome.message);
@@ -375,6 +386,56 @@ permissionsCommand
           console.log(outcome.message);
           console.error(`(refused — draft id ${outcome.draftId})`);
           break;
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+permissionsCommand
+  .command("log")
+  .description("List every public-answer-log entry (oldest first) — every question a colleague asked publicly, and how it was handled (#43/#45)")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const entries = runListPublicAnswerLogEntries(config);
+      if (entries.length === 0) {
+        console.log("No public-answer-log entries yet.");
+        return;
+      }
+      for (const entry of entries) {
+        console.log(
+          `[${entry.id}] ${entry.createdAt} asker=${entry.askerRef} outcome=${entry.outcome}` +
+            `${entry.topicId ? ` topic=${entry.topicId}` : ""}${entry.correctsEntryId ? ` corrects=${entry.correctsEntryId}` : ""} ` +
+            `question="${entry.question}"`,
+        );
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+permissionsCommand
+  .command("correct")
+  .description(
+    "Correct a public answer already logged (#45): posts the correction linked to the original in the same " +
+      "thread, drops that topic's T0 autonomy a level immediately, and — unless --thread-gone — reports it posted",
+  )
+  .argument("<entryId>", "the public-answer-log entry id to correct, from `duo permissions log`")
+  .argument("<correctedText>", "the correct answer, in your own words")
+  .option("--thread-gone", "the original thread no longer exists — the correction and topic demotion still happen, but nothing can be posted there")
+  .action((entryId: string, correctedText: string, options: { threadGone?: boolean }) => {
+    const config = loadConfig();
+    try {
+      const result = runCorrectPublicAnswer(entryId, correctedText, !options.threadGone, config);
+      console.log(result.text);
+      console.error(
+        result.postedInThread
+          ? `(posted to the original thread — correction id ${result.correctionEntryId}; notified: ${result.notifiedAskerRefs.join(", ")})`
+          : `(${result.threadGoneNotice})`,
+      );
+      if (result.demotion?.demoted) {
+        console.error(`(topic [${result.correctedTopicId}] T0 autonomy dropped: ${result.demotion.fromLevel} -> ${result.demotion.toLevel})`);
       }
     } catch (error) {
       reportError(error);
