@@ -27,7 +27,12 @@ export function resolveProvider(
   if (!config.providerName) {
     throw new ProviderConfigError("DUO_PROVIDER");
   }
-  const factory = registry[config.providerName];
+  // Own-property check: a plain bracket lookup on registry would also
+  // resolve Object.prototype members (e.g. DUO_PROVIDER="constructor"),
+  // silently returning a non-provider value instead of a clean, named error.
+  const factory = Object.prototype.hasOwnProperty.call(registry, config.providerName)
+    ? registry[config.providerName]
+    : undefined;
   if (!factory) {
     throw new ProviderConfigError("DUO_PROVIDER", config.providerName);
   }

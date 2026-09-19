@@ -11,7 +11,6 @@ afterEach(() => {
 describe("resolveProvider", () => {
   it("throws ProviderConfigError naming DUO_PROVIDER when unset", () => {
     const config = loadConfig({});
-    expect(() => resolveProvider(config)).toThrow(ProviderConfigError);
     try {
       resolveProvider(config);
       expect.unreachable();
@@ -29,6 +28,20 @@ describe("resolveProvider", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(ProviderConfigError);
       expect((error as ProviderConfigError).message).toContain("not-a-real-provider");
+    }
+  });
+
+  it("throws ProviderConfigError naming the value even when it collides with Object.prototype", () => {
+    // Guards against a plain bracket lookup silently resolving
+    // Object.prototype members (e.g. registry["constructor"]) instead of
+    // treating them as unregistered provider names.
+    const config = loadConfig({ DUO_PROVIDER: "constructor" });
+    try {
+      resolveProvider(config);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProviderConfigError);
+      expect((error as ProviderConfigError).message).toContain("constructor");
     }
   });
 
@@ -109,5 +122,35 @@ describe("OllamaProvider.complete", () => {
     await expect(provider.complete("hi")).rejects.toThrow(/llama3/);
     await expect(provider.complete("hi")).rejects.toThrow(/404/);
     await expect(provider.complete("hi")).rejects.not.toThrow(/unreachable/i);
+  });
+
+  it("throws a ProviderError naming the model, not a raw SyntaxError, when a 2xx response body is not JSON", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not json", { status: 200, headers: { "Content-Type": "text/plain" } })),
+    );
+    const config = loadConfig({
+      DUO_PROVIDER: "ollama",
+      DUO_OLLAMA_MODEL: "llama3",
+      DUO_OLLAMA_HOST: "http://h:1",
+    });
+    const provider = resolveProvider(config);
+    await expect(provider.complete("hi")).rejects.toThrow(/non-JSON/i);
+    await expect(provider.complete("hi")).rejects.toThrow(/llama3/);
+    await expect(provider.complete("hi")).rejects.not.toThrow(SyntaxError);
+  });
+
+  it("throws a ProviderError naming an unexpected shape when a 2xx response is valid JSON but null", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("null", { status: 200 })),
+    );
+    const config = loadConfig({
+      DUO_PROVIDER: "ollama",
+      DUO_OLLAMA_MODEL: "llama3",
+      DUO_OLLAMA_HOST: "http://h:1",
+    });
+    const provider = resolveProvider(config);
+    await expect(provider.complete("hi")).rejects.toThrow(/unexpected response shape/i);
   });
 });

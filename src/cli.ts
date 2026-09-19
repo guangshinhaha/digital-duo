@@ -8,6 +8,12 @@ const program = new Command();
 
 program.name("duo").description("Digital Duo CLI").version("0.1.0");
 
+/** Formats an unknown thrown value to stderr and sets a non-zero exit code. */
+function reportError(error: unknown): void {
+  console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+}
+
 program
   .command("status")
   .description("Print the configured provider, store location, and whether the store exists")
@@ -26,12 +32,8 @@ program
       const result = await runAsk(prompt, config);
       console.log(result);
     } catch (error) {
-      console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = 1;
+      reportError(error);
     }
   });
 
-program.parseAsync(process.argv).catch((error) => {
-  console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
-});
+program.parseAsync(process.argv).catch(reportError);

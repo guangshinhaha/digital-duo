@@ -45,8 +45,19 @@ class OllamaProvider implements InferenceProvider {
       );
     }
 
-    const data = (await response.json()) as { response?: unknown };
-    if (typeof data.response !== "string") {
+    let data: { response?: unknown } | null;
+    try {
+      data = (await response.json()) as { response?: unknown } | null;
+    } catch (cause) {
+      // A 2xx response with a non-JSON body — report it the same way as
+      // every other Ollama failure, not as a raw, unlabeled parser error.
+      throw new ProviderError(
+        `Ollama returned a non-JSON response for model "${this.model}" at ${this.host}: ${String(
+          cause instanceof Error ? cause.message : cause,
+        )}`,
+      );
+    }
+    if (data === null || typeof data.response !== "string") {
       throw new ProviderError(
         `Ollama returned an unexpected response shape for model "${this.model}" at ${this.host}`,
       );
