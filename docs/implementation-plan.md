@@ -686,11 +686,94 @@ correctly out of this chain's scope.
 
 **Wave W5 is now complete.** `main` tip: `46c20aa`.
 
-**Next: wave W6** (`e13`, role-duos, the last wave): #72→61→62→63. Single chain, sequential.
-Once this lands, all 72 issues in the original backlog are closed (#22 and epic `e8` stay
-permanently skipped per §2/§4, both blocked on #15 — that's expected, not a gap, unless/until #15
-is resolved separately).
+**Wave W6** (`e13`, role-duos, the last wave) — #72→61→62→63, single chain, sequential:
 
-To resume: work straight through the wave sequence in §1 using the policy in §4, without
-re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
-resolve itself, or at a wave boundary worth a status check.
+#72 PR [#148](https://github.com/guangshinhaha/digital-duo/pull/148) `f0bd104` (task, lighter
+path) — `src/role-duo/` (types/loader/seed), layered on #65's `Duo` primitive (`owner.kind:
+"role"`), not a parallel entity type. Seeds standing orders from every consenting holder's
+already-approved rules (`listActiveRules`), matched across holders' separate stores by topic
+label; surfaces conflicting positions rather than averaging them; excludes and names
+non-consenting holders; states honestly when only one holder's material was used; withdrawal
+flips consent and re-seeds. `duo role-duo seed/withdraw`. Review fix: `withdrawHolderConsent`
+wrote the updated definition to disk *before* recomputing the seed — a seeding failure would
+have left the definition recording a withdrawal the seed file didn't yet reflect; fixed by
+computing the seed first. 824 tests. #61 PR
+[#149](https://github.com/guangshinhaha/digital-duo/pull/149) `456fbe6` (**full path**, `story`
+label) — `src/continuity/predecessor.ts`, layered on #32's `draftReply`; names the predecessor
+and states evidence age prominently; a live-matter question declines as current but still
+answers historically with a "may have changed" caveat; staleness hedging strengthens
+monotonically (fresh/aging/stale/very_stale, reusing #33/#69's 180-day convention). **Real
+classification-boundary gap found and fixed before shipping**, introduced by this issue's own
+design and caught in its own self-review (not pre-existing): a successor is not the predecessor's
+duo's owner, so the default owner's-eyes-unfiltered `gatherDraftContext` would have let a
+successor read the predecessor's entire personal store — the same class of bypass #43 caught for
+public answering — fixed by passing the same lowest-defined-clearance ceiling #43 established,
+with a regression test. 836 tests. #62 PR
+[#151](https://github.com/guangshinhaha/digital-duo/pull/151) `e1346da` (**full path**, `story`
+label) — `src/continuity/handover.ts`: assembles recurring questions, standing orders with
+evidence, refusals, thread activity, and open escalations purely from what earlier epics already
+derived, nothing re-derived; owner cuts any item (or hand-edits an `excluded` flag) before one
+explicit `share` act; a thin/empty corpus names gaps rather than padding; the draft lives in the
+store's own gitignored data directory, never the git-tracked `duoDir` — an unreviewed pack may
+hold something personal. Two review fixes: a rule and its own topic shared the same id, so
+cutting one would silently cut the other too (fixed by prefixing every section's ids); reading a
+hand-edited draft with no validation meant `"excluded": "false"` (a truthy string in JS) silently
+left an item un-cut, and a malformed file threw a raw `SyntaxError` (fixed with a strict-boolean
+shape check and `HandoverDraftMalformedError`). 848 tests. #63 PR
+[#153](https://github.com/guangshinhaha/digital-duo/pull/153) `dbf2841` (task, lighter path) —
+`src/continuity/{lifecycle,transfer,lifecycle-log}.ts`: `archiveDuo` revokes every autonomy grant
+(new `grid.ts#revokeAllAutonomy`, logged via the ledger's existing `"revoked"` event); a transfer
+completes only once both named parties separately confirm — structurally impossible to complete
+from one call, matched against the request's own recorded parties, never a caller-asserted role;
+`endDuo` removes both the encrypted store and `duoDir` (the one thing `duo purge` deliberately
+never touches — a new, separate, stronger action, that invariant left alone). Orphan status is an
+explicit, named report wired as a fail-safe into both `duo draft` and #61's consult command —
+nothing in this codebase can detect "the owner left" on its own. Every archival/transfer/deletion
+is logged to its own durable, own-directory lifecycle log that survives the very deletion it
+records. Review fix: a doc comment claimed the deletion event logged *before* `endDuo` ran; the
+code correctly logs it *after* — fixed the comment, not the code. **877 tests at the end of this
+chain.**
+
+**A second, entirely separate Claude Code session did unrelated concurrent work on `main`
+throughout this wave** — PRs [#150](https://github.com/guangshinhaha/digital-duo/pull/150) and
+[#152](https://github.com/guangshinhaha/digital-duo/pull/152) (`docs/client-surface-design`,
+`feat/client-core-gaps`; session `01F1ZFT1BqF3qsF4u9av82Bo`, authored and merged by the repo
+owner's own account), building a Mac/phone client + `duo serve` daemon — entirely outside this
+plan and this orchestrating session's scope. Verified via GitHub before treating it as
+legitimate rather than unexpected repo state. Not part of the 72-issue backlog; not touched or
+reviewed by this run. Full suite after both landed: **943 tests**, `npm run typecheck`/`npm run
+build`/`npm test` all green at `main`'s tip.
+
+**One low-severity gap found during #61, filed rather than fixed inline**: [#155](https://github.com/guangshinhaha/digital-duo/issues/155)
+— `src/drafting/generate.ts`'s `extractiveDraft` (the no-provider fallback inside `draftReply`)
+never calls `stripMarkingLine` (#50), unlike `src/permissions/answer.ts`'s own extractive
+fallback, so a raw classification marking line can be echoed verbatim by `duo draft`, public
+answering, or predecessor consultation whenever no inference provider is configured. Not a
+classification-boundary breach — the content is already permitted through whatever ceiling
+applies by the time this runs — a polish/consistency issue, same class as what #50 fixed once
+already. Investigated for an inline fix during doc consolidation: the straightforward version
+doesn't fully close the gap, since `DraftEvidenceItem` (`src/drafting/context.ts`) doesn't carry
+a record's `classification` at all (it's dropped when hybrid search results are mapped into
+evidence items), and `Rule.text` has no classification field to strip from in the first place —
+a correct fix touches evidence-item construction and possibly `derivation/rules.ts`'s
+text-selection, not just `generate.ts` as the issue titled it. Left filed, not patched, rather
+than ship a partial fix under time pressure.
+
+**Wave W6 is now complete — this was the last wave.** All 72 issues in the original backlog that
+were in scope for this run are closed. #14, #15, #22, and epic `e8` (Slack) stay permanently
+skipped per §2/§4 — both are standing gating conversations, not code, and nothing in this run
+was blocked incorrectly by them. Two follow-up issues were filed against already-merged work
+rather than fixed inline: [#137](https://github.com/guangshinhaha/digital-duo/issues/137)
+(relevance-gate precision on rhetorical questions) and [#155](https://github.com/guangshinhaha/digital-duo/issues/155)
+(classification-marking leak in the extractive draft fallback). `main` tip: `dbf2841`, plus the
+unrelated client-surface work in #150/#152.
+
+**Resume point, if this backlog is ever revisited:** there is no wave left to run. A future
+session picking this up should (1) decide G1/G2 (#14/#15) if `e8`/Slack or a real inference
+provider ever becomes relevant, (2) triage #137 and #155 as ordinary bug-fix issues, not part of
+a wave, and (3) be aware `main` also carries the independent client-surface work from session
+`01F1ZFT1BqF3qsF4u9av82Bo` (`docs/client-design.md`, `docs/client-tech-design.md`, `src/serve/`)
+— unrelated to this plan, safe to ignore unless asked to extend it.
+
+*(This closing instruction applied while waves remained; it no longer does — see "Resume point,
+if this backlog is ever revisited" above.)*
