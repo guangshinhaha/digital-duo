@@ -171,10 +171,32 @@ ceremony on work that doesn't need it:
   minor readability cleanup (an async IIFE simplified to a plain `if`) made before commit. No
   topic assignment yet — that's #24, next.
 
-**Next:** #24 (W2, epic `e3` — topic assignment with stable identifiers) — check its label before
-assuming which path applies. #23 begins wave W2, where `e3` (derivation), `e10` (permissions),
-and `e64` (shared-duos) run as parallel epics per §1, though concurrency stays sequential through
-W2 per §2's locked decision.
+- #24 (PR [#89](https://github.com/guangshinhaha/digital-duo/pull/89), merged, squash commit
+  `d4c5f33`) — lighter path: `src/derivation/topics.ts`. Only `qa_pairs` with `topic_id IS
+  NULL` are considered on any run, so a previously-assigned pair's topic id never moves (AR-8) —
+  new pairs' questions are embedded (backfilling via #20's `embedRecords`), greedily clustered by
+  cosine similarity, then each cluster is matched against existing topics' centroids
+  (`topic_centroids` table) before minting anything new; an unmatched cluster becomes a new
+  topic surfaced for owner review rather than force-fitted. `duo/topics.json` (id/label/createdAt
+  only, no vectors) is the source of truth for labels, read first every run; the DB `topics`
+  table is a projection unconditionally rebuilt from it at the end of every run, so a hand-rename
+  is exactly what the next run's DB reflects — matching is keyed by id and centroid, neither of
+  which the file carries. Cluster labeling is best-effort LLM, falling back to a deterministic
+  default (same "degrade rather than fail" shape as #23's adjudicator). New `DUO_DIR` config
+  option (default `"duo"`), kept separate from the encrypted store. `duo derive topics` CLI
+  command. 169 tests. Self-review found one fixable issue before commit: the empty-store/no-op
+  path called `embedRecords` and then queried `record_embeddings` directly, but that first
+  `embedRecords` call opens the store read-only (`mutate: false`) and its schema-creation inside
+  that call is never persisted when there's nothing to embed — so a truly empty store threw "no
+  such table: record_embeddings". Fixed by exporting embeddings.ts's `ensureEmbeddingSchema` and
+  calling it directly in topics.ts's own read pass. Deliberately does not write back to
+  `IngestRecord.topics` — record-store.ts documents records as insert-only, so topic linkage
+  lives entirely on `qa_pairs.topic_id`. No rule induction yet — that's #25, next.
+
+**Next:** #25 (W2, epic `e3` — per-topic rule induction with evidence and a support filter) —
+check its label before assuming which path applies. `e3` (derivation), `e10` (permissions), and
+`e64` (shared-duos) run as parallel epics per §1, though concurrency stays sequential through W2
+per §2's locked decision.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
