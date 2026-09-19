@@ -132,6 +132,18 @@ export async function runSelfConsistencySampling(
   }
   const elapsedMs = Date.now() - start;
 
+  // Character-for-character identical samples are unambiguous full
+  // agreement — checked before ever embedding anything, both because it's
+  // strictly cheaper and because it's *more* correct than the embedding
+  // path: a sample with no signal any embedding model can pick up on
+  // (e.g. very short, or outside the model's vocabulary) would otherwise
+  // embed to a degenerate all-zero vector, whose cosine similarity to
+  // itself is conventionally undefined and this module treats as 0 — the
+  // opposite of what identical text actually means.
+  if (samples.every((sample) => sample === samples[0])) {
+    return { samples, sampleEmbeddings: [], agreement: 1, sampleCount: samples.length, elapsedMs };
+  }
+
   let sampleEmbeddings: (readonly number[])[] = [];
   let agreement = 1;
   try {

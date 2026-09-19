@@ -146,12 +146,13 @@ describe("runSelfConsistencySampling — fixed sample count, cost recorded (AC c
       [0, 1, 0],
       [0, 0, 1],
     ];
-    let i = 0;
+    let generated = 0;
+    let embedded = 0;
     const result = await runSelfConsistencySampling(
       "prompt",
       3,
-      async () => `sample-${i}`,
-      async () => vectors[i++],
+      async () => `sample-${generated++}`, // distinct text per call, so the identical-text short-circuit doesn't apply
+      async () => vectors[embedded++],
     );
     expect(result.agreement).toBeCloseTo(0, 5);
   });
@@ -163,10 +164,11 @@ describe("runSelfConsistencySampling — fixed sample count, cost recorded (AC c
   });
 
   it("degrades to a neutral agreement score if embedding the samples fails", async () => {
+    let generated = 0;
     const result = await runSelfConsistencySampling(
       "prompt",
       2,
-      async () => "answer",
+      async () => `answer-${generated++}`, // distinct text, so embedding is actually attempted (and fails) rather than short-circuiting on identical text
       async () => {
         throw new Error("embedding service down");
       },

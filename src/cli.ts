@@ -1,8 +1,11 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
+import { runDraft, runRecordDraftOutcome } from "./commands/draft.js";
+import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
@@ -335,6 +338,69 @@ permissionsCommand
             `confidence=${entry.confidence} declined=${entry.declined} question="${entry.question}"`,
         );
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+/** Reads piped stdin as thread context (#32 AC4: "the owner pipes the thread in"). Returns null when stdin is a TTY (nothing piped) or empty, so a plain interactive `duo draft <question>` never blocks waiting for input that was never coming. */
+function readPipedThreadContext(): string | null {
+  if (process.stdin.isTTY) {
+    return null;
+  }
+  try {
+    const content = readFileSync(0, "utf8").trim();
+    return content.length > 0 ? content : null;
+  } catch {
+    return null;
+  }
+}
+
+// The owner's own draft pipeline (docs/v1-tech-design.md §1.7, epic e5):
+// a CLI surface that closes the correction loop before any Slack app is
+// approved (AR-4 — gov workspaces commonly restrict installs hard).
+program
+  .command("draft")
+  .description("Draft a reply to a question, in your own voice, citing the standing orders and past exchanges it drew on")
+  .argument("<question>", "the question to draft a reply to")
+  .action(async (question: string) => {
+    const config = loadConfig();
+    const threadContext = readPipedThreadContext();
+    try {
+      const result = await runDraft(question, threadContext, config);
+      if (result.kind === "escalation") {
+        console.log(result.reason);
+        console.error(`(escalated — draft id ${result.draftId})`);
+        return;
+      }
+      console.log(result.text);
+      console.log("");
+      console.log(`Confidence: ${result.confidence.score.toFixed(2)} (draft id ${result.draftId})`);
+      if (result.sources.length > 0) {
+        console.log("Drew on:");
+        for (const source of result.sources) {
+          console.log(`  [${source.kind}:${source.id}] ${source.label}`);
+        }
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+program
+  .command("draft-outcome")
+  .description("Record what happened to a draft — sent, edited, or discarded — for the correction loop and the eval")
+  .argument("<draftId>", "the draft id printed by `duo draft`")
+  .argument("<outcome>", `one of: ${DRAFT_OUTCOMES.join(", ")}`)
+  .action((draftId: string, outcome: string) => {
+    const config = loadConfig();
+    if (!DRAFT_OUTCOMES.includes(outcome as (typeof DRAFT_OUTCOMES)[number])) {
+      reportError(new Error(`outcome must be one of: ${DRAFT_OUTCOMES.join(", ")}`));
+      return;
+    }
+    try {
+      runRecordDraftOutcome(draftId, outcome as (typeof DRAFT_OUTCOMES)[number], config);
+      console.log(`Recorded draft ${draftId} as ${outcome}.`);
     } catch (error) {
       reportError(error);
     }
