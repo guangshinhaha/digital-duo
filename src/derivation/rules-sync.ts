@@ -1,7 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { withDatabase } from "../store/store.js";
-import { RULE_STATUSES, deleteRule, listRuleEvidence, listRules, putRule, type Rule, type RuleStatus } from "./rules.js";
+import {
+  RULE_ORIGINS,
+  RULE_REVIEW_STATUSES,
+  RULE_STATUSES,
+  deleteRule,
+  listRuleEvidence,
+  listRules,
+  putRule,
+  type Rule,
+  type RuleOrigin,
+  type RuleReviewStatus,
+  type RuleStatus,
+} from "./rules.js";
 
 /**
  * `duo/rules/*.md` is the source of truth for humans (v1-tech-design.md
@@ -91,6 +103,12 @@ export function serializeRuleFile(rule: Rule, evidence: readonly string[]): stri
     `consistency: ${rule.consistency}`,
     `created_at: ${yamlScalar(rule.createdAt)}`,
     `last_confirmed_at: ${yamlScalar(rule.lastConfirmedAt)}`,
+    // #28: the owner's own review decision, written into the same file the
+    // owner already hand-edits — approving/rejecting/promoting (#28) rewrites
+    // these two lines, which is what makes the decision visible in the file
+    // itself and durable across the next `duo derive sync` ("files win").
+    `review_status: ${rule.reviewStatus}`,
+    `origin: ${rule.origin}`,
     evidenceBlock,
   ].join("\n");
   return `---\n${frontmatter}\n---\n\n${rule.text}\n`;
@@ -149,6 +167,8 @@ export function parseRuleFile(filePath: string, content: string): ParsedRuleFile
   const consistencyRaw = fields.get("consistency");
   const createdAt = fields.get("created_at");
   const lastConfirmedAtRaw = fields.get("last_confirmed_at");
+  const reviewStatusRaw = fields.get("review_status");
+  const originRaw = fields.get("origin");
 
   if (!id) {
     throw new MalformedRuleFileError(filePath, 'missing required field "id"');
@@ -173,6 +193,19 @@ export function parseRuleFile(filePath: string, content: string): ParsedRuleFile
   if (body.length === 0) {
     throw new MalformedRuleFileError(filePath, "rule body (the markdown text after frontmatter) is empty");
   }
+  // Optional, defaulting rather than required: a file written before #28
+  // shipped (or a hand-edit that only touches the fields it cares about)
+  // has neither field, and that must still parse — "pending"/"derived" are
+  // exactly what a rule that has never been reviewed already means.
+  if (reviewStatusRaw !== undefined && !(RULE_REVIEW_STATUSES as readonly string[]).includes(reviewStatusRaw)) {
+    throw new MalformedRuleFileError(
+      filePath,
+      `field "review_status" must be one of ${RULE_REVIEW_STATUSES.join(", ")}, got "${reviewStatusRaw}"`,
+    );
+  }
+  if (originRaw !== undefined && !(RULE_ORIGINS as readonly string[]).includes(originRaw)) {
+    throw new MalformedRuleFileError(filePath, `field "origin" must be one of ${RULE_ORIGINS.join(", ")}, got "${originRaw}"`);
+  }
 
   return {
     rule: {
@@ -183,6 +216,8 @@ export function parseRuleFile(filePath: string, content: string): ParsedRuleFile
       consistency,
       createdAt,
       lastConfirmedAt: lastConfirmedAtRaw === undefined || lastConfirmedAtRaw === "null" ? null : lastConfirmedAtRaw,
+      reviewStatus: (reviewStatusRaw as RuleReviewStatus | undefined) ?? "pending",
+      origin: (originRaw as RuleOrigin | undefined) ?? "derived",
       text: body,
     },
     evidence,

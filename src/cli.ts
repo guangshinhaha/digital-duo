@@ -6,7 +6,15 @@ import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeri
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
-import { runMirrorPortrait } from "./commands/mirror.js";
+import {
+  runMirrorPortrait,
+  runMirrorRuleApprove,
+  runMirrorRulePromote,
+  runMirrorRuleReject,
+  runMirrorRuleShow,
+  runMirrorRuleWrite,
+  runMirrorRulesList,
+} from "./commands/mirror.js";
 import { runAskAsAsker, runEnforceCeiling, runListAuditEntries, runShowAuditEntry } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
@@ -529,6 +537,134 @@ mirrorCommand
       for (const thread of portrait.busiestThreads) {
         console.log(`  ${formatPercent(thread.share).padStart(6)} (${thread.count})  ${thread.threadId}`);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const rulesCommand = mirrorCommand
+  .command("rules")
+  .description("Review the standing orders derived from your history (#28)");
+
+function renderRuleLine(rule: { id: string; text: string; status: string; supportCount: number; consistency: number }): string {
+  return `  [${rule.id}] (${rule.status}, support=${rule.supportCount}, consistency=${rule.consistency.toFixed(2)}) ${rule.text}`;
+}
+
+rulesCommand
+  .command("list")
+  .description("List rules awaiting review, weak signals, and inconsistent topics")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const listing = runMirrorRulesList(config);
+      if (listing.awaitingApproval.length === 0) {
+        console.log(
+          "No rule has cleared the confirmation threshold (≥3 consistent pairs) yet — nothing is awaiting approval.",
+        );
+      } else {
+        console.log(`Awaiting your approval (${listing.awaitingApproval.length}):`);
+        listing.awaitingApproval.forEach((rule) => console.log(renderRuleLine(rule)));
+      }
+      console.log("");
+      console.log(
+        listing.weakSignals.length === 0
+          ? "No weak signals below threshold."
+          : `Weak signals below threshold, promotable by hand (${listing.weakSignals.length}):`,
+      );
+      listing.weakSignals.forEach((rule) => console.log(renderRuleLine(rule)));
+      if (listing.inconsistent.length > 0) {
+        console.log("");
+        console.log(`Inconsistent — conflicting answers, no confident rule (${listing.inconsistent.length}):`);
+        listing.inconsistent.forEach((rule) => console.log(renderRuleLine(rule)));
+      }
+      if (listing.awaitingApproval.length === 0 && listing.weakSignals.length === 0 && listing.inconsistent.length === 0) {
+        console.log(
+          "No rules were derived at all yet. Write one by hand with `duo mirror rules write --label <topic> --text <rule text>`.",
+        );
+      }
+      if (listing.approved.length > 0 || listing.rejected.length > 0) {
+        console.log("");
+        console.log(`Already reviewed: ${listing.approved.length} approved, ${listing.rejected.length} rejected.`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+rulesCommand
+  .command("show")
+  .description("Show a rule and the exchanges its citations point to")
+  .argument("<ruleId>", "the rule's id")
+  .action((ruleId: string) => {
+    const config = loadConfig();
+    try {
+      const { rule, evidence } = runMirrorRuleShow(ruleId, config);
+      console.log(renderRuleLine(rule));
+      console.log(`review: ${rule.reviewStatus} · origin: ${rule.origin}`);
+      console.log("");
+      console.log(evidence.length === 0 ? "No cited exchanges." : "Cited exchanges:");
+      for (const exchange of evidence) {
+        console.log(`  Q: ${exchange.questionText ?? "(record no longer available)"}`);
+        console.log(`  A: ${exchange.answerText ?? "(record no longer available)"}`);
+        console.log("");
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+rulesCommand
+  .command("approve")
+  .description("Approve a confirmed rule, making it active (#28 AC1)")
+  .argument("<ruleId>", "the rule's id")
+  .action((ruleId: string) => {
+    const config = loadConfig();
+    try {
+      const rule = runMirrorRuleApprove(ruleId, config);
+      console.log(`Approved [${rule.id}]: ${rule.text}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+rulesCommand
+  .command("reject")
+  .description("Reject a rule; it becomes inactive and is never re-proposed unchanged (#28 AC2)")
+  .argument("<ruleId>", "the rule's id")
+  .action((ruleId: string) => {
+    const config = loadConfig();
+    try {
+      const rule = runMirrorRuleReject(ruleId, config);
+      console.log(`Rejected [${rule.id}].`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+rulesCommand
+  .command("promote")
+  .description("Promote a below-threshold weak signal to an active, owner-asserted rule (#28 AC3)")
+  .argument("<ruleId>", "the rule's id")
+  .action((ruleId: string) => {
+    const config = loadConfig();
+    try {
+      const rule = runMirrorRulePromote(ruleId, config);
+      console.log(`Promoted [${rule.id}] (owner-asserted): ${rule.text}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+rulesCommand
+  .command("write")
+  .description("Write a new rule by hand when nothing was derived (#28 AC4)")
+  .requiredOption("--label <label>", "a short topic label for the new rule")
+  .requiredOption("--text <text>", "the rule's text, in your own words")
+  .action((options: { label: string; text: string }) => {
+    const config = loadConfig();
+    try {
+      const rule = runMirrorRuleWrite(options.label, options.text, config);
+      console.log(`Wrote [${rule.id}] (owner-asserted, approved): ${rule.text}`);
     } catch (error) {
       reportError(error);
     }
