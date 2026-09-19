@@ -93,11 +93,14 @@ ceremony on work that doesn't need it:
 
 ## 5. Resume point
 
-**Done:** #16 (PR [#73](https://github.com/guangshinhaha/digital-duo/pull/73), merged,
-squash commit `4fd79b9`).
+**Done:**
+- #16 (PR [#73](https://github.com/guangshinhaha/digital-duo/pull/73), merged, squash commit `4fd79b9`).
+- #65 (PR [#74](https://github.com/guangshinhaha/digital-duo/pull/74), merged, squash commit
+  `52a7181`) — lighter path: `src/duo/` (`Owner`, `KnowledgeSource`, `Duo` entity,
+  `requireHumanOwner`, definition validation), 15 tests, zero code-review findings. Not yet
+  wired into the CLI — nothing there reads an owner yet, so there was nothing to retrofit.
 
-**Next:** #65 (W0), then #17 (W0) — both via the story/task split in §4 (#65 is a `task`
-labelled `refactor`, so the lighter path applies; check its label before assuming).
+**Next:** #17 (W0, closes out the wave) — check its label before assuming which path applies.
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
