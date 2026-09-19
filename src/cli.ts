@@ -403,18 +403,29 @@ program
 
 program
   .command("draft-outcome")
-  .description("Record what happened to a draft — sent, edited, or discarded — for the correction loop and the eval")
+  .description(
+    "Record what happened to a draft — sent, edited, or discarded — for the correction loop and the eval. " +
+      "For \"edited\", pass the text you actually sent to also classify the edit and queue a correction candidate (#37)",
+  )
   .argument("<draftId>", "the draft id printed by `duo draft`")
   .argument("<outcome>", `one of: ${DRAFT_OUTCOMES.join(", ")}`)
-  .action((draftId: string, outcome: string) => {
+  .argument("[sentText]", "the text actually sent — required to classify an \"edited\" outcome, ignored otherwise")
+  .action(async (draftId: string, outcome: string, sentText: string | undefined) => {
     const config = loadConfig();
     if (!DRAFT_OUTCOMES.includes(outcome as (typeof DRAFT_OUTCOMES)[number])) {
       reportError(new Error(`outcome must be one of: ${DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
     try {
-      runRecordDraftOutcome(draftId, outcome as (typeof DRAFT_OUTCOMES)[number], config);
+      const result = await runRecordDraftOutcome(draftId, outcome as (typeof DRAFT_OUTCOMES)[number], config, sentText);
       console.log(`Recorded draft ${draftId} as ${outcome}.`);
+      if (result) {
+        console.log(
+          result.classification === "trivial"
+            ? "Edit judged trivial (whitespace/typo-level) — nothing queued."
+            : `Edit classified as "${result.classification}"; queued: ${result.queuedKinds.length > 0 ? result.queuedKinds.join(", ") : "nothing new (already queued or previously rejected)"}.`,
+        );
+      }
     } catch (error) {
       reportError(error);
     }

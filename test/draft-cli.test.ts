@@ -3,8 +3,25 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCli } from "./helpers/run-cli.js";
 import { useTempDir } from "./helpers/temp-dir.js";
+import { appendDraft } from "../src/drafting/draft-log.js";
+import { createEncryptedStore } from "../src/store/store.js";
 
 const tempDir = useTempDir();
+const PASSPHRASE = "test-passphrase";
+
+/** Seeds a confident (non-escalated) draft directly, since a real `duo draft` always escalates on an empty store — #37's classification only matters once there's a draft with real text to diff against. */
+function seedConfidentDraft(storePath: string, question: string, draftText: string): string {
+  createEncryptedStore(storePath, PASSPHRASE);
+  return appendDraft(storePath, PASSPHRASE, {
+    question,
+    threadContext: null,
+    draftText,
+    escalated: false,
+    escalationReason: null,
+    confidenceScore: 0.9,
+    sources: [],
+  });
+}
 
 async function initStore(storePath: string, cwd: string): Promise<void> {
   const result = await runCli(["init"], { cwd, env: { DUO_STORE_PATH: storePath } });
@@ -76,6 +93,77 @@ describe("duo draft-outcome — the outcome of a draft is recorded (#32 AC3)", (
     const result = await runCli(["draft-outcome", "not-a-real-id", "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toMatch(/not-a-real-id/);
+  });
+});
+
+describe("duo draft-outcome edited <sentText> — classifies the edit and queues a correction candidate (#37)", () => {
+  it("classifies a style-only edit and queues nothing but a voice-profile-shaped candidate", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const draftId = seedConfidentDraft(storePath, "when is the meeting?", "the meeting is on tuesday at 3pm in the main office");
+
+    const result = await runCli(
+      ["draft-outcome", draftId, "edited", "meeting tuesday 3pm main office"],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/classified as "style"/);
+    expect(result.stdout).toMatch(/queued: style/);
+  });
+
+  it("classifies a substance edit and queues a standing-order-shaped candidate", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const draftId = seedConfidentDraft(storePath, "when is the meeting?", "the meeting is on tuesday at 3pm in the main office");
+
+    const result = await runCli(
+      ["draft-outcome", draftId, "edited", "the budget review moved to thursday afternoon"],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/classified as "substance"/);
+    expect(result.stdout).toMatch(/queued: substance/);
+  });
+
+  it("does not classify at all when no sent text is given for a plain edited outcome", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const draftId = seedConfidentDraft(storePath, "q", "a draft");
+
+    const result = await runCli(["draft-outcome", draftId, "edited"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toMatch(/classified/);
+  });
+
+  it("still records the outcome, without erroring, against an escalated draft that has no draft text to classify", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    createEncryptedStore(storePath, PASSPHRASE);
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "thin",
+      confidenceScore: 0,
+      sources: [],
+    });
+
+    const result = await runCli(
+      ["draft-outcome", draftId, "edited", "some answer"],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/Recorded draft .* as edited/);
+    expect(result.stdout).not.toMatch(/classified/);
+  });
+
+  it("reports a trivial edit and queues nothing", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    const draftId = seedConfidentDraft(storePath, "is that right?", "Yes, that's correct.");
+
+    const result = await runCli(
+      ["draft-outcome", draftId, "edited", "Yes, that's correct"],
+      { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(/trivial/);
   });
 });
 
