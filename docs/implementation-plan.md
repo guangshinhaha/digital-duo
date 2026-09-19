@@ -642,11 +642,54 @@ regression test added. **745 tests, full suite green.**
 follow-up issue filed against already-merged `e5` ([#137](https://github.com/guangshinhaha/digital-duo/issues/137),
 relevance gate precision), not actioned in this run. `main` tip: `a214c11`.
 
-**Next: wave W5** (`e9`, public-answering): #43→44→45→**46∥47**, the first wave to consume the
-full permission engine (`e10`) and trust grid (`e11`) built ahead of it in W2/W3. Single chain
-(no other epic runs alongside it this wave) — the plan allows #46/#47 to run in parallel with
-each other since they're the tail of one epic, but running the chain sequentially through them is
-equally correct and simpler; use judgment on whether splitting them is worth a second worktree.
+**Wave W5** (`e9`, public-answering, #43→44→45→46→47, run sequentially rather than splitting
+#46/#47 across a second worktree — simpler, equally correct) — the first wave to consume the
+full permission engine (`e10`) and trust grid (`e11`) built ahead of it in W2/W3:
+
+#43 PR [#142](https://github.com/guangshinhaha/digital-duo/pull/142) `34344aa` (**full path**,
+`story` label) — `src/permissions/public-answer.ts` + `public-answer-log.ts` (a purpose-built log,
+not `audit_log` — that schema's clearance columns don't fit a topic-gated flow), `duo permissions
+ask-public`. **Real permission-boundary bug, caught in review and fixed directly** (this is the
+first wave whose own chain, not the orchestrating session, found and fixed a trust-boundary gap):
+naively reusing #32's owner's-eyes-unfiltered `gatherDraftContext`/`draftReply` for a *public*
+answer would have let restricted or unmarked (`"unknown"`) material leak the moment this epic
+gave that pipeline's output a way to leave the owner's own eyes — the first real breach of the
+classification boundary #48-51 established back in W2. Fixed with an optional `clearanceCeiling`
+param on `gatherDraftContext`/`draftReply` (filters via #48's `isVisibleToClearance` *before*
+rule-hit/topic/evidence resolution); public answering passes the lowest defined level uniformly,
+per the issue's own out-of-scope note (no per-asker differentiation yet). Added
+`DraftContext.topicId`/`DraftAnswer.topicId` so public answering has something to check against
+the T0 trust cell at all. #44 PR
+[#143](https://github.com/guangshinhaha/digital-duo/pull/143) `93dc0ae` (**full path**, `story`
+label) — `src/permissions/attribution.ts` (mirrors `src/shared-duo/attribution.ts`'s pattern),
+`DUO_OWNER_NAME` config; every one of #43's three return paths composed through
+`withPublicAttribution` before logging/returning, unsuppressible by any parameter. #45 PR
+[#144](https://github.com/guangshinhaha/digital-duo/pull/144) `ff0707a` (**full path**, `story`
+label) — `src/permissions/public-correction.ts` wires #55's `applyCorrection` (T0 demotion)
+together with an append-only `"corrected"` log entry (`correctsEntryId`, original never touched);
+`threadStillExists` is a caller-supplied fact, same idiom as `actions/reversible.ts`'s
+`canRevertHere`, since no live channel integration exists (`e8` stays blocked). #46 PR
+[#145](https://github.com/guangshinhaha/digital-duo/pull/145) `2687394` (**full path**, `story`
+label) — `escalation_urgency_log`/`escalation_digests` over #32's existing `drafts` table (no
+parallel tracking); urgency classified on objective severity signals, not self-declared "urgent"
+framing, per the issue's own flagged risk. Self-review caught a real bug before commit: an INSERT
+had 3 `?` placeholders bound against 4 arguments (copy-paste leftover) — would have thrown at
+runtime on the first escalated draft. #47 PR
+[#146](https://github.com/guangshinhaha/digital-duo/pull/146) `46c20aa` (**full path**, `story`
+label) — `src/drafting/proactive-offer.ts` + `channel-mutes.ts` (`duo/muted-channels.json`,
+checked-in convention); the first real consumer of #31's `runRelevanceGate`, built for exactly
+this; "one action to post it" reuses #32's existing `duo draft-outcome <id> sent` rather than a
+new send path. **811 tests at the end of this chain.** No blockers hit; every issue resolved with
+existing `e10`/`e11`/`e5` machinery already in place, as the plan anticipated. [#137](https://github.com/guangshinhaha/digital-duo/issues/137)
+(relevance-gate precision, filed in W4) stays open and untouched — #47 reuses that gate unchanged,
+correctly out of this chain's scope.
+
+**Wave W5 is now complete.** `main` tip: `46c20aa`.
+
+**Next: wave W6** (`e13`, role-duos, the last wave): #72→61→62→63. Single chain, sequential.
+Once this lands, all 72 issues in the original backlog are closed (#22 and epic `e8` stay
+permanently skipped per §2/§4, both blocked on #15 — that's expected, not a gap, unless/until #15
+is resolved separately).
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
