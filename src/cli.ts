@@ -55,6 +55,7 @@ import {
   type CalibrationProgress,
 } from "./commands/mirror.js";
 import { runCorrectionsApprove, runCorrectionsReject, runCorrectionsReview } from "./commands/corrections.js";
+import { runEscalationsCheck, runEscalationsDigest, runEscalationsHistory, runEscalationsRate } from "./commands/escalations.js";
 import {
   runAnswerPublicly,
   runAskAsAsker,
@@ -646,6 +647,97 @@ correctionsCommand
     try {
       runCorrectionsReject(id, config);
       console.log(`Rejected [${id}].`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// Batched escalation digests (docs/concept.md §10, #46): "escalations must
+// batch into a digest; only a narrow urgent class interrupts live." Built
+// over #32's own drafts table (every escalated draft, whichever pipeline
+// produced it) rather than a parallel tracking mechanism.
+const escalationsCommand = program
+  .command("escalations")
+  .description("Batched escalation digests, the rare urgent-interrupt path, and the drift-visibility rate between them (#46)");
+
+function renderDigestItem(item: { draftId: string; question: string; escalationReason: string | null; createdAt: string }): string {
+  return `  [${item.draftId}] ${item.createdAt} ${item.question}${item.escalationReason ? `\n    ${item.escalationReason}` : ""}`;
+}
+
+escalationsCommand
+  .command("check")
+  .description(
+    "The rare, live-interrupt path (#46 AC3): every urgent, unresolved escalation not yet surfaced. " +
+      "Each one is reported here exactly once — it will not appear again on a later check",
+  )
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const result = runEscalationsCheck(config);
+      if (result.items.length === 0) {
+        console.log("No urgent escalations.");
+        return;
+      }
+      console.log(`${result.items.length} urgent escalation(s) — this should stay rare:`);
+      result.items.forEach((item) => console.log(renderDigestItem(item)));
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+escalationsCommand
+  .command("digest")
+  .description(
+    "Assemble and send the batched digest of every ordinary escalation since the last one (#46 AC1). " +
+      "Sends and prints nothing at all when there is nothing new (#46 AC2) — an escalation the owner already " +
+      "answered directly (`duo draft-answer`) is omitted as already resolved (#46 AC4)",
+  )
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const result = runEscalationsDigest(config);
+      if (!result.sent) {
+        console.log("Nothing to digest.");
+        return;
+      }
+      console.log(`Digest [${result.digestId}] — ${result.items.length} escalation(s) since the last one:`);
+      result.items.forEach((item) => console.log(renderDigestItem(item)));
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+escalationsCommand
+  .command("history")
+  .description("List every digest actually sent, oldest first")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const digests = runEscalationsHistory(config);
+      if (digests.length === 0) {
+        console.log("No digest has been sent yet.");
+        return;
+      }
+      for (const digest of digests) {
+        console.log(`[${digest.id}] ${digest.createdAt} — ${digest.itemCount} escalation(s)`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+escalationsCommand
+  .command("rate")
+  .description("The all-time share of escalations classified urgent (#46 AC3) — the number to watch for drift away from \"rare\"")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const rate = runEscalationsRate(config);
+      console.log(
+        rate.total === 0
+          ? "No escalations classified yet."
+          : `${rate.urgent}/${rate.total} escalation(s) classified urgent (${(rate.rate * 100).toFixed(1)}%).`,
+      );
     } catch (error) {
       reportError(error);
     }
