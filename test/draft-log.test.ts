@@ -38,6 +38,40 @@ describe("appendDraft / getDraft", () => {
     expect(draft?.sources).toEqual([{ kind: "rule", id: "topic-leave", label: "standing order: five days" }]);
   });
 
+  it("defaults refused to false and escalationThreshold to 0.55 when the caller omits them", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.refused).toBe(false);
+    expect(draft?.escalationThreshold).toBe(0.55);
+  });
+
+  it("round-trips a refused escalation with a non-default threshold", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "refused subject",
+      confidenceScore: 0,
+      sources: [],
+      refused: true,
+      escalationThreshold: 0.7,
+    });
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.refused).toBe(true);
+    expect(draft?.escalationThreshold).toBe(0.7);
+  });
+
   it("round-trips an escalated entry with a null draftText", () => {
     const storePath = initStore();
     const id = appendDraft(storePath, PASSPHRASE, {

@@ -7,14 +7,23 @@ import { OwnerMessage } from "./OwnerMessage.js";
 import { ConfidenceHairline } from "./ConfidenceHairline.js";
 import type { DraftPipelineResult } from "../api/types.js";
 
-/** Adapts a `DraftRecord` (the list shape) into the discriminated union `ConfidenceHairline` expects — a draft record is always one or the other by construction (`draftText === null` iff escalated), so this narrowing can't fail on real data. */
+/**
+ * Adapts a `DraftRecord` (the list shape) into the discriminated union
+ * `ConfidenceHairline` expects — a draft record is always one or the
+ * other by construction (`draftText === null` iff escalated), so this
+ * narrowing can't fail on real data. Uses `draft.refused` and
+ * `draft.escalationThreshold` directly rather than guessing at either:
+ * an earlier version pattern-matched `refused` out of `escalationReason`'s
+ * human-readable text and hardcoded the threshold, both of which drift
+ * the moment the server-side wording or a configured threshold changes.
+ */
 function toDraftPipelineResult(draft: DraftRecord): DraftPipelineResult {
   if (draft.escalated) {
     return {
       kind: "escalation",
       draftId: draft.id,
       reason: draft.escalationReason ?? "",
-      refused: draft.escalationReason?.toLowerCase().includes("refus") ?? false,
+      refused: draft.refused,
       confidence: undefined,
     };
   }
@@ -23,8 +32,26 @@ function toDraftPipelineResult(draft: DraftRecord): DraftPipelineResult {
     draftId: draft.id,
     text: draft.draftText ?? "",
     sources: draft.sources,
-    confidence: { score: draft.confidenceScore, passesThreshold: true, threshold: 0.55 },
+    confidence: { score: draft.confidenceScore, passesThreshold: true, threshold: draft.escalationThreshold },
   };
+}
+
+function SourceList({ sources }: { sources: DraftRecord["sources"] }) {
+  if (sources.length === 0) {
+    return null;
+  }
+  return (
+    <details className="text-xs text-[var(--muted)]">
+      <summary>
+        Drew on {sources.length} source{sources.length === 1 ? "" : "s"}
+      </summary>
+      <ul className="mt-1 space-y-1">
+        {sources.map((source) => (
+          <li key={`${source.kind}:${source.id}`}>{source.label}</li>
+        ))}
+      </ul>
+    </details>
+  );
 }
 
 /**
@@ -49,23 +76,29 @@ export function DraftCard({ api, draft }: { api: DuoApiConfig; draft: DraftRecor
         <div className="rounded-[var(--r-lg)] border border-dashed border-[var(--edge)] px-4 py-3 text-[var(--muted)]" data-testid="escalation-reason">
           {draft.escalationReason}
         </div>
-        {!(result.kind === "escalation" && result.refused) && (
-          <div className="flex gap-2">
-            <input
-              className="flex-1 rounded-[var(--r-sm)] border border-[var(--edge)] bg-[var(--surface)] px-2 py-1 text-[var(--text)]"
-              placeholder="Answer it yourself — becomes a standing-order candidate"
-              value={answerText}
-              onChange={(e) => setAnswerText(e.target.value)}
-            />
-            <button
-              className="rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-1 text-white disabled:opacity-40"
-              disabled={!answerText || answerEscalation.isPending}
-              onClick={() => answerEscalation.mutate({ draftId: draft.id, answer: answerText })}
-            >
-              Answer
-            </button>
-          </div>
-        )}
+        <SourceList sources={draft.sources} />
+        {!draft.refused &&
+          (answerEscalation.isSuccess ? (
+            <p className="text-xs text-[var(--confident)]" data-testid="answer-confirmation">
+              Queued as a standing-order candidate.
+            </p>
+          ) : (
+            <div className="flex gap-2">
+              <input
+                className="flex-1 rounded-[var(--r-sm)] border border-[var(--edge)] bg-[var(--surface)] px-2 py-1 text-[var(--text)]"
+                placeholder="Answer it yourself — becomes a standing-order candidate"
+                value={answerText}
+                onChange={(e) => setAnswerText(e.target.value)}
+              />
+              <button
+                className="rounded-[var(--r-sm)] bg-[var(--accent)] px-3 py-1 text-white disabled:opacity-40"
+                disabled={!answerText || answerEscalation.isPending}
+                onClick={() => answerEscalation.mutate({ draftId: draft.id, answer: answerText })}
+              >
+                Answer
+              </button>
+            </div>
+          ))}
       </div>
     );
   }
@@ -86,16 +119,7 @@ export function DraftCard({ api, draft }: { api: DuoApiConfig; draft: DraftRecor
           draft.draftText
         )}
       </DuoMessage>
-      {draft.sources.length > 0 && (
-        <details className="text-xs text-[var(--muted)]">
-          <summary>Drew on {draft.sources.length} source{draft.sources.length === 1 ? "" : "s"}</summary>
-          <ul className="mt-1 space-y-1">
-            {draft.sources.map((source) => (
-              <li key={`${source.kind}:${source.id}`}>{source.label}</li>
-            ))}
-          </ul>
-        </details>
-      )}
+      <SourceList sources={draft.sources} />
       <div className="flex gap-2">
         {editing ? (
           <>

@@ -41,6 +41,10 @@ export interface DraftRecord {
   outcome: DraftOutcome | null;
   outcomeRecordedAt: string | null;
   sentText: string | null;
+  /** True only for a refused-subject escalation — a real stored field, not derived from escalationReason's text (src/drafting/draft-log.ts's own reasoning for why). */
+  refused: boolean;
+  /** The composite-confidence escalation threshold that was actually in effect when this draft was generated — what ConfidenceHairline compares confidenceScore against, instead of a hardcoded guess. */
+  escalationThreshold: number;
 }
 
 /**

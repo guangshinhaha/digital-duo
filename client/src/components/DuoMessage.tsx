@@ -8,10 +8,11 @@ import type { ReactNode } from "react";
  * owner's own avatar on generated text is impossible to build with it, not
  * merely discouraged.
  *
- * Never import an avatar/identity component inside this file's subtree.
- * (See client/eslint.config.js's no-restricted-imports rule, which
- * enforces this at lint time — this comment is the "why", that rule is
- * the "how it's kept true".)
+ * `OwnerMessage` (or any owner-identity component) must never render
+ * inside this component's children, anywhere in the codebase. (See
+ * client/eslint.config.js's no-restricted-syntax JSX-nesting rule, which
+ * enforces this at lint time across every `.tsx` file — this comment is
+ * the "why", that rule is the "how it's kept true".)
  */
 export function DuoMessage({ children }: { children: ReactNode }) {
   return (

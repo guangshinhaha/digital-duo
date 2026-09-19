@@ -25,6 +25,8 @@ const draftRecord: DraftRecord = {
   outcome: null,
   outcomeRecordedAt: null,
   sentText: null,
+  refused: false,
+  escalationThreshold: 0.55,
 };
 
 const escalatedRecord: DraftRecord = {
@@ -33,6 +35,16 @@ const escalatedRecord: DraftRecord = {
   draftText: null,
   escalated: true,
   escalationReason: "no supporting evidence",
+  refused: false,
+};
+
+const refusedRecord: DraftRecord = {
+  ...draftRecord,
+  id: "d3",
+  draftText: null,
+  escalated: true,
+  escalationReason: "this topic is on your refused list",
+  refused: true,
 };
 
 describe("DraftCard — Send / Edit / Ignore (the correction loop's only input)", () => {
@@ -84,6 +96,29 @@ describe("DraftCard — Send / Edit / Ignore (the correction loop's only input)"
     expect(screen.getByTestId("escalation-reason")).toHaveTextContent("no supporting evidence");
     expect(screen.queryByText("Send")).toBeNull();
     expect(screen.getByPlaceholderText(/Answer it yourself/)).toBeInTheDocument();
+  });
+
+  it("a refused escalation hides the answer box — based on the real `refused` field, not the reason text", () => {
+    renderWithClient(<DraftCard api={api} draft={refusedRecord} />);
+    expect(screen.getByTestId("escalation-reason")).toHaveTextContent("this topic is on your refused list");
+    expect(screen.queryByPlaceholderText(/Answer it yourself/)).toBeNull();
+  });
+
+  it("a non-refused escalation whose reason text happens to mention \"refus\" still shows the answer box", () => {
+    // The regression case for the substring-matching bug this field
+    // replaced: wording alone must never flip whether the box shows.
+    renderWithClient(<DraftCard api={api} draft={{ ...escalatedRecord, escalationReason: "I refuse to guess with this little evidence", refused: false }} />);
+    expect(screen.getByPlaceholderText(/Answer it yourself/)).toBeInTheDocument();
+  });
+
+  it("answering an escalation shows a confirmation instead of leaving the box open to a duplicate submission", async () => {
+    renderWithClient(<DraftCard api={api} draft={escalatedRecord} />);
+    fireEvent.change(screen.getByPlaceholderText(/Answer it yourself/), { target: { value: "Ten days." } });
+    fireEvent.click(screen.getByText("Answer"));
+
+    await waitFor(() => expect(screen.getByTestId("answer-confirmation")).toBeInTheDocument());
+    expect(screen.queryByPlaceholderText(/Answer it yourself/)).toBeNull();
+    expect((fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter((c) => c[0] === "http://test/drafts/d2/answer")).toHaveLength(1);
   });
 
   it("answering an escalation posts to /drafts/:id/answer", async () => {

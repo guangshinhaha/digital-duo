@@ -40,6 +40,26 @@ export interface DraftRecord {
    * recorded before this field existed.
    */
   readonly sentText: string | null;
+  /**
+   * True for a refused-subject escalation (#34 AC2), false for every
+   * other escalation and for a non-escalated draft. Persisted rather than
+   * reconstructed from `escalationReason`'s text, because that text is
+   * meant for a human to read, not for a caller to pattern-match — a
+   * future rewording of the refusal message must never silently change
+   * whether a client thinks a question was refused or just uncertain.
+   * Defaults to `false` for any draft recorded before this field existed.
+   */
+  readonly refused: boolean;
+  /**
+   * The composite-confidence escalation threshold in effect when this
+   * draft was generated (`DuoConfig["confidence"].escalationThreshold`)
+   * — persisted so a client can render a confidence indicator (e.g. a
+   * hairline) against the threshold that was actually applied, rather
+   * than a hardcoded guess that drifts the moment the threshold is
+   * reconfigured. Defaults to the shipped default (0.55) for any draft
+   * recorded before this field existed.
+   */
+  readonly escalationThreshold: number;
 }
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -56,7 +76,9 @@ export function ensureDraftLogSchema(db: Database): void {
       created_at TEXT NOT NULL,
       outcome TEXT,
       outcome_recorded_at TEXT,
-      sent_text TEXT
+      sent_text TEXT,
+      refused INTEGER NOT NULL DEFAULT 0,
+      escalation_threshold REAL NOT NULL DEFAULT 0.55
     ) STRICT
   `);
 }
@@ -69,7 +91,14 @@ export interface AppendDraftInput {
   readonly escalationReason: string | null;
   readonly confidenceScore: number;
   readonly sources: readonly DraftSource[];
+  /** See `DraftRecord.refused`'s doc comment. `false` for a non-escalated draft. Optional — defaults to `false`, the correct value for every caller that isn't drafting/pipeline.ts's refused-subject path. */
+  readonly refused?: boolean;
+  /** See `DraftRecord.escalationThreshold`'s doc comment — the threshold in effect for this call. Optional — defaults to the shipped default (0.55, matching DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD in config.ts) for a caller that isn't threading a real DuoConfig["confidence"] through. */
+  readonly escalationThreshold?: number;
 }
+
+/** Mirrors config.ts's own DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD — duplicated as a literal rather than imported, since draft-log.ts is a low-level storage module that otherwise has no dependency on config.ts, and this is only ever the fallback for a caller that doesn't have (or care about) a real configured threshold. */
+const DEFAULT_ESCALATION_THRESHOLD = 0.55;
 
 /** Appends one draft (answered or escalated) and returns its id. */
 export function appendDraft(storePath: string, passphrase: string, input: AppendDraftInput): string {
@@ -79,8 +108,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
     ensureDraftLogSchema(db);
     db.prepare(
       `
-      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
     `,
     ).run(
       id,
@@ -92,6 +121,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
       input.confidenceScore,
       JSON.stringify(input.sources),
       createdAt,
+      input.refused ? 1 : 0,
+      input.escalationThreshold ?? DEFAULT_ESCALATION_THRESHOLD,
     );
   });
   return id;
@@ -144,6 +175,8 @@ interface DraftRow {
   outcome: string | null;
   outcome_recorded_at: string | null;
   sent_text: string | null;
+  refused: number;
+  escalation_threshold: number;
 }
 
 function rowToDraft(row: DraftRow): DraftRecord {
@@ -160,6 +193,8 @@ function rowToDraft(row: DraftRow): DraftRecord {
     outcome: row.outcome as DraftOutcome | null,
     outcomeRecordedAt: row.outcome_recorded_at,
     sentText: row.sent_text,
+    refused: row.refused === 1,
+    escalationThreshold: row.escalation_threshold,
   };
 }
 
