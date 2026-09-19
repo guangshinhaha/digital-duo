@@ -378,10 +378,35 @@ ceremony on work that doesn't need it:
   deduplicated `answerSharedDuo`'s two near-identical usage-log writes into one. No attribution
   enforcement or usage reporting yet — that's #70, next.
 
-**Next:** #70 (wave W2, epic `e64` — shared-duos), story-labeled: make it obvious a shared duo has
-no personal author, full `lfg` path per §4. Per §1/§2, `e10` and `e64` ran strictly one at a time
-on `main` within wave W2, not concurrently with each other or with anything else — `e64` continues
-alone.
+- #70 (PR [#109](https://github.com/guangshinhaha/digital-duo/pull/109), merged, squash commit
+  `7f68472`) — **full path** (`story` label, §4): `src/shared-duo/attribution.ts`
+  (`attributionLine`/`withAttribution`) — every one of `answerSharedDuo`'s three return paths
+  (covered answer, out-of-scope decline, new decision decline) is wrapped in `withAttribution`
+  before it's handed back, naming "the shared duo" and its owner; no parameter on
+  `answerSharedDuo` and nothing read from the persona file could suppress it. `src/shared-duo/
+  decision-guard.ts` (`isDecisionRequest`) — a deterministic keyword heuristic (same
+  "documented v1 stand-in" idiom `work-relevance.ts` uses), checked *before* retrieval: a
+  question asking the duo to decide/approve/authorize/sign off/greenlight/overrule always
+  declines with a fixed message naming the owner, even when a configured document is squarely
+  on-topic (AC2's key adversarial case — "approve this expense claim" never answers from the
+  Expense claims document as if the duo could sign off on it). `SharedDuoAnswer.declineReason`
+  distinguishes "out_of_scope" from "not_a_decision_maker"; `duo shared ask`'s decline wording
+  now reflects which. 338 tests (34 new). Multi-angle review (adversarial + simplification, per
+  the story path) found two real regex bugs before commit: `authoriz\b` never matched
+  "authorize"/"authorized" because the trailing word boundary landed mid-word (fixed to
+  `authoriz\w*`), and "green light" (space-separated) wasn't matched by
+  `greenlight|green-light` alone (fixed to `green[\s-]?light`). Also caught and corrected a
+  flawed test premise: `AuthoredKnowledgeSource.retrieve` matches by containment of the *query*
+  in the *document*, not the reverse, so a long natural-language question is never a hit
+  regardless of wording — replaced a misleading integration test with a plain unit-level
+  negative case in `decision-guard`'s own tests. No usage-report/abandonment-tracking CLI yet —
+  that's #71, next and last of this chain.
+
+**Next:** #71 (wave W2, epic `e64` — shared-duos), task-labeled, lighter path per §4: measure
+whether the shared duo is actually used — the last issue of this chain. Once merged, wave W2 is
+complete (all three epics — `e3`, `e10`, `e64` — done in order), and the orchestrating session
+moves to wave W3, where real parallelism starts (per the resume note this PR also writes once
+#71 lands).
 
 To resume: work straight through the wave sequence in §1 using the policy in §4, without
 re-deriving this plan. Stop only at a GATE/blocked stop `lfg` (or the lighter path) can't
