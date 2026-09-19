@@ -159,3 +159,26 @@ describe("grantAutonomy — grants are visible in one place (#53 AC4)", () => {
     expect(grid).toEqual([{ topicId: "topic-deploy", topicLabel: "Deploy access", tier: "T0", level: "auto", source: "granted", stale: false }]);
   });
 });
+
+describe("grantAutonomy — a T3 grant never lands at 'auto' (#59: no T3 action is autonomous on first grant)", () => {
+  it("caps a T3 grant at 'approve', unlike every other tier", () => {
+    const storePath = initStore();
+    seedTopics([{ id: "topic-deploy", label: "Deploy access" }]);
+    const outcome = grantAutonomy(storePath, PASSPHRASE, duoDir(), { scopeText: "deploy access", tier: "T3" });
+    expect(outcome).toMatchObject({ status: "applied", tier: "T3" });
+    withDatabase(storePath, PASSPHRASE, false, (db) => {
+      expect(getCellRow(db, "topic-deploy", "T3")?.level).toBe("approve");
+    });
+  });
+
+  it("still caps T0/T1/T2 grants at 'auto', unaffected by the T3-specific cap", () => {
+    const storePath = initStore();
+    seedTopics([{ id: "topic-deploy", label: "Deploy access" }]);
+    for (const tier of ["T0", "T1", "T2"] as const) {
+      grantAutonomy(storePath, PASSPHRASE, duoDir(), { scopeText: "deploy access", tier });
+      withDatabase(storePath, PASSPHRASE, false, (db) => {
+        expect(getCellRow(db, "topic-deploy", tier)?.level).toBe("auto");
+      });
+    }
+  });
+});

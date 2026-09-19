@@ -6,11 +6,13 @@ import { findConflictingRefusal, type Refusal } from "./refusals.js";
 
 /**
  * `docs/concept.md` §6: two routes to autonomy, "earned" (the ledger, #54)
- * and "granted" (standing orders, this module). A grant always moves a
- * cell straight to `"auto"` — that is what "granted outright" means; a
- * partial grant to `"approve"` isn't part of the story this issue
- * describes, and would need its own confirmation semantics this issue
- * doesn't specify.
+ * and "granted" (standing orders, this module). A grant moves a cell
+ * straight to `"auto"` — that is what "granted outright" means — for
+ * every tier except T3, which #59 caps at `"approve"` even on a grant
+ * ("no T3 action is autonomous on first grant... every one enters as
+ * draft-and-approve"). A partial grant to `"approve"` for any other tier
+ * isn't part of the story #53 describes, and would need its own
+ * confirmation semantics that issue didn't specify.
  */
 
 export interface GrantCandidate {
@@ -106,6 +108,16 @@ export function grantAutonomy(storePath: string, passphrase: string, duoDir: str
     return { status: "refused", refusal: conflict };
   }
 
+  // #59 AC ("no T3 action is autonomous on first grant: every one enters
+  // as draft-and-approve") — a standing-order grant on a T3 cell lands at
+  // "approve", never "auto", unlike every other tier. In practice the
+  // action-ladder's own T3 module (`src/actions/binding.ts`) never even
+  // reads this cell's level — every T3 action is staged for approval
+  // regardless — but capping it here too means the trust grid itself
+  // never *claims* an autonomy this codebase doesn't act on, which would
+  // be misleading to an owner reading `duo trust grid`.
+  const grantedLevel = input.tier === "T3" ? "approve" : "auto";
+
   withDatabase(storePath, passphrase, true, (db) => {
     ensureTrustSchema(db);
     ensureTrustLedgerSchema(db);
@@ -113,7 +125,7 @@ export function grantAutonomy(storePath: string, passphrase: string, duoDir: str
     upsertCellRow(db, {
       topicId,
       tier: input.tier,
-      level: "auto",
+      level: grantedLevel,
       source: "granted",
       cleanStreak: 0,
       lastOfferStreak: null,
@@ -121,7 +133,7 @@ export function grantAutonomy(storePath: string, passphrase: string, duoDir: str
       demotionAnnounced: true,
       updatedAt: now,
     });
-    appendLedgerEntry(db, { topicId, tier: input.tier, eventType: "granted", detail: { scopeText: input.scopeText, topicLabel } });
+    appendLedgerEntry(db, { topicId, tier: input.tier, eventType: "granted", detail: { scopeText: input.scopeText, topicLabel, level: grantedLevel } });
   });
 
   return { status: "applied", topicId, topicLabel, tier: input.tier };

@@ -88,7 +88,7 @@ describe("resolveActionForUse — a T4 action never resolves to a grid-derived l
 });
 
 describe("registerAction — an action reclassified into T4 loses its autonomy immediately (#60 AC2)", () => {
-  it("revokes the prior T3-auto grant and reports it lapsed when audience rises to external", () => {
+  it("revokes the prior T3 grant and reports it lapsed when audience rises to external", () => {
     const storePath = initStore();
     seedTopics([{ id: "topic-a", label: "Alpha" }]);
     registerAction(storePath, PASSPHRASE, { id: "send-notice", description: "send", reversible: true, obligates: true, audience: "internal", topicIds: ["topic-a"] }); // T3
@@ -97,7 +97,10 @@ describe("registerAction — an action reclassified into T4 loses its autonomy i
     const result = registerAction(storePath, PASSPHRASE, { id: "send-notice", description: "send", reversible: true, obligates: true, audience: "external", topicIds: ["topic-a"] }); // T4
     expect(result.action.tier).toBe("T4");
     expect(result.previousTier).toBe("T3");
-    expect(result.lapsedGrants).toEqual([{ topicId: "topic-a", tier: "T3", previousLevel: "auto" }]);
+    // #59 caps a T3 grant at "approve", not "auto" (no T3 action is
+    // autonomous on first grant) — the revocation logic still fires for
+    // any non-"ask" level, so this is the exact value that lapses now.
+    expect(result.lapsedGrants).toEqual([{ topicId: "topic-a", tier: "T3", previousLevel: "approve" }]);
 
     const outcome = resolveActionForUse(storePath, PASSPHRASE, duoDir(), "send-notice", "topic-a");
     expect(outcome).toEqual({ status: "resolved", tier: "T4", level: "confirm_required", stale: false });
