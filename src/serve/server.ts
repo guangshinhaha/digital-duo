@@ -66,6 +66,8 @@ function statusForError(error: Error): number {
     case "NotAnEscalationError":
     case "DraftIsRefusedError":
       return 409;
+    case "BlankEditError":
+      return 400;
     default:
       return 500;
   }
@@ -150,15 +152,11 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       reply.code(400).send(errorBody("bad_request", `outcome must be one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
-    // An "edited" outcome with a blank sentText isn't a discarded edit —
-    // it's an empty string that classifyAndQueueEdit (corrections/classify.ts)
-    // would score as a near-zero-content "style" tweak (newContentRatio
-    // of nothing is 0), silently recording that the owner made a trivial
-    // wording change when they actually deleted the entire answer.
-    if (outcome === "edited" && sentText !== undefined && sentText.trim().length === 0) {
-      reply.code(400).send(errorBody("bad_request", "sentText cannot be empty for an \"edited\" outcome"));
-      return;
-    }
+    // The blank-sentText-on-"edited" check lives in recordDraftOutcomeAndClassify
+    // itself (corrections/classify.ts), not here — so duo draft-outcome
+    // gets the same guard as this route, rather than each caller
+    // duplicating it (an earlier version of this fix did exactly that,
+    // and only here, leaving the CLI path unguarded).
     try {
       const classifier = deps.inferenceProvider ? createLlmEditClassifier(deps.inferenceProvider) : undefined;
       const result = await recordDraftOutcomeAndClassify(

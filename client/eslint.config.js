@@ -10,14 +10,22 @@ import tseslint from "typescript-eslint";
  *
  * `no-restricted-syntax` with a JSX-descendant selector, not
  * `no-restricted-imports`: the real invariant is about *composition*
- * (`<OwnerMessage>` must never render inside `<DuoMessage>`'s children,
- * anywhere in the codebase), not about which files are allowed to import
- * which module. An import-based rule scoped to DuoMessage.tsx alone only
- * catches DuoMessage importing OwnerMessage directly — it does nothing
- * to stop a *caller* elsewhere from writing
- * `<DuoMessage><OwnerMessage>…</OwnerMessage></DuoMessage>`, which is
- * the actual AR-13 violation. This rule applies to every `.tsx` file for
- * exactly that reason.
+ * (`<OwnerMessage>` must never render inside `<DuoMessage>`'s children),
+ * not about which files are allowed to import which module. This
+ * selector matches ancestor/descendant JSX nodes *within one syntax
+ * tree*, at any depth — so it catches `<DuoMessage><OwnerMessage/>
+ * </DuoMessage>` the moment it's typed, in any file, even through an
+ * inline wrapper written in the same expression.
+ *
+ * It cannot catch composition *across* a component boundary, though: a
+ * `Bubble` whose own source is `<DuoMessage>{children}</DuoMessage>` (no
+ * literal `<OwnerMessage>` in sight) used elsewhere as
+ * `<Bubble><OwnerMessage/></Bubble>` (no literal `<DuoMessage>` in sight
+ * either) gives this rule nothing to match at either call site, though
+ * React still mounts one inside the other at runtime.
+ * `DuoMessage.tsx`'s `InsideDuoMessage` context is the runtime half that
+ * closes that gap regardless of indirection — this rule is the fast,
+ * dev-time layer; that one is the complete guarantee.
  */
 export default tseslint.config(
   { ignores: ["dist/**"] },

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useAssertNotInsideDuoMessage } from "./DuoMessage.js";
 
 /**
  * Renders the owner's own words — a sent reply, a typed question. The only
@@ -6,6 +7,7 @@ import type { ReactNode } from "react";
  * (`DuoMessage`'s doc comment explains why that split exists).
  */
 export function OwnerMessage({ children }: { children: ReactNode }) {
+  useAssertNotInsideDuoMessage("OwnerMessage");
   return (
     <div
       data-testid="owner-message"
