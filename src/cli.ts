@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
+import { runDerivePairs } from "./commands/derive.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
@@ -148,6 +149,27 @@ program
       for (const { record } of outcome.results) {
         console.log(`[${record.id.slice(0, 8)}] (${record.author}) ${record.text}`);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The derivation pipeline (v1-tech-design.md §1.5): pair extraction, topic
+// assignment, rule induction, and voice/sync land here across #23-#26.
+const deriveCommand = program.command("derive").description("Run a stage of the derivation pipeline over the store");
+
+deriveCommand
+  .command("pairs")
+  .description("Extract question/answer pairs from threads in the store")
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      const summary = await runDerivePairs(config);
+      console.log(
+        `Extracted ${summary.pairs.length} pair(s) (${summary.written} new, ${summary.alreadyPresent} already present); ` +
+          `${summary.unansweredCount} unanswered question(s), ${summary.ambiguousCount} ambiguous ` +
+          `(${summary.adjudicatedCount} resolved by adjudication).`,
+      );
     } catch (error) {
       reportError(error);
     }
