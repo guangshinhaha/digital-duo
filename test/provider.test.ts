@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { defaultRegistry, resolveProvider } from "../src/provider/registry.js";
+import { defaultRegistry, resolveProvider, tryResolveProvider } from "../src/provider/registry.js";
 import { ProviderConfigError } from "../src/provider/types.js";
 import { fakeProvider } from "./fixtures/fake-provider.js";
 
@@ -68,6 +68,23 @@ describe("resolveProvider", () => {
     const provider = resolveProvider(config, registry);
     expect(provider).toBe(fakeProvider);
     expect(provider.name).toBe("fake");
+  });
+});
+
+describe("tryResolveProvider", () => {
+  it("returns undefined, not a thrown error, when no provider is configured (G1 unresolved)", () => {
+    const config = loadConfig({});
+    expect(tryResolveProvider(config)).toBeUndefined();
+  });
+
+  it("returns undefined for an invalid provider name too — every ProviderConfigError degrades, not just the unset case", () => {
+    const config = loadConfig({ DUO_PROVIDER: "not-a-real-provider" });
+    expect(tryResolveProvider(config)).toBeUndefined();
+  });
+
+  it("returns the resolved provider when one is fully configured", () => {
+    const config = loadConfig({ DUO_PROVIDER: "ollama", DUO_OLLAMA_MODEL: "llama3" });
+    expect(tryResolveProvider(config)?.name).toBe("ollama");
   });
 });
 

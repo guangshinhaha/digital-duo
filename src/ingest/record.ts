@@ -137,6 +137,32 @@ export function detectClassification(text: string): RecordClassification {
   return MARKING_LABELS[normalized] ?? "unknown";
 }
 
+/**
+ * Strips a record's own marking line off its text for display (#50: an
+ * answer built from a visible record's text shouldn't echo the raw
+ * classification stamp back at an asker who is, by construction, already
+ * cleared to see the content beneath it). Only handles the unambiguous
+ * case — the whole first line is a bare marking with nothing else on it —
+ * the same shape detectClassification's own "no colon" branch recognises;
+ * a marking sharing its line with real message text (the colon case) is
+ * left untouched rather than risk truncating content it can't cleanly
+ * separate.
+ */
+export function stripMarkingLine(record: Pick<IngestRecord, "text" | "classification">): string {
+  if (record.classification === "unknown") {
+    return record.text;
+  }
+  const newlineIndex = record.text.indexOf("\n");
+  if (newlineIndex === -1) {
+    return record.text; // the whole text is one line — nothing to strip without losing the message itself
+  }
+  const firstLine = record.text.slice(0, newlineIndex).trim();
+  if (firstLine.includes(":")) {
+    return record.text; // marking shares its line with real content; leave it alone
+  }
+  return record.text.slice(newlineIndex + 1).trimStart();
+}
+
 function asStringArray(value: unknown, field: string): readonly string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     fail(field, `expected an array of strings, got ${JSON.stringify(value)}`);

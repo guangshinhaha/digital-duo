@@ -6,7 +6,7 @@ import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeri
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
-import { runEnforceCeiling } from "./commands/permissions.js";
+import { runAskAsAsker, runEnforceCeiling } from "./commands/permissions.js";
 import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runStatus } from "./commands/status.js";
@@ -268,6 +268,27 @@ permissionsCommand
           ? "No records sit above the configured ceiling; nothing removed."
           : `Removed ${result.removed} record(s) above the configured ceiling.`,
       );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+permissionsCommand
+  .command("ask")
+  .description("Answer a question as a specific asker, filtered to what they may see, and log it to the audit trail")
+  .argument("<question>", "the question to answer")
+  .requiredOption("--as <askerId>", "the asker's identity, resolved against duo/directory.json")
+  .action(async (question: string, options: { as: string }) => {
+    const config = loadConfig();
+    try {
+      const result = await runAskAsAsker(question, options.as, config);
+      if (result.warning) {
+        console.error(result.warning);
+      }
+      console.log(result.answer);
+      if (result.declined) {
+        console.error("(declined — nothing visible to this asker informed this answer)");
+      }
     } catch (error) {
       reportError(error);
     }
