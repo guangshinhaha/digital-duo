@@ -27,7 +27,8 @@ import { PENDING_ACTION_STATUSES } from "./actions/approvals.js";
 import { PREPARED_ARTIFACT_KINDS } from "./actions/preparation.js";
 import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
-import { runDraft, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
+import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
+import { runList } from "./commands/list.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
@@ -573,6 +574,52 @@ program
     try {
       const candidateId = runRecordEscalationAnswer(draftId, answer, config);
       console.log(`Queued standing-order candidate ${candidateId} from draft ${draftId}. It will be reviewed in the next batch.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const draftsCommand = program.command("drafts").description("List drafts (client-tech-design.md G-a: the Review surface's read side)");
+
+draftsCommand
+  .command("list")
+  .description("List drafts, oldest first — by default every one ever recorded")
+  .option("--pending", "only drafts with no outcome recorded yet")
+  .option("--outcome <outcome>", `only drafts with this outcome, one of: ${DRAFT_OUTCOMES.join(", ")}`)
+  .option("--limit <n>", "cap the number of rows returned", (value: string) => Number.parseInt(value, 10))
+  .action((options: { pending?: boolean; outcome?: string; limit?: number }) => {
+    const config = loadConfig();
+    if (options.outcome !== undefined && !DRAFT_OUTCOMES.includes(options.outcome as (typeof DRAFT_OUTCOMES)[number])) {
+      reportError(new Error(`--outcome must be one of: ${DRAFT_OUTCOMES.join(", ")}`));
+      return;
+    }
+    try {
+      const drafts = runDraftsList(config, {
+        outcome: options.pending ? "pending" : (options.outcome as (typeof DRAFT_OUTCOMES)[number] | undefined),
+        limit: options.limit,
+      });
+      if (drafts.length === 0) {
+        console.log("No drafts.");
+        return;
+      }
+      for (const draft of drafts) {
+        const status = draft.escalated ? "escalated" : draft.outcome ? `outcome=${draft.outcome}` : "pending";
+        console.log(`[${draft.id}] ${draft.createdAt} ${status} confidence=${draft.confidenceScore.toFixed(2)} question="${draft.question}"`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+program
+  .command("list")
+  .description("List every duo this process can currently reach — your personal duo, plus the shared duo if one is configured")
+  .action(() => {
+    try {
+      const duos = runList();
+      for (const duo of duos) {
+        console.log(duo.kind === "personal" ? "personal  (this duo — duo ask / duo draft)" : `shared    owner=${duo.ownerName} (${duo.ownerId})  (duo shared ask)`);
+      }
     } catch (error) {
       reportError(error);
     }

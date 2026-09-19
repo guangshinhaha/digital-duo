@@ -208,3 +208,88 @@ describe("duo draft-answer — an escalation can be turned into a rule on the sp
     expect(result.stderr).toMatch(/not-a-real-id/);
   });
 });
+
+describe("duo drafts list — the Review surface's read side (client-tech-design.md G-a)", () => {
+  it("says so on an empty store", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["drafts", "list"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("No drafts.");
+  });
+
+  it("lists a drafted question with its confidence and id", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    await runCli(["draft", "what is the meaning of life"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+
+    const result = await runCli(["drafts", "list"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("what is the meaning of life");
+    expect(result.stdout).toMatch(/\[[\w-]+\]/);
+  });
+
+  it("--pending excludes a draft once its outcome is recorded", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const draftResult = await runCli(["draft", "what is the meaning of life"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    const idMatch = /draft id ([\w-]+)/.exec(draftResult.stderr);
+    const draftId = idMatch![1];
+    await runCli(["draft-outcome", draftId, "discarded"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+
+    const result = await runCli(["drafts", "list", "--pending"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("No drafts.");
+  });
+
+  it("refuses an unrecognized --outcome value", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["drafts", "list", "--outcome", "not-a-real-outcome"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/--outcome must be one of/);
+  });
+});
+
+describe("duo list — every duo this process can currently reach", () => {
+  it("lists only the personal duo when no shared duo is configured", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    const result = await runCli(["list"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("personal");
+    expect(result.stdout).not.toContain("shared");
+  });
+
+  it("also lists the shared duo once shared-duo/persona.json is configured", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+    const personaPath = join(tempDir(), "shared-duo", "persona.json");
+    mkdirSync(join(tempDir(), "shared-duo"), { recursive: true });
+    writeFileSync(
+      personaPath,
+      JSON.stringify({
+        id: "shared-duo",
+        owner: { kind: "person", id: "alex", name: "Alex" },
+        persona: { voice: "plain" },
+        standingOrders: [],
+        refusals: [],
+        knowledge: { kind: "authored", documents: [] },
+      }),
+    );
+
+    const result = await runCli(["list"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath, DUO_SHARED_PERSONA_PATH: personaPath },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("personal");
+    expect(result.stdout).toContain("shared");
+    expect(result.stdout).toContain("Alex");
+  });
+});
