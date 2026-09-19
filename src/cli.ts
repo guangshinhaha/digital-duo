@@ -20,7 +20,7 @@ import { runPurge } from "./commands/purge.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
 import { runStatus } from "./commands/status.js";
-import { runTrustGrant, runTrustGrid, runTrustPromote, runTrustPromotions } from "./commands/trust.js";
+import { runTrustCorrect, runTrustGrant, runTrustGrid, runTrustLedger, runTrustPromote, runTrustPromotions } from "./commands/trust.js";
 
 const program = new Command();
 
@@ -536,6 +536,47 @@ trustCommand
           ? `Promoted [${topicId}] ${tier} to ${cell.level}.`
           : `Declined. [${topicId}] ${tier} stays at ${cell.level}; it won't be offered again until well past this point.`,
       );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+trustCommand
+  .command("correct")
+  .description("Record a correction on a cell: it demotes at once, restarting its promotion counter (#55 AC1/AC3)")
+  .argument("<topicId>", "the topic id the corrected answer was about")
+  .argument("<tier>", "T0, T1, T2, or T3")
+  .requiredOption("--reason <text>", "what was corrected — an audit-log entry id, or a plain description; recorded in the trust ledger")
+  .action((topicId: string, tier: string, options: { reason: string }) => {
+    const config = loadConfig();
+    try {
+      const result = runTrustCorrect(topicId, tier, options.reason, config);
+      console.log(
+        result.demoted
+          ? `Demoted [${result.topicId}] ${result.tier}: ${result.fromLevel} -> ${result.toLevel}. It'll check first next time and say why.`
+          : `[${result.topicId}] ${result.tier} was already at the floor ("ask") — nothing lower to drop to, but the correction is recorded.`,
+      );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+trustCommand
+  .command("ledger")
+  .description("List every trust event ever recorded (grants, instances, promotions, demotions), or narrow to one cell")
+  .option("--topic <topicId>", "narrow to one topic (requires --tier too)")
+  .option("--tier <tier>", "narrow to one tier (requires --topic too)")
+  .action((options: { topic?: string; tier?: string }) => {
+    const config = loadConfig();
+    try {
+      const entries = runTrustLedger(config, options);
+      if (entries.length === 0) {
+        console.log("No trust events recorded yet.");
+        return;
+      }
+      for (const entry of entries) {
+        console.log(`[${entry.id}] ${entry.createdAt} ${entry.topicId} ${entry.tier} ${entry.eventType} ${JSON.stringify(entry.detail)}`);
+      }
     } catch (error) {
       reportError(error);
     }
