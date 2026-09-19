@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runAsk } from "./commands/ask.js";
-import { runDerivePairs } from "./commands/derive.js";
+import { runDerivePairs, runDeriveTopics } from "./commands/derive.js";
 import { runEmbed } from "./commands/embed.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
 import { runInit } from "./commands/init.js";
@@ -170,6 +170,25 @@ deriveCommand
           `${summary.unansweredCount} unanswered question(s), ${summary.ambiguousCount} ambiguous ` +
           `(${summary.adjudicatedCount} resolved by adjudication).`,
       );
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+deriveCommand
+  .command("topics")
+  .description("Assign qa_pairs to stable topic ids, clustering by question embedding and matching against duo/topics.json")
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      const result = await runDeriveTopics(config);
+      console.log(
+        `Assigned ${result.assignedPairs} pair(s): ${result.matchedTopicIds.length} matched existing topic(s), ` +
+          `${result.newTopics.length} new topic(s) minted for review.`,
+      );
+      for (const topic of result.newTopics) {
+        console.log(`  new: [${topic.id}] ${topic.label}`);
+      }
     } catch (error) {
       reportError(error);
     }

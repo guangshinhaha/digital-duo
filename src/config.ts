@@ -1,4 +1,8 @@
 const DEFAULT_STORE_PATH = "data/duo.db";
+// The human-readable, git-versioned half of the derived output
+// (v1-tech-design.md §1.3: `duo/topics.json`, `duo/rules/*.md`, `duo/voice.md`) —
+// deliberately separate from `storePath`'s encrypted database directory.
+const DEFAULT_DUO_DIR = "duo";
 const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 // Embeddings run locally via Ollama unconditionally (v1-tech-design.md §1.2)
 // — unlike the completion model, this doesn't wait on G1, so it gets a real
@@ -10,6 +14,8 @@ export interface DuoConfig {
   providerName: string | undefined;
   /** Path to the local store file. Defaults to "data/duo.db". */
   storePath: string;
+  /** Directory for human-readable, git-versioned derived output (topics.json, rules/*.md, voice.md). Defaults to "duo". Never encrypted, never purged by `duo purge`. */
+  duoDir: string;
   ollama: {
     /** Ollama HTTP host. Defaults to "http://localhost:11434". */
     host: string;
@@ -31,6 +37,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
   return {
     providerName: env.DUO_PROVIDER || undefined,
     storePath: env.DUO_STORE_PATH || DEFAULT_STORE_PATH,
+    duoDir: env.DUO_DIR || DEFAULT_DUO_DIR,
     ollama: {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
       model: env.DUO_OLLAMA_MODEL || undefined,
