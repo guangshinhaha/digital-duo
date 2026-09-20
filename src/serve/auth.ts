@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { touchLastSeen, verifyDeviceToken } from "./tokens.js";
+import { touchLastSeen, verifyAskToken, verifyDeviceToken } from "./tokens.js";
 
 /** How often (ms) a given device's `last_seen_at` is allowed to trigger a write — see `verifyDeviceToken`'s doc comment on why an unthrottled write-per-request would be expensive. */
 const LAST_SEEN_THROTTLE_MS = 60_000;
@@ -20,6 +20,24 @@ const TOKEN_CACHE_TTL_MS = 5_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_FAILURES = 10;
 
+/** Shared by the hook's missing-token 401 and the /ask route's defensive fallback for a request the hook somehow passed through unauthenticated (#159) — one literal so the two can never drift. */
+export const MISSING_TOKEN_MESSAGE = "Missing bearer token.";
+
+/** Issue #159: who is making this request — an ask-link holder (ask-only powers) or a paired device (the owner's superset). Every route decides authorization against `principal.kind`; `/ask` is the only route that accepts both kinds. */
+type PrincipalKind = "ask" | "device";
+
+export interface Principal {
+  readonly kind: PrincipalKind;
+  readonly name: string;
+}
+
+declare module "fastify" {
+  interface FastifyRequest {
+    /** Attached by the auth hook on every authenticated request (#159); absent only on the exempt `/health` route. */
+    principal?: Principal;
+  }
+}
+
 interface FailureWindow {
   count: number;
   windowStart: number;
@@ -27,6 +45,8 @@ interface FailureWindow {
 
 interface CachedVerification {
   deviceId: string;
+  /** Cached alongside the id so a cache-hit request can attach a full principal without re-decrypting the store. */
+  name: string;
   verifiedAt: number;
 }
 
@@ -44,6 +64,13 @@ function rateLimited(reply: FastifyReply): void {
  * `device_tokens` table — the actual authentication layer, since a tailnet
  * only authenticates the *device* onto the network, not a *client* to this
  * daemon (`client-tech-design.md` Part 2).
+ *
+ * `POST /ask` (#159) is the one exception in *kind*, not in mechanism: the
+ * same hook also verifies ask tokens there (device tokens still pass — the
+ * owner is a superset of an asker) and attaches the principal the route
+ * projects its response by. On every other route an ask token is refused
+ * exactly as an unknown device token is — structurally, since its hash is
+ * not in `device_tokens`.
  */
 export function registerAuth(app: FastifyInstance, storePath: string, passphrase: string): void {
   const failures = new Map<string, FailureWindow>();
@@ -111,36 +138,71 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
       if (limited) {
         rateLimited(reply);
       } else {
-        unauthorized(reply, "Missing bearer token.");
+        unauthorized(reply, MISSING_TOKEN_MESSAGE);
       }
       return;
     }
 
     const now = Date.now();
-    const cached = verifiedTokens.get(token);
-    let deviceId: string | undefined = cached && now - cached.verifiedAt <= TOKEN_CACHE_TTL_MS ? cached.deviceId : undefined;
+    // Fastify 5 resolves routing before onRequest hooks, so the matched
+    // route's own URL is available here; a request that matched no route
+    // has none, so fall back to the path portion of request.url — parsed,
+    // never a raw exact-compare, because a query string would break it.
+    const routeUrl = request.routeOptions?.url ?? request.url.split("?")[0];
+    const isAskRoute = routeUrl === "/ask";
 
-    if (deviceId === undefined) {
+    const cached = verifiedTokens.get(token);
+    let verified: { deviceId: string; name: string } | undefined =
+      cached !== undefined && now - cached.verifiedAt <= TOKEN_CACHE_TTL_MS
+        ? { deviceId: cached.deviceId, name: cached.name }
+        : undefined;
+
+    // #159, KTD3: device-cache check (free, above) → ask verify (uncached,
+    // the dominant /ask caller) → device verify. Ask tokens are never cached
+    // and never touchLastSeen — they carry no last_seen by #158's design,
+    // and a success cache would serve a revoked or expired link for up to
+    // TOKEN_CACHE_TTL_MS (R3). Exactly one recordFailure runs per request,
+    // only after both kinds miss — the single failure path below serves
+    // both routes, differing only in its two message strings.
+    if (isAskRoute && verified === undefined) {
+      const ask = verifyAskToken(storePath, passphrase, token);
+      if (ask) {
+        request.principal = { kind: "ask", name: ask.name };
+        return;
+      }
+    }
+
+    if (verified === undefined) {
       const device = verifyDeviceToken(storePath, passphrase, token);
       if (!device) {
         verifiedTokens.delete(token);
         const limited = recordFailure(ip);
-        request.log.warn({ ip, limited }, "auth failed: unknown or revoked device token");
+        request.log.warn(
+          { ip, limited },
+          isAskRoute
+            ? "auth failed: unknown, expired, or revoked ask or device token"
+            : "auth failed: unknown or revoked device token",
+        );
         if (limited) {
           rateLimited(reply);
+        } else if (isAskRoute) {
+          // Kind-blind by construction: unknown, expired, and revoked
+          // tokens of both kinds get this same body — no oracle (R1).
+          unauthorized(reply, "Invalid, expired, or revoked token.");
         } else {
           unauthorized(reply, "Invalid or revoked device token.");
         }
         return;
       }
-      deviceId = device.id;
-      verifiedTokens.set(token, { deviceId, verifiedAt: now });
+      verified = { deviceId: device.id, name: device.name };
+      verifiedTokens.set(token, { deviceId: verified.deviceId, name: verified.name, verifiedAt: now });
     }
+    request.principal = { kind: "device", name: verified.name };
 
-    const last = lastTouch.get(deviceId) ?? 0;
+    const last = lastTouch.get(verified.deviceId) ?? 0;
     if (now - last > LAST_SEEN_THROTTLE_MS) {
-      lastTouch.set(deviceId, now);
-      touchLastSeen(storePath, passphrase, deviceId);
+      lastTouch.set(verified.deviceId, now);
+      touchLastSeen(storePath, passphrase, verified.deviceId);
     }
   });
 }

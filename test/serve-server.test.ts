@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
@@ -6,9 +7,21 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
+import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
+import { putRule } from "../src/derivation/rules.js";
+import { writeTopicsFile } from "../src/derivation/topics.js";
+import { embedRecords } from "../src/ingest/embeddings.js";
+import { createRecord, type RecordInput } from "../src/ingest/record.js";
+import { writeRecords } from "../src/ingest/record-store.js";
+import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
+import { applyCorrection } from "../src/trust/demotion.js";
+import { grantAutonomy } from "../src/trust/grants.js";
+import { writeRefusalsFile } from "../src/trust/refusals.js";
+import type { InferenceProvider } from "../src/provider/types.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
 import { createAskToken, createDeviceToken, revokeAskToken } from "../src/serve/tokens.js";
-import { createEncryptedStore } from "../src/store/store.js";
+import { loadUsageLog } from "../src/shared-duo/usage-log.js";
+import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -19,7 +32,7 @@ function initStore(): string {
   return storePath;
 }
 
-function deps(storePath: string): ServeDeps {
+function deps(storePath: string, overrides: Partial<ServeDeps> = {}): ServeDeps {
   const config = loadConfig();
   return {
     storePath,
@@ -28,12 +41,116 @@ function deps(storePath: string): ServeDeps {
     embeddingProvider: createFakeEmbeddingProvider(),
     inferenceProvider: undefined,
     confidenceConfig: config.confidence,
+    ownerName: config.ownerName,
     // Isolated from the real environment: this repo's own checked-in
     // shared-duo/persona.json is a real file at the default relative
     // path, and `env: process.env` here would otherwise leak it into
-    // these tests via listAvailableDuos's default path resolution.
-    env: { DUO_SHARED_PERSONA_PATH: join(tempDir(), "shared-duo", "persona.json") },
+    // these tests via listAvailableDuos's default path resolution. The
+    // usage log is isolated for the same reason — a stray default-path
+    // entry would make the /ask usage-log assertions read real files.
+    env: {
+      DUO_SHARED_PERSONA_PATH: join(tempDir(), "shared-duo", "persona.json"),
+      DUO_SHARED_USAGE_LOG_PATH: join(tempDir(), "shared-duo-runtime", "usage.json"),
+    },
+    ...overrides,
   };
+}
+
+/** An inference provider whose every completion returns the same fixed text — public-answer.test.ts's agreeingProvider, for the answered-outcome fixture chain. */
+function agreeingProvider(response: string): InferenceProvider {
+  return { name: "fake", async complete() { return response; } };
+}
+
+/** The slice of an inject() response the /ask assertions read — written once for every ask-shaped helper below. */
+type AskResponse = { statusCode: number; body: string; json(): any };
+
+/**
+ * shared-cli.test.ts's persona fixture, written to the exact path deps()
+ * points DUO_SHARED_PERSONA_PATH at. Malformed variants (a 404 test) are
+ * written by the tests themselves, on top of this helper's directory.
+ */
+function writeSharedPersona(overrides: Record<string, unknown> = {}): string {
+  const dir = join(tempDir(), "shared-duo");
+  const path = join(dir, "persona.json");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "shared-duo",
+      owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
+      persona: { voice: "plain, procedural" },
+      standingOrders: ["answer only from the configured documents"],
+      refusals: ["does not decide anything on the team's behalf"],
+      knowledge: {
+        kind: "authored",
+        documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."],
+      },
+      ...overrides,
+    }),
+  );
+  return path;
+}
+
+let recordCounter = 0;
+function record(overrides: Partial<RecordInput> & { text: string }) {
+  recordCounter += 1;
+  return createRecord({
+    source: "test",
+    sourceRef: null,
+    kind: "my_answer",
+    author: "me",
+    timestamp: `2026-01-01T00:00:${String(recordCounter).padStart(2, "0")}.000Z`,
+    threadId: `t${recordCounter}`,
+    audience: "channel",
+    ...overrides,
+  });
+}
+
+/**
+ * The full fixture chain answerPublicly's answered outcome needs
+ * (public-answer.test.ts:47-107's seedLeaveTopic, kept in one place so
+ * several /ask tests can share it): a publicly-markable Q/A pair, embedded
+ * retrieval, a confirmed approved rule, the topics file, and — unless
+ * `demote` — a T0 autonomy grant.
+ */
+async function seedAnsweredTopic(storePath: string, options: { demote?: boolean } = {}): Promise<void> {
+  const dir = join(tempDir(), "duo");
+  const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
+  const answer = record({ text: `OFFICIAL (OPEN)\nfive days per quarter, per the vacation policy`, threadId: "shared" });
+  writeRecords(storePath, PASSPHRASE, [question, answer]);
+  const embeddingProvider = createFakeEmbeddingProvider();
+  await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+  const { pairs } = await extractQaPairs([question, answer]);
+  writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+  withDatabase(storePath, PASSPHRASE, true, (db) => {
+    putRule(
+      db,
+      {
+        id: "topic-leave",
+        topicId: "topic-leave",
+        text: "Standard leave is five days per quarter.",
+        status: "confirmed",
+        supportCount: 3,
+        consistency: 0.95,
+        createdAt: new Date().toISOString(),
+        lastConfirmedAt: new Date().toISOString(),
+        reviewStatus: "approved",
+        origin: "derived",
+        supersededByRuleId: null,
+        correctionDraftId: null,
+        correctionQuestion: null,
+      },
+      pairs.map((pair) => pair.id),
+    );
+  });
+  writeTopicsFile(dir, [{ id: "topic-leave", label: "Vacation leave", createdAt: new Date().toISOString() }]);
+  grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+  if (options.demote) {
+    // One correction drops the T0 cell to "approve" with a one-time
+    // demotion notice pending — the only fixture shape answerPublicly's
+    // ownerNotice field can ever come from (#55 AC2).
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-leave", tier: "T0", correctionRef: "test-correction" });
+  }
 }
 
 describe("createServer — auth (client-tech-design.md Part 2)", () => {
@@ -111,17 +228,55 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // Issue #158: ask tokens are refused by table separation — the hook only
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
-  const ownerRoutes = ["/duos", "/drafts", "/review", "/mirror/portrait", "/trust/grid", "/audit"] as const;
+  // Issue #159 pins the FULL owner-route inventory (every method), not just
+  // the GETs: the four POSTs are owner-only surfaces too, and a seam bug
+  // that only leaked on POSTs would otherwise pass unnoticed.
+  interface OwnerRoute {
+    readonly method: "GET" | "POST";
+    readonly url: string;
+    readonly payload?: unknown;
+  }
+  const ownerRoutes: readonly OwnerRoute[] = [
+    { method: "GET", url: "/duos" },
+    { method: "GET", url: "/drafts" },
+    { method: "GET", url: "/drafts/some-draft-id" },
+    { method: "GET", url: "/review" },
+    { method: "GET", url: "/mirror/portrait" },
+    { method: "GET", url: "/mirror/rules" },
+    { method: "GET", url: "/mirror/rules/some-rule-id" },
+    { method: "GET", url: "/trust/grid" },
+    { method: "GET", url: "/audit" },
+    { method: "POST", url: "/drafts", payload: { question: "q" } },
+    { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
+    { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
+    { method: "POST", url: "/mirror/rules/some-rule-id/approve" },
+  ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" } });
-    for (const url of ownerRoutes) {
-      const response = await app.inject({ method: "GET", url, headers: { authorization: `Bearer ${token}` } });
-      expect(response.statusCode, url).toBe(401);
-      // The hook rejects before routing, so the refusal body is
-      // route-independent and identical to an invalid device token's.
-      expect(response.body, url).toBe(invalid.body);
-    }
+    // Each request comes from its own IP: 13 refused requests from one IP
+    // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
+    // the tail of the inventory into 429s — a different (also correct)
+    // behavior than the byte-identical 401 this helper exists to pin.
+    const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
+    // Concurrent injects are safe here: every store call the hook makes is
+    // fully synchronous (KTD6), so no two requests can interleave
+    // mid-verification — and 13 sequential cache-miss verifies would each
+    // pay a full store decrypt for no behavioral reason.
+    await Promise.all(
+      ownerRoutes.map(async (route, i) => {
+        const response = await app.inject({
+          method: route.method,
+          url: route.url,
+          headers: { authorization: `Bearer ${token}` },
+          ...(route.method === "POST" ? { payload: route.payload ?? {} } : {}),
+          remoteAddress: `10.0.0.${i + 1}`,
+        });
+        expect(response.statusCode, `${route.method} ${route.url}`).toBe(401);
+        // The hook rejects before routing, so the refusal body is
+        // route-independent and identical to an invalid device token's.
+        expect(response.body, `${route.method} ${route.url}`).toBe(invalid.body);
+      }),
+    );
   }
 
   it("refuses a fresh, valid ask token on every owner route exactly as it refuses an invalid device token", async () => {
@@ -489,5 +644,412 @@ describe("createServer — routes", () => {
     expect(created.statusCode).toBe(201);
     const fetched = await app.inject({ method: "GET", url: `/drafts/${created.json().draftId}`, headers: authHeader });
     expect(fetched.json().provenance).toEqual({ origin: "owner" });
+  });
+});
+
+describe("createServer — POST /ask auth seam (#159)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let askToken: { id: string; name: string; token: string };
+  let askHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${askToken.token}` };
+  });
+
+  it("accepts a valid ask token on /ask and reaches the route handler", async () => {
+    const response = await app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "what is the leave policy" } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ duo: "personal", kind: "passed_on" });
+  });
+
+  it("refuses a revoked ask token on its very next /ask — no success cache serves it (R3)", async () => {
+    const first = await app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "q" } });
+    expect(first.statusCode).toBe(200);
+
+    revokeAskToken(storePath, PASSPHRASE, askToken.id);
+    const second = await app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "q" } });
+    expect(second.statusCode).toBe(401);
+  });
+
+  it("refuses an ask token the moment it expires, inside any would-be cache window (R3)", async () => {
+    // One second, not a few tens of ms: the first ask itself pays a full
+    // store decrypt (scrypt + AES-GCM), so a tighter expiry would sometimes
+    // already be past when verification runs. Still far inside the 5-second
+    // device cache window this test exists to prove does not apply.
+    const shortLived = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 1_000).toISOString());
+    const header = { authorization: `Bearer ${shortLived.token}` };
+    const first = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(first.statusCode).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const second = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(second.statusCode).toBe(401);
+  });
+
+  it("accepts a device token on /ask — the owner is a superset of an asker (R1)", async () => {
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const header = { authorization: `Bearer ${paired.token}` };
+    // First request exercises the cache-miss (two-decrypt) path; the
+    // second rides the 5-second device cache — both must pass.
+    const first = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(first.statusCode).toBe(200);
+    const second = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(second.statusCode).toBe(200);
+  });
+
+  it("refuses /ask with one uniform, kind-blind body — no oracle separates unknown from revoked (R1)", async () => {
+    const unknown = await app.inject({ method: "POST", url: "/ask", headers: { authorization: "Bearer not-a-real-token" }, payload: { question: "q" } });
+    expect(unknown.statusCode).toBe(401);
+
+    const revokedLink = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    revokeAskToken(storePath, PASSPHRASE, revokedLink.id);
+    const revoked = await app.inject({ method: "POST", url: "/ask", headers: { authorization: `Bearer ${revokedLink.token}` }, payload: { question: "q" } });
+    expect(revoked.statusCode).toBe(401);
+    expect(revoked.body).toBe(unknown.body);
+  });
+
+  it("matches /ask with a query string as /ask — routing resolves before the hook, so no raw url exact-compare", async () => {
+    const response = await app.inject({ method: "POST", url: "/ask?x=1", headers: askHeader, payload: { question: "q" } });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("counts one failure per failed /ask authentication and blocks at exactly 10, not 5 (R4)", async () => {
+    const statuses: number[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      const response = await app.inject({ method: "POST", url: "/ask", headers: { authorization: "Bearer not-a-real-token" }, payload: { question: "q" } });
+      statuses.push(response.statusCode);
+    }
+    expect(statuses.slice(0, 10)).toEqual(Array(10).fill(401));
+    expect(statuses.slice(10)).toEqual([429, 429]);
+  });
+});
+
+describe("createServer — POST /ask personal branch (#159)", () => {
+  let storePath: string;
+  let app: FastifyInstance;
+  let askToken: { id: string; name: string; token: string };
+  let askHeader: { authorization: string };
+  let deviceHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${askToken.token}` };
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    deviceHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  /** Injects a POST /ask against this describe's app (or an override app for provider-substitution tests). */
+  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<AskResponse> {
+    return (appOverride ?? app).inject({ method: "POST", url: "/ask", headers, payload });
+  }
+
+  it("answers passed_on on an empty store, asker-visible fields only (R7/R8)", async () => {
+    const response = await ask({ question: "what is the leave policy" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "personal", kind: "passed_on" });
+    expect(typeof body.text).toBe("string");
+    expect(body.text.length).toBeGreaterThan(0);
+    expect(body).not.toHaveProperty("draftId");
+    expect(body).not.toHaveProperty("logEntryId");
+    expect(body).not.toHaveProperty("topicId");
+    expect(body).not.toHaveProperty("confidence");
+    expect(body).not.toHaveProperty("evidenceAgeDays");
+    expect(body).not.toHaveProperty("ownerNotice");
+    expect(body).not.toHaveProperty("sources");
+  });
+
+  it("declines a refused subject (R7)", async () => {
+    writeRefusalsFile(join(tempDir(), "duo"), [{ heading: "vacation", reason: "Leave policy is under review; don't speak for me on it." }]);
+    const response = await ask({ question: "how much vacation leave do I get" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ duo: "personal", kind: "declined_refused" });
+  });
+
+  it("answers a granted, publicly-markable topic with sources (R7)", async () => {
+    await seedAnsweredTopic(storePath);
+    const app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("Five days per quarter, per policy.") }));
+    const response = await ask({ question: "how much vacation leave do I get" }, askHeader, app);
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "personal", kind: "answered" });
+    expect(body.sources.length).toBeGreaterThan(0);
+    expect(body.text).toContain("Five days per quarter");
+  });
+
+  it("gives a device principal the full outcome fields an asker never sees (R8)", async () => {
+    const response = await ask({ question: "q" }, deviceHeader);
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.kind).toBe("passed_on");
+    expect(typeof body.draftId).toBe("string");
+    expect(typeof body.logEntryId).toBe("string");
+  });
+
+  it("carries a one-time ownerNotice to the device principal — owner-facing, not asker-facing (R8)", async () => {
+    await seedAnsweredTopic(storePath, { demote: true });
+    const app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("Five days per quarter, per policy.") }));
+    const response = await ask({ question: "how much vacation leave do I get" }, deviceHeader, app);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().kind).toBe("passed_on");
+    expect(response.json().ownerNotice).toMatch(/got that wrong/i);
+  });
+
+  it("never carries that ownerNotice to an ask principal (R8)", async () => {
+    await seedAnsweredTopic(storePath, { demote: true });
+    const app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("Five days per quarter, per policy.") }));
+    const response = await ask({ question: "how much vacation leave do I get" }, askHeader, app);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().kind).toBe("passed_on");
+    expect(response.json()).not.toHaveProperty("ownerNotice");
+  });
+
+  it("rejects a missing, empty, whitespace-only, or non-string question with 400 (R5)", async () => {
+    for (const payload of [{}, { question: "" }, { question: "   " }, { question: 42 }]) {
+      const response = await ask(payload);
+      expect(response.statusCode, JSON.stringify(payload)).toBe(400);
+      expect(response.json().error.code).toBe("bad_request");
+    }
+  });
+
+  it("rejects a bodyless POST with 400, not a 500 from destructuring a missing body (R5)", async () => {
+    const response = await app.inject({ method: "POST", url: "/ask", headers: askHeader });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("bad_request");
+  });
+
+  it("rejects an unknown duo value by naming the accepted values — role duos are never askable (R5)", async () => {
+    const response = await ask({ question: "q", duo: "role" });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("personal, shared");
+  });
+
+  it("maps a delegation failure to a generic 500 that leaks neither the error nor any path (R6/KTD4)", async () => {
+    await seedAnsweredTopic(storePath);
+    const throwing: InferenceProvider = {
+      name: "fake",
+      async complete() {
+        throw new Error(`provider exploded at ${join(tempDir(), "secret-path")}`);
+      },
+    };
+    const app = createServer(deps(storePath, { inferenceProvider: throwing }));
+    const response = await ask({ question: "how much vacation leave do I get" }, askHeader, app);
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ error: { code: "internal_error", message: "Something went wrong answering that." } });
+    expect(response.body).not.toContain(tempDir());
+    expect(response.body).not.toContain("provider exploded");
+  });
+});
+
+describe("createServer — POST /ask shared branch (#159, U3)", () => {
+  let storePath: string;
+  let askToken: { id: string; name: string; token: string };
+  let askHeader: { authorization: string };
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${askToken.token}` };
+  });
+
+  /** Injects a POST /ask against this describe's app (or an override app for provider-substitution tests). */
+  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<AskResponse> {
+    return (appOverride ?? app).inject({ method: "POST", url: "/ask", headers, payload });
+  }
+
+  it("answers a covered question with citations and the attribution intact (R7)", async () => {
+    writeSharedPersona();
+    // "leave requests" verbatim: AuthoredKnowledgeSource matches by
+    // substring (the query must appear in the document), the exact shape
+    // shared-cli.test.ts exercises.
+    const response = await ask({ question: "leave requests", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "shared", kind: "answered" });
+    expect(body.citations.length).toBeGreaterThan(0);
+    expect(body.citations[0].title).toBe("Leave requests");
+    expect(body.text).toContain("submit through the HR portal");
+    expect(body.text).toContain("source: Leave requests, updated 2026-06-01");
+  });
+
+  it("normalizes an out-of-scope decline to passed_on and keeps the declineReason (R7)", async () => {
+    writeSharedPersona();
+    const response = await ask({ question: "what is the parking policy", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "shared", kind: "passed_on", declineReason: "out_of_scope" });
+    expect(body.text).toContain("Dana Cole");
+    expect(body).not.toHaveProperty("citations");
+  });
+
+  it("normalizes a decision request to declined_refused (R7)", async () => {
+    writeSharedPersona();
+    const response = await ask({ question: "can you approve my leave request", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ duo: "shared", kind: "declined_refused", declineReason: "not_a_decision_maker" });
+  });
+
+  it("404s with shared_duo_unavailable when no persona is configured, naming the personal fallback (R10)", async () => {
+    const response = await ask({ question: "q", duo: "shared" });
+    expect(response.statusCode).toBe(404);
+    const body = response.json();
+    expect(body.error.code).toBe("shared_duo_unavailable");
+    expect(body.error.message).toContain("personal");
+  });
+
+  it("404s identically on a malformed persona file — never a 500 from a thrown load (R10)", async () => {
+    const dir = join(tempDir(), "shared-duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "persona.json"), "{ not json");
+    const response = await ask({ question: "q", duo: "shared" });
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.code).toBe("shared_duo_unavailable");
+  });
+
+  it("writes exactly one usage-log entry per shared ask, under the asker's id (R6 log fidelity)", async () => {
+    writeSharedPersona();
+    const response = await ask({ question: "leave requests", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const entries = loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"));
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ question: "leave requests", askerId: "Sam", declined: false });
+  });
+
+  it("returns byte-identical shared bodies to ask and device principals — the shared outcome carries no owner-only fields (R8)", async () => {
+    writeSharedPersona();
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const deviceHeader = { authorization: `Bearer ${paired.token}` };
+    const asAsker = await ask({ question: "leave requests", duo: "shared" }, askHeader);
+    const asOwner = await ask({ question: "leave requests", duo: "shared" }, deviceHeader);
+    expect(asAsker.statusCode).toBe(200);
+    expect(asOwner.statusCode).toBe(200);
+    expect(asOwner.body).toBe(asAsker.body);
+  });
+});
+
+describe("createServer — POST /ask asker identity (#159, U4)", () => {
+  let storePath: string;
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+  });
+
+  function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
+    const dir = join(tempDir(), "duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "directory.json"),
+      JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
+    );
+  }
+
+  function mintAndAsk(name: string, payload: unknown = { question: "q" }): Promise<AskResponse> {
+    const link = createAskToken(storePath, PASSPHRASE, name, new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    return app.inject({ method: "POST", url: "/ask", headers: { authorization: `Bearer ${link.token}` }, payload });
+  }
+
+  it("logs an in-directory asker under the directory's canonical id, matching case-insensitively (R6 log fidelity)", async () => {
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const response = await mintAndAsk("Sam-Carter");
+    expect(response.statusCode).toBe(200);
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged).toHaveLength(1);
+    expect(logged[0].askerRef).toBe("sam-carter");
+  });
+
+  it("logs an unresolvable asker under the raw link name, with no behavioral difference (R9)", async () => {
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const unresolved = await mintAndAsk("ZZZ-not-in-directory");
+    const resolved = await mintAndAsk("Sam-Carter");
+    expect(unresolved.statusCode).toBe(200);
+    expect(resolved.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE).map((entry) => entry.askerRef)).toEqual(["ZZZ-not-in-directory", "sam-carter"]);
+    // Same outcome shape and wording — resolution changes the log record,
+    // never the answer (R9).
+    expect(unresolved.json().kind).toBe(resolved.json().kind);
+    expect(unresolved.json().text).toBe(resolved.json().text);
+  });
+
+  it("falls back to the raw name on a malformed directory.json — identity resolution never 500s an ask", async () => {
+    const dir = join(tempDir(), "duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "directory.json"), "{ not json");
+    const response = await mintAndAsk("Sam");
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0].askerRef).toBe("Sam");
+  });
+
+  it("logs a device principal as the owner", async () => {
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${paired.token}` },
+      payload: { question: "q" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0].askerRef).toBe("owner");
+  });
+
+  it("carries the resolved id into the shared usage log too", async () => {
+    writeSharedPersona();
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const response = await mintAndAsk("sam-carter", { question: "leave requests", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const entries = loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].askerId).toBe("sam-carter");
+  });
+});
+
+describe("createServer — POST /ask concurrency (#159, U5)", () => {
+  // No mutex exists here by design (the plan's KTD6): `withDatabase` is
+  // fully synchronous and every store mutation on the ask and hook paths
+  // is one top-level, self-contained call, so interleaved request handlers
+  // can only interleave at awaits — between whole store calls — and each
+  // append reads the current store. These tests pin that invariant so an
+  // async-store refactor cannot silently reintroduce a lost-write race
+  // (R11's named proof).
+
+  let storePath: string;
+  let app: FastifyInstance;
+  let askHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const link = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${link.token}` };
+  });
+
+  it("two personal asks in flight concurrently both land their log rows — no lost write (R11)", async () => {
+    const responses = await Promise.all([
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "first question" } }),
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "second question" } }),
+    ]);
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged).toHaveLength(2);
+    expect(new Set(logged.map((entry) => entry.question))).toEqual(new Set(["first question", "second question"]));
+  });
+
+  it("two shared asks in flight concurrently both land their usage entries (R11)", async () => {
+    writeSharedPersona();
+    const responses = await Promise.all([
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "leave requests", duo: "shared" } }),
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "leave requests", duo: "shared" } }),
+    ]);
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
+    expect(loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"))).toHaveLength(2);
   });
 });

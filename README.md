@@ -64,6 +64,24 @@ needs it. Verified: official Node **22.22.x LTS** (`.nvmrc` pins it). Not every 
 Homebrew's `node` 23.x is compiled without FTS5 (`no such module: fts5`), and Node < 22.5 has
 no `node:sqlite` at all. Run `nvm use` before `npm test`.
 
+### Known limitations
+
+- **One writer at a time, per process.** `withDatabase` (`src/store/store.ts`) is synchronous
+  by design: each call decrypts, mutates, and re-encrypts the whole store as one blocking
+  operation, which is what makes concurrent requests inside one `duo serve` process safe
+  without a lock (the concurrency tests in `test/serve-server.test.ts` pin this). **Two
+  processes on the same store — the daemon and any CLI command — can still race and clobber
+  each other's whole-file writes.** One instance: `duo ask-link revoke` racing a daemon ask
+  write can leave the revoked token verifiable until the next store write. Don't run store-
+  writing commands while `duo serve` is serving the same store; a real cross-process lock is
+  tracked as follow-up store-infrastructure work.
+- **Passed-on answers notify nobody.** An ask the duo passes on (or declines) is recorded in
+  the owner's logs, but nothing pushes a notification to the owner — the asker is told it was
+  passed on, and the owner finds it in `duo permissions log` / the drafts queue.
+- **A valid ask link spends the owner's inference budget.** Every successful `/ask` runs the
+  full answering pipeline; a leaked link keeps that spend unbounded until it expires or is
+  revoked. Mint links with the shortest workable `--expires-in-hours`.
+
 ## License
 
 TBD
