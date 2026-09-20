@@ -2,7 +2,14 @@ import type { DuoConfig } from "../config.js";
 import { readRefusalsFile } from "../drafting/refusals.js";
 import { scoreRelevanceGate, type GateEvalReport } from "../eval/gate-eval.js";
 import { loadGateLabels } from "../eval/gate-labels.js";
-import { fixtureSha256, loadJevMultiwayTasks } from "../eval/jev-fixtures.js";
+import { fixtureSha256, loadJevMultiwayTasks, loadJevTraces } from "../eval/jev-fixtures.js";
+import {
+  JevStage2AbortedError,
+  persistStage2Report,
+  requireStage1Pass,
+  runJevStage2Replay,
+  type JevStage2Report,
+} from "../eval/jev-trace-eval.js";
 import {
   persistStage1Report,
   runJevStage1Quality,
@@ -118,6 +125,45 @@ export async function runEvalJevStage1(
       baseline: scoreRelevanceGate(labels, [...refusals]),
       quality: { status: "failed", failureSummary: sanitizeFailure(error) },
     });
+    throw error;
+  }
+}
+
+/**
+ * Implements the Jev spike's `duo eval jev stage2` (plan U6): the offline
+ * trace replay, gated on the persisted stage-1 pass. The gate refusal fires
+ * before any fixture load or request is built, so an ungated run costs
+ * nothing and egresses nothing. An aborted replay persists its partial
+ * report before the provider error propagates (KTD6) — the stage-1 numbers
+ * stay exactly as they were, and the verdict can report "navigation unknown".
+ *
+ * Provider injection matches runEvalJevStage1: the checked-in suite drives
+ * this whole path offline through the fake; `src/cli.ts` constructs the
+ * real adapter at the process boundary.
+ */
+export async function runEvalJevStage2(
+  config: DuoConfig,
+  provider: TypedDecisionProvider,
+): Promise<JevStage2Report> {
+  const stage1 = requireStage1Pass(config.jev.runtimeDir);
+  const traces = loadJevTraces(config.eval.jevTracesPath);
+
+  try {
+    const report = await runJevStage2Replay(provider, {
+      traces,
+      gatewayOrigin: new URL(config.jev.gatewayUrl).origin,
+      tracesHash: fixtureSha256(config.eval.jevTracesPath),
+      stage1,
+    });
+    persistStage2Report(config.jev.runtimeDir, report);
+    return report;
+  } catch (error) {
+    if (error instanceof JevStage2AbortedError) {
+      persistStage2Report(config.jev.runtimeDir, error.partial);
+      // Rethrow the underlying provider error, not the carrier — the CLI's
+      // error reporting (and callers) branch on the provider error class.
+      throw error.cause ?? error;
+    }
     throw error;
   }
 }
