@@ -61,6 +61,9 @@ function agreeingProvider(response: string): InferenceProvider {
   return { name: "fake", async complete() { return response; } };
 }
 
+/** The slice of an inject() response the /ask assertions read — written once for every ask-shaped helper below. */
+type AskResponse = { statusCode: number; body: string; json(): any };
+
 /**
  * shared-cli.test.ts's persona fixture, written to the exact path deps()
  * points DUO_SHARED_PERSONA_PATH at. Malformed variants (a 404 test) are
@@ -255,21 +258,25 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
-    let host = 1;
-    for (const route of ownerRoutes) {
-      const response = await app.inject({
-        method: route.method,
-        url: route.url,
-        headers: { authorization: `Bearer ${token}` },
-        ...(route.method === "POST" ? { payload: route.payload ?? {} } : {}),
-        remoteAddress: `10.0.0.${host}`,
-      });
-      host += 1;
-      expect(response.statusCode, `${route.method} ${route.url}`).toBe(401);
-      // The hook rejects before routing, so the refusal body is
-      // route-independent and identical to an invalid device token's.
-      expect(response.body, `${route.method} ${route.url}`).toBe(invalid.body);
-    }
+    // Concurrent injects are safe here: every store call the hook makes is
+    // fully synchronous (KTD6), so no two requests can interleave
+    // mid-verification — and 13 sequential cache-miss verifies would each
+    // pay a full store decrypt for no behavioral reason.
+    await Promise.all(
+      ownerRoutes.map(async (route, i) => {
+        const response = await app.inject({
+          method: route.method,
+          url: route.url,
+          headers: { authorization: `Bearer ${token}` },
+          ...(route.method === "POST" ? { payload: route.payload ?? {} } : {}),
+          remoteAddress: `10.0.0.${i + 1}`,
+        });
+        expect(response.statusCode, `${route.method} ${route.url}`).toBe(401);
+        // The hook rejects before routing, so the refusal body is
+        // route-independent and identical to an invalid device token's.
+        expect(response.body, `${route.method} ${route.url}`).toBe(invalid.body);
+      }),
+    );
   }
 
   it("refuses a fresh, valid ask token on every owner route exactly as it refuses an invalid device token", async () => {
@@ -663,21 +670,23 @@ describe("createServer — POST /ask auth seam (#159)", () => {
 
 describe("createServer — POST /ask personal branch (#159)", () => {
   let storePath: string;
+  let app: FastifyInstance;
   let askToken: { id: string; name: string; token: string };
   let askHeader: { authorization: string };
   let deviceHeader: { authorization: string };
 
   beforeEach(() => {
     storePath = initStore();
+    app = createServer(deps(storePath));
     askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
     askHeader = { authorization: `Bearer ${askToken.token}` };
     const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
     deviceHeader = { authorization: `Bearer ${paired.token}` };
   });
 
-  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<{ statusCode: number; body: string; json(): any }> {
-    const target = appOverride ?? createServer(deps(storePath));
-    return target.inject({ method: "POST", url: "/ask", headers, payload });
+  /** Injects a POST /ask against this describe's app (or an override app for provider-substitution tests). */
+  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<AskResponse> {
+    return (appOverride ?? app).inject({ method: "POST", url: "/ask", headers, payload });
   }
 
   it("answers passed_on on an empty store, asker-visible fields only (R7/R8)", async () => {
@@ -750,7 +759,7 @@ describe("createServer — POST /ask personal branch (#159)", () => {
   });
 
   it("rejects a bodyless POST with 400, not a 500 from destructuring a missing body (R5)", async () => {
-    const response = await createServer(deps(storePath)).inject({ method: "POST", url: "/ask", headers: askHeader });
+    const response = await app.inject({ method: "POST", url: "/ask", headers: askHeader });
     expect(response.statusCode).toBe(400);
     expect(response.json().error.code).toBe("bad_request");
   });
@@ -792,7 +801,7 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
   });
 
   /** Injects a POST /ask against this describe's app (or an override app for provider-substitution tests). */
-  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<{ statusCode: number; body: string; json(): any }> {
+  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<AskResponse> {
     return (appOverride ?? app).inject({ method: "POST", url: "/ask", headers, payload });
   }
 
@@ -884,7 +893,7 @@ describe("createServer — POST /ask asker identity (#159, U4)", () => {
     );
   }
 
-  function mintAndAsk(name: string, payload: unknown = { question: "q" }): Promise<{ statusCode: number; body: string; json(): any }> {
+  function mintAndAsk(name: string, payload: unknown = { question: "q" }): Promise<AskResponse> {
     const link = createAskToken(storePath, PASSPHRASE, name, new Date(Date.now() + 60 * 60 * 1000).toISOString());
     return app.inject({ method: "POST", url: "/ask", headers: { authorization: `Bearer ${link.token}` }, payload });
   }

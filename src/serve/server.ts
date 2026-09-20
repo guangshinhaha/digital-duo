@@ -11,12 +11,12 @@ import { listAvailableDuos } from "../duo/registry.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { loadDirectory, resolveAsker } from "../permissions/directory.js";
-import { answerPublicly } from "../permissions/public-answer.js";
+import { answerPublicly, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
-import { registerAuth, type Principal } from "./auth.js";
+import { MISSING_TOKEN_MESSAGE, registerAuth, type Principal } from "./auth.js";
 
 /**
  * Everything a route needs, resolved once at boot (`client-tech-design.md`
@@ -189,20 +189,21 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       // Unreachable in practice — the hook attaches a principal on every
       // authenticated /ask before this handler runs — but the projection
       // below is unsafe without one, so refuse rather than guess.
-      reply.code(401).send(errorBody("unauthorized", "Missing bearer token."));
+      reply.code(401).send(errorBody("unauthorized", MISSING_TOKEN_MESSAGE));
       return;
     }
 
     // `request.body` is undefined or a non-object on a bodyless or
-    // malformed POST — check the shape before destructuring it (unlike
-    // POST /drafts above, whose blind destructuring would 500 here).
+    // malformed POST — default to `{}` so the question check below is the
+    // single 400 every bad-body shape gets (unlike POST /drafts above,
+    // whose blind destructuring would 500 here).
     const body = request.body;
-    if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      reply.code(400).send(errorBody("bad_request", "question is required and must be a non-empty string"));
-      return;
-    }
-    const { question, duo } = body as { question?: unknown; duo?: unknown };
-    if (typeof question !== "string" || question.trim() === "") {
+    const { question, duo } = (typeof body === "object" && body !== null && !Array.isArray(body) ? body : {}) as {
+      question?: unknown;
+      duo?: unknown;
+    };
+    const trimmed = typeof question === "string" ? question.trim() : "";
+    if (trimmed === "") {
       reply.code(400).send(errorBody("bad_request", "question is required and must be a non-empty string"));
       return;
     }
@@ -210,8 +211,6 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       reply.code(400).send(errorBody("bad_request", "duo must be one of: personal, shared"));
       return;
     }
-    const trimmed = question.trim();
-    const askerRef = askerRefFor(principal, deps.duoDir);
 
     try {
       if (duo === "shared") {
@@ -230,14 +229,22 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
           reply.code(404).send(errorBody("shared_duo_unavailable", `The shared duo is not available right now; ask the personal duo instead (omit "duo": "shared").`));
           return;
         }
+        const askerRef = askerRefFor(principal, deps.duoDir);
         const answer = await answerSharedDuo(sharedDuo, trimmed, askerRef, usageLogPath);
         // The shared path's flat declined/declineReason normalizes into the
         // same three kinds every 200 carries (KTD4): out_of_scope is "I
         // can't cover this, ask the owner" — a pass-on — while
-        // not_a_decision_maker is a refusal.
+        // not_a_decision_maker is a refusal. The annotation ties these
+        // literals to the personal path's `outcome.kind` vocabulary — drift
+        // between the two envelopes is a compile error, not a review catch.
+        const kind: PublicAnswerOutcome["kind"] = answer.declined
+          ? answer.declineReason === "not_a_decision_maker"
+            ? "declined_refused"
+            : "passed_on"
+          : "answered";
         const envelope: Record<string, unknown> = {
           duo: "shared",
-          kind: answer.declined ? (answer.declineReason === "not_a_decision_maker" ? "declined_refused" : "passed_on") : "answered",
+          kind,
           text: answer.text,
         };
         if (!answer.declined) {
@@ -255,7 +262,7 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
         deps.passphrase,
         deps.duoDir,
         trimmed,
-        askerRef,
+        askerRefFor(principal, deps.duoDir),
         deps.embeddingProvider,
         deps.inferenceProvider,
         deps.confidenceConfig,
