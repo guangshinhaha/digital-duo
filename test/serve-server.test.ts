@@ -382,6 +382,40 @@ describe("createServer — routes", () => {
     expect(response.json()).toHaveLength(2);
   });
 
+  // guangshinhaha/duo#29: paging must reach the newest window. The route
+  // passes limit/before through to listDrafts unchanged — so the fix in the
+  // module must be visible here as *which* ids come back, not just how many.
+  it("GET /drafts?limit returns the newest drafts, and a backward walk via before continues from there", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      ids.push(
+        appendDraft(storePath, PASSPHRASE, {
+          question: `q${i}`,
+          threadContext: null,
+          draftText: "a",
+          escalated: false,
+          escalationReason: null,
+          confidenceScore: 0.7,
+          sources: [],
+        }),
+      );
+      // Distinct createdAt per draft: appendDraft stamps "now", and a tight
+      // loop can land two drafts on the same millisecond, which would make
+      // the newest-first ordering and the exclusive cursor ambiguous.
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    const pageOne = await app.inject({ method: "GET", url: "/drafts?limit=2", headers: authHeader });
+    expect(pageOne.statusCode).toBe(200);
+    const pageOneBody = pageOne.json();
+    expect(pageOneBody.map((draft: { id: string }) => draft.id)).toEqual([ids[2], ids[1]]);
+
+    const before = encodeURIComponent(pageOneBody[pageOneBody.length - 1].createdAt);
+    const pageTwo = await app.inject({ method: "GET", url: `/drafts?limit=2&before=${before}`, headers: authHeader });
+    expect(pageTwo.statusCode).toBe(200);
+    expect(pageTwo.json().map((draft: { id: string }) => draft.id)).toEqual([ids[0]]);
+  });
+
   it("GET /drafts/:id 404s naming the id for an unknown draft", async () => {
     const response = await app.inject({ method: "GET", url: "/drafts/not-a-real-id", headers: authHeader });
     expect(response.statusCode).toBe(404);

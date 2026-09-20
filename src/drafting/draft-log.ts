@@ -423,7 +423,7 @@ export interface ListDraftsOptions {
   readonly outcome?: DraftOutcome | "pending";
   /** Only drafts created strictly before this ISO timestamp — paging backward through history once the current page has been read. */
   readonly before?: string;
-  /** Caps the number of rows returned. Omit for no cap. */
+  /** Caps the number of rows returned and makes the page newest-first (see listDrafts). Omit for no cap. */
   readonly limit?: number;
 }
 
@@ -432,6 +432,16 @@ export interface ListDraftsOptions {
  * happens in SQL, not after the fact in JS — a `duo serve` Review surface
  * polling for `{ outcome: "pending" }` must not pull the entire draft log
  * over the wire on every poll (`client-tech-design.md` G-b).
+ *
+ * Direction depends on whether a page was asked for. With `limit`, pages
+ * are newest-first: `ORDER BY created_at DESC, id DESC` under the same
+ * exclusive `before` bound, so page one is the newest window and feeding
+ * the oldest item of each page back as `before` walks backward through
+ * adjacent windows. The original ascending-`LIMIT` shape — which, combined
+ * with a `before` ceiling, could only ever read from the beginning of
+ * history and never reached the newest drafts — was a defect (guangshinhaha/duo#29).
+ * Without `limit`, the un-paged order stays oldest-first, byte-identical to
+ * the behaviour every existing un-paged caller was written against.
  */
 export function listDrafts(storePath: string, passphrase: string, options: ListDraftsOptions = {}): DraftRecord[] {
   return withDatabase(storePath, passphrase, false, (db) => {
@@ -453,7 +463,10 @@ export function listDrafts(storePath: string, passphrase: string, options: ListD
     if (options.limit !== undefined) {
       params.push(options.limit);
     }
-    const rows = db.prepare(`SELECT * FROM drafts ${where} ORDER BY created_at, id ${limitClause}`).all(...params) as unknown as DraftRow[];
+    // Newest-first exactly when a page size was requested — see the doc
+    // comment above for why the un-paged order must not change.
+    const order = options.limit !== undefined ? "created_at DESC, id DESC" : "created_at, id";
+    const rows = db.prepare(`SELECT * FROM drafts ${where} ORDER BY ${order} ${limitClause}`).all(...params) as unknown as DraftRow[];
     return rows.map(rowToDraft);
   });
 }
