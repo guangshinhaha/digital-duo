@@ -143,6 +143,23 @@ export function countRecords(storePath: string, passphrase: string): number {
 }
 
 /**
+ * Record counts grouped by `source` (#175: "what does this duo know, and
+ * where did it come from"). A plain read of what the store already keeps —
+ * `source` is a column on every record — so an absent table or an empty
+ * corpus is simply `{}`, never an error.
+ */
+export function countRecordsBySource(storePath: string, passphrase: string): Record<string, number> {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureRecordsSchema(db);
+    const rows = db.prepare(`SELECT source, COUNT(*) AS count FROM records GROUP BY source`).all() as unknown as {
+      source: string;
+      count: number;
+    }[];
+    return Object.fromEntries(rows.map((row) => [row.source, row.count]));
+  });
+}
+
+/**
  * Every record in the store, unfiltered. Used by #21's phase B to read
  * back everything phase A staged before applying the retention filter —
  * this is a full enumeration, not a relevance search, so it doesn't go

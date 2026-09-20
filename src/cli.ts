@@ -75,7 +75,7 @@ import { runPurge } from "./commands/purge.js";
 import { runRoleDuoSeed, runRoleDuoWithdraw } from "./commands/role-duo.js";
 import { runSearch } from "./commands/search.js";
 import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.js";
-import { runStatus } from "./commands/status.js";
+import { runKnowledge, runStatus } from "./commands/status.js";
 import { runTrustCorrect, runTrustGrant, runTrustGrid, runTrustLedger, runTrustPromote, runTrustPromotions } from "./commands/trust.js";
 
 const program = new Command();
@@ -105,6 +105,18 @@ program
   .action(() => {
     const config = loadConfig();
     console.log(runStatus(config));
+  });
+
+program
+  .command("knowledge")
+  .description("Summarize what this duo knows: records by source, the last import, corpus coverage, rules by review status, providers, and shared-duo usage")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      console.log(runKnowledge(config));
+    } catch (error) {
+      reportError(error);
+    }
   });
 
 program
