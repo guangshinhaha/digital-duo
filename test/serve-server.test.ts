@@ -6,6 +6,7 @@ import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
+import type { ChannelAdapter, ChannelDeliveryRequest } from "../src/drafting/delivery.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
@@ -1051,5 +1052,111 @@ describe("createServer — POST /ask concurrency (#159, U5)", () => {
     ]);
     expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
     expect(loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"))).toHaveLength(2);
+  });
+});
+
+describe("POST /drafts/:id/outcome — delivery through the origin channel (#170)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+  let requests: ChannelDeliveryRequest[];
+  let adapters: ChannelAdapter[];
+
+  beforeEach(() => {
+    storePath = initStore();
+    requests = [];
+    adapters = [
+      {
+        channelKind: "slack",
+        async deliver(request) {
+          requests.push(request);
+        },
+      },
+    ];
+    app = createServer({ ...deps(storePath), channelAdapters: adapters });
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  function appendChannelDraft(): string {
+    return appendDraft(storePath, PASSPHRASE, {
+      question: "how do I get deploy access?",
+      threadContext: null,
+      draftText: "point them at the runbook",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: {
+        origin: "channel",
+        channelKind: "slack",
+        askerRef: "directory.json#sam",
+        threadId: "C0123456789.1660000000",
+        permalink: "https://example.slack.com/archives/C0123456789/p1660000000000000",
+      },
+    });
+  }
+
+  it("a sent channel draft is delivered through the daemon's adapter, and the state is on the wire", async () => {
+    const draftId = appendChannelDraft();
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ askerRef: "directory.json#sam", text: "point them at the runbook" });
+
+    const fetched = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(fetched.json().delivery).toEqual({ state: "delivered" });
+  });
+
+  it("a failed delivery does not fail the call: 200, outcome stands, failure recorded on the draft", async () => {
+    const draftId = appendChannelDraft();
+    adapters[0] = {
+      channelKind: "slack",
+      async deliver() {
+        throw new Error("Slack API returned 500");
+      },
+    };
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent" },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const fetched = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    const body = fetched.json();
+    expect(body.outcome).toBe("sent");
+    expect(body.delivery).toEqual({ state: "failed", reason: "Slack API returned 500" });
+  });
+
+  it("an owner-asked draft records no delivery — nothing was handed off, and the route says nothing about channels", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "what do I think about X?",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "owner" },
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(requests).toHaveLength(0);
+
+    const fetched = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(fetched.json().delivery).toBeNull();
   });
 });

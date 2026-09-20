@@ -5,7 +5,8 @@ import { tryResolveProvider } from "../provider/registry.js";
 import { listDrafts, type DraftRecord, type ListDraftsOptions, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { draftReply, type DraftPipelineResult } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
-import { createLlmEditClassifier, recordDraftOutcomeAndClassify, type ClassifyAndQueueResult } from "../corrections/classify.js";
+import { createLlmEditClassifier, type ClassifyAndQueueResult } from "../corrections/classify.js";
+import { recordOutcomeAndDeliver } from "../drafting/delivery.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -35,10 +36,14 @@ export async function runDraft(
  * (#37, v1-tech-design.md §1.9) as an immediate side effect of recording
  * the outcome — it only ever queues candidates, never writes to
  * `duo/rules/` or `duo/voice.md` ("queue it; do not write immediately"),
- * so running it eagerly here is safe. The orchestration itself lives in
- * `recordDraftOutcomeAndClassify` (corrections/classify.ts), parameterized
- * on an explicit passphrase rather than one resolved here — this function's
- * whole job is resolving that passphrase and the provider from `config`.
+ * so running it eagerly here is safe. Since #170 the same call is also the
+ * delivery seam: a channel-origin draft records an honest delivery failure
+ * ("no connected adapter…") because a CLI process has no live channel
+ * transport, while the daemon hands the text to its registered adapter —
+ * the orchestration lives in `recordOutcomeAndDeliver`
+ * (drafting/delivery.ts), parameterized on an explicit passphrase rather
+ * than one resolved here — this function's whole job is resolving that
+ * passphrase and the provider from `config`.
  */
 export async function runRecordDraftOutcome(
   draftId: string,
@@ -51,7 +56,7 @@ export async function runRecordDraftOutcome(
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const provider = tryResolveProvider(config);
   const classifier = provider ? createLlmEditClassifier(provider) : undefined;
-  return recordDraftOutcomeAndClassify(config.storePath, passphrase, draftId, outcome, sentText, classifier);
+  return recordOutcomeAndDeliver(config.storePath, passphrase, draftId, outcome, sentText, { classifier });
 }
 
 /** Implements `duo draft-answer <draftId> <answer>` (#34 AC3): turns an escalation the owner knows the answer to into a queued standing-order candidate. */

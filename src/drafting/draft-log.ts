@@ -68,6 +68,24 @@ export type DraftProvenance =
   | { readonly origin: "unknown" };
 
 /**
+ * What happened when a sent draft was handed back to its origin channel
+ * (#170) — recorded against the draft, never raised as the outcome call's
+ * result, so a transport failure can never cost the training signal. Only
+ * channel-origin drafts sent/edited through the delivery seam ever hold a
+ * non-null `delivery`; an owner-asked draft delivers nothing by design and
+ * stays null (that is not an error), and so does any draft that was never
+ * sent.
+ *
+ * `pending` is durable truth, not a UI nicety: it is written at handoff,
+ * before the adapter is ever called, so a daemon that dies mid-delivery
+ * leaves an honest row behind.
+ */
+export type DraftDelivery =
+  | { readonly state: "pending" }
+  | { readonly state: "delivered" }
+  | { readonly state: "failed"; readonly reason: string };
+
+/**
  * One `duo draft` call, in full — durable enough for the correction loop
  * and the offline eval (v1-tech-design.md §1.9/§1.10) to both read later,
  * matching #48-#51's precedent of building a permission/audit surface
@@ -122,6 +140,13 @@ export interface DraftRecord {
    * throws on read.
    */
   readonly provenance: DraftProvenance;
+  /**
+   * What became of this draft's delivery back to its origin channel
+   * (#170) — see `DraftDelivery`. Null when nothing was ever handed off:
+   * an owner-asked draft, a discarded one, or any draft recorded before
+   * this field existed.
+   */
+  readonly delivery: DraftDelivery | null;
 }
 
 /**
@@ -144,6 +169,10 @@ const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: st
   // rowToDraft reads NULL as { origin: "unknown" } — the honest answer for
   // a draft whose origin was never recorded.
   { column: "provenance", ddl: "ALTER TABLE drafts ADD COLUMN provenance TEXT" },
+  // Both NULL on a pre-existing row: nothing was ever delivered for it, and
+  // rowToDraft reads that as delivery null.
+  { column: "delivery_state", ddl: "ALTER TABLE drafts ADD COLUMN delivery_state TEXT" },
+  { column: "delivery_reason", ddl: "ALTER TABLE drafts ADD COLUMN delivery_reason TEXT" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -165,7 +194,9 @@ export function ensureDraftLogSchema(db: Database): void {
       -- Keep in sync with DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD (config.ts)
       -- — a SQL DDL literal can't reference a TS constant directly.
       escalation_threshold REAL NOT NULL DEFAULT 0.55,
-      provenance TEXT
+      provenance TEXT,
+      delivery_state TEXT,
+      delivery_reason TEXT
     ) STRICT
   `);
 
@@ -270,6 +301,30 @@ export function recordDraftOutcome(
   });
 }
 
+/**
+ * Records what became of a sent draft's delivery back to its origin
+ * channel (#170) — the write half of the delivery seam in
+ * `drafting/delivery.ts`. Overwrites any prior state, so a re-sent draft
+ * tells the truth about its latest attempt. Throws `DraftNotFoundError`
+ * for an unknown id, same as `recordDraftOutcome`.
+ */
+export function recordDeliveryOutcome(
+  storePath: string,
+  passphrase: string,
+  draftId: string,
+  delivery: DraftDelivery,
+): void {
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureDraftLogSchema(db);
+    const result = db
+      .prepare(`UPDATE drafts SET delivery_state = ?, delivery_reason = ? WHERE id = ?`)
+      .run(delivery.state, delivery.state === "failed" ? delivery.reason : null, draftId);
+    if (result.changes === 0) {
+      throw new DraftNotFoundError(draftId);
+    }
+  });
+}
+
 interface DraftRow {
   id: string;
   question: string;
@@ -286,6 +341,8 @@ interface DraftRow {
   refused: number;
   escalation_threshold: number;
   provenance: string | null;
+  delivery_state: string | null;
+  delivery_reason: string | null;
 }
 
 /**
@@ -342,6 +399,14 @@ function rowToDraft(row: DraftRow): DraftRecord {
     refused: row.refused === 1,
     escalationThreshold: row.escalation_threshold,
     provenance: parseProvenance(row.provenance),
+    delivery:
+      row.delivery_state === "pending"
+        ? { state: "pending" }
+        : row.delivery_state === "delivered"
+          ? { state: "delivered" }
+          : row.delivery_state === "failed"
+            ? { state: "failed", reason: row.delivery_reason ?? "delivery failed" }
+            : null,
   };
 }
 

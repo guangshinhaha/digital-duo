@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCli } from "./helpers/run-cli.js";
 import { useTempDir } from "./helpers/temp-dir.js";
-import { appendDraft } from "../src/drafting/draft-log.js";
+import { appendDraft, getDraft } from "../src/drafting/draft-log.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -93,6 +93,54 @@ describe("duo draft-outcome — the outcome of a draft is recorded (#32 AC3)", (
     const result = await runCli(["draft-outcome", "not-a-real-id", "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toMatch(/not-a-real-id/);
+  });
+});
+
+describe("duo draft-outcome sent — the CLI reaches the same delivery seam as the daemon (#170)", () => {
+  it("a channel draft sent from the CLI records an honest delivery failure — the CLI process has no connected adapter", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    createEncryptedStore(storePath, PASSPHRASE);
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I get deploy access?",
+      threadContext: null,
+      draftText: "point them at the runbook",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "slack", askerRef: "directory.json#sam", threadId: null, permalink: null },
+    });
+
+    const result = await runCli(["draft-outcome", draftId, "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } });
+    expect(result.exitCode).toBe(0);
+
+    // Not an error — the outcome stands and the failure is recorded against
+    // the draft, exactly as a daemon-side transport failure would be.
+    const draft = getDraft(storePath, PASSPHRASE, draftId);
+    expect(draft?.outcome).toBe("sent");
+    expect(draft?.delivery).toMatchObject({ state: "failed" });
+    if (draft?.delivery?.state === "failed") {
+      expect(draft.delivery.reason).toContain("slack");
+    }
+  });
+
+  it("an owner draft sent from the CLI records no delivery at all", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    createEncryptedStore(storePath, PASSPHRASE);
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "what do I think about X?",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "owner" },
+    });
+
+    const result = await runCli(["draft-outcome", draftId, "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } });
+    expect(result.exitCode).toBe(0);
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toBeNull();
   });
 });
 
