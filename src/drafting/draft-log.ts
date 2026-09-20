@@ -38,6 +38,36 @@ export const DRAFT_OUTCOMES = [...SETTABLE_DRAFT_OUTCOMES, "escalation_answered"
 export type DraftOutcome = (typeof DRAFT_OUTCOMES)[number];
 
 /**
+ * Where a draft came from (#169), as structured data rather than free
+ * text. `threadContext` stays exactly what it is — grounding text for the
+ * model — because a free-text string can never answer "which thread, in
+ * which channel, asked by whom" reliably, and a client must not infer any
+ * of that from prose (a surface inventing behaviour is invariant #1's
+ * exact failure mode). Three origins:
+ *
+ * - `owner` — the owner asked their own duo (`duo draft`, POST /drafts).
+ *   No asker, no permalink: it is not a reply to anybody.
+ * - `channel` — a channel adapter asked on a person's behalf. The fields
+ *   identify the ask and where a delivered answer would land; `threadId`
+ *   and `permalink` are nullable because an adapter may genuinely not
+ *   have them (an email has no thread id; an IRC adapter may have no
+ *   permalink API).
+ * - `unknown` — the row predates provenance or its stored JSON is
+ *   unreadable. Read defensively, never thrown: an unreadable row must
+ *   not take the whole draft log down with it.
+ */
+export type DraftProvenance =
+  | { readonly origin: "owner" }
+  | {
+      readonly origin: "channel";
+      readonly channelKind: string;
+      readonly askerRef: string;
+      readonly threadId: string | null;
+      readonly permalink: string | null;
+    }
+  | { readonly origin: "unknown" };
+
+/**
  * One `duo draft` call, in full — durable enough for the correction loop
  * and the offline eval (v1-tech-design.md §1.9/§1.10) to both read later,
  * matching #48-#51's precedent of building a permission/audit surface
@@ -85,6 +115,13 @@ export interface DraftRecord {
    * recorded before this field existed.
    */
   readonly escalationThreshold: number;
+  /**
+   * Where this draft came from (#169) — see `DraftProvenance`. A row
+   * written before the field existed reads `{ origin: "unknown" }`, and
+   * so does one whose stored JSON has been corrupted; neither ever
+   * throws on read.
+   */
+  readonly provenance: DraftProvenance;
 }
 
 /**
@@ -103,6 +140,10 @@ export interface DraftRecord {
 const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: string }[] = [
   { column: "refused", ddl: "ALTER TABLE drafts ADD COLUMN refused INTEGER NOT NULL DEFAULT 0" },
   { column: "escalation_threshold", ddl: "ALTER TABLE drafts ADD COLUMN escalation_threshold REAL NOT NULL DEFAULT 0.55" },
+  // NULL, not a JSON default: a pre-existing row has no provenance, and
+  // rowToDraft reads NULL as { origin: "unknown" } — the honest answer for
+  // a draft whose origin was never recorded.
+  { column: "provenance", ddl: "ALTER TABLE drafts ADD COLUMN provenance TEXT" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -123,7 +164,8 @@ export function ensureDraftLogSchema(db: Database): void {
       refused INTEGER NOT NULL DEFAULT 0,
       -- Keep in sync with DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD (config.ts)
       -- — a SQL DDL literal can't reference a TS constant directly.
-      escalation_threshold REAL NOT NULL DEFAULT 0.55
+      escalation_threshold REAL NOT NULL DEFAULT 0.55,
+      provenance TEXT
     ) STRICT
   `);
 
@@ -149,6 +191,14 @@ export interface AppendDraftInput {
   readonly refused?: boolean;
   /** See `DraftRecord.escalationThreshold`'s doc comment — the threshold in effect for this call. Optional — defaults to `DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD` (config.ts) for a caller that isn't threading a real `DuoConfig["confidence"]` through. */
   readonly escalationThreshold?: number;
+  /**
+   * Where this draft came from (#169) — see `DraftProvenance`. Optional
+   * because every pre-#169 caller (tests, eval harness, corrections
+   * fixtures) has no origin to declare; omitted stores NULL, which reads
+   * back as `{ origin: "unknown" }`. The pipeline and the channel
+   * adapters are the callers that set it.
+   */
+  readonly provenance?: DraftProvenance;
 }
 
 /** Appends one draft (answered or escalated) and returns its id. */
@@ -159,8 +209,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
     ensureDraftLogSchema(db);
     db.prepare(
       `
-      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold, provenance)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
     `,
     ).run(
       id,
@@ -174,6 +224,7 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
       createdAt,
       input.refused ? 1 : 0,
       input.escalationThreshold ?? DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD,
+      input.provenance ? JSON.stringify(input.provenance) : null,
     );
   });
   return id;
@@ -234,6 +285,44 @@ interface DraftRow {
   sent_text: string | null;
   refused: number;
   escalation_threshold: number;
+  provenance: string | null;
+}
+
+/**
+ * Parses a stored provenance JSON string into a `DraftProvenance`, falling
+ * back to `{ origin: "unknown" }` for NULL, unparseable JSON, or a value
+ * with the wrong shape. Defensive on purpose: the draft log is the
+ * product's memory, and one corrupted cell (a truncated write, a manual
+ * sqlite edit) must never make every future `getDraft`/`listDrafts` throw —
+ * "unknown" is the honest reading of a row whose origin can't be read.
+ */
+function parseProvenance(raw: string | null): DraftProvenance {
+  if (raw === null) {
+    return { origin: "unknown" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { origin: "unknown" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { origin: "unknown" };
+  }
+  const candidate = parsed as { origin?: unknown; channelKind?: unknown; askerRef?: unknown; threadId?: unknown; permalink?: unknown };
+  if (candidate.origin === "owner") {
+    return { origin: "owner" };
+  }
+  if (candidate.origin === "channel" && typeof candidate.channelKind === "string" && typeof candidate.askerRef === "string") {
+    return {
+      origin: "channel",
+      channelKind: candidate.channelKind,
+      askerRef: candidate.askerRef,
+      threadId: typeof candidate.threadId === "string" ? candidate.threadId : null,
+      permalink: typeof candidate.permalink === "string" ? candidate.permalink : null,
+    };
+  }
+  return { origin: "unknown" };
 }
 
 function rowToDraft(row: DraftRow): DraftRecord {
@@ -252,6 +341,7 @@ function rowToDraft(row: DraftRow): DraftRecord {
     sentText: row.sent_text,
     refused: row.refused === 1,
     escalationThreshold: row.escalation_threshold,
+    provenance: parseProvenance(row.provenance),
   };
 }
 
