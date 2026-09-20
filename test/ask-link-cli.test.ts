@@ -111,6 +111,22 @@ describe("duo ask-link — short-lived, ask-only links (issue #158)", () => {
     expect(result.stderr).toContain("--expires-in-hours");
   });
 
+  it("rejects a --expires-in-hours too large for a representable date, naming the flag", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    // 3000000000 hours overflows ECMAScript's ±8.64e15 ms Date range; it
+    // must fail the flag validation, not die in toISOString() with the
+    // unattributed "Invalid time value" (review finding #4).
+    const result = await runCli(["ask-link", "new", "Sam", "--expires-in-hours", "3000000000"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("--expires-in-hours");
+    expect(result.stderr).not.toContain("Invalid time value");
+  });
+
   it("says so on an empty roster", async () => {
     const storePath = join(tempDir(), "data", "duo.db");
     await initStore(storePath, tempDir());

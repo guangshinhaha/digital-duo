@@ -197,6 +197,14 @@ askLinkCommand
       reportError(new Error(`--expires-in-hours must be a positive whole number of hours, got ${options.expiresInHours}`));
       return;
     }
+    // ECMAScript Dates max out at ±8.64e15 ms, so a value whose offset
+    // overflows that (e.g. a pasted epoch) would crash in toISOString()
+    // below with the unattributed "Invalid time value" — reject it here
+    // with the flag named instead (review finding #4).
+    if (options.expiresInHours * 3_600_000 + Date.now() > 8.64e15) {
+      reportError(new Error(`--expires-in-hours is too large — the resulting expiry would exceed the maximum representable date, got ${options.expiresInHours}`));
+      return;
+    }
     try {
       // KTD4: the default-and-flag arithmetic lives here at the CLI edge;
       // createAskToken takes the expiry itself as an ISO-8601 string.
