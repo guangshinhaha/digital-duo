@@ -186,7 +186,10 @@ const askLinkCommand = program.command("ask-link").description("Mint and manage 
 askLinkCommand
   .command("new")
   .description("Mint a short-lived, ask-only link and print its token once — copy it to the person now, it is never shown again")
-  .argument("<name>", "a name for whom the link is intended, e.g. \"Sam\"")
+  .argument(
+    "<name>",
+    "a name for whom the link is intended — use the asker's duo/directory.json id (e.g. \"sam-carter\") so their asks log under it; a free-form name (e.g. \"Sam\") logs as-is",
+  )
   .option("--expires-in-hours <n>", "hours before this link expires (default 24; a positive whole number)", parseIntegerOption("--expires-in-hours"), 24)
   .action((name: string, options: { expiresInHours: number }) => {
     const config = loadConfig();

@@ -10,12 +10,13 @@ import { queueStandingOrderCandidate } from "../drafting/standing-order-candidat
 import { listAvailableDuos } from "../duo/registry.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
+import { loadDirectory, resolveAsker } from "../permissions/directory.js";
 import { answerPublicly } from "../permissions/public-answer.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
-import { registerAuth } from "./auth.js";
+import { registerAuth, type Principal } from "./auth.js";
 
 /**
  * Everything a route needs, resolved once at boot (`client-tech-design.md`
@@ -37,6 +38,34 @@ export interface ServeDeps {
 
 function errorBody(code: string, message: string) {
   return { error: { code, message } };
+}
+
+/**
+ * #159 (KTD5): the ref an ask is logged under. An ask principal resolves
+ * against `duo/directory.json` — the resolved entry's canonical id when the
+ * link's name matches one (case-insensitively), the raw name otherwise —
+ * and a device principal logs as the fixed "owner". Resolution feeds the
+ * logs only: `answerPublicly` applies a uniform clearance ceiling and
+ * `answerSharedDuo` does no per-asker permissioning, so the answer is
+ * identical either way (R9). A malformed directory falls back to the raw
+ * name rather than failing the ask — identity resolution never turns a
+ * 200 into a 500.
+ */
+function askerRefFor(principal: Principal, duoDir: string): string {
+  if (principal.kind === "device") {
+    return "owner";
+  }
+  try {
+    const resolution = resolveAsker(principal.name, loadDirectory(duoDir));
+    return resolution.resolved ? resolution.identity.id : principal.name;
+  } catch {
+    // A directory that cannot be read at all — malformed JSON throws a
+    // raw SyntaxError from loadDirectory, a wrong shape an
+    // InvalidDirectoryError — logs every ask under the raw name rather
+    // than failing the ask. The directory is owner-maintained; an
+    // unresolvable roster degrades the logs' fidelity, never the answers.
+    return principal.name;
+  }
 }
 
 /** Thrown to signal a 400 from inside a route body without duplicating the reply.code(400).send(...) dance at every call site — `registerRoutes` never lets this reach the client uncaught; every parse call site catches it explicitly (below). */
@@ -182,7 +211,7 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       return;
     }
     const trimmed = question.trim();
-    const askerRef = principal.kind === "ask" ? principal.name : "owner";
+    const askerRef = askerRefFor(principal, deps.duoDir);
 
     try {
       if (duo === "shared") {

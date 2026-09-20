@@ -860,3 +860,92 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
     expect(asOwner.body).toBe(asAsker.body);
   });
 });
+
+describe("createServer — POST /ask asker identity (#159, U4)", () => {
+  let storePath: string;
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+  });
+
+  function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
+    const dir = join(tempDir(), "duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "directory.json"),
+      JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
+    );
+  }
+
+  function mintAndAsk(name: string, payload: unknown = { question: "q" }): Promise<{ statusCode: number; body: string; json(): any }> {
+    const link = createAskToken(storePath, PASSPHRASE, name, new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    return app.inject({ method: "POST", url: "/ask", headers: { authorization: `Bearer ${link.token}` }, payload });
+  }
+
+  it("logs an in-directory asker under the directory's canonical id, matching case-insensitively (R6 log fidelity)", async () => {
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const response = await mintAndAsk("Sam-Carter");
+    expect(response.statusCode).toBe(200);
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged).toHaveLength(1);
+    expect(logged[0].askerRef).toBe("sam-carter");
+  });
+
+  it("logs an unresolvable asker under the raw link name, with no behavioral difference (R9)", async () => {
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const unresolved = await mintAndAsk("ZZZ-not-in-directory");
+    const resolved = await mintAndAsk("Sam-Carter");
+    expect(unresolved.statusCode).toBe(200);
+    expect(resolved.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE).map((entry) => entry.askerRef)).toEqual(["ZZZ-not-in-directory", "sam-carter"]);
+    // Same outcome shape and wording — resolution changes the log record,
+    // never the answer (R9).
+    expect(unresolved.json().kind).toBe(resolved.json().kind);
+    expect(unresolved.json().text).toBe(resolved.json().text);
+  });
+
+  it("falls back to the raw name on a malformed directory.json — identity resolution never 500s an ask", async () => {
+    const dir = join(tempDir(), "duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "directory.json"), "{ not json");
+    const response = await mintAndAsk("Sam");
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0].askerRef).toBe("Sam");
+  });
+
+  it("logs a device principal as the owner", async () => {
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${paired.token}` },
+      payload: { question: "q" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0].askerRef).toBe("owner");
+  });
+
+  it("carries the resolved id into the shared usage log too", async () => {
+    const personaDir = join(tempDir(), "shared-duo");
+    mkdirSync(personaDir, { recursive: true });
+    writeFileSync(
+      join(personaDir, "persona.json"),
+      JSON.stringify({
+        id: "shared-duo",
+        owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
+        persona: { voice: "plain, procedural" },
+        standingOrders: ["answer only from the configured documents"],
+        refusals: ["does not decide anything on the team's behalf"],
+        knowledge: { kind: "authored", documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."] },
+      }),
+    );
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const response = await mintAndAsk("sam-carter", { question: "leave requests", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const entries = loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].askerId).toBe("sam-carter");
+  });
+});
