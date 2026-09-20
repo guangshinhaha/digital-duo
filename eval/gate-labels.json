@@ -50,5 +50,6 @@
   { "id": "r001", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Who even reviews these tickets anymore, right?" },
   { "id": "r002", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Isn't it wild how long that outage went on?" },
   { "id": "r003", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Can you believe they pushed the deadline again?" },
-  { "id": "r004", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Why does this always happen on a Friday?" }
+  { "id": "r004", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Why does this always happen on a Friday?" },
+  { "id": "r005", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Isn’t it wild how long that outage went on?" }
 ]

@@ -67,6 +67,42 @@ describe("classifyMention — an ambiguous mention defaults to silence (AC3)", (
   });
 });
 
+describe("classifyMention — a rhetorical question is venting, not asking (#137)", () => {
+  // The four fixture strings from eval/gate-labels.json plus cases beyond
+  // them, so the marker set is principled rather than over-fit to the
+  // labels it is measured against.
+  it.each([
+    "Why does this always happen on a Friday?", // complaint framing: why + always
+    "Why do the release notes never mention the breaking changes?", // why + never
+    "Who even reviews these tickets anymore, right?", // exasperation: question word + even
+    "What even is this error message", // ...with no question mark needed to fire the marker
+    "Isn't it wild how long that outage went on?", // negative question + evaluative word
+    "Hasn't this week been ridiculous?",
+    "Can you believe they pushed the deadline again?", // fixed rhetorical idiom
+    "Who cares about the Q3 numbers at this point?",
+    "Who knows?", // the shrug idiom, unlike "Who knows the admin password?"
+    "That demo was a disaster, am I right?", // agreement-seeking tag
+    "Isn’t it wild how long that outage went on?", // r002 with a smart-punctuation apostrophe (U+2019) — the phone/Slack default
+    "That demo was a disaster, wouldn’t you say?", // ...likewise for the agreement-tag pattern
+  ])("blocks %j as ambiguous, never genuine_question", (text) => {
+    expect(classifyMention(text)).toEqual({ passes: false, reason: "ambiguous" });
+  });
+
+  // The mirror image, just as important: the markers are high-precision
+  // shape cues, not a blanket suspicion of questions. Each case here sits
+  // one word away from a rhetorical form and must keep passing.
+  it.each([
+    "Why does the build fail on the release branch?", // "why" without complaint framing
+    "Who knows the admin password?", // "who knows" with an object asks, doesn't shrug
+    "Which of the two options is right?", // "right?" as the last word, not a tag
+    "Isn't the vendor contract up for renewal next quarter?", // negative question, no evaluation
+    "Can you review the budget doc before Friday?", // AC1 behavior unchanged
+    "Isn’t the vendor contract up for renewal next quarter?", // apostrophe folding must not make negative questions suspicious
+  ])("still passes %j as a genuine question", (text) => {
+    expect(classifyMention(text)).toEqual({ passes: true, reason: "genuine_question" });
+  });
+});
+
 describe("classifyMention — a refused subject never reaches drafting (AC4)", () => {
   it("blocks a question-shaped mention that touches a refusal, before any noise/question check", () => {
     expect(classifyMention("What's my compensation for this quarter?", ["compensation"])).toEqual({
