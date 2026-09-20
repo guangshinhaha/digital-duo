@@ -28,6 +28,23 @@ export interface SharedDuoUsageEntry {
    * asking still works without naming yourself.
    */
   readonly askerId: string;
+  /**
+   * #160: tri-state, same meaning as `public_answer_log.asker_resolved` —
+   * `true`/`false` = a `duo/directory.json` lookup ran at answer time and
+   * matched/didn't (ask-link asks through `POST /ask`); `null` = no lookup
+   * ran (CLI `duo shared ask`) or none was recorded (entries written before
+   * #160, normalized to null at load). Recorded for content parity with the
+   * personal branch even though a shared duo never permission-filters by
+   * asker — the identity detail of *who came through which link* is audit
+   * context, not a filter input.
+   */
+  readonly askerResolved: boolean | null;
+  /**
+   * #160: the verified ask token's id when this ask came through an ask
+   * link, null otherwise — never the raw secret, same rule as
+   * `public_answer_log.ask_link_id`.
+   */
+  readonly askLinkId: string | null;
   readonly declined: boolean;
   readonly citedTitles: readonly string[];
   readonly staleCitation: boolean;
@@ -36,7 +53,10 @@ export interface SharedDuoUsageEntry {
 /** Thrown when the usage log file exists but isn't a well-formed JSON array. */
 export class InvalidUsageLogError extends Error {}
 
-/** Every entry ever recorded, oldest first. Returns `[]` when the log doesn't exist yet — the shared duo hasn't been asked anything, not an error. */
+/**
+ * Every entry ever recorded, oldest first. Returns `[]` when the log doesn't exist yet — the shared duo hasn't been asked anything, not an error.
+ * Entries written before #160 lack `askerResolved`/`askLinkId`; they are normalized to null at load — not recorded — rather than surfacing `undefined`.
+ */
 export function loadUsageLog(logPath: string): SharedDuoUsageEntry[] {
   if (!existsSync(logPath)) {
     return [];
@@ -45,7 +65,11 @@ export function loadUsageLog(logPath: string): SharedDuoUsageEntry[] {
   if (!Array.isArray(parsed)) {
     throw new InvalidUsageLogError(`Malformed shared duo usage log at "${logPath}": expected a JSON array`);
   }
-  return parsed as SharedDuoUsageEntry[];
+  return (parsed as SharedDuoUsageEntry[]).map((entry) => ({
+    ...entry,
+    askerResolved: entry.askerResolved ?? null,
+    askLinkId: entry.askLinkId ?? null,
+  }));
 }
 
 /**

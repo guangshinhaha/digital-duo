@@ -8,6 +8,8 @@ function entry(overrides: Partial<SharedDuoUsageEntry> = {}): SharedDuoUsageEntr
     createdAt: "2026-08-01T00:00:00.000Z",
     question: "what is the leave policy?",
     askerId: "alice",
+    askerResolved: null,
+    askLinkId: null,
     declined: false,
     citedTitles: ["Leave requests"],
     staleCitation: false,

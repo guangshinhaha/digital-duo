@@ -3,6 +3,9 @@ import { withAttribution } from "./attribution.js";
 import { isDecisionRequest } from "./decision-guard.js";
 import { isStale, parsePublishedDocument, type PublishedDocument } from "./documents.js";
 import { appendUsageEntry } from "./usage-log.js";
+// Type-only: the shared path takes the same #160 asker-context shape the
+// personal path defines, without importing anything that runs from it.
+import type { AskerContext } from "../permissions/public-answer.js";
 
 /**
  * What a shared duo answers when nothing it was configured with covers
@@ -85,16 +88,21 @@ export interface SharedDuoAnswer {
  * (#69 AC2's "passes the question on", AC4's repeated-question gaps) —
  * done here, not by the CLI, so a call from anywhere always logs, the
  * same "the answering function itself owns the log write" shape #50's
- * answerForAsker uses for the personal duo's audit log. `askerId` is
- * recorded for #71's usage report (distinct/repeat askers) only — it is
- * never resolved against a directory or used to filter what the answer
- * draws from, since a shared duo does no per-asker permissioning at all
- * (v1-spec.md §3).
+ * answerForAsker uses for the personal duo's audit log. `asker.ref` is
+ * recorded as `askerId` for #71's usage report (distinct/repeat askers)
+ * only — it is never resolved against a directory or used to filter what
+ * the answer draws from, since a shared duo does no per-asker
+ * permissioning at all (v1-spec.md §3). #160 adds the asker context
+ * (`askLinkId`, `askerResolved`) to the entry for content parity with the
+ * personal branch's `public_answer_log` — audit context only. There is
+ * deliberately no clearance field here: this branch applies no
+ * classification filter (its knowledge is authored-only by construction,
+ * #68), so there is no ceiling to record.
  */
 export async function answerSharedDuo(
   duo: Duo,
   question: string,
-  askerId: string,
+  asker: AskerContext,
   usageLogPath: string,
   asOf: Date = new Date(),
 ): Promise<SharedDuoAnswer> {
@@ -120,7 +128,9 @@ export async function answerSharedDuo(
 
   appendUsageEntry(usageLogPath, {
     question,
-    askerId,
+    askerId: asker.ref,
+    askerResolved: asker.resolved,
+    askLinkId: asker.askLinkId,
     declined: result.declined,
     citedTitles: result.citations.map((citation) => citation.title),
     staleCitation: result.citations.some((citation) => citation.stale),

@@ -15,7 +15,10 @@ export async function runSharedAsk(
 ): Promise<SharedDuoAnswer> {
   const { personaPath, usageLogPath } = loadSharedDuoConfig(env);
   const duo = loadSharedDuo(personaPath);
-  return answerSharedDuo(duo, question, askerId, usageLogPath);
+  // #160: the CLI never comes through an ask link and (#69/#71) never
+  // resolves the ref — stated explicitly now that the answering function
+  // takes the full asker context.
+  return answerSharedDuo(duo, question, { ref: askerId, resolved: null, askLinkId: null }, usageLogPath);
 }
 
 /** Implements `duo shared gaps` (#69 AC4): the out-of-scope questions the shared duo has been asked, most-repeated first. */
