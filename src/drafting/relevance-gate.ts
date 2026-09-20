@@ -71,6 +71,47 @@ const NOISE_MARKERS = [
 const QUESTION_START_PATTERN =
   /^\s*(who|what|when|where|why|how|which|can|could|would|will|should|do|does|did|is|are|was|were)\b/i;
 
+// Rhetorical/sarcastic-question markers — #137. The question signal above
+// only says a mention is question-SHAPED; it can't tell "What's the status
+// on the contract?" (asking the owner) from "Why does this always happen
+// on a Friday?" (venting) or "Isn't it wild how long that outage went
+// on?" (fishing for agreement), and answering the second kind as if it
+// were the first is exactly the spurious draft this gate exists to
+// suppress — all four of #137's measured false positives were rhetorical
+// questions. Each pattern below is a high-precision shape cue for that,
+// in the same "documented v1 stand-in for real classification" idiom as
+// NOISE_MARKERS: a short marker set, not intent detection, and a marker
+// miss just leaves the mention wherever the question/noise signals
+// already put it. The set deliberately errs toward matching: a rhetorical
+// question left unflagged is the expensive false positive, while a
+// genuine question caught here ("Why have we never tested the
+// failover?") becomes a false negative, which per the asymmetric design
+// above costs nothing. All patterns run against lowercased text.
+const RHETORICAL_PATTERNS = [
+  // Complaint framing: a why-question about something that happens every
+  // time or never at all ("why does this always happen...", "why do the
+  // notes never mention...").
+  /\bwhy\b[^?]*\b(always|never)\b[^?]*\?/,
+  // Exasperation: an intensifier directly after the question word ("who
+  // even reviews these anymore", "what even is this").
+  /\b(who|what|why|how|when|where|which)\s+even\b/,
+  // An opinion offered for agreement: a negative question carrying an
+  // evaluative word ("isn't it wild how...", "hasn't this week been
+  // ridiculous"). Without the evaluative word a negative question stays
+  // genuine — "isn't the contract up for renewal?" is really asking.
+  /\b(isn't|aren't|wasn't|weren't|doesn't|don't|can't|couldn't|shouldn't|wouldn't|hasn't|haven't)\s+(it|that|this|there)\b[^?]{0,30}\b(wild|crazy|insane|ridiculous|absurd|hilarious|unbelievable|incredible|amazing|classic|typical)\b/,
+  // Agreement-seeking tags: a trailing cue that makes the "question" a
+  // statement fishing for a yes ("..., right?", "am I right?"). "right?"
+  // needs the comma — "which option is right?" is genuinely asking.
+  /(,\s*right|am i right|wouldn't you say|don't you think)\?\s*$/,
+  // Fixed idioms that are rhetorical in essentially any mention: "can
+  // you believe", "who cares", and the shrug "who knows?" (with its own
+  // question mark, unlike the genuine "who knows the admin password?").
+  /\b(can|could) you believe\b/,
+  /\bwho cares\b/,
+  /\bwho knows\?/,
+] as const;
+
 function looksLikeNoise(text: string): boolean {
   const lower = text.toLowerCase();
   return NOISE_MARKERS.some((marker) => lower.includes(marker));
@@ -78,6 +119,13 @@ function looksLikeNoise(text: string): boolean {
 
 function looksLikeQuestion(text: string): boolean {
   return text.includes("?") || QUESTION_START_PATTERN.test(text.trim());
+}
+
+// #137: question-shaped, but venting or fishing for agreement rather
+// than asking the owner anything.
+function looksRhetorical(text: string): boolean {
+  const lower = text.toLowerCase();
+  return RHETORICAL_PATTERNS.some((pattern) => pattern.test(lower));
 }
 
 /**
@@ -106,6 +154,9 @@ export function matchesRefusedSubject(text: string, refusals: readonly string[])
  * signals are then evaluated together: noise alone blocks, a genuine
  * question alone passes, and — the asymmetric-cost case — both or neither
  * signal firing blocks as ambiguous (AC3) rather than passing by default.
+ * A rhetorical question (#137) blocks the same way: it carries the
+ * question shape but not the question intent, which is not something a
+ * keyword gate can settle confidently.
  */
 export function classifyMention(text: string, refusals: readonly string[] = []): GateVerdict {
   if (matchesRefusedSubject(text, refusals) !== undefined) {
@@ -114,15 +165,18 @@ export function classifyMention(text: string, refusals: readonly string[] = []):
 
   const noisy = looksLikeNoise(text);
   const question = looksLikeQuestion(text);
+  const rhetorical = looksRhetorical(text);
 
-  if (question && !noisy) {
+  if (question && !noisy && !rhetorical) {
     return { passes: true, reason: "genuine_question" };
   }
   if (noisy && !question) {
     return { passes: false, reason: "noise" };
   }
   // Either both signals fired (a "thanks, and also — is this due Friday?"
-  // mixed message) or neither did (no signal at all): both are exactly the
-  // "cannot classify confidently" case AC3 describes, and both block.
+  // mixed message), neither did (no signal at all), or the question was
+  // rhetorical (#137: venting or fishing for agreement, not asking):
+  // all are exactly the "cannot classify confidently" case AC3 describes,
+  // and all block.
   return { passes: false, reason: "ambiguous" };
 }

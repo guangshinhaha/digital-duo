@@ -39,9 +39,13 @@ describe("scoreRelevanceGate — precision and recall, never averaged into one f
 
   it("names false positives explicitly, per #36 AC2, rather than only counting them", () => {
     // A question-shaped mention the gate will actually pass, hand-labelled
-    // as not really answerable — a real false positive against the gate's
-    // current keyword heuristic.
-    const labels: GateLabelExample[] = [example({ id: "r1", text: "Why does this always happen?", expected: "not_answerable" })];
+    // as not really answerable (a musing question, not addressed to the
+    // owner — rhetorical ones are blocked since #137, so this needs a
+    // mention the gate still passes): a real false positive against the
+    // gate's keyword heuristic.
+    const labels: GateLabelExample[] = [
+      example({ id: "r1", text: "What did the client mean by that email?", expected: "not_answerable" }),
+    ];
     const report = scoreRelevanceGate(labels);
     expect(report.falsePositives).toBe(1);
     expect(report.falsePositiveExamples).toHaveLength(1);
@@ -72,7 +76,7 @@ describe("assertPrecisionFloor — #36 AC2, fails loudly on a regression", () =>
   it("throws PrecisionFloorViolationError, naming the newly admitted false positives, when precision drops below the floor", () => {
     const labels: GateLabelExample[] = [
       example({ id: "q1", text: "can you review this?", expected: "answerable" }), // TP
-      example({ id: "r1", text: "Why does this always happen?", expected: "not_answerable" }), // FP
+      example({ id: "r1", text: "What did the client mean by that email?", expected: "not_answerable" }), // FP — the gate passes it; the label says no
     ];
     const report = scoreRelevanceGate(labels); // precision = 1/2 = 0.5
     expect(() => assertPrecisionFloor(report, 0.95)).toThrow(PrecisionFloorViolationError);
@@ -92,27 +96,21 @@ describe("assertPrecisionFloor — #36 AC2, fails loudly on a regression", () =>
 
 describe("scoreRelevanceGate — the real, checked-in eval/gate-labels.json (#36 AC: labelled set lives in the repo)", () => {
   it("pins the gate's current, honest precision/recall against the committed fixture", () => {
-    // This is a documented, real finding from building this harness, not
-    // an assumption: the relevance gate's keyword heuristic (#31) treats
-    // any "?" or a leading question word as a genuine question, so a
-    // rhetorical/sarcastic question (mentionType "rhetorical_question" in
-    // the fixture) is scored as a false positive. Tuning the gate itself
-    // is explicitly out of scope for #36 ("that happens in #31") — this
-    // test pins today's real numbers as a regression tripwire: a future
-    // change that pushes precision *lower* than this must fail here, and
-    // a change that fixes the gap should update this test deliberately,
-    // not by accident.
+    // History, kept deliberately: #36 found the gate's keyword heuristic
+    // (#31) scored rhetorical/sarcastic questions as genuine, pinning
+    // precision at 0.750 (below the 0.95 floor), with all four false
+    // positives in mentionType "rhetorical_question". #137 fixed that by
+    // routing rhetorical markers to the ambiguous branch, so the pinned
+    // numbers were updated deliberately, as this test's own contract
+    // provides: a future change that pushes precision *lower* than the
+    // floor must fail here, not silently re-pin.
     const labels = loadGateLabels(fileURLToPath(new URL("../eval/gate-labels.json", import.meta.url)));
     const report = scoreRelevanceGate(labels);
 
-    expect(report.recall).toBe(1); // no genuine question is ever missed
-    expect(report.precision).toBeCloseTo(0.75, 5); // below the 0.95 floor — see comment above
-    expect(report.falsePositiveExamples.map((item) => item.mentionType)).toEqual([
-      "rhetorical_question",
-      "rhetorical_question",
-      "rhetorical_question",
-      "rhetorical_question",
-    ]);
+    expect(report.recall).toBe(1); // no genuine question is ever missed, #137 included
+    expect(report.precision).toBeCloseTo(1, 5); // the 0.95 floor is now met — see comment above
+    expect(report.falsePositiveExamples).toEqual([]);
+    expect(report.falseNegativeExamples).toEqual([]);
     expect(report.underrepresentedMentionTypes).toEqual([]);
   });
 });

@@ -82,8 +82,10 @@ describe("duo eval gate (#36)", () => {
       labelsPath,
       JSON.stringify([
         { id: "q1", mentionType: "genuine_question", expected: "answerable", text: "can you review this by EOD?" },
-        // A question-shaped mention hand-labelled as not really answerable — a real false positive against classifyMention's keyword heuristic.
-        { id: "r1", mentionType: "rhetorical_question", expected: "not_answerable", text: "Why does this always happen?" },
+        // A question-shaped mention hand-labelled as not really answerable (a musing question, not
+        // addressed to the owner — rhetorical ones are blocked since #137, so this needs a mention
+        // classifyMention still passes) — a real false positive against the gate's keyword heuristic.
+        { id: "r1", mentionType: "musing_question", expected: "not_answerable", text: "What did the client mean by that email?" },
       ]),
       "utf8",
     );
@@ -97,7 +99,7 @@ describe("duo eval gate (#36)", () => {
     expect(result.stderr).toMatch(/r1/);
     // AC3: coverage is still printed even though the run fails on the floor.
     expect(result.stdout).toMatch(/genuine_question: 1/);
-    expect(result.stdout).toMatch(/rhetorical_question: 1/);
+    expect(result.stdout).toMatch(/musing_question: 1/);
   });
 
   it("flags an under-represented mention type", async () => {
