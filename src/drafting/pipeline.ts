@@ -1,4 +1,5 @@
 import type { DuoConfig } from "../config.js";
+import { detectClassification, stripMarkingLine } from "../ingest/record.js";
 import type { ClassificationLevel } from "../ingest/record.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import {
@@ -48,13 +49,26 @@ function truncate(text: string, max: number): string {
 function buildSources(context: DraftContext): DraftSource[] {
   const sources: DraftSource[] = [];
   if (context.ruleHit) {
-    sources.push({ kind: "rule", id: context.ruleHit.id, label: `standing order: ${truncate(context.ruleHit.text, 80)}` });
+    // Same strip as extractiveDraft's rule branch (#155): the label quotes
+    // the rule's own text, and the no-provider default rule text is a marked
+    // answer copied verbatim — a source label must not echo the raw marking
+    // back out any more than the draft body does.
+    sources.push({
+      kind: "rule",
+      id: context.ruleHit.id,
+      label: `standing order: ${truncate(stripMarkingLine({ text: context.ruleHit.text, classification: detectClassification(context.ruleHit.text) }), 80)}`,
+    });
   }
   for (const item of context.evidence) {
+    // Same strip as extractiveDraft's evidence branch (#155): public
+    // answering passes these labels into the posted answer
+    // (renderSourceAttribution), and the public clearance ceiling admits
+    // exactly the marked records — an unstripped label would echo the
+    // marking on the surface with the widest audience.
     sources.push({
       kind: "evidence",
       id: item.recordId,
-      label: `past exchange (similarity ${item.similarity.toFixed(2)}): ${truncate(item.text, 80)}`,
+      label: `past exchange (similarity ${item.similarity.toFixed(2)}): ${truncate(stripMarkingLine(item), 80)}`,
     });
   }
   return sources;

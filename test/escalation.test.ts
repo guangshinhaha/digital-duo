@@ -16,7 +16,7 @@ describe("explainEscalation — names which signal was weak and what would help 
       WEIGHTS,
       0.55,
     );
-    const reason = explainEscalation(confidence, context({ evidence: [{ recordId: "r1", text: "x", timestamp: "t", similarity: 0.1 }] }));
+    const reason = explainEscalation(confidence, context({ evidence: [{ recordId: "r1", text: "x", timestamp: "t", similarity: 0.1, classification: "unknown" }] }));
     expect(reason).toContain("no standing order");
     expect(reason).toMatch(/weak/i);
     expect(reason.toLowerCase()).toContain("would");

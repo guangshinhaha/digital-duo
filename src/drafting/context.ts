@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { EmbeddingProvider } from "../provider/types.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import type { ClassificationLevel } from "../ingest/record.js";
+import type { ClassificationLevel, RecordClassification } from "../ingest/record.js";
 import { ensureRecordsSchema } from "../ingest/record-store.js";
 import { ensureEmbeddingSchema, hybridSearch } from "../ingest/embeddings.js";
 import { isVisibleToClearance } from "../permissions/classification.js";
@@ -17,6 +17,14 @@ export interface DraftEvidenceItem {
   readonly text: string;
   readonly timestamp: string;
   readonly similarity: number;
+  /**
+   * The record's own classification, carried through from retrieval (#155):
+   * the text stays verbatim here, but extractiveDraft needs the
+   * classification alongside it to strip the record's raw marking line
+   * before echoing that text into an answer — the same strip
+   * src/permissions/answer.ts's fallback performs on full records.
+   */
+  readonly classification: RecordClassification;
 }
 
 export interface DraftContext {
@@ -233,7 +241,7 @@ export async function gatherDraftContext(
   const evidence: DraftEvidenceItem[] = admissible.map((result, index) => {
     const stored = vectors.get(result.record.id);
     const similarity = queryVector && stored ? cosineSimilarity(queryVector, stored) : 1 / (1 + index);
-    return { recordId: result.record.id, text: result.record.text, timestamp: result.record.timestamp, similarity };
+    return { recordId: result.record.id, text: result.record.text, timestamp: result.record.timestamp, similarity, classification: result.record.classification };
   });
 
   const dated = evidence

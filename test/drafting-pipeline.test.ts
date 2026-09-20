@@ -48,9 +48,11 @@ function agreeingProvider(response: string): InferenceProvider {
   return { name: "fake", async complete() { return response; } };
 }
 
-async function seedConfirmedRule(storePath: string): Promise<void> {
+async function seedConfirmedRule(storePath: string, options: { answerText?: string; ruleText?: string } = {}): Promise<void> {
+  const answerText = options.answerText ?? "five days per quarter, per the vacation policy";
+  const ruleText = options.ruleText ?? "Standard leave is five days per quarter.";
   const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
-  const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "shared" });
+  const answer = record({ text: answerText, threadId: "shared" });
   writeRecords(storePath, PASSPHRASE, [question, answer]);
   const embeddingProvider = createFakeEmbeddingProvider();
   await embedRecords(storePath, PASSPHRASE, embeddingProvider);
@@ -62,7 +64,7 @@ async function seedConfirmedRule(storePath: string): Promise<void> {
       {
         id: "topic-leave",
         topicId: "topic-leave",
-        text: "Standard leave is five days per quarter.",
+        text: ruleText,
         status: "confirmed",
         supportCount: 3,
         consistency: 0.95,
@@ -128,6 +130,74 @@ describe("draftReply — a question produces a draft with sources (#32 AC1)", ()
     expect(result.kind).toBe("draft");
     if (result.kind !== "draft") throw new Error("expected a draft");
     expect(result.text).toBe("Standard leave is five days per quarter.");
+  });
+});
+
+describe("draftReply — the no-provider extractive fallback never echoes a raw classification marking (#155)", () => {
+  // Same convention answer.test.ts's own no-provider fallback test uses: a
+  // marked record whose marking is a bare first line, so stripMarkingLine's
+  // unambiguous case is the one under test.
+  const MARKED_ANSWER_TEXT = "OFFICIAL (OPEN)\nfive days per quarter, per the vacation policy";
+
+  it("echoes a marked evidence record's text without its raw marking line — the same strip answerForAsker's fallback already did (#50)", async () => {
+    const storePath = initStore();
+    // Three marked answers and no rule: enough retrieval strength (3 = the
+    // strong-evidence bar) to clear the escalation threshold with no rule
+    // hit, so the draft that comes back is extractiveDraft(evidence[0]).
+    writeRecords(
+      storePath,
+      PASSPHRASE,
+      [record({ text: MARKED_ANSWER_TEXT }), record({ text: MARKED_ANSWER_TEXT }), record({ text: MARKED_ANSWER_TEXT })],
+    );
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      embeddingProvider,
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toContain("five days per quarter, per the vacation policy");
+    expect(result.text).not.toContain("OFFICIAL (OPEN)");
+    // The whole result object, not just its body: source labels quote the same
+    // record text, and public answering posts them (renderSourceAttribution).
+    expect(result.sources.some((source) => source.label.includes("five days per quarter"))).toBe(true);
+    expect(result.sources.some((source) => source.label.includes("OFFICIAL (OPEN)"))).toBe(false);
+  });
+
+  it("echoes a rule hit's text without its raw marking line — the no-provider default rule text is a marked answer copied verbatim", async () => {
+    const storePath = initStore();
+    // ruleText === answerText is exactly what runRuleInduction +
+    // defaultRuleText store when no inference provider is configured: the
+    // most central answer's text, verbatim — marking line included.
+    await seedConfirmedRule(storePath, { answerText: MARKED_ANSWER_TEXT, ruleText: MARKED_ANSWER_TEXT });
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toContain("five days per quarter, per the vacation policy");
+    expect(result.text).not.toContain("OFFICIAL (OPEN)");
+    // The rule's own source label quotes the same marked rule text.
+    expect(result.sources.some((source) => source.label.includes("five days per quarter"))).toBe(true);
+    expect(result.sources.some((source) => source.label.includes("OFFICIAL (OPEN)"))).toBe(false);
   });
 });
 

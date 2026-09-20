@@ -42,7 +42,10 @@ describe("buildDraftPrompt", () => {
     const prompt = buildDraftPrompt(
       "How much leave?",
       null,
-      baseContext({ ruleHit: RULE, evidence: [{ recordId: "r1", text: "past answer text", timestamp: "2026-01-01T00:00:00.000Z", similarity: 0.9 }] }),
+      baseContext({
+        ruleHit: RULE,
+        evidence: [{ recordId: "r1", text: "past answer text", timestamp: "2026-01-01T00:00:00.000Z", similarity: 0.9, classification: "unknown" }],
+      }),
     );
     expect(prompt).toContain(RULE.text);
     expect(prompt).toContain("past answer text");
@@ -56,15 +59,30 @@ describe("buildDraftPrompt", () => {
 
 describe("extractiveDraft", () => {
   it("prefers the rule's own text when a rule hit exists", () => {
-    expect(extractiveDraft(baseContext({ ruleHit: RULE, evidence: [{ recordId: "r1", text: "other", timestamp: "t", similarity: 0.5 }] }))).toBe(
-      RULE.text,
-    );
+    expect(
+      extractiveDraft(baseContext({ ruleHit: RULE, evidence: [{ recordId: "r1", text: "other", timestamp: "t", similarity: 0.5, classification: "unknown" }] })),
+    ).toBe(RULE.text);
   });
 
   it("falls back to the closest evidence when there's no rule hit", () => {
-    expect(extractiveDraft(baseContext({ evidence: [{ recordId: "r1", text: "closest evidence text", timestamp: "t", similarity: 0.9 }] }))).toBe(
-      "closest evidence text",
-    );
+    expect(
+      extractiveDraft(baseContext({ evidence: [{ recordId: "r1", text: "closest evidence text", timestamp: "t", similarity: 0.9, classification: "unknown" }] })),
+    ).toBe("closest evidence text");
+  });
+
+  it("strips a leading classification marking off the closest evidence's text (#155)", () => {
+    expect(
+      extractiveDraft(
+        baseContext({
+          evidence: [{ recordId: "r1", text: "OFFICIAL (OPEN)\nclosest evidence text", timestamp: "t", similarity: 0.9, classification: "official_open" }],
+        }),
+      ),
+    ).toBe("closest evidence text");
+  });
+
+  it("strips a leading classification marking off the rule's own text (#155) — a no-provider induction stores a marked answer verbatim as the rule text", () => {
+    const markedRule = { ...RULE, text: "OFFICIAL (OPEN)\nStandard leave is five days per quarter." };
+    expect(extractiveDraft(baseContext({ ruleHit: markedRule }))).toBe("Standard leave is five days per quarter.");
   });
 
   it("returns undefined when there's nothing to draft from at all", () => {
