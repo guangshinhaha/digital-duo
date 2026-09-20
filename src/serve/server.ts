@@ -7,7 +7,7 @@ import { approveCandidate, getReviewCandidate, rejectCandidate } from "../correc
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
 import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
-import { recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
+import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
@@ -140,6 +140,12 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/duos", async () => listAvailableDuos(deps.env));
+
+  // #171: "what this duo is reachable through" — one row per registered
+  // adapter, every display string supplied by the adapter itself, so the
+  // client renders strings it never has to recognise. No adapters is the
+  // supported empty list: a duo with no channels answers only the owner.
+  app.get("/channels", async () => describeChannels(deps.channelAdapters ?? [], deps.duoDir));
 
   // #177: "which devices can read my corpus right now" (client-tech-design.md
   // Part 2), answerable from a client instead of only at the Mac's terminal.

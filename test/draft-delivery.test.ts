@@ -2,8 +2,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { listCorrectionCandidates } from "../src/corrections/queue.js";
+import { muteChannel, unmuteChannel } from "../src/drafting/channel-mutes.js";
 import { appendDraft, getDraft, type DraftProvenance } from "../src/drafting/draft-log.js";
-import { recordOutcomeAndDeliver, type ChannelAdapter, type ChannelDeliveryRequest } from "../src/drafting/delivery.js";
+import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter, type ChannelDeliveryRequest } from "../src/drafting/delivery.js";
 import { createEncryptedStore, withDatabase, type Database } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -43,6 +44,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     const requests: ChannelDeliveryRequest[] = [];
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver(request) {
         requests.push(request);
       },
@@ -67,6 +72,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     const requests: ChannelDeliveryRequest[] = [];
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver(request) {
         requests.push(request);
       },
@@ -88,6 +97,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     });
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         // The draft is readable *from inside the adapter*: pending was
         // written before deliver() was ever called.
@@ -110,6 +123,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     const failure = new Error("Slack API returned 500");
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         throw failure;
       },
@@ -130,6 +147,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     const draftId = appendChannelDraft(storePath, "alpha beta gamma delta");
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         throw new Error("network unreachable");
       },
@@ -158,6 +179,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     let deliverCalled = false;
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         deliverCalled = true;
       },
@@ -194,6 +219,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     let deliverCalled = false;
     const email: ChannelAdapter = {
       channelKind: "email",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         deliverCalled = true;
       },
@@ -215,6 +244,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     let deliverCalled = false;
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         deliverCalled = true;
       },
@@ -232,6 +265,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     let deliverCalled = false;
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         deliverCalled = true;
       },
@@ -291,6 +328,10 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     const requests: ChannelDeliveryRequest[] = [];
     const slack: ChannelAdapter = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver(request) {
         requests.push(request);
       },
@@ -298,5 +339,85 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     await recordOutcomeAndDeliver(storePath, PASSPHRASE, "legacy-1", "sent", undefined, { channelAdapters: [slack] });
     expect(requests).toHaveLength(1);
     expect(getDraft(storePath, PASSPHRASE, "legacy-1")?.delivery).toEqual({ state: "delivered" });
+  });
+});
+
+describe("describeChannels — what this duo is reachable through (#171)", () => {
+  function adapter(kind: string, label: string, status: () => Promise<{ state: "connected" | "failed"; reason?: string; lastActivityAt: string | null }>): ChannelAdapter {
+    return { channelKind: kind, label, status, async deliver() {} };
+  }
+
+  it("returns one row per adapter: kind, the adapter's own label, state, last activity, mute state", async () => {
+    const duoDir = join(tempDir(), "duo");
+    const rows = await describeChannels(
+      [
+        adapter("slack", "Acme Slack", async () => ({ state: "connected", lastActivityAt: "2026-09-20T10:00:00.000Z" })),
+        adapter("email", "Work inbox", async () => ({ state: "connected", lastActivityAt: null })),
+      ],
+      duoDir,
+    );
+    expect(rows).toEqual([
+      { kind: "slack", label: "Acme Slack", state: "connected", lastActivityAt: "2026-09-20T10:00:00.000Z", muted: false },
+      { kind: "email", label: "Work inbox", state: "connected", lastActivityAt: null, muted: false },
+    ]);
+  });
+
+  it("a broken channel says so, with its adapter's own reason — passed through verbatim, never re-worded", async () => {
+    const duoDir = join(tempDir(), "duo");
+    const rows = await describeChannels(
+      [
+        adapter("slack", "Acme Slack", async () => ({
+          state: "failed",
+          reason: "auth token expired — reconnect where the credentials live",
+          lastActivityAt: "2026-09-19T10:00:00.000Z",
+        })),
+      ],
+      duoDir,
+    );
+    expect(rows).toEqual([
+      {
+        kind: "slack",
+        label: "Acme Slack",
+        state: "failed",
+        reason: "auth token expired — reconnect where the credentials live",
+        lastActivityAt: "2026-09-19T10:00:00.000Z",
+        muted: false,
+      },
+    ]);
+  });
+
+  it("a status probe that crashes renders as a broken channel, never a thrown surface — this list is the 'why is it quiet' screen", async () => {
+    const duoDir = join(tempDir(), "duo");
+    const rows = await describeChannels(
+      [
+        {
+          channelKind: "slack",
+          label: "Acme Slack",
+          async status() {
+            throw new Error("probe timed out");
+          },
+          async deliver() {},
+        },
+      ],
+      duoDir,
+    );
+    expect(rows).toEqual([{ kind: "slack", label: "Acme Slack", state: "failed", reason: "probe timed out", lastActivityAt: null, muted: false }]);
+  });
+
+  it("mute state comes from the CLI's own store — same file, same case-insensitive match as `duo mentions`", async () => {
+    const duoDir = join(tempDir(), "duo");
+    const slack = adapter("slack", "Acme Slack", async () => ({ state: "connected", lastActivityAt: null }));
+
+    expect((await describeChannels([slack], duoDir))[0].muted).toBe(false);
+
+    muteChannel(duoDir, "Slack"); // what `duo mentions mute Slack` writes
+    expect((await describeChannels([slack], duoDir))[0].muted).toBe(true);
+
+    unmuteChannel(duoDir, "slack");
+    expect((await describeChannels([slack], duoDir))[0].muted).toBe(false);
+  });
+
+  it("no adapters is an empty list — a duo with no channels is a supported configuration, not an error", async () => {
+    expect(await describeChannels([], join(tempDir(), "duo"))).toEqual([]);
   });
 });
