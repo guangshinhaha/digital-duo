@@ -1058,6 +1058,151 @@ describe("createServer — POST /ask asker identity (#159, U4)", () => {
   });
 });
 
+describe("createServer — POST /ask audit-trail asker context (#160)", () => {
+  let storePath: string;
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+  });
+
+  function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
+    const dir = join(tempDir(), "duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "directory.json"),
+      JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
+    );
+  }
+
+  function mint(name: string) {
+    return createAskToken(storePath, PASSPHRASE, name, new Date(Date.now() + 60 * 60 * 1000).toISOString());
+  }
+
+  /** AC1: a personal answer through an ask link names the link by id, the resolution outcome, and the ceiling — never the raw secret. */
+  it("logs an in-directory ask link's id, resolved true, and the official_open ceiling on a passed_on answer", async () => {
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const link = mint("Sam-Carter");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "q" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().kind).toBe("passed_on");
+
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      askerRef: "sam-carter",
+      askLinkId: link.id,
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
+    // The raw secret never lands in the trail — the id alone names the link.
+    expect(JSON.stringify(logged)).not.toContain(link.token);
+  });
+
+  it("logs an off-directory ask link as resolved false under the raw name, with the link id still recorded", async () => {
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const link = mint("someone-else");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "q" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0]).toMatchObject({
+      askerRef: "someone-else",
+      askLinkId: link.id,
+      askerResolved: false,
+      clearanceApplied: "official_open",
+    });
+  });
+
+  it("treats a malformed directory as an attempted-and-failed lookup (resolved false), never a 500", async () => {
+    const dir = join(tempDir(), "duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "directory.json"), "{ not json");
+    const link = mint("Sam");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "q" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0]).toMatchObject({
+      askerRef: "Sam",
+      askLinkId: link.id,
+      askerResolved: false,
+    });
+  });
+
+  it("logs a device principal with no link and no lookup — owner / null / null / official_open", async () => {
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${paired.token}` },
+      payload: { question: "q" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0]).toMatchObject({
+      askerRef: "owner",
+      askLinkId: null,
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
+  });
+
+  it("carries the link id and resolution into the shared usage log too — content parity across both branches", async () => {
+    writeSharedPersona();
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const link = mint("sam-carter");
+    const response = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "leave requests", duo: "shared" },
+    });
+    expect(response.statusCode).toBe(200);
+    const entries = loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"));
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ askerId: "sam-carter", askLinkId: link.id, askerResolved: true });
+    expect(JSON.stringify(entries)).not.toContain(link.token);
+  });
+
+  /** AC2: revoking a link changes who may ask next; it never rewrites what was already answered. */
+  it("leaves a revoked link's past answers unchanged, and refuses its next ask", async () => {
+    const link = mint("Sam");
+    const first = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "q" },
+    });
+    expect(first.statusCode).toBe(200);
+    const before = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+
+    revokeAskToken(storePath, PASSPHRASE, link.id);
+
+    const second = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "q" },
+    });
+    expect(second.statusCode).toBe(401);
+    // The revoked link's earlier answer stands exactly as written — same
+    // rows, same context, append-only.
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)).toEqual(before);
+  });
+});
+
 describe("createServer — POST /ask concurrency (#159, U5)", () => {
   // No mutex exists here by design (the plan's KTD6): `withDatabase` is
   // fully synchronous and every store mutation on the ask and hook paths

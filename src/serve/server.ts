@@ -17,7 +17,7 @@ import { hybridSearch } from "../ingest/embeddings.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { loadDirectory, resolveAsker } from "../permissions/directory.js";
-import { answerPublicly, type PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { answerPublicly, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
@@ -58,30 +58,40 @@ function errorBody(code: string, message: string) {
 }
 
 /**
- * #159 (KTD5): the ref an ask is logged under. An ask principal resolves
- * against `duo/directory.json` — the resolved entry's canonical id when the
- * link's name matches one (case-insensitively), the raw name otherwise —
- * and a device principal logs as the fixed "owner". Resolution feeds the
- * logs only: `answerPublicly` applies a uniform clearance ceiling and
- * `answerSharedDuo` does no per-asker permissioning, so the answer is
- * identical either way (R9). A malformed directory falls back to the raw
- * name rather than failing the ask — identity resolution never turns a
- * 200 into a 500.
+ * #159 (KTD5) + #160: the full asker context an ask is logged under. An
+ * ask principal resolves against `duo/directory.json` — the resolved
+ * entry's canonical id when the link's name matches one
+ * (case-insensitively), the raw name otherwise — and carries the verified
+ * ask link's id (`principal.tokenId`) plus the lookup outcome (`resolved`:
+ * true on a match, false on no match or an unreadable directory — an
+ * attempted-and-failed lookup, not "no lookup ran"). A device principal
+ * logs as the fixed "owner" with no link and no lookup (`resolved: null`).
+ * Context feeds the logs only: `answerPublicly` applies a uniform
+ * clearance ceiling and `answerSharedDuo` does no per-asker permissioning,
+ * so the answer is identical either way (R9). A malformed directory falls
+ * back to the raw name rather than failing the ask — identity resolution
+ * never turns a 200 into a 500.
  */
-function askerRefFor(principal: Principal, duoDir: string): string {
+function askerContextFor(principal: Principal, duoDir: string): AskerContext {
   if (principal.kind === "device") {
-    return "owner";
+    return { ref: "owner", resolved: null, askLinkId: null };
   }
   try {
     const resolution = resolveAsker(principal.name, loadDirectory(duoDir));
-    return resolution.resolved ? resolution.identity.id : principal.name;
+    return {
+      ref: resolution.resolved ? resolution.identity.id : principal.name,
+      resolved: resolution.resolved,
+      askLinkId: principal.tokenId,
+    };
   } catch {
     // A directory that cannot be read at all — malformed JSON throws a
     // raw SyntaxError from loadDirectory, a wrong shape an
     // InvalidDirectoryError — logs every ask under the raw name rather
     // than failing the ask. The directory is owner-maintained; an
     // unresolvable roster degrades the logs' fidelity, never the answers.
-    return principal.name;
+    // The lookup *ran* and failed, so `resolved: false` — not the null
+    // that would claim no lookup ever happened.
+    return { ref: principal.name, resolved: false, askLinkId: principal.tokenId };
   }
 }
 
@@ -370,8 +380,8 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
           reply.code(404).send(errorBody("shared_duo_unavailable", `The shared duo is not available right now; ask the personal duo instead (omit "duo": "shared").`));
           return;
         }
-        const askerRef = askerRefFor(principal, deps.duoDir);
-        const answer = await answerSharedDuo(sharedDuo, trimmed, askerRef, usageLogPath);
+        const asker = askerContextFor(principal, deps.duoDir);
+        const answer = await answerSharedDuo(sharedDuo, trimmed, asker, usageLogPath);
         // The shared path's flat declined/declineReason normalizes into the
         // same three kinds every 200 carries (KTD4): out_of_scope is "I
         // can't cover this, ask the owner" — a pass-on — while
@@ -403,7 +413,7 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
         deps.passphrase,
         deps.duoDir,
         trimmed,
-        askerRefFor(principal, deps.duoDir),
+        askerContextFor(principal, deps.duoDir),
         deps.embeddingProvider,
         deps.inferenceProvider,
         deps.confidenceConfig,
