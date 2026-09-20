@@ -10,6 +10,7 @@ import { queueStandingOrderCandidate } from "../drafting/standing-order-candidat
 import { listAvailableDuos } from "../duo/registry.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
+import { answerPublicly } from "../permissions/public-answer.js";
 import { listGrid } from "../trust/grid.js";
 import { registerAuth } from "./auth.js";
 
@@ -26,6 +27,8 @@ export interface ServeDeps {
   readonly embeddingProvider: EmbeddingProvider;
   readonly inferenceProvider: InferenceProvider | undefined;
   readonly confidenceConfig: DuoConfig["confidence"];
+  /** Whose duo this is — flows into `answerPublicly` exactly as `runAnswerPublicly` passes `config.ownerName`, for the public attribution line every asker-visible text carries (#159). */
+  readonly ownerName: string;
   readonly env: NodeJS.ProcessEnv;
 }
 
@@ -140,6 +143,93 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
     // exactly one row, draft or escalation) — there is nothing pending.
     reply.code(201);
     return result;
+  });
+
+  // Issue #159: the one route an ask token authorizes. A thin wrapper, not
+  // new answering logic — delegation mirrors `runAnswerPublicly`
+  // argument-for-argument, so every behavioral question (scoping,
+  // conservatism, refusal) is answered by the existing function. The auth
+  // hook has already verified the bearer as an ask or device principal;
+  // `principal.kind` alone decides the response projection (R8).
+  app.post<{ Body: unknown }>("/ask", async (request, reply) => {
+    const principal = request.principal;
+    if (!principal) {
+      // Unreachable in practice — the hook attaches a principal on every
+      // authenticated /ask before this handler runs — but the projection
+      // below is unsafe without one, so refuse rather than guess.
+      reply.code(401).send(errorBody("unauthorized", "Missing bearer token."));
+      return;
+    }
+
+    // `request.body` is undefined or a non-object on a bodyless or
+    // malformed POST — check the shape before destructuring it (unlike
+    // POST /drafts above, whose blind destructuring would 500 here).
+    const body = request.body;
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      reply.code(400).send(errorBody("bad_request", "question is required and must be a non-empty string"));
+      return;
+    }
+    const { question, duo } = body as { question?: unknown; duo?: unknown };
+    if (typeof question !== "string" || question.trim() === "") {
+      reply.code(400).send(errorBody("bad_request", "question is required and must be a non-empty string"));
+      return;
+    }
+    if (duo !== undefined && duo !== "personal" && duo !== "shared") {
+      reply.code(400).send(errorBody("bad_request", "duo must be one of: personal, shared"));
+      return;
+    }
+    const trimmed = question.trim();
+    const askerRef = principal.kind === "ask" ? principal.name : "owner";
+
+    try {
+      const outcome = await answerPublicly(
+        deps.storePath,
+        deps.passphrase,
+        deps.duoDir,
+        trimmed,
+        askerRef,
+        deps.embeddingProvider,
+        deps.inferenceProvider,
+        deps.confidenceConfig,
+        deps.ownerName,
+      );
+      // The CLI's three-outcome shape (R7), not a new HTTP vocabulary:
+      // asker-visible fields for everyone, the owner-facing fields the
+      // CLI prints on stderr only for a device principal (R8).
+      const envelope: Record<string, unknown> = {
+        duo: "personal",
+        kind: outcome.kind,
+        text: outcome.kind === "answered" ? outcome.text : outcome.message,
+      };
+      if (outcome.kind === "answered") {
+        envelope.sources = outcome.sources;
+      }
+      if (principal.kind === "device") {
+        envelope.draftId = outcome.draftId;
+        envelope.logEntryId = outcome.logEntryId;
+        if (outcome.kind === "answered") {
+          envelope.topicId = outcome.topicId;
+          envelope.confidence = outcome.confidence;
+          envelope.evidenceAgeDays = outcome.evidenceAgeDays;
+        } else if (outcome.kind === "passed_on") {
+          if (outcome.topicId !== undefined) {
+            envelope.topicId = outcome.topicId;
+          }
+          if (outcome.ownerNotice !== undefined) {
+            envelope.ownerNotice = outcome.ownerNotice;
+          }
+        }
+      }
+      return envelope;
+    } catch (error) {
+      // The asker-visible surface must never echo an internal error —
+      // provider details or filesystem paths are owner information (the
+      // POST /drafts no-catch precedent passes Fastify's default error
+      // body through, which is wrong for this audience).
+      request.log.error({ err: error }, "POST /ask: answering failed");
+      reply.code(500).send(errorBody("internal_error", "Something went wrong answering that."));
+      return;
+    }
   });
 
   app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string } }>("/drafts/:id/outcome", async (request, reply) => {

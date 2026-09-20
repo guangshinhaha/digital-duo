@@ -6,9 +6,20 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
+import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
+import { putRule } from "../src/derivation/rules.js";
+import { writeTopicsFile } from "../src/derivation/topics.js";
+import { embedRecords } from "../src/ingest/embeddings.js";
+import { createRecord, type RecordInput } from "../src/ingest/record.js";
+import { writeRecords } from "../src/ingest/record-store.js";
+import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
+import { applyCorrection } from "../src/trust/demotion.js";
+import { grantAutonomy } from "../src/trust/grants.js";
+import { writeRefusalsFile } from "../src/trust/refusals.js";
+import type { InferenceProvider } from "../src/provider/types.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
 import { createAskToken, createDeviceToken, revokeAskToken } from "../src/serve/tokens.js";
-import { createEncryptedStore } from "../src/store/store.js";
+import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -19,7 +30,7 @@ function initStore(): string {
   return storePath;
 }
 
-function deps(storePath: string): ServeDeps {
+function deps(storePath: string, overrides: Partial<ServeDeps> = {}): ServeDeps {
   const config = loadConfig();
   return {
     storePath,
@@ -28,12 +39,86 @@ function deps(storePath: string): ServeDeps {
     embeddingProvider: createFakeEmbeddingProvider(),
     inferenceProvider: undefined,
     confidenceConfig: config.confidence,
+    ownerName: config.ownerName,
     // Isolated from the real environment: this repo's own checked-in
     // shared-duo/persona.json is a real file at the default relative
     // path, and `env: process.env` here would otherwise leak it into
-    // these tests via listAvailableDuos's default path resolution.
-    env: { DUO_SHARED_PERSONA_PATH: join(tempDir(), "shared-duo", "persona.json") },
+    // these tests via listAvailableDuos's default path resolution. The
+    // usage log is isolated for the same reason — a stray default-path
+    // entry would make the /ask usage-log assertions read real files.
+    env: {
+      DUO_SHARED_PERSONA_PATH: join(tempDir(), "shared-duo", "persona.json"),
+      DUO_SHARED_USAGE_LOG_PATH: join(tempDir(), "shared-duo-runtime", "usage.json"),
+    },
+    ...overrides,
   };
+}
+
+/** An inference provider whose every completion returns the same fixed text — public-answer.test.ts's agreeingProvider, for the answered-outcome fixture chain. */
+function agreeingProvider(response: string): InferenceProvider {
+  return { name: "fake", async complete() { return response; } };
+}
+
+let recordCounter = 0;
+function record(overrides: Partial<RecordInput> & { text: string }) {
+  recordCounter += 1;
+  return createRecord({
+    source: "test",
+    sourceRef: null,
+    kind: "my_answer",
+    author: "me",
+    timestamp: `2026-01-01T00:00:${String(recordCounter).padStart(2, "0")}.000Z`,
+    threadId: `t${recordCounter}`,
+    audience: "channel",
+    ...overrides,
+  });
+}
+
+/**
+ * The full fixture chain answerPublicly's answered outcome needs
+ * (public-answer.test.ts:47-107's seedLeaveTopic, kept in one place so
+ * several /ask tests can share it): a publicly-markable Q/A pair, embedded
+ * retrieval, a confirmed approved rule, the topics file, and — unless
+ * `demote` — a T0 autonomy grant.
+ */
+async function seedAnsweredTopic(storePath: string, options: { demote?: boolean } = {}): Promise<void> {
+  const dir = join(tempDir(), "duo");
+  const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
+  const answer = record({ text: `OFFICIAL (OPEN)\nfive days per quarter, per the vacation policy`, threadId: "shared" });
+  writeRecords(storePath, PASSPHRASE, [question, answer]);
+  const embeddingProvider = createFakeEmbeddingProvider();
+  await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+  const { pairs } = await extractQaPairs([question, answer]);
+  writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+  withDatabase(storePath, PASSPHRASE, true, (db) => {
+    putRule(
+      db,
+      {
+        id: "topic-leave",
+        topicId: "topic-leave",
+        text: "Standard leave is five days per quarter.",
+        status: "confirmed",
+        supportCount: 3,
+        consistency: 0.95,
+        createdAt: new Date().toISOString(),
+        lastConfirmedAt: new Date().toISOString(),
+        reviewStatus: "approved",
+        origin: "derived",
+        supersededByRuleId: null,
+        correctionDraftId: null,
+        correctionQuestion: null,
+      },
+      pairs.map((pair) => pair.id),
+    );
+  });
+  writeTopicsFile(dir, [{ id: "topic-leave", label: "Vacation leave", createdAt: new Date().toISOString() }]);
+  grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+  if (options.demote) {
+    // One correction drops the T0 cell to "approve" with a one-time
+    // demotion notice pending — the only fixture shape answerPublicly's
+    // ownerNotice field can ever come from (#55 AC2).
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-leave", tier: "T0", correctionRef: "test-correction" });
+  }
 }
 
 describe("createServer — auth (client-tech-design.md Part 2)", () => {
@@ -111,16 +196,50 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // Issue #158: ask tokens are refused by table separation — the hook only
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
-  const ownerRoutes = ["/duos", "/drafts", "/review", "/mirror/portrait", "/trust/grid", "/audit"] as const;
+  // Issue #159 pins the FULL owner-route inventory (every method), not just
+  // the GETs: the four POSTs are owner-only surfaces too, and a seam bug
+  // that only leaked on POSTs would otherwise pass unnoticed.
+  interface OwnerRoute {
+    readonly method: "GET" | "POST";
+    readonly url: string;
+    readonly payload?: unknown;
+  }
+  const ownerRoutes: readonly OwnerRoute[] = [
+    { method: "GET", url: "/duos" },
+    { method: "GET", url: "/drafts" },
+    { method: "GET", url: "/drafts/some-draft-id" },
+    { method: "GET", url: "/review" },
+    { method: "GET", url: "/mirror/portrait" },
+    { method: "GET", url: "/mirror/rules" },
+    { method: "GET", url: "/mirror/rules/some-rule-id" },
+    { method: "GET", url: "/trust/grid" },
+    { method: "GET", url: "/audit" },
+    { method: "POST", url: "/drafts", payload: { question: "q" } },
+    { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
+    { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
+    { method: "POST", url: "/mirror/rules/some-rule-id/approve" },
+  ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" } });
-    for (const url of ownerRoutes) {
-      const response = await app.inject({ method: "GET", url, headers: { authorization: `Bearer ${token}` } });
-      expect(response.statusCode, url).toBe(401);
+    // Each request comes from its own IP: 13 refused requests from one IP
+    // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
+    // the tail of the inventory into 429s — a different (also correct)
+    // behavior than the byte-identical 401 this helper exists to pin.
+    const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
+    let host = 1;
+    for (const route of ownerRoutes) {
+      const response = await app.inject({
+        method: route.method,
+        url: route.url,
+        headers: { authorization: `Bearer ${token}` },
+        ...(route.method === "POST" ? { payload: route.payload ?? {} } : {}),
+        remoteAddress: `10.0.0.${host}`,
+      });
+      host += 1;
+      expect(response.statusCode, `${route.method} ${route.url}`).toBe(401);
       // The hook rejects before routing, so the refusal body is
       // route-independent and identical to an invalid device token's.
-      expect(response.body, url).toBe(invalid.body);
+      expect(response.body, `${route.method} ${route.url}`).toBe(invalid.body);
     }
   }
 
@@ -429,5 +548,203 @@ describe("createServer — routes", () => {
     const response = await app.inject({ method: "GET", url: "/audit", headers: authHeader });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([]);
+  });
+});
+
+describe("createServer — POST /ask auth seam (#159)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let askToken: { id: string; name: string; token: string };
+  let askHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${askToken.token}` };
+  });
+
+  it("accepts a valid ask token on /ask and reaches the route handler", async () => {
+    const response = await app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "what is the leave policy" } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ duo: "personal", kind: "passed_on" });
+  });
+
+  it("refuses a revoked ask token on its very next /ask — no success cache serves it (R3)", async () => {
+    const first = await app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "q" } });
+    expect(first.statusCode).toBe(200);
+
+    revokeAskToken(storePath, PASSPHRASE, askToken.id);
+    const second = await app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "q" } });
+    expect(second.statusCode).toBe(401);
+  });
+
+  it("refuses an ask token the moment it expires, inside any would-be cache window (R3)", async () => {
+    // One second, not a few tens of ms: the first ask itself pays a full
+    // store decrypt (scrypt + AES-GCM), so a tighter expiry would sometimes
+    // already be past when verification runs. Still far inside the 5-second
+    // device cache window this test exists to prove does not apply.
+    const shortLived = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 1_000).toISOString());
+    const header = { authorization: `Bearer ${shortLived.token}` };
+    const first = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(first.statusCode).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const second = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(second.statusCode).toBe(401);
+  });
+
+  it("accepts a device token on /ask — the owner is a superset of an asker (R1)", async () => {
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const header = { authorization: `Bearer ${paired.token}` };
+    // First request exercises the cache-miss (two-decrypt) path; the
+    // second rides the 5-second device cache — both must pass.
+    const first = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(first.statusCode).toBe(200);
+    const second = await app.inject({ method: "POST", url: "/ask", headers: header, payload: { question: "q" } });
+    expect(second.statusCode).toBe(200);
+  });
+
+  it("refuses /ask with one uniform, kind-blind body — no oracle separates unknown from revoked (R1)", async () => {
+    const unknown = await app.inject({ method: "POST", url: "/ask", headers: { authorization: "Bearer not-a-real-token" }, payload: { question: "q" } });
+    expect(unknown.statusCode).toBe(401);
+
+    const revokedLink = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    revokeAskToken(storePath, PASSPHRASE, revokedLink.id);
+    const revoked = await app.inject({ method: "POST", url: "/ask", headers: { authorization: `Bearer ${revokedLink.token}` }, payload: { question: "q" } });
+    expect(revoked.statusCode).toBe(401);
+    expect(revoked.body).toBe(unknown.body);
+  });
+
+  it("matches /ask with a query string as /ask — routing resolves before the hook, so no raw url exact-compare", async () => {
+    const response = await app.inject({ method: "POST", url: "/ask?x=1", headers: askHeader, payload: { question: "q" } });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("counts one failure per failed /ask authentication and blocks at exactly 10, not 5 (R4)", async () => {
+    const statuses: number[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      const response = await app.inject({ method: "POST", url: "/ask", headers: { authorization: "Bearer not-a-real-token" }, payload: { question: "q" } });
+      statuses.push(response.statusCode);
+    }
+    expect(statuses.slice(0, 10)).toEqual(Array(10).fill(401));
+    expect(statuses.slice(10)).toEqual([429, 429]);
+  });
+});
+
+describe("createServer — POST /ask personal branch (#159)", () => {
+  let storePath: string;
+  let askToken: { id: string; name: string; token: string };
+  let askHeader: { authorization: string };
+  let deviceHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${askToken.token}` };
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    deviceHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<{ statusCode: number; body: string; json(): any }> {
+    const target = appOverride ?? createServer(deps(storePath));
+    return target.inject({ method: "POST", url: "/ask", headers, payload });
+  }
+
+  it("answers passed_on on an empty store, asker-visible fields only (R7/R8)", async () => {
+    const response = await ask({ question: "what is the leave policy" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "personal", kind: "passed_on" });
+    expect(typeof body.text).toBe("string");
+    expect(body.text.length).toBeGreaterThan(0);
+    expect(body).not.toHaveProperty("draftId");
+    expect(body).not.toHaveProperty("logEntryId");
+    expect(body).not.toHaveProperty("topicId");
+    expect(body).not.toHaveProperty("confidence");
+    expect(body).not.toHaveProperty("evidenceAgeDays");
+    expect(body).not.toHaveProperty("ownerNotice");
+    expect(body).not.toHaveProperty("sources");
+  });
+
+  it("declines a refused subject (R7)", async () => {
+    writeRefusalsFile(join(tempDir(), "duo"), [{ heading: "vacation", reason: "Leave policy is under review; don't speak for me on it." }]);
+    const response = await ask({ question: "how much vacation leave do I get" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ duo: "personal", kind: "declined_refused" });
+  });
+
+  it("answers a granted, publicly-markable topic with sources (R7)", async () => {
+    await seedAnsweredTopic(storePath);
+    const app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("Five days per quarter, per policy.") }));
+    const response = await ask({ question: "how much vacation leave do I get" }, askHeader, app);
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "personal", kind: "answered" });
+    expect(body.sources.length).toBeGreaterThan(0);
+    expect(body.text).toContain("Five days per quarter");
+  });
+
+  it("gives a device principal the full outcome fields an asker never sees (R8)", async () => {
+    const response = await ask({ question: "q" }, deviceHeader);
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.kind).toBe("passed_on");
+    expect(typeof body.draftId).toBe("string");
+    expect(typeof body.logEntryId).toBe("string");
+  });
+
+  it("carries a one-time ownerNotice to the device principal — owner-facing, not asker-facing (R8)", async () => {
+    await seedAnsweredTopic(storePath, { demote: true });
+    const app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("Five days per quarter, per policy.") }));
+    const response = await ask({ question: "how much vacation leave do I get" }, deviceHeader, app);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().kind).toBe("passed_on");
+    expect(response.json().ownerNotice).toMatch(/got that wrong/i);
+  });
+
+  it("never carries that ownerNotice to an ask principal (R8)", async () => {
+    await seedAnsweredTopic(storePath, { demote: true });
+    const app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("Five days per quarter, per policy.") }));
+    const response = await ask({ question: "how much vacation leave do I get" }, askHeader, app);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().kind).toBe("passed_on");
+    expect(response.json()).not.toHaveProperty("ownerNotice");
+  });
+
+  it("rejects a missing, empty, whitespace-only, or non-string question with 400 (R5)", async () => {
+    for (const payload of [{}, { question: "" }, { question: "   " }, { question: 42 }]) {
+      const response = await ask(payload);
+      expect(response.statusCode, JSON.stringify(payload)).toBe(400);
+      expect(response.json().error.code).toBe("bad_request");
+    }
+  });
+
+  it("rejects a bodyless POST with 400, not a 500 from destructuring a missing body (R5)", async () => {
+    const response = await createServer(deps(storePath)).inject({ method: "POST", url: "/ask", headers: askHeader });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("bad_request");
+  });
+
+  it("rejects an unknown duo value by naming the accepted values — role duos are never askable (R5)", async () => {
+    const response = await ask({ question: "q", duo: "role" });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("personal, shared");
+  });
+
+  it("maps a delegation failure to a generic 500 that leaks neither the error nor any path (R6/KTD4)", async () => {
+    await seedAnsweredTopic(storePath);
+    const throwing: InferenceProvider = {
+      name: "fake",
+      async complete() {
+        throw new Error(`provider exploded at ${join(tempDir(), "secret-path")}`);
+      },
+    };
+    const app = createServer(deps(storePath, { inferenceProvider: throwing }));
+    const response = await ask({ question: "how much vacation leave do I get" }, askHeader, app);
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ error: { code: "internal_error", message: "Something went wrong answering that." } });
+    expect(response.body).not.toContain(tempDir());
+    expect(response.body).not.toContain("provider exploded");
   });
 });
