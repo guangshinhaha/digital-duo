@@ -2,9 +2,17 @@ import type { DuoConfig } from "../config.js";
 import { readRefusalsFile } from "../drafting/refusals.js";
 import { scoreRelevanceGate, type GateEvalReport } from "../eval/gate-eval.js";
 import { loadGateLabels } from "../eval/gate-labels.js";
+import { fixtureSha256, loadJevMultiwayTasks } from "../eval/jev-fixtures.js";
+import {
+  persistStage1Report,
+  runJevStage1Quality,
+  sanitizeFailure,
+  type JevStage1Report,
+} from "../eval/jev-gate-eval.js";
 import { runOfflineEval, type OfflineEvalOptions, type OfflineEvalReport } from "../eval/offline-eval.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
+import type { TypedDecisionProvider } from "../provider/types.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -52,4 +60,47 @@ export function runEvalGate(config: DuoConfig): GateEvalReport {
   const labels = loadGateLabels(config.eval.gateLabelsPath);
   const refusals = readRefusalsFile(config.duoDir);
   return scoreRelevanceGate(labels, refusals);
+}
+
+/**
+ * Implements the Jev spike's `duo eval jev stage1` (plan U4): runs the
+ * quality head-to-head and persists `stage1-report.json` under the
+ * configured runtime dir — always, including on failure, because a failed
+ * run's evidence must outlive the abort (KTD5/KTD6). Like runEvalGate,
+ * this never asserts R5 itself: the CLI action prints the full report
+ * first and only then decides whether to fail on it.
+ *
+ * The provider is injected rather than constructed here so the checked-in
+ * suite runs this whole path offline through the fake; `src/cli.ts`
+ * constructs the real adapter (and gets its ProviderConfigError) at the
+ * process boundary.
+ */
+export async function runEvalJevStage1(
+  config: DuoConfig,
+  provider: TypedDecisionProvider,
+): Promise<JevStage1Report> {
+  const labels = loadGateLabels(config.eval.gateLabelsPath);
+  const refusals = readRefusalsFile(config.duoDir);
+  const tasks = loadJevMultiwayTasks(config.eval.jevMultiwayTasksPath);
+  const gatewayOrigin = new URL(config.jev.gatewayUrl).origin;
+  const fixtureHashes = {
+    gateLabels: fixtureSha256(config.eval.gateLabelsPath),
+    multiwayTasks: fixtureSha256(config.eval.jevMultiwayTasksPath),
+  };
+
+  try {
+    const report = await runJevStage1Quality(provider, { labels, refusals, tasks, gatewayOrigin, fixtureHashes });
+    persistStage1Report(config.jev.runtimeDir, report);
+    return report;
+  } catch (error) {
+    persistStage1Report(config.jev.runtimeDir, {
+      generatedAt: new Date().toISOString(),
+      gatewayOrigin,
+      fixtureHashes,
+      refusalsLoaded: refusals.length,
+      baseline: scoreRelevanceGate(labels, [...refusals]),
+      quality: { status: "failed", failureSummary: sanitizeFailure(error) },
+    });
+    throw error;
+  }
 }
