@@ -5,7 +5,7 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
-import { muteChannel } from "../src/drafting/channel-mutes.js";
+import { muteChannel, muteThread } from "../src/drafting/channel-mutes.js";
 import { listGateDecisions } from "../src/drafting/gate-log.js";
 import { offerDraftForMention } from "../src/drafting/proactive-offer.js";
 import { embedRecords } from "../src/ingest/embeddings.js";
@@ -215,6 +215,55 @@ describe("offerDraftForMention — the owner can mute proactive offers per chann
     );
 
     expect(outcome.kind).toBe("offer");
+  });
+
+  it("makes no offer from a muted thread either — same muted path, gate never runs (#172)", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedStalePrinterTopic(storePath);
+    muteThread(dir, "#printer-support", "C0123456789.1660000000");
+
+    const outcome = await offerDraftForMention(
+      storePath,
+      PASSPHRASE,
+      dir,
+      { text: "Can you check on the printer hardware issue on the third floor?", from: "alice", channel: "#printer-support", threadId: "C0123456789.1660000000" },
+      createFakeEmbeddingProvider(),
+      agreeingProvider("IT handles that — I'll check on it."),
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(outcome.kind).toBe("muted");
+    expect(listGateDecisions(storePath, PASSPHRASE)).toHaveLength(0);
+  });
+
+  it("a thread mute does not mute the channel: other threads, and channel-only mentions, still offer (#172)", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedStalePrinterTopic(storePath);
+    muteThread(dir, "#printer-support", "C0123456789.1660000000");
+
+    const otherThread = await offerDraftForMention(
+      storePath,
+      PASSPHRASE,
+      dir,
+      { text: "Can you check on the printer hardware issue on the third floor?", from: "alice", channel: "#printer-support", threadId: "C9999999999.1660000001" },
+      createFakeEmbeddingProvider(),
+      agreeingProvider("IT handles that — I'll check on it."),
+      CONFIDENCE_CONFIG,
+    );
+    expect(otherThread.kind).toBe("offer");
+
+    const noThread = await offerDraftForMention(
+      storePath,
+      PASSPHRASE,
+      dir,
+      { text: "Can you check on the printer hardware issue on the third floor?", from: "alice", channel: "#printer-support" },
+      createFakeEmbeddingProvider(),
+      agreeingProvider("IT handles that — I'll check on it."),
+      CONFIDENCE_CONFIG,
+    );
+    expect(noThread.kind).toBe("offer");
   });
 
   it("a mention with no channel at all is never treated as muted", async () => {

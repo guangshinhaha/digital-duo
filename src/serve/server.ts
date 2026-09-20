@@ -8,6 +8,7 @@ import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
 import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
+import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
@@ -100,6 +101,32 @@ function parsePositiveIntParam(name: string, raw: string | undefined): number | 
 }
 
 /**
+ * Validates the body of POST /channels/policy/mute and /unmute (#172): a
+ * required non-empty `channel`, an optional non-empty `threadId` scoping
+ * below it, and no "/" in either — the separator is what scopes a thread
+ * within a channel in the one mute store, so it cannot also be data.
+ */
+function readMuteTarget(body: { channel?: unknown; threadId?: unknown }): { channel: string; threadId?: string } {
+  const { channel, threadId } = body;
+  if (typeof channel !== "string" || channel.trim().length === 0) {
+    throw new BadRequestError("channel is required and must be a non-empty string");
+  }
+  if (channel.includes("/")) {
+    throw new BadRequestError(`channel must not contain "/" — it scopes a thread within a channel — got ${JSON.stringify(channel)}`);
+  }
+  if (threadId === undefined) {
+    return { channel };
+  }
+  if (typeof threadId !== "string" || threadId.trim().length === 0) {
+    throw new BadRequestError("threadId, when present, must be a non-empty string");
+  }
+  if (threadId.includes("/")) {
+    throw new BadRequestError(`threadId must not contain "/" — it scopes a thread within a channel — got ${JSON.stringify(threadId)}`);
+  }
+  return { channel, threadId };
+}
+
+/**
  * One shape for every error response (`client-tech-design.md` §1.5): a
  * domain error's own message is already written for a human, so this maps
  * the *class* to a status code and passes the message straight through
@@ -129,6 +156,9 @@ function statusForError(error: Error): number {
     case "CandidateConflictError":
       return 409;
     case "BlankEditError":
+    // #172: a channel/thread mute key containing the "/" separator — the
+    // entry would be ambiguous in the one mute store, so it is refused.
+    case "InvalidMuteKeyError":
       return 400;
     default:
       return 500;
@@ -146,6 +176,51 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   // client renders strings it never has to recognise. No adapters is the
   // supported empty list: a duo with no channels answers only the owner.
   app.get("/channels", async () => describeChannels(deps.channelAdapters ?? [], deps.duoDir));
+
+  // #172: the drafting policy — which channels, and which threads within
+  // them, produce no proactive offers at all — over HTTP. This is the ONE
+  // mute store `duo mentions mute/unmute/muted` reads and writes
+  // (muted-channels.json), through exactly those same module functions: a
+  // mute set here is the mute the CLI reads, and a mute set at the terminal
+  // shows here. GET decodes the store by scope; the POSTs validate their
+  // target, write through the module, and answer with the updated policy.
+  app.get("/channels/policy", async () => readMutedPolicy(deps.duoDir));
+
+  app.post<{ Body: { channel?: unknown; threadId?: unknown } }>("/channels/policy/mute", async (request, reply) => {
+    try {
+      const { channel, threadId } = readMuteTarget(request.body);
+      if (threadId !== undefined) {
+        muteThread(deps.duoDir, channel, threadId);
+      } else {
+        muteChannel(deps.duoDir, channel);
+      }
+      return readMutedPolicy(deps.duoDir);
+    } catch (error) {
+      if (error instanceof BadRequestError) {
+        reply.code(400).send(errorBody("bad_request", error.message));
+        return;
+      }
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post<{ Body: { channel?: unknown; threadId?: unknown } }>("/channels/policy/unmute", async (request, reply) => {
+    try {
+      const { channel, threadId } = readMuteTarget(request.body);
+      if (threadId !== undefined) {
+        unmuteThread(deps.duoDir, channel, threadId);
+      } else {
+        unmuteChannel(deps.duoDir, channel);
+      }
+      return readMutedPolicy(deps.duoDir);
+    } catch (error) {
+      if (error instanceof BadRequestError) {
+        reply.code(400).send(errorBody("bad_request", error.message));
+        return;
+      }
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
 
   // #177: "which devices can read my corpus right now" (client-tech-design.md
   // Part 2), answerable from a client instead of only at the Mac's terminal.

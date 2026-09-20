@@ -92,4 +92,49 @@ describe("duo mentions mute / unmute / muted (#47 AC3)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/was not muted/i);
   });
+
+  it("mutes a thread within a channel without muting the channel (#172)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+    const env = { DUO_STORE_PATH: storePath };
+
+    const muteResult = await runCli(["mentions", "mute", "#eng-support", "--thread", "C0123456789.1660000000"], { cwd: tempDir(), env });
+    expect(muteResult.exitCode).toBe(0);
+    expect(muteResult.stdout).toMatch(/muted/i);
+
+    const listResult = await runCli(["mentions", "muted"], { cwd: tempDir(), env });
+    expect(listResult.stdout).toContain("#eng-support/C0123456789.1660000000");
+
+    // The muted thread makes no offer; a different thread in the same
+    // channel still can (here: no draft to offer — the channel is not muted).
+    const mutedThread = await runCli(
+      ["mentions", "offer", "Can you review the budget doc before Friday?", "--channel", "#eng-support", "--thread-id", "C0123456789.1660000000"],
+      { cwd: tempDir(), env },
+    );
+    expect(mutedThread.exitCode).toBe(0);
+    expect(mutedThread.stdout).toMatch(/muted/i);
+
+    const otherThread = await runCli(
+      ["mentions", "offer", "Can you review the budget doc before Friday?", "--channel", "#eng-support", "--thread-id", "C9999999999.1660000001"],
+      { cwd: tempDir(), env },
+    );
+    expect(otherThread.exitCode).toBe(0);
+    expect(otherThread.stdout).not.toMatch(/^Muted/m);
+    expect(otherThread.stdout).toMatch(/no draft to offer|gate declined/i);
+
+    const unmuteResult = await runCli(["mentions", "unmute", "#eng-support", "--thread", "C0123456789.1660000000"], { cwd: tempDir(), env });
+    expect(unmuteResult.exitCode).toBe(0);
+    expect(unmuteResult.stdout).toMatch(/unmuted/i);
+
+    const afterResult = await runCli(["mentions", "muted"], { cwd: tempDir(), env });
+    expect(afterResult.stdout).toMatch(/no channel is muted/i);
+  });
+
+  it("refuses a thread mute with \"/\" in either part, naming the rule (#172)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+    const result = await runCli(["mentions", "mute", "#eng/support", "--thread", "C0123456789.1660000000"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/\//);
+  });
 });

@@ -60,3 +60,88 @@ export function unmuteChannel(duoDir: string, channel: string): { wasMuted: bool
   writeMutedChannels(duoDir, updated);
   return { wasMuted: true, channels: updated };
 }
+
+// #172: the same one store grows scope *below* channel level — a thread
+// within a channel can be muted on its own. No second file, no second
+// vocabulary: a thread entry is stored as `<channel>/<threadId>`, which is
+// why "/" is banned in both parts at every write. The CLI's commands and
+// the daemon's routes read and write these same entries through these same
+// functions — one store, one code path (#172 AC3).
+
+/** Scopes a thread within its channel in the one mute file — structural, so it cannot also be data. */
+const THREAD_ENTRY_SEPARATOR = "/";
+
+/** Thrown by every thread-mute write whose channel or thread id contains the separator — the entry would be ambiguous, so it is refused rather than silently re-scoped. */
+export class InvalidMuteKeyError extends Error {
+  constructor(part: string) {
+    super(`Channel and thread ids must not contain "${THREAD_ENTRY_SEPARATOR}" (it scopes a thread within a channel), got ${JSON.stringify(part)}`);
+    this.name = "InvalidMuteKeyError";
+  }
+}
+
+function assertValidMuteKeyPart(part: string): void {
+  if (part.includes(THREAD_ENTRY_SEPARATOR)) {
+    throw new InvalidMuteKeyError(part);
+  }
+}
+
+function threadEntry(channel: string, threadId: string): string {
+  return `${channel}${THREAD_ENTRY_SEPARATOR}${threadId}`;
+}
+
+/** Whether one specific thread is muted — a thread mute never mutes its channel (#172 AC2). */
+export function isThreadMuted(duoDir: string, channel: string, threadId: string): boolean {
+  const key = threadEntry(channel, threadId).toLowerCase();
+  return readMutedChannels(duoDir).some((entry) => entry.toLowerCase() === key);
+}
+
+/** Mutes one thread within a channel — idempotent, same as `muteChannel`. Returns the full updated entry list. */
+export function muteThread(duoDir: string, channel: string, threadId: string): string[] {
+  assertValidMuteKeyPart(channel);
+  assertValidMuteKeyPart(threadId);
+  const existing = readMutedChannels(duoDir);
+  if (isThreadMuted(duoDir, channel, threadId)) {
+    return existing;
+  }
+  const updated = [...existing, threadEntry(channel, threadId)];
+  writeMutedChannels(duoDir, updated);
+  return updated;
+}
+
+/** Unmutes one thread — reversible and honest about nothing-to-undo, same contract as `unmuteChannel`. */
+export function unmuteThread(duoDir: string, channel: string, threadId: string): { wasMuted: boolean; channels: string[] } {
+  assertValidMuteKeyPart(channel);
+  assertValidMuteKeyPart(threadId);
+  const existing = readMutedChannels(duoDir);
+  const key = threadEntry(channel, threadId).toLowerCase();
+  const updated = existing.filter((entry) => entry.toLowerCase() !== key);
+  if (updated.length === existing.length) {
+    return { wasMuted: false, channels: existing };
+  }
+  writeMutedChannels(duoDir, updated);
+  return { wasMuted: true, channels: updated };
+}
+
+/** The drafting policy as one read (#172): the one store, split by scope — channel-level entries, and thread-scoped mutes decoded to `{channel, threadId}`. */
+export interface ChannelPolicy {
+  readonly muted: string[];
+  readonly mutedThreads: { readonly channel: string; readonly threadId: string }[];
+}
+
+/**
+ * Reads the one mute store as policy, split by scope. Decoding splits each
+ * thread entry at its *first* separator: writes ban "/" in both parts, so a
+ * hand-edited entry with extra separators degrades to a strange thread id
+ * rather than corrupting the channel name.
+ */
+export function readMutedPolicy(duoDir: string): ChannelPolicy {
+  const entries = readMutedChannels(duoDir);
+  const muted = entries.filter((entry) => !entry.includes(THREAD_ENTRY_SEPARATOR));
+  const mutedThreads = entries
+    .filter((entry) => entry.includes(THREAD_ENTRY_SEPARATOR))
+    .map((entry) => {
+      const separatorAt = entry.indexOf(THREAD_ENTRY_SEPARATOR);
+      return { channel: entry.slice(0, separatorAt), threadId: entry.slice(separatorAt + 1) };
+    });
+  return { muted, mutedThreads };
+}

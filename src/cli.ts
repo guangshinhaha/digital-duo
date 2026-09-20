@@ -997,14 +997,19 @@ mentionsCommand
   .argument("<text>", "the mention's text")
   .option("--from <name>", "who mentioned the owner")
   .option("--channel <channel>", "which channel this arrived in — checked against the mute list (#47 AC3)")
+  .option("--thread-id <threadId>", "the thread within --channel this arrived in — checked against thread-scoped mutes (#172)")
   .option("--thread-context <text>", "prior messages in the same thread, if any")
-  .action(async (text: string, options: { from?: string; channel?: string; threadContext?: string }) => {
+  .action(async (text: string, options: { from?: string; channel?: string; threadId?: string; threadContext?: string }) => {
     const config = loadConfig();
     try {
       const outcome = await runMentionsOffer(text, options, config);
       switch (outcome.kind) {
         case "muted":
-          console.log(`Muted — no offer made (channel "${outcome.channel}").`);
+          console.log(
+            outcome.threadId === undefined
+              ? `Muted — no offer made (channel "${outcome.channel}").`
+              : `Muted — no offer made (thread ${outcome.threadId} in channel "${outcome.channel}").`,
+          );
           break;
         case "gate_declined":
           console.log(`Gate declined (${outcome.reason}) — no offer made.`);
@@ -1027,13 +1032,17 @@ mentionsCommand
 
 mentionsCommand
   .command("mute")
-  .description("Mute proactive offers from a channel (#47 AC3) — reversible with `duo mentions unmute`")
+  .description("Mute proactive offers from a channel, or one thread within it via --thread (#47 AC3, #172) — reversible with `duo mentions unmute`")
   .argument("<channel>", "the channel to mute")
-  .action((channel: string) => {
+  .option("--thread <threadId>", "mute only this thread within the channel, not the whole channel (#172)")
+  .action((channel: string, options: { thread?: string }) => {
     const config = loadConfig();
     try {
-      const channels = runMentionsMute(channel, config);
-      console.log(`Muted "${channel}". Currently muted: ${channels.join(", ") || "(none)"}.`);
+      const entries = runMentionsMute(channel, config, options.thread);
+      const mutedWhat = options.thread === undefined ? `"${channel}"` : `thread ${options.thread} in "${channel}"`;
+      // The store is one list: entries echo back in their stored form, a
+      // thread mute appearing as `channel/threadId` — visible, not decoded.
+      console.log(`Muted ${mutedWhat}. Currently muted: ${entries.join(", ") || "(none)"}.`);
     } catch (error) {
       reportError(error);
     }
@@ -1041,16 +1050,18 @@ mentionsCommand
 
 mentionsCommand
   .command("unmute")
-  .description("Unmute a previously-muted channel (#47 AC3)")
+  .description("Unmute a previously-muted channel, or one thread within it via --thread (#47 AC3, #172)")
   .argument("<channel>", "the channel to unmute")
-  .action((channel: string) => {
+  .option("--thread <threadId>", "unmute only this thread within the channel (#172)")
+  .action((channel: string, options: { thread?: string }) => {
     const config = loadConfig();
     try {
-      const result = runMentionsUnmute(channel, config);
+      const result = runMentionsUnmute(channel, config, options.thread);
+      const unmutedWhat = options.thread === undefined ? `"${channel}"` : `thread ${options.thread} in "${channel}"`;
       console.log(
         result.wasMuted
-          ? `Unmuted "${channel}". Currently muted: ${result.channels.join(", ") || "(none)"}.`
-          : `"${channel}" was not muted.`,
+          ? `Unmuted ${unmutedWhat}. Currently muted: ${result.channels.join(", ") || "(none)"}.`
+          : `${unmutedWhat} was not muted.`,
       );
     } catch (error) {
       reportError(error);
@@ -1059,7 +1070,7 @@ mentionsCommand
 
 mentionsCommand
   .command("muted")
-  .description("List every currently-muted channel (#47 AC3: \"the setting is visible\")")
+  .description("List every currently-muted channel and thread (#47 AC3: \"the setting is visible\") — thread mutes appear as channel/threadId, their stored form")
   .action(() => {
     const config = loadConfig();
     try {
