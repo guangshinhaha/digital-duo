@@ -1,3 +1,4 @@
+import { detectClassification, stripMarkingLine } from "../ingest/record.js";
 import type { DraftContext } from "./context.js";
 
 /**
@@ -38,18 +39,27 @@ export function buildDraftPrompt(question: string, threadContext: string | null,
 /**
  * No-provider / degrade fallback: the standing order's own text if one
  * directly covers the question, else the single closest piece of past
- * evidence, verbatim — no synthesis, same "degrade rather than fail" shape
- * as src/permissions/answer.ts's extractiveAnswer. Returns undefined only
- * when there's truly nothing to draft from, which is exactly the signal
- * the pipeline uses to skip generation and go straight to composing an
- * escalation.
+ * evidence, verbatim except for a leading classification marking
+ * (stripMarkingLine, #155) — no synthesis, same "degrade rather than fail"
+ * shape as src/permissions/answer.ts's extractiveAnswer, which strips the
+ * same marking for the same reason: whoever reads the draft was already
+ * allowed the content (by clearance, or by being the owner), so the raw
+ * stamp adds nothing but noise. Fixing it here, the one fallback every
+ * draftReply surface shares, covers `duo draft`, public answering, and
+ * predecessor consultation at once. Returns undefined only when there's
+ * truly nothing to draft from, which is exactly the signal the pipeline
+ * uses to skip generation and go straight to composing an escalation.
  */
 export function extractiveDraft(context: DraftContext): string | undefined {
   if (context.ruleHit) {
-    return context.ruleHit.text;
+    // A rule row carries no classification of its own (rules.ts), but the
+    // no-provider default rule text is a marked answer copied verbatim — so
+    // read the marking back off the rule's own first line, the same read
+    // detectClassification made at ingest, and strip only that.
+    return stripMarkingLine({ text: context.ruleHit.text, classification: detectClassification(context.ruleHit.text) });
   }
   const best = context.evidence[0];
-  return best?.text;
+  return best ? stripMarkingLine(best) : undefined;
 }
 
 function cosineSimilarity(a: readonly number[], b: readonly number[]): number {

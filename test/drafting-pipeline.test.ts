@@ -131,6 +131,92 @@ describe("draftReply — a question produces a draft with sources (#32 AC1)", ()
   });
 });
 
+describe("draftReply — the no-provider extractive fallback never echoes a raw classification marking (#155)", () => {
+  // Same convention answer.test.ts's own no-provider fallback test uses: a
+  // marked record whose marking is a bare first line, so stripMarkingLine's
+  // unambiguous case is the one under test.
+  const MARKED_ANSWER_TEXT = "OFFICIAL (OPEN)\nfive days per quarter, per the vacation policy";
+
+  it("echoes a marked evidence record's text without its raw marking line — the same strip answerForAsker's fallback already did (#50)", async () => {
+    const storePath = initStore();
+    // Three marked answers and no rule: enough retrieval strength (3 = the
+    // strong-evidence bar) to clear the escalation threshold with no rule
+    // hit, so the draft that comes back is extractiveDraft(evidence[0]).
+    for (let i = 0; i < 3; i++) {
+      writeRecords(storePath, PASSPHRASE, [record({ text: MARKED_ANSWER_TEXT })]);
+    }
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      embeddingProvider,
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toContain("five days per quarter, per the vacation policy");
+    expect(result.text).not.toContain("OFFICIAL (OPEN)");
+  });
+
+  it("echoes a rule hit's text without its raw marking line — the no-provider default rule text is a marked answer copied verbatim", async () => {
+    const storePath = initStore();
+    const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
+    const answer = record({ text: MARKED_ANSWER_TEXT, threadId: "shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave-marked" })));
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      putRule(
+        db,
+        {
+          id: "topic-leave-marked",
+          topicId: "topic-leave-marked",
+          // Exactly what runRuleInduction + defaultRuleText store when no
+          // inference provider is configured: the most central answer's
+          // text, verbatim — marking line included.
+          text: MARKED_ANSWER_TEXT,
+          status: "confirmed",
+          supportCount: 3,
+          consistency: 0.95,
+          createdAt: new Date().toISOString(),
+          lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "approved",
+          origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
+        },
+        pairs.map((pair) => pair.id),
+      );
+    });
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      embeddingProvider,
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toContain("five days per quarter, per the vacation policy");
+    expect(result.text).not.toContain("OFFICIAL (OPEN)");
+  });
+});
+
 describe("draftReply — an unanswerable question escalates instead of guessing (#32 AC2)", () => {
   it("escalates, with an explanation, when there is no supporting evidence at all", async () => {
     const storePath = initStore();
