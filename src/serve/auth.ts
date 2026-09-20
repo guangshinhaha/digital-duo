@@ -106,6 +106,14 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
     if (request.url === "/health") {
       return;
     }
+    // /ws authenticates by first *message* instead (serve/ws.ts): the browser
+    // WebSocket API cannot set an Authorization header, so the bearer check
+    // here must not 401 the upgrade before the socket ever opens. The query
+    // string, if any, is irrelevant — a token in it never authenticates
+    // anything; the socket's own auth message is the only way in.
+    if (request.url === "/ws" || request.url.startsWith("/ws?")) {
+      return;
+    }
     const ip = request.ip;
     const existingWindow = failures.get(ip);
     // A cheap precheck so a client already over the cap doesn't pay for a

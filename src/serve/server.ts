@@ -1,3 +1,4 @@
+import cors from "@fastify/cors";
 import Fastify, { type FastifyInstance } from "fastify";
 import type { DuoConfig } from "../config.js";
 import { createLlmEditClassifier, recordDraftOutcomeAndClassify } from "../corrections/classify.js";
@@ -17,6 +18,8 @@ import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type Principal } from "./auth.js";
+import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
+import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
 
 /**
  * Everything a route needs, resolved once at boot (`client-tech-design.md`
@@ -109,7 +112,7 @@ function statusForError(error: Error): number {
 }
 
 /** Registers every route on an already-constructed Fastify instance. Split out so `createServer` can add auth first and routes after, without routes needing to know that ordering exists. */
-function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
+function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: DraftReadyHub): void {
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/duos", async () => listAvailableDuos(deps.env));
@@ -173,7 +176,10 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
     // 201, not 202: this is synchronous (see the comment above) and a
     // draft-log row now exists either way (draftReply always writes
     // exactly one row, draft or escalation) — there is nothing pending.
+    // Same-tick draft-ready push (#162): both pipeline outcomes leave a row
+    // the owner can act on, so both are announced.
     reply.code(201);
+    draftReady.publish(result.draftId);
     return result;
   });
 
@@ -400,7 +406,21 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
  */
 export function createServer(deps: ServeDeps): FastifyInstance {
   const app = Fastify({ logger: false });
+  // CORS registers *before* the auth hook on purpose: a browser preflight is
+  // an OPTIONS request the browser will not attach `Authorization` to, so if
+  // auth ran first every preflight would 401 and no browser-origin client
+  // could ever talk to this daemon. Ordering CORS first also puts the
+  // allow-origin header on error responses (401/404), which is what lets a
+  // browser read those bodies at all. An empty allowlist (resolveCorsOrigins
+  // → false) disables CORS outright: default-deny, never a wildcard.
+  const corsOrigins = resolveCorsOrigins(deps.env);
+  app.register(cors, {
+    origin: corsOrigins,
+    allowedHeaders: [...CORS_ALLOWED_HEADERS],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  });
   registerAuth(app, deps.storePath, deps.passphrase);
-  registerRoutes(app, deps);
+  const draftReady = registerDraftReadySocket(app, deps);
+  registerRoutes(app, deps, draftReady);
   return app;
 }
