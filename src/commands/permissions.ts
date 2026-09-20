@@ -61,7 +61,10 @@ export async function runAnswerPublicly(
     passphrase,
     config.duoDir,
     question,
-    askerRef,
+    // #160: the CLI never comes through an ask link and (#43) never
+    // resolves the ref against duo/directory.json — both now stated
+    // explicitly rather than left implicit in the old bare-string param.
+    { ref: askerRef, resolved: null, askLinkId: null },
     embeddingProvider,
     inferenceProvider,
     config.confidence,

@@ -9,7 +9,7 @@ import { writeTopicsFile } from "../src/derivation/topics.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import { embedRecords } from "../src/ingest/embeddings.js";
-import { answerPublicly } from "../src/permissions/public-answer.js";
+import { answerPublicly, type AskerContext } from "../src/permissions/public-answer.js";
 import { appendPublicAnswerLogEntry, listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import {
   correctPublicAnswer,
@@ -88,13 +88,13 @@ async function seedGrantedLeaveTopic(storePath: string, dir: string): Promise<vo
   grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
 }
 
-async function postAnAnswer(storePath: string, dir: string, askerRef = "colleague-1"): Promise<string> {
+async function postAnAnswer(storePath: string, dir: string, asker: AskerContext = { ref: "colleague-1", resolved: null, askLinkId: null }): Promise<string> {
   const outcome = await answerPublicly(
     storePath,
     PASSPHRASE,
     dir,
     "how much vacation leave do I get",
-    askerRef,
+    asker,
     createFakeEmbeddingProvider(),
     agreeingProvider("Five days per quarter, per policy."),
     CONFIDENCE_CONFIG,
@@ -111,7 +111,13 @@ describe("correctPublicAnswer — a correction reaches the original readers (#45
     const storePath = initStore();
     const dir = duoDir();
     await seedGrantedLeaveTopic(storePath, dir);
-    const originalId = await postAnAnswer(storePath, dir, "colleague-1");
+    // The original came through an ask link with a resolved asker, so this
+    // test also pins #160's KTD6: the correction mirrors that context.
+    const originalId = await postAnAnswer(storePath, dir, {
+      ref: "jdoe",
+      resolved: true,
+      askLinkId: "0193c0ff-2000-7000-8000-000000000001",
+    });
 
     const result = correctPublicAnswer(storePath, PASSPHRASE, dir, originalId, "Actually it's ten days per quarter.", OWNER_NAME, true);
 
@@ -120,7 +126,7 @@ describe("correctPublicAnswer — a correction reaches the original readers (#45
     expect(result.threadGoneNotice).toBeUndefined();
     expect(result.text).toContain("ten days per quarter");
     expect(result.text).toContain("Five days per quarter"); // quotes the original for visible linkage
-    expect(result.notifiedAskerRefs).toEqual(["colleague-1"]);
+    expect(result.notifiedAskerRefs).toEqual(["jdoe"]);
 
     const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
     expect(entries).toHaveLength(2);
@@ -128,9 +134,23 @@ describe("correctPublicAnswer — a correction reaches the original readers (#45
     expect(correctionEntry?.correctsEntryId).toBe(originalId);
     expect(correctionEntry?.outcome).toBe("corrected");
     expect(correctionEntry?.text).toBe(result.text);
+    // #160 (KTD6): the correction entry carries the original's asker context.
+    expect(correctionEntry).toMatchObject({
+      askerRef: "jdoe",
+      askLinkId: "0193c0ff-2000-7000-8000-000000000001",
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
 
     const originalEntry = entries.find((entry) => entry.id === originalId);
     expect(originalEntry?.text).toContain("Five days per quarter"); // the original stands, unedited (out of scope: deleting it)
+    // ...including its asker context, exactly as answered (#160).
+    expect(originalEntry).toMatchObject({
+      askerRef: "jdoe",
+      askLinkId: "0193c0ff-2000-7000-8000-000000000001",
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
   });
 });
 
@@ -195,6 +215,9 @@ describe("correctPublicAnswer — error cases", () => {
       outcome: "passed_on",
       text: "passed on",
       draftId: "draft-1",
+      askLinkId: null,
+      askerResolved: null,
+      clearanceApplied: "official_open",
     });
     expect(() => correctPublicAnswer(storePath, PASSPHRASE, dir, passedOnId, "text", OWNER_NAME)).toThrow(NothingToCorrectError);
   });
@@ -209,6 +232,9 @@ describe("correctPublicAnswer — error cases", () => {
       outcome: "answered",
       text: "an answer with no topic somehow",
       draftId: "draft-2",
+      askLinkId: null,
+      askerResolved: null,
+      clearanceApplied: "official_open",
     });
     const result = correctPublicAnswer(storePath, PASSPHRASE, dir, entryId, "corrected text", OWNER_NAME);
     expect(result.demotion).toBeUndefined();

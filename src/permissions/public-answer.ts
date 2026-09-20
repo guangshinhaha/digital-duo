@@ -76,6 +76,22 @@ export interface PublicDeclinedRefused {
 export type PublicAnswerOutcome = PublicAnswered | PublicPassedOn | PublicDeclinedRefused;
 
 /**
+ * Who asked, as #160's audit context records it — one structured value in
+ * place of the bare `askerRef` string, so a caller must state all three
+ * facts rather than leave them implicit. `ref` is the display/handling ref
+ * exactly as before; `resolved` is the tri-state lookup outcome (null = no
+ * lookup ran — CLI asks per #43, device "owner"); `askLinkId` names the
+ * verified ask link by id, never the raw secret. The shared-duo answering
+ * path (#159's `answerSharedDuo`) takes this same shape for its usage-log
+ * entries, so both branches of `POST /ask` record identical asker context.
+ */
+export interface AskerContext {
+  readonly ref: string;
+  readonly resolved: boolean | null;
+  readonly askLinkId: string | null;
+}
+
+/**
  * The graduation from private drafting (docs/v1-spec.md §2): a colleague's
  * question always drafts privately first — `draftReply` is #32/#34's own T1
  * pipeline, run here exactly as `duo draft` runs it, so the correction loop
@@ -111,7 +127,7 @@ export async function answerPublicly(
   passphrase: string,
   duoDir: string,
   question: string,
-  askerRef: string,
+  asker: AskerContext,
   embeddingProvider: EmbeddingProvider,
   inferenceProvider: InferenceProvider | undefined,
   confidenceConfig: DuoConfig["confidence"],
@@ -134,11 +150,14 @@ export async function answerPublicly(
     const message = withPublicAttribution(pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
-      askerRef,
+      askerRef: asker.ref,
       topicId: null,
       outcome,
       text: message,
       draftId: pipelineResult.draftId,
+      askLinkId: asker.askLinkId,
+      askerResolved: asker.resolved,
+      clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
     });
     return pipelineResult.refused
       ? { kind: "declined_refused", draftId: pipelineResult.draftId, logEntryId, message }
@@ -160,11 +179,14 @@ export async function answerPublicly(
     const message = withPublicAttribution(PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
-      askerRef,
+      askerRef: asker.ref,
       topicId: topicId ?? null,
       outcome: "passed_on",
       text: message,
       draftId: pipelineResult.draftId,
+      askLinkId: asker.askLinkId,
+      askerResolved: asker.resolved,
+      clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
     });
     return {
       kind: "passed_on",
@@ -182,11 +204,14 @@ export async function answerPublicly(
   });
   const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
     question,
-    askerRef,
+    askerRef: asker.ref,
     topicId,
     outcome: "answered",
     text,
     draftId: pipelineResult.draftId,
+    askLinkId: asker.askLinkId,
+    askerResolved: asker.resolved,
+    clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
   });
   return {
     kind: "answered",

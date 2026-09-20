@@ -121,6 +121,13 @@ export function correctPublicAnswer(
     text,
     draftId: original.draftId,
     correctsEntryId: originalEntryId,
+    // #160 (KTD6): the correction stays inside the same exchange's audit
+    // trail, so it mirrors the original's asker context — the link that
+    // asked, its resolution outcome, and the ceiling the original answer
+    // was filtered through — exactly as it already mirrored askerRef/draftId.
+    askLinkId: original.askLinkId,
+    askerResolved: original.askerResolved,
+    clearanceApplied: original.clearanceApplied,
   });
 
   return {
