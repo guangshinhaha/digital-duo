@@ -139,3 +139,123 @@ export function touchLastSeen(storePath: string, passphrase: string, id: string)
     db.prepare(`UPDATE device_tokens SET last_seen_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
   });
 }
+
+/**
+ * Issue #158 — ask links are a second token kind alongside `DeviceToken`,
+ * deliberately not device tokens with a permission flag: a device pairing
+ * carries full owner power on every route, while an ask link is a
+ * short-lived, ask-only credential minted for one person. Separating the
+ * kinds by table is also what makes refusal structural on every existing
+ * route — an ask token's hash is not in `device_tokens`, so the daemon's
+ * auth hook already refuses it exactly as it refuses an unknown token
+ * (nothing in `src/serve/auth.ts` knows ask links exist). #159's `POST /ask`
+ * is the only route that will ever accept one.
+ */
+export interface AskToken {
+  readonly id: string;
+  readonly name: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly revokedAt: string | null;
+}
+
+interface AskTokenRow {
+  id: string;
+  name: string;
+  token_hash: string;
+  created_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+function rowToAskToken(row: AskTokenRow): AskToken {
+  return { id: row.id, name: row.name, createdAt: row.created_at, expiresAt: row.expires_at, revokedAt: row.revoked_at };
+}
+
+export function ensureAskTokenSchema(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ask_tokens (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT
+    ) STRICT
+  `);
+}
+
+/** Result of `duo ask-link new`: the raw token is returned exactly once and never persisted anywhere in this form — copy it now. */
+export interface MintedAskLink {
+  readonly id: string;
+  readonly name: string;
+  readonly token: string;
+  readonly expiresAt: string;
+}
+
+/** Mints an ask link whose expiry is set by the caller as an ISO-8601 string (issue #158). */
+export function createAskToken(storePath: string, passphrase: string, name: string, expiresAt: string): MintedAskLink {
+  const id = randomUUID();
+  const token = randomBytes(32).toString("base64url");
+  const createdAt = new Date().toISOString();
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureAskTokenSchema(db);
+    db.prepare(`INSERT INTO ask_tokens (id, name, token_hash, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, NULL)`).run(
+      id,
+      name,
+      hashToken(token),
+      createdAt,
+      expiresAt,
+    );
+  });
+  return { id, name, token, expiresAt };
+}
+
+/** Every ask link, oldest first — whether it can still be used is `revokedAt === null` and an unexpired `expiresAt`. */
+export function listAskTokens(storePath: string, passphrase: string): AskToken[] {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureAskTokenSchema(db);
+    const rows = db.prepare(`SELECT * FROM ask_tokens ORDER BY created_at, id`).all() as unknown as AskTokenRow[];
+    return rows.map(rowToAskToken);
+  });
+}
+
+export class AskTokenNotFoundError extends Error {
+  constructor(id: string) {
+    super(`No ask link with id "${id}"`);
+    this.name = "AskTokenNotFoundError";
+  }
+}
+
+/** Revokes an ask link immediately; revoking an already-revoked link is a no-op, not an error (issue #158). */
+export function revokeAskToken(storePath: string, passphrase: string, id: string): void {
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureAskTokenSchema(db);
+    const result = db.prepare(`UPDATE ask_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`).run(new Date().toISOString(), id);
+    if (result.changes === 0) {
+      const exists = db.prepare(`SELECT 1 FROM ask_tokens WHERE id = ?`).get(id);
+      if (!exists) {
+        throw new AskTokenNotFoundError(id);
+      }
+      // Already revoked — revoking twice is a no-op, not an error.
+    }
+  });
+}
+
+/**
+ * Verifies a raw ask-link bearer token: unrevoked and unexpired, looked up
+ * by SHA-256 hash exactly like `verifyDeviceToken`. Read-only for the same
+ * cost reason, and with no write path at all — "not silently renewed"
+ * (issue #158) is enforced by there being nothing here that could extend,
+ * recreate, or reset an expiry. Timestamps compare as ISO-8601 strings,
+ * which is order-equivalent to time comparison and the repo's convention.
+ */
+export function verifyAskToken(storePath: string, passphrase: string, rawToken: string): AskToken | undefined {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureAskTokenSchema(db);
+    const row = db
+      .prepare(`SELECT * FROM ask_tokens WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?`)
+      .get(hashToken(rawToken), new Date().toISOString()) as AskTokenRow | undefined;
+    return row ? rowToAskToken(row) : undefined;
+  });
+}
