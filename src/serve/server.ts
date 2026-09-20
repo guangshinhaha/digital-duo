@@ -301,7 +301,11 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
       // provider details or filesystem paths are owner information (the
       // POST /drafts no-catch precedent passes Fastify's default error
       // body through, which is wrong for this audience).
-      request.log.error({ err: error }, "POST /ask: answering failed");
+      // The daemon runs Fastify with logger:false, so request.log.error
+      // would be a no-op (U2 step 6: the real error reaches the owner
+      // server-side via console.error, matching the CLI's reportError
+      // stderr convention).
+      console.error("POST /ask: answering failed:", error);
       reply.code(500).send(errorBody("internal_error", "Something went wrong answering that."));
       return;
     }
