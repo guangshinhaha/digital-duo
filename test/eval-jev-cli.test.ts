@@ -116,6 +116,18 @@ describe("jev verdict assembler — recommended-verdict mapping (in-process)", (
     expect(verdict).toBe("don't adopt");
   });
 
+  it("flags a stale stage-2 report replayed against an earlier stage-1 — a mixed-run clean adopt is impossible", () => {
+    const stale: JevStage2Report = {
+      ...stage2Report(),
+      stage1: { generatedAt: "2026-09-20T11:00:00.000Z", gatewayOrigin: "https://api.typesafe.ai" },
+    };
+    const { verdict, conditions } = recommendJevVerdict(stage1Report(), stale);
+    expect(verdict).toBe("adopt-with-conditions");
+    const joined = conditions.join(" ");
+    expect(joined).toMatch(/stale/i);
+    expect(joined).toMatch(/duo eval jev stage2/);
+  });
+
   it("keeps an earned quality pass decisive but names every gapped, failed, or degenerate headline (KTD6)", () => {
     const { verdict, conditions } = recommendJevVerdict(
       stage1Report({

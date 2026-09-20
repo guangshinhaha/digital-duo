@@ -173,6 +173,21 @@ describe("JevProvider.decide — failure paths (KTD2 taxonomy)", () => {
       provider.decide({ mention: "hi" }, [{ kind: "binary", instructions: "q?" }]),
     ).rejects.toThrow(/unexpected response shape/i);
   });
+
+  it("throws ProviderError when a 2xx noul is outside [0,1] — a percent-scale or negative value never becomes a probability", async () => {
+    const config = loadConfig({ DUO_JEV_API_KEY: "sk-test-123" });
+    for (const noul of [83, -1]) {
+      vi.stubGlobal(
+        "fetch",
+        stubFetchWith(JSON.stringify({ model: "jev-1.13.0", answers: { q0: { noul } } })),
+      );
+      const provider = createJevProvider(config);
+      const failure = provider.decide({ mention: "hi" }, [{ kind: "binary", instructions: "q?" }]);
+      await expect(failure).rejects.toThrow(ProviderError);
+      await expect(failure).rejects.toThrow(/outside 0-1/);
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("registry guard — Jev never enters the production registry (KTD3/G1)", () => {

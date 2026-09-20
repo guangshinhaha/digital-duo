@@ -143,6 +143,11 @@ class JevProvider implements TypedDecisionProvider {
             `Jev gateway returned an unexpected response shape: question ${index} has no numeric noul answer`,
           );
         }
+        if (probability < 0 || probability > 1) {
+          throw new ProviderError(
+            `Jev gateway returned an out-of-contract noul for question ${index}: ${probability} is outside 0-1`,
+          );
+        }
         const binary: BinaryAnswer = { kind: "binary", probability };
         return binary;
       }

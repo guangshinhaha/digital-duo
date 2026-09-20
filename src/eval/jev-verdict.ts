@@ -82,6 +82,17 @@ export function recommendJevVerdict(
     conditions.push("Stage 2 (navigation replay) was not run — navigation is unknown.");
   } else if (stage2.status === "failed") {
     conditions.push(`Navigation is unknown: the replay aborted (${stage2.failureSummary ?? "no summary recorded"}).`);
+  } else if (
+    stage2.stage1.generatedAt !== stage1.generatedAt ||
+    stage2.stage1.gatewayOrigin !== stage1.gatewayOrigin
+  ) {
+    // Lineage check: a stage-1 re-run overwrites its report in place, so a
+    // stale stage-2 must never merge into a clean verdict unnoticed.
+    conditions.push(
+      `Stage-2 report is stale: it replayed the stage-1 run generated ${stage2.stage1.generatedAt} at ` +
+        `${stage2.stage1.gatewayOrigin}, but the current stage-1 report was generated ${stage1.generatedAt} at ` +
+        `${stage1.gatewayOrigin} — re-run \`duo eval jev stage2\` so the navigation numbers match the quality run.`,
+    );
   }
 
   return { verdict: conditions.length > 0 ? "adopt-with-conditions" : "adopt", conditions };

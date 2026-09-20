@@ -95,7 +95,7 @@ describe("encoding — fixture fields and string constants only (KTD4/KTD10)", (
         multiwayTaskRequest(TASK),
         traceStepRequest(TRACE, TRACE.steps[0]),
       ]) {
-        const serialized = JSON.stringify({ state: request.state, questions: request.questions });
+        const serialized = JSON.stringify({ state: request.state, questions: [request.question] });
         expect(serialized).not.toContain("CANARY-OWNER-7f3a");
       }
     } finally {
