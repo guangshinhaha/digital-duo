@@ -57,6 +57,13 @@ role duos).
 - **Start with what needs no one's permission.** Every approval you wait on is a week not shipped.
 - **A persona without decision history is a commodity.** Never build a persona-authoring product, and never call a duo an employee.
 
+## Development
+
+Requires a Node build with `node:sqlite` compiled **with FTS5** — the store's full-text index
+needs it. Verified: official Node **22.22.x LTS** (`.nvmrc` pins it). Not every build works:
+Homebrew's `node` 23.x is compiled without FTS5 (`no such module: fts5`), and Node < 22.5 has
+no `node:sqlite` at all. Run `nvm use` before `npm test`.
+
 ## License
 
 TBD

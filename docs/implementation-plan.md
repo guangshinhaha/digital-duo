@@ -809,13 +809,15 @@ Everything in §1–5 above describes the original 72-issue backlog and how it w
     identity/clearance and already treats an unrecognised asker as unresolved-safe-default, which
     covers "people outside the team or agency" without redesign — a teammate gets added with a
     real clearance, an outsider just falls through to the same conservative default.
-- **A real, unresolved problem**: 325 of 921 tests fail in this environment right now. Root
-  cause: the store uses Node's built-in `node:sqlite`, and this machine's Node build (v23.11.0)
-  doesn't have FTS5 compiled in (`no such module: fts5`). Not necessarily a code regression —
-  the implementing session's own note claims tests were green at its own `main` tip — but it
-  doesn't reproduce here as-is, and nothing has been verified in this environment since. This
-  should be the first thing a resuming session checks, since it blocks trusting any test run
-  until it's resolved (a different Node build, a build flag, or a fallback in `store.ts`).
+- **A real, unresolved problem** ~~unresolved~~ **— RESOLVED 2026-09-20, environment not code**:
+  325 of 921 tests failed in this environment. Root cause: the store uses Node's built-in
+  `node:sqlite`, and Homebrew's Node build (v23.11.0, `/opt/homebrew/bin/node`) is compiled
+  without FTS5 (`no such module: fts5`); the machine's PATH-default nvm Node (v18.20.8) predates
+  `node:sqlite` entirely. Verified fix: run under nvm's **v22.22.3**
+  (`PATH="$HOME/.nvm/versions/node/v22.22.3/bin:$PATH" npm test`) — **957/957 tests pass**, so
+  the code was never regressed. Pinned durably: `.nvmrc` (22.22.3), `engines.node >=22.5`, and a
+  Development section in README. No fallback in `store.ts` was built — one working Node build
+  beats a permanent second search path.
 - **Still genuinely open, not started**: #137 (relevance gate misclassifies rhetorical
   questions), #155 (classification marking can leak through the no-provider draft fallback),
   and all four issues under #157/#1 above.
