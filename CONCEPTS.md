@@ -15,3 +15,9 @@ A short-lived, ask-only credential minted one per person, authorizing exactly on
 *Avoid:* ask link
 
 Lifecycle: expiry is mandatory and is the sole limit (there is no use count); the raw value is displayed exactly once, at mint. Revocation and expiry take effect on the very next verification with no tolerance window — an ask token must never inherit the device token's stale-success cache tolerance without an explicit, stated policy.
+
+## Answer outcomes
+
+### Answer outcome (answered / passed on / declined)
+The three-kind result every ask surface returns, regardless of who is asking or over which surface: answered (with sources), passed on (escalated to the owner), or declined (refused). The shared duo's flat decline states normalize into the same kinds — out of scope maps to passed on, not-a-decision-maker to declined.
+*Avoid:* inventing per-surface outcome vocabularies
