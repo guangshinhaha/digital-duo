@@ -86,7 +86,8 @@ const QUESTION_START_PATTERN =
 // question left unflagged is the expensive false positive, while a
 // genuine question caught here ("Why have we never tested the
 // failover?") becomes a false negative, which per the asymmetric design
-// above costs nothing. All patterns run against lowercased text.
+// above costs nothing. All patterns run against lowercased text with
+// curly apostrophes folded onto the ASCII one (see looksRhetorical).
 const RHETORICAL_PATTERNS = [
   // Complaint framing: a why-question about something that happens every
   // time or never at all ("why does this always happen...", "why do the
@@ -124,7 +125,10 @@ function looksLikeQuestion(text: string): boolean {
 // #137: question-shaped, but venting or fishing for agreement rather
 // than asking the owner anything.
 function looksRhetorical(text: string): boolean {
-  const lower = text.toLowerCase();
+  // The apostrophe-bearing patterns above spell ASCII ', so fold the curly
+  // single quotes phone/Slack autocorrect produces (#137 review finding:
+  // "isn’t it wild…" would otherwise slip through as a genuine question).
+  const lower = text.toLowerCase().replace(/[‘’]/g, "'");
   return RHETORICAL_PATTERNS.some((pattern) => pattern.test(lower));
 }
 
@@ -165,7 +169,10 @@ export function classifyMention(text: string, refusals: readonly string[] = []):
 
   const noisy = looksLikeNoise(text);
   const question = looksLikeQuestion(text);
-  const rhetorical = looksRhetorical(text);
+  // Only reachable from the genuine-question branch below, so skip the
+  // pattern pass entirely on the gate's dominant input: a mention that
+  // isn't question-shaped can't be a rhetorical question.
+  const rhetorical = question && looksRhetorical(text);
 
   if (question && !noisy && !rhetorical) {
     return { passes: true, reason: "genuine_question" };
