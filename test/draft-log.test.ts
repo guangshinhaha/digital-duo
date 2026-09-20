@@ -294,6 +294,84 @@ describe("listDrafts", () => {
   });
 });
 
+describe("listDrafts paging direction — a paged read must reach the newest window (guangshinhaha/duo#29)", () => {
+  /**
+   * appendDraft stamps `createdAt` as it runs, and a tight loop can land two
+   * drafts on the same millisecond — which would make "newest" ambiguous and
+   * an exclusive `before` cursor skip a same-timestamp sibling. This sleeps
+   * the given milliseconds synchronously (Atomics.wait on a shared buffer),
+   * so each seeded draft gets a distinct timestamp without turning these
+   * tests async.
+   */
+  function sleepSync(milliseconds: number): void {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+  }
+
+  /** Seeds `count` drafts, oldest first, with guaranteed-distinct timestamps; returns their ids and a createdAt lookup. */
+  function seedDrafts(storePath: string, count: number): { ids: string[]; createdAtOf: (id: string) => string } {
+    const ids: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      ids.push(
+        appendDraft(storePath, PASSPHRASE, {
+          question: `q${i}`,
+          threadContext: null,
+          draftText: "a",
+          escalated: false,
+          escalationReason: null,
+          confidenceScore: 0.7,
+          sources: [],
+        }),
+      );
+      if (i < count - 1) {
+        sleepSync(2);
+      }
+    }
+    return { ids, createdAtOf: (id) => getDraft(storePath, PASSPHRASE, id)!.createdAt };
+  }
+
+  it("with limit, returns the newest drafts first — not the oldest window that an ascending LIMIT can never move past", () => {
+    const storePath = initStore();
+    const { ids } = seedDrafts(storePath, 3); // ids[0] oldest … ids[2] newest
+    expect(listDrafts(storePath, PASSPHRASE, { limit: 2 }).map((draft) => draft.id)).toEqual([ids[2], ids[1]]);
+  });
+
+  it("a backward walk composes: page two, via before, continues exactly where page one ended", () => {
+    const storePath = initStore();
+    const { ids, createdAtOf } = seedDrafts(storePath, 3);
+
+    const pageOne = listDrafts(storePath, PASSPHRASE, { limit: 2 }).map((draft) => draft.id);
+    expect(pageOne).toEqual([ids[2], ids[1]]);
+
+    // The cursor is the oldest item page one returned; `before` is exclusive,
+    // so page two is everything strictly older — the adjacent older page, not
+    // a re-read from the beginning of history.
+    const pageTwo = listDrafts(storePath, PASSPHRASE, { limit: 2, before: createdAtOf(pageOne[pageOne.length - 1]) }).map(
+      (draft) => draft.id,
+    );
+    expect(pageTwo).toEqual([ids[0]]);
+
+    // Disjoint, and together exactly the whole log.
+    expect(pageOne.filter((id) => pageTwo.includes(id))).toEqual([]);
+    expect([...pageOne, ...pageTwo]).toEqual([ids[2], ids[1], ids[0]]);
+  });
+
+  it("a cursor past the oldest draft answers an empty page, not an error", () => {
+    const storePath = initStore();
+    const { ids, createdAtOf } = seedDrafts(storePath, 2);
+    const before = new Date(new Date(createdAtOf(ids[0])).getTime() - 1).toISOString();
+    expect(listDrafts(storePath, PASSPHRASE, { limit: 2, before })).toEqual([]);
+  });
+
+  it("without limit, the order stays oldest-first — byte-identical to the un-paged behaviour this fix must not change", () => {
+    const storePath = initStore();
+    const { ids } = seedDrafts(storePath, 3);
+    expect(listDrafts(storePath, PASSPHRASE).map((draft) => draft.id)).toEqual(ids);
+    // And with only a before cursor, still oldest-first within the window.
+    const { createdAtOf } = { createdAtOf: (id: string) => getDraft(storePath, PASSPHRASE, id)!.createdAt };
+    expect(listDrafts(storePath, PASSPHRASE, { before: createdAtOf(ids[2]) }).map((draft) => draft.id)).toEqual([ids[0], ids[1]]);
+  });
+});
+
 describe("ensureDraftLogSchema — migrating a pre-existing drafts table", () => {
   /** The exact 12-column shape `drafts` had before `refused`/`escalation_threshold` existed — reproduces a real `duo serve`/`duo draft` store that ran before this change, since `CREATE TABLE IF NOT EXISTS` alone is a no-op against a table that already exists. */
   function createPreMigrationDraftsTable(db: Database): void {
