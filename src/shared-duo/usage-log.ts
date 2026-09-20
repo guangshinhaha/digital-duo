@@ -65,11 +65,14 @@ export function loadUsageLog(logPath: string): SharedDuoUsageEntry[] {
   if (!Array.isArray(parsed)) {
     throw new InvalidUsageLogError(`Malformed shared duo usage log at "${logPath}": expected a JSON array`);
   }
-  return (parsed as SharedDuoUsageEntry[]).map((entry) => ({
-    ...entry,
-    askerResolved: entry.askerResolved ?? null,
-    askLinkId: entry.askLinkId ?? null,
-  }));
+  // Clone only the pre-#160 entries that actually lack a field — a
+  // per-entry allocation on every load would be new hot-path work for the
+  // common all-present case.
+  return (parsed as SharedDuoUsageEntry[]).map((entry) =>
+    entry.askerResolved === undefined || entry.askLinkId === undefined
+      ? { ...entry, askerResolved: entry.askerResolved ?? null, askLinkId: entry.askLinkId ?? null }
+      : entry,
+  );
 }
 
 /**

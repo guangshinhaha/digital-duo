@@ -92,6 +92,16 @@ export interface AskerContext {
 }
 
 /**
+ * The asker context every non-route writer supplies: no link (the CLI
+ * never comes through an ask link) and no lookup (#43 never resolves the
+ * ref; #69/#71 likewise). Named once here so each call site states the
+ * invariant by calling it rather than by repeating a raw literal.
+ */
+export function cliAskerContext(ref: string): AskerContext {
+  return { ref, resolved: null, askLinkId: null };
+}
+
+/**
  * The graduation from private drafting (docs/v1-spec.md §2): a colleague's
  * question always drafts privately first — `draftReply` is #32/#34's own T1
  * pipeline, run here exactly as `duo draft` runs it, so the correction loop
@@ -133,6 +143,14 @@ export async function answerPublicly(
   confidenceConfig: DuoConfig["confidence"],
   ownerName: string,
 ): Promise<PublicAnswerOutcome> {
+  // The asker-context fields every one of the three log appends below
+  // carries identically — only topicId/outcome/text/draftId vary by branch.
+  const askerLogContext = {
+    askerRef: asker.ref,
+    askLinkId: asker.askLinkId,
+    askerResolved: asker.resolved,
+    clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
+  };
   const pipelineResult = await draftReply(
     storePath,
     passphrase,
@@ -150,14 +168,11 @@ export async function answerPublicly(
     const message = withPublicAttribution(pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
-      askerRef: asker.ref,
+      ...askerLogContext,
       topicId: null,
       outcome,
       text: message,
       draftId: pipelineResult.draftId,
-      askLinkId: asker.askLinkId,
-      askerResolved: asker.resolved,
-      clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
     });
     return pipelineResult.refused
       ? { kind: "declined_refused", draftId: pipelineResult.draftId, logEntryId, message }
@@ -179,14 +194,11 @@ export async function answerPublicly(
     const message = withPublicAttribution(PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
-      askerRef: asker.ref,
+      ...askerLogContext,
       topicId: topicId ?? null,
       outcome: "passed_on",
       text: message,
       draftId: pipelineResult.draftId,
-      askLinkId: asker.askLinkId,
-      askerResolved: asker.resolved,
-      clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
     });
     return {
       kind: "passed_on",
@@ -204,14 +216,11 @@ export async function answerPublicly(
   });
   const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
     question,
-    askerRef: asker.ref,
+    ...askerLogContext,
     topicId,
     outcome: "answered",
     text,
     draftId: pipelineResult.draftId,
-    askLinkId: asker.askLinkId,
-    askerResolved: asker.resolved,
-    clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
   });
   return {
     kind: "answered",

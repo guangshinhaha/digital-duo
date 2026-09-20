@@ -74,6 +74,16 @@ type AskResponse = { statusCode: number; body: string; json(): any };
  * points DUO_SHARED_PERSONA_PATH at. Malformed variants (a 404 test) are
  * written by the tests themselves, on top of this helper's directory.
  */
+/** Writes duo/directory.json for the asker-identity tests (#159/#160) — every entry defaults to open clearance. */
+function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
+  const dir = join(tempDir(), "duo");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "directory.json"),
+    JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
+  );
+}
+
 function writeSharedPersona(overrides: Record<string, unknown> = {}): string {
   const dir = join(tempDir(), "shared-duo");
   const path = join(dir, "persona.json");
@@ -990,15 +1000,6 @@ describe("createServer — POST /ask asker identity (#159, U4)", () => {
     app = createServer(deps(storePath));
   });
 
-  function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
-    const dir = join(tempDir(), "duo");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "directory.json"),
-      JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
-    );
-  }
-
   function mintAndAsk(name: string, payload: unknown = { question: "q" }): Promise<AskResponse> {
     const link = createAskToken(storePath, PASSPHRASE, name, new Date(Date.now() + 60 * 60 * 1000).toISOString());
     return app.inject({ method: "POST", url: "/ask", headers: { authorization: `Bearer ${link.token}` }, payload });
@@ -1066,15 +1067,6 @@ describe("createServer — POST /ask audit-trail asker context (#160)", () => {
     storePath = initStore();
     app = createServer(deps(storePath));
   });
-
-  function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
-    const dir = join(tempDir(), "duo");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "directory.json"),
-      JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
-    );
-  }
 
   function mint(name: string) {
     return createAskToken(storePath, PASSPHRASE, name, new Date(Date.now() + 60 * 60 * 1000).toISOString());

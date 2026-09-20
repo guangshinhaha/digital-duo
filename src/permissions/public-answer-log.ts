@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ClassificationLevel } from "../ingest/record.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 
@@ -70,8 +71,8 @@ export interface PublicAnswerLogEntryInput {
    * recorded (pre-#160 rows).
    */
   readonly askerResolved: boolean | null;
-  /** #160: the classification ceiling this answer was actually filtered through — the personal path always passes `PUBLIC_ANSWER_CLEARANCE_CEILING`. */
-  readonly clearanceApplied: string;
+  /** #160: the classification ceiling this answer was actually filtered through — the personal path always passes `PUBLIC_ANSWER_CLEARANCE_CEILING`. Same type as `audit_log`'s identically-named column. */
+  readonly clearanceApplied: ClassificationLevel;
 }
 
 export interface PublicAnswerLogEntry extends PublicAnswerLogEntryInput {
@@ -107,7 +108,7 @@ function rowToEntry(row: PublicAnswerLogRow): PublicAnswerLogEntry {
     correctsEntryId: row.corrects_entry_id,
     askLinkId: row.ask_link_id,
     askerResolved: row.asker_resolved === null ? null : row.asker_resolved === 1,
-    clearanceApplied: row.clearance_applied,
+    clearanceApplied: row.clearance_applied as ClassificationLevel,
   };
 }
 

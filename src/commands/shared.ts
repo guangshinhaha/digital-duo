@@ -1,5 +1,6 @@
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { answerSharedDuo, type SharedDuoAnswer } from "../shared-duo/answer.js";
+import { cliAskerContext } from "../permissions/public-answer.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { loadUsageLog, unresolvedQuestionGaps, type QuestionGap } from "../shared-duo/usage-log.js";
 import { buildUsageReport, type SharedDuoUsageReport } from "../shared-duo/usage-report.js";
@@ -15,10 +16,8 @@ export async function runSharedAsk(
 ): Promise<SharedDuoAnswer> {
   const { personaPath, usageLogPath } = loadSharedDuoConfig(env);
   const duo = loadSharedDuo(personaPath);
-  // #160: the CLI never comes through an ask link and (#69/#71) never
-  // resolves the ref — stated explicitly now that the answering function
-  // takes the full asker context.
-  return answerSharedDuo(duo, question, { ref: askerId, resolved: null, askLinkId: null }, usageLogPath);
+  // #160: no link, no lookup — see cliAskerContext.
+  return answerSharedDuo(duo, question, cliAskerContext(askerId), usageLogPath);
 }
 
 /** Implements `duo shared gaps` (#69 AC4): the out-of-scope questions the shared duo has been asked, most-repeated first. */
