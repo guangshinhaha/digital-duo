@@ -23,7 +23,7 @@ import { grantAutonomy } from "../src/trust/grants.js";
 import { writeRefusalsFile } from "../src/trust/refusals.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
-import { createAskToken, createDeviceToken, revokeAskToken } from "../src/serve/tokens.js";
+import { createAskToken, createDeviceToken, listDeviceTokens, revokeAskToken } from "../src/serve/tokens.js";
 import { loadUsageLog } from "../src/shared-duo/usage-log.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
@@ -233,8 +233,9 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
   // Issue #159 pins the FULL owner-route inventory (every method), not just
-  // the GETs: the four POSTs are owner-only surfaces too, and a seam bug
-  // that only leaked on POSTs would otherwise pass unnoticed.
+  // the GETs: the five POSTs are owner-only surfaces too, and a seam bug
+  // that only leaked on POSTs would otherwise pass unnoticed. #177's two
+  // device routes extend the inventory the same way.
   interface OwnerRoute {
     readonly method: "GET" | "POST";
     readonly url: string;
@@ -250,21 +251,23 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/mirror/rules/some-rule-id" },
     { method: "GET", url: "/trust/grid" },
     { method: "GET", url: "/audit" },
+    { method: "GET", url: "/devices" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
     { method: "POST", url: "/mirror/rules/some-rule-id/approve" },
+    { method: "POST", url: "/devices/some-device-id/revoke" },
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 13 refused requests from one IP
+    // Each request comes from its own IP: 15 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 13 sequential cache-miss verifies would each
+    // mid-verification — and 15 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -1517,5 +1520,108 @@ describe("GET /knowledge — what this duo knows (#175)", () => {
     const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
     const response = await app.inject({ method: "GET", url: "/knowledge", headers: { authorization: `Bearer ${minted.token}` } });
     expect(response.statusCode).toBe(401);
+  });
+});
+
+describe("GET /devices and POST /devices/:id/revoke — paired devices over HTTP (#177)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let deviceId: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    deviceId = paired.id;
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /devices answers 'which devices can read my corpus right now': id, name, createdAt, lastSeenAt — never the token or its hash", async () => {
+    const phone = createDeviceToken(storePath, PASSPHRASE, "phone");
+    // The phone has actually talked to the daemon, so its last_seen_at is
+    // stamped through the real auth path (a device's first request always
+    // touches; the 60s throttle only applies after).
+    const seen = await app.inject({ method: "GET", url: "/duos", headers: { authorization: `Bearer ${phone.token}` } });
+    expect(seen.statusCode).toBe(200);
+
+    const response = await app.inject({ method: "GET", url: "/devices", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    // The same read `duo pair list` makes, verbatim — the route adds nothing.
+    expect(response.json()).toEqual(listDeviceTokens(storePath, PASSPHRASE));
+
+    const byName = Object.fromEntries(response.json().map((device: { name: string }) => [device.name, device]));
+    expect(byName.phone.lastSeenAt).not.toBeNull();
+    expect(byName.phone.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // Never the token or its hash: the DeviceToken shape has no field that
+    // could carry either, and the raw tokens appear nowhere in the payload.
+    expect(Object.keys(byName.phone).sort()).toEqual(["createdAt", "id", "lastSeenAt", "name", "revokedAt"]);
+    expect(response.body).not.toContain(phone.token);
+    expect(response.body).not.toContain(authHeader.authorization.slice("Bearer ".length));
+  });
+
+  it("is an owner route: an ask token is refused on both, like any other", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const list = await app.inject({ method: "GET", url: "/devices", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const revoke = await app.inject({ method: "POST", url: "/devices/some-device-id/revoke", headers: askHeader });
+    expect(revoke.statusCode).toBe(401);
+  });
+
+  it("a device revoked over HTTP stops authenticating immediately — the route evicts the verification cache the same tick, the window an out-of-process CLI revoke can only wait out", async () => {
+    const phone = createDeviceToken(storePath, PASSPHRASE, "phone");
+    // Warm the 5-second verification cache exactly as a polling client
+    // would — without same-tick eviction, the assertion after the revoke
+    // would still be 200 (the documented staleness window).
+    const before = await app.inject({ method: "GET", url: "/duos", headers: { authorization: `Bearer ${phone.token}` } });
+    expect(before.statusCode).toBe(200);
+
+    const revoked = await app.inject({ method: "POST", url: `/devices/${phone.id}/revoke`, headers: authHeader });
+    expect(revoked.statusCode).toBe(200);
+
+    const after = await app.inject({ method: "GET", url: "/duos", headers: { authorization: `Bearer ${phone.token}` } });
+    expect(after.statusCode).toBe(401);
+  });
+
+  it("revoke returns the updated device with revokedAt set — the row stays listed, exactly what `duo pair list` shows", async () => {
+    const phone = createDeviceToken(storePath, PASSPHRASE, "phone");
+    const response = await app.inject({ method: "POST", url: `/devices/${phone.id}/revoke`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ id: phone.id, name: "phone", revokedAt: expect.any(String) });
+
+    const listed = await app.inject({ method: "GET", url: "/devices", headers: authHeader });
+    expect(listed.json().find((device: { id: string }) => device.id === phone.id).revokedAt).not.toBeNull();
+  });
+
+  it("revoking an unknown id 404s naming it; revoking twice is the same no-op `duo pair revoke` documents", async () => {
+    const missing = await app.inject({ method: "POST", url: "/devices/not-a-real-id/revoke", headers: authHeader });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().error.message).toContain("not-a-real-id");
+
+    const phone = createDeviceToken(storePath, PASSPHRASE, "phone");
+    expect((await app.inject({ method: "POST", url: `/devices/${phone.id}/revoke`, headers: authHeader })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: `/devices/${phone.id}/revoke`, headers: authHeader })).statusCode).toBe(200);
+  });
+
+  it("the last device revoking itself is allowed and cuts itself off — and the owner still re-pairs from the Mac with `duo pair`", async () => {
+    // This describe's own device is the only one paired, and it revokes
+    // itself with its own token — deliberately (see the route's doc
+    // comment): pairing stays a physical act at the machine holding the
+    // corpus, so there is no lockout to guard against.
+    const selfRevoke = await app.inject({ method: "POST", url: `/devices/${deviceId}/revoke`, headers: authHeader });
+    expect(selfRevoke.statusCode).toBe(200);
+
+    // Self-revocation really cuts the caller off: its own cached
+    // verification was evicted too, so the very next request is refused.
+    const after = await app.inject({ method: "GET", url: "/devices", headers: authHeader });
+    expect(after.statusCode).toBe(401);
+
+    // `duo pair` at the Mac mints a working token on the spot.
+    const rePaired = createDeviceToken(storePath, PASSPHRASE, "mac-again");
+    const fresh = await app.inject({ method: "GET", url: "/devices", headers: { authorization: `Bearer ${rePaired.token}` } });
+    expect(fresh.statusCode).toBe(200);
+    // The revoked row stays — plus the re-pair.
+    expect(fresh.json()).toHaveLength(2);
   });
 });

@@ -21,8 +21,9 @@ import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
-import { MISSING_TOKEN_MESSAGE, registerAuth, type Principal } from "./auth.js";
+import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
+import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
 
 /**
@@ -135,10 +136,40 @@ function statusForError(error: Error): number {
 }
 
 /** Registers every route on an already-constructed Fastify instance. Split out so `createServer` can add auth first and routes after, without routes needing to know that ordering exists. */
-function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: DraftReadyHub): void {
+function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: DraftReadyHub, auth: AuthCache): void {
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/duos", async () => listAvailableDuos(deps.env));
+
+  // #177: "which devices can read my corpus right now" (client-tech-design.md
+  // Part 2), answerable from a client instead of only at the Mac's terminal.
+  // A thin wrapper over the same read `duo pair list` makes — DeviceToken has
+  // no token or hash field, so the list structurally cannot leak a credential.
+  app.get("/devices", async () => listDeviceTokens(deps.storePath, deps.passphrase));
+
+  // Same-module revoke as `duo pair revoke`, plus the same-tick teardown only
+  // an in-process caller can do: the daemon itself holds this device's cached
+  // verification (auth.ts) and live socket (ws.ts), so it drops both now
+  // instead of waiting out TOKEN_CACHE_TTL_MS and the WS re-verify pass —
+  // strictly tighter than the documented staleness windows an out-of-process
+  // CLI revoke rides, never looser.
+  //
+  // Revoking the last remaining device, or the very device making this call,
+  // is deliberate and allowed: pairing stays a physical act at the machine
+  // holding the corpus (#177's own out-of-scope line), so `duo pair` at the
+  // Mac always re-mints a working token — there is no lockout to refuse. A
+  // self-revoking caller really does cut itself off: the eviction covers its
+  // own cached verification, so its next request 401s.
+  app.post<{ Params: { id: string } }>("/devices/:id/revoke", async (request, reply) => {
+    try {
+      revokeDeviceToken(deps.storePath, deps.passphrase, request.params.id);
+      draftReady.closeDevice(request.params.id);
+      auth.evictDevice(request.params.id);
+      return getDeviceToken(deps.storePath, deps.passphrase, request.params.id);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
 
   app.get<{ Querystring: { outcome?: string; before?: string; limit?: string } }>("/drafts", async (request, reply) => {
     const { outcome, before, limit } = request.query;
@@ -513,8 +544,8 @@ export function createServer(deps: ServeDeps): FastifyInstance {
     allowedHeaders: [...CORS_ALLOWED_HEADERS],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
-  registerAuth(app, deps.storePath, deps.passphrase);
+  const auth = registerAuth(app, deps.storePath, deps.passphrase);
   const draftReady = registerDraftReadySocket(app, deps);
-  registerRoutes(app, deps, draftReady);
+  registerRoutes(app, deps, draftReady, auth);
   return app;
 }

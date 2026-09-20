@@ -25,6 +25,14 @@ const DEFAULT_REVERIFY_MS = 5_000;
 export interface DraftReadyHub {
   /** Announces a draft id now pending owner action. Sends to every live authenticated socket; a socket that has gone away is skipped, never thrown on. */
   publish(draftId: string): void;
+  /**
+   * Closes every live socket authenticated as one device (#177). Same close
+   * code and reason the re-verify pass uses for an out-of-process `duo pair
+   * revoke`, but same-tick: an in-process revocation (POST
+   * /devices/:id/revoke) already knows the verdict, so it doesn't wait out
+   * the re-verify window to act on it.
+   */
+  closeDevice(deviceId: string): void;
 }
 
 interface LiveSocket {
@@ -149,6 +157,16 @@ export function registerDraftReadySocket(
           socket.send(payload);
         }
       }
+    },
+    closeDevice(deviceId: string): void {
+      for (const [socket, entry] of live) {
+        if (entry.deviceId === deviceId) {
+          socket.close(AUTH_CLOSE, "device token revoked");
+        }
+      }
+      // No live.delete here: socket.close fires the "close" handler above,
+      // which is already the one place that removes a socket and stops the
+      // timer — same teardown path every other close takes.
     },
   };
 }

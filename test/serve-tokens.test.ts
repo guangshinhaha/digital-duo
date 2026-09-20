@@ -6,6 +6,7 @@ import {
   createAskToken,
   createDeviceToken,
   DeviceTokenNotFoundError,
+  getDeviceToken,
   listAskTokens,
   listDeviceTokens,
   revokeAskToken,
@@ -80,6 +81,18 @@ describe("device tokens (client-tech-design.md Part 2)", () => {
     const first = createDeviceToken(storePath, PASSPHRASE, "Mac");
     const second = createDeviceToken(storePath, PASSPHRASE, "iPhone");
     expect(listDeviceTokens(storePath, PASSPHRASE).map((d) => d.id)).toEqual([first.id, second.id]);
+  });
+
+  it("reads one device back by id, revoked state included — the read behind #177's revoke route", () => {
+    const storePath = initStore();
+    const paired = createDeviceToken(storePath, PASSPHRASE, "iPhone");
+    expect(getDeviceToken(storePath, PASSPHRASE, paired.id)).toMatchObject({ id: paired.id, name: "iPhone" });
+    expect(getDeviceToken(storePath, PASSPHRASE, paired.id)?.revokedAt).toBeNull();
+
+    revokeDeviceToken(storePath, PASSPHRASE, paired.id);
+    expect(getDeviceToken(storePath, PASSPHRASE, paired.id)?.revokedAt).not.toBeNull();
+
+    expect(getDeviceToken(storePath, PASSPHRASE, "not-a-real-id")).toBeUndefined();
   });
 });
 
