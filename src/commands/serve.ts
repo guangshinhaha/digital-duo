@@ -4,7 +4,18 @@ import { tryResolveProvider } from "../provider/registry.js";
 import { assertServableHost } from "../serve/bind.js";
 import { resolvePassphraseForServing } from "../serve/passphrase.js";
 import { createServer, type ServeDeps } from "../serve/server.js";
-import { createDeviceToken, listDeviceTokens, revokeDeviceToken, type DeviceToken, type PairedDevice } from "../serve/tokens.js";
+import {
+  createAskToken,
+  createDeviceToken,
+  listAskTokens,
+  listDeviceTokens,
+  revokeAskToken,
+  revokeDeviceToken,
+  type AskToken,
+  type DeviceToken,
+  type MintedAskLink,
+  type PairedDevice,
+} from "../serve/tokens.js";
 import { DecryptionError } from "../store/crypto.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists, withDatabase } from "../store/store.js";
@@ -92,4 +103,32 @@ export function runPairRevoke(id: string, config: DuoConfig, env: NodeJS.Process
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   revokeDeviceToken(config.storePath, passphrase, id);
+}
+
+// `duo ask-link` (issue #158) mints a second token kind, not a device token
+// with a permission flag: an ask link is short-lived and ask-only, and lives
+// in its own `ask_tokens` table so it is structurally never a PairedDevice
+// (`duo pair list` reads `device_tokens` and cannot see these). The expiry
+// arithmetic (default 24h, `--expires-in-hours`) is the CLI edge's job
+// (KTD4) — this layer takes the ISO-8601 instant as given.
+
+/** Implements `duo ask-link new <name>`: mints a short-lived, ask-only link and returns it exactly once — the raw token is never persisted anywhere in recoverable form. */
+export function runAskLink(name: string, expiresAt: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): MintedAskLink {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return createAskToken(config.storePath, passphrase, name, expiresAt);
+}
+
+/** Implements `duo ask-link list` — oldest first, revoked and expired included; no token value is ever listed. */
+export function runAskLinkList(config: DuoConfig, env: NodeJS.ProcessEnv = process.env): AskToken[] {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  return listAskTokens(config.storePath, passphrase);
+}
+
+/** Implements `duo ask-link revoke <id>`. Immediate; revoking an already-revoked link is a no-op, not an error. */
+export function runAskLinkRevoke(id: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): void {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  revokeAskToken(config.storePath, passphrase, id);
 }

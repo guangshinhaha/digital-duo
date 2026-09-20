@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
+import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
@@ -171,6 +171,82 @@ pairCommand
     try {
       runPairRevoke(id, config);
       console.log(`Device ${id} revoked.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// Ask links (issue #158): a second token kind beside `duo pair` — a
+// short-lived, ask-only credential minted for one person. An ask link is
+// never a PairedDevice and never appears in `duo pair list`; the token
+// layer's own refusal of it on every existing route is structural (see
+// src/serve/tokens.ts's AskToken doc comment).
+const askLinkCommand = program.command("ask-link").description("Mint and manage short-lived, ask-only links (issue #158) — never a paired device");
+
+askLinkCommand
+  .command("new")
+  .description("Mint a short-lived, ask-only link and print its token once — copy it to the person now, it is never shown again")
+  .argument("<name>", "a name for whom the link is intended, e.g. \"Sam\"")
+  .option("--expires-in-hours <n>", "hours before this link expires (default 24; a positive whole number)", parseIntegerOption("--expires-in-hours"), 24)
+  .action((name: string, options: { expiresInHours: number }) => {
+    const config = loadConfig();
+    // parseIntegerOption only guarantees a finite number — the positive-
+    // integer contract (KTD4: no fractional-hours link is ever minted) is
+    // checked here at the action boundary, before any arithmetic.
+    if (!Number.isInteger(options.expiresInHours) || options.expiresInHours <= 0) {
+      reportError(new Error(`--expires-in-hours must be a positive whole number of hours, got ${options.expiresInHours}`));
+      return;
+    }
+    try {
+      // KTD4: the default-and-flag arithmetic lives here at the CLI edge;
+      // createAskToken takes the expiry itself as an ISO-8601 string.
+      const expiresAt = new Date(Date.now() + options.expiresInHours * 3_600_000).toISOString();
+      const link = runAskLink(name, expiresAt, config);
+      console.log(`Ask link "${link.name}" created (id ${link.id}). Expires ${link.expiresAt}.`);
+      console.log("Token (copy this now, it will not be shown again):");
+      console.log(link.token);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+askLinkCommand
+  .command("list")
+  .description("List every ask link with its expiry and status — outstanding, expired, or revoked; no token value is ever shown")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const links = runAskLinkList(config);
+      if (links.length === 0) {
+        console.log("No ask links.");
+        return;
+      }
+      const now = new Date().toISOString();
+      for (const link of links) {
+        // A revoked link matches `pair list`'s own revoked line exactly;
+        // otherwise the ask scope rides alongside the expiry (ISO-8601
+        // strings compare order-equivalently to their instants).
+        if (link.revokedAt !== null) {
+          console.log(`[${link.id}] ${link.name} — revoked ${link.revokedAt}`);
+          continue;
+        }
+        const expiry = link.expiresAt <= now ? `expired ${link.expiresAt}` : `expires ${link.expiresAt}`;
+        console.log(`[${link.id}] ${link.name} — ask · ${expiry}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+askLinkCommand
+  .command("revoke")
+  .description("Revoke an ask link immediately — it stops working on its very next use; revoking twice is a no-op")
+  .argument("<id>", "the link's id, from `duo ask-link list`")
+  .action((id: string) => {
+    const config = loadConfig();
+    try {
+      runAskLinkRevoke(id, config);
+      console.log(`Ask link ${id} revoked.`);
     } catch (error) {
       reportError(error);
     }
