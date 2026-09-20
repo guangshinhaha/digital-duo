@@ -81,6 +81,19 @@ export function listDeviceTokens(storePath: string, passphrase: string): DeviceT
   });
 }
 
+/**
+ * One paired device by id, or undefined — the read-back #177's revoke route
+ * returns after `revokeDeviceToken`, so a client sees the `revokedAt` it just
+ * caused without the route re-deriving anything from the list.
+ */
+export function getDeviceToken(storePath: string, passphrase: string, id: string): DeviceToken | undefined {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureDeviceTokenSchema(db);
+    const row = db.prepare(`SELECT * FROM device_tokens WHERE id = ?`).get(id) as DeviceTokenRow | undefined;
+    return row ? rowToToken(row) : undefined;
+  });
+}
+
 export class DeviceTokenNotFoundError extends Error {
   constructor(id: string) {
     super(`No paired device with id "${id}"`);

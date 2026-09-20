@@ -50,6 +50,22 @@ interface CachedVerification {
   verifiedAt: number;
 }
 
+/**
+ * What `registerAuth` hands back to the routes: the one lever a same-process
+ * caller has that an out-of-process one (`duo pair revoke`, which cannot
+ * reach this daemon's memory) does not.
+ */
+export interface AuthCache {
+  /**
+   * Drops every cached verification for one device, same-tick (#177's
+   * `POST /devices/:id/revoke`) — a revoked token is then refused on its
+   * very next request, rather than inside TOKEN_CACHE_TTL_MS. Strictly
+   * tighter than the documented staleness window an out-of-process revoke
+   * rides, never looser; the TTL expiry path itself is unchanged.
+   */
+  evictDevice(deviceId: string): void;
+}
+
 function unauthorized(reply: FastifyReply, message: string): void {
   reply.code(401).send({ error: { code: "unauthorized", message } });
 }
@@ -71,8 +87,11 @@ function rateLimited(reply: FastifyReply): void {
  * projects its response by. On every other route an ask token is refused
  * exactly as an unknown device token is — structurally, since its hash is
  * not in `device_tokens`.
+ *
+ * Returns the `AuthCache` handle so a same-process revocation (#177) can
+ * evict a device's cached verification immediately.
  */
-export function registerAuth(app: FastifyInstance, storePath: string, passphrase: string): void {
+export function registerAuth(app: FastifyInstance, storePath: string, passphrase: string): AuthCache {
   const failures = new Map<string, FailureWindow>();
   const lastTouch = new Map<string, number>();
   // Bounded by paired-device count (a handful, per client-tech-design.md's
@@ -205,4 +224,17 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
       touchLastSeen(storePath, passphrase, verified.deviceId);
     }
   });
+
+  return {
+    // Keyed by raw token but evicted by device id — `CachedVerification`
+    // keeps the deviceId alongside for exactly this scan (a handful of
+    // paired devices, so this is not a hot loop).
+    evictDevice(deviceId: string): void {
+      for (const [token, cached] of verifiedTokens) {
+        if (cached.deviceId === deviceId) {
+          verifiedTokens.delete(token);
+        }
+      }
+    },
+  };
 }

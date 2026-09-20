@@ -214,6 +214,30 @@ describe("GET /ws — the draft-ready channel (issue #162)", () => {
     expect(code).toBe(AUTH_CLOSE);
   }, 15_000);
 
+  it("revoking over HTTP closes that device's live socket the same tick — no re-verify window needed (#177)", async () => {
+    // DUO_WS_REVERIFY_MS is at its 5-second default here and the socket
+    // closes in milliseconds, so the close can only come from the revoke
+    // route itself — the in-process equivalent of what the CLI-side revoke
+    // above gets from the re-verify pass.
+    const owner = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const target = connect(wsUrl);
+    const first = nextMessage(target);
+    await new Promise((resolve) => target.once("open", resolve));
+    send(target, { type: "auth", token }); // the fixture's test-device is the revoked one
+    await first;
+
+    const closed = nextClose(target);
+    const testDeviceId = listDeviceTokens(storePath, PASSPHRASE).find((device) => device.name === "test-device")!.id;
+    const revoked = await app.inject({
+      method: "POST",
+      url: `/devices/${testDeviceId}/revoke`,
+      headers: { authorization: `Bearer ${owner.token}` },
+    });
+    expect(revoked.statusCode).toBe(200);
+    const { code } = await closed;
+    expect(code).toBe(AUTH_CLOSE);
+  });
+
   it("an ask token is not a device token: it cannot open the socket", async () => {
     const { createAskToken } = await import("../src/serve/tokens.js");
     const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
