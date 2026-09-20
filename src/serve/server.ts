@@ -1,11 +1,12 @@
 import cors from "@fastify/cors";
 import Fastify, { type FastifyInstance } from "fastify";
 import type { DuoConfig } from "../config.js";
-import { createLlmEditClassifier, recordDraftOutcomeAndClassify } from "../corrections/classify.js";
+import { createLlmEditClassifier } from "../corrections/classify.js";
 import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
 import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
+import { recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
@@ -37,6 +38,14 @@ export interface ServeDeps {
   /** Whose duo this is — flows into `answerPublicly` exactly as `runAnswerPublicly` passes `config.ownerName`, for the public attribution line every asker-visible text carries (#159). */
   readonly ownerName: string;
   readonly env: NodeJS.ProcessEnv;
+  /**
+   * Adapters the daemon can deliver sent drafts through (#170), matched to
+   * a draft's `provenance.channelKind`. Optional — a daemon with none
+   * (today: no channel transport ships in this repo) records an honest
+   * delivery failure for a channel-origin draft rather than pretending it
+   * was delivered.
+   */
+  readonly channelAdapters?: readonly ChannelAdapter[];
 }
 
 function errorBody(code: string, message: string) {
@@ -327,21 +336,19 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       reply.code(400).send(errorBody("bad_request", `outcome must be one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`));
       return;
     }
-    // The blank-sentText-on-"edited" check lives in recordDraftOutcomeAndClassify
-    // itself (corrections/classify.ts), not here — so duo draft-outcome
-    // gets the same guard as this route, rather than each caller
-    // duplicating it (an earlier version of this fix did exactly that,
-    // and only here, leaving the CLI path unguarded).
+    // The blank-sentText-on-"edited" check lives in recordOutcomeAndDeliver
+    // (via corrections/classify.ts), not here — so duo draft-outcome gets
+    // the same guard as this route, rather than each caller duplicating it
+    // (an earlier version of this fix did exactly that, and only here,
+    // leaving the CLI path unguarded). Delivery through the draft's origin
+    // channel (#170) rides the same seam, also not here: this route adds no
+    // behaviour of its own beyond validating the request.
     try {
       const classifier = deps.inferenceProvider ? createLlmEditClassifier(deps.inferenceProvider) : undefined;
-      const result = await recordDraftOutcomeAndClassify(
-        deps.storePath,
-        deps.passphrase,
-        request.params.id,
-        outcome as SettableDraftOutcome,
-        sentText,
+      const result = await recordOutcomeAndDeliver(deps.storePath, deps.passphrase, request.params.id, outcome as SettableDraftOutcome, sentText, {
         classifier,
-      );
+        channelAdapters: deps.channelAdapters,
+      });
       return result ?? {};
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
