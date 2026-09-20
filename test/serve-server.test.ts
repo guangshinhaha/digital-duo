@@ -74,16 +74,6 @@ type AskResponse = { statusCode: number; body: string; json(): any };
  * points DUO_SHARED_PERSONA_PATH at. Malformed variants (a 404 test) are
  * written by the tests themselves, on top of this helper's directory.
  */
-/** Writes duo/directory.json for the asker-identity tests (#159/#160) — every entry defaults to open clearance. */
-function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
-  const dir = join(tempDir(), "duo");
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    join(dir, "directory.json"),
-    JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
-  );
-}
-
 function writeSharedPersona(overrides: Record<string, unknown> = {}): string {
   const dir = join(tempDir(), "shared-duo");
   const path = join(dir, "persona.json");
@@ -104,6 +94,16 @@ function writeSharedPersona(overrides: Record<string, unknown> = {}): string {
     }),
   );
   return path;
+}
+
+/** Writes duo/directory.json for the asker-identity tests (#159/#160) — every entry defaults to open clearance. */
+function writeDirectory(entries: ReadonlyArray<{ id: string; name: string; clearance?: string }>): void {
+  const dir = join(tempDir(), "duo");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "directory.json"),
+    JSON.stringify(entries.map((entry) => ({ groups: [], clearance: "official_open", ...entry }))),
+  );
 }
 
 let recordCounter = 0;
@@ -1170,7 +1170,9 @@ describe("createServer — POST /ask audit-trail asker context (#160)", () => {
 
   /** AC2: revoking a link changes who may ask next; it never rewrites what was already answered. */
   it("leaves a revoked link's past answers unchanged, and refuses its next ask", async () => {
-    const link = mint("Sam");
+    writeSharedPersona();
+    writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
+    const link = mint("sam-carter");
     const first = await app.inject({
       method: "POST",
       url: "/ask",
@@ -1178,7 +1180,19 @@ describe("createServer — POST /ask audit-trail asker context (#160)", () => {
       payload: { question: "q" },
     });
     expect(first.statusCode).toBe(200);
+    const sharedFirst = await app.inject({
+      method: "POST",
+      url: "/ask",
+      headers: { authorization: `Bearer ${link.token}` },
+      payload: { question: "leave requests", duo: "shared" },
+    });
+    expect(sharedFirst.statusCode).toBe(200);
+    const usagePath = join(tempDir(), "shared-duo-runtime", "usage.json");
     const before = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    // Both snapshots must be non-empty for the equality pins below to mean
+    // anything — each names its newest entry, so an empty snapshot fails here.
+    expect(before.at(-1)).toMatchObject({ askLinkId: link.id });
+    const usageBefore = loadUsageLog(usagePath);
 
     revokeAskToken(storePath, PASSPHRASE, link.id);
 
@@ -1189,9 +1203,12 @@ describe("createServer — POST /ask audit-trail asker context (#160)", () => {
       payload: { question: "q" },
     });
     expect(second.statusCode).toBe(401);
-    // The revoked link's earlier answer stands exactly as written — same
-    // rows, same context, append-only.
+    // The revoked link's earlier answers stand exactly as written — same
+    // rows, same context, append-only, on both the personal and shared logs.
     expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)).toEqual(before);
+    const usageAfter = loadUsageLog(usagePath);
+    expect(usageAfter).toEqual(usageBefore);
+    expect(usageAfter.at(-1)).toMatchObject({ askLinkId: link.id });
   });
 });
 

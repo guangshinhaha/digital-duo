@@ -299,7 +299,9 @@ describe("answerSharedDuo — ask-link asker context lands in the usage log (#16
       askLinkId: "0193c0ff-3000-7000-8000-000000000001",
       declined: false,
     });
-    expect(JSON.stringify(entries)).not.toContain("sec_");
+    // The no-raw-secret property is pinned at the serve level against a
+    // genuinely minted token (serve-server.test.ts, #160 AC1) — this fixture
+    // mints no token, so there is no secret here to check.
   });
 
   it("records the same context on a declined ask — the trail covers what the duo refused too", async () => {

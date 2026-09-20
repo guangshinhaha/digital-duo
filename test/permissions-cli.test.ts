@@ -208,8 +208,8 @@ describe("duo permissions log / correct (#45)", () => {
     expect(lines[0]).not.toMatch(/link=/);
     expect(lines[0]).toMatch(/clearance=official_open/);
     expect(lines[1]).toMatch(/link=0193c0ff-4000-7000-8000-000000000001 clearance=official_open/);
-    // The link is named by id only — a raw secret never reaches the line.
-    expect(logResult.stdout).not.toMatch(/sec_/);
+    // The link is named by id only; the no-raw-secret property is pinned at the
+    // serve level against a genuinely minted token (serve-server.test.ts, #160 AC1).
   });
 });
 

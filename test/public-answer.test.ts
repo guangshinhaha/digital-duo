@@ -13,7 +13,7 @@ import { writeRecords } from "../src/ingest/record-store.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { writeRefusalsFile } from "../src/trust/refusals.js";
 import { listGrid } from "../src/trust/grid.js";
-import { answerPublicly, PUBLIC_PASSED_ON_MESSAGE, PUBLIC_REFUSAL_MESSAGE, type AskerContext } from "../src/permissions/public-answer.js";
+import { answerPublicly, PUBLIC_ANSWER_CLEARANCE_CEILING, PUBLIC_PASSED_ON_MESSAGE, PUBLIC_REFUSAL_MESSAGE, type AskerContext } from "../src/permissions/public-answer.js";
 import { appendPublicAnswerLogEntry, ensurePublicAnswerLogSchema, getPublicAnswerLogEntry, listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
@@ -423,11 +423,10 @@ describe("public_answer_log — ask-link asker context (#160)", () => {
     expect(entries[1]).toMatchObject({ askLinkId: "0193c0ff-1000-7000-8000-000000000001", askerResolved: false, clearanceApplied: "official_open" });
     expect(entries[2]).toMatchObject({ askLinkId: null, askerResolved: null, clearanceApplied: "official_open" });
 
-    // The full row round-trips by id too, and the raw secret appears nowhere —
-    // only the link's id is ever recorded.
+    // The full row round-trips by id too, naming only the link's id — the
+    // no-raw-secret pin against a genuinely minted token lives at the serve level.
     const single = getPublicAnswerLogEntry(storePath, PASSPHRASE, throughLink);
     expect(single?.askLinkId).toBe("0193c0ff-1000-7000-8000-000000000001");
-    expect(JSON.stringify(single)).not.toContain("sec_");
   });
 
   it("threads a link's AskerContext through answerPublicly into the logged entry", async () => {
@@ -512,9 +511,27 @@ describe("public_answer_log — ask-link asker context (#160)", () => {
       clearanceApplied: "official_open",
     });
     expect(entries[1]).toMatchObject({ askLinkId: "0193c0ff-1000-7000-8000-000000000003", askerResolved: false, clearanceApplied: "official_open" });
+    // The DDL's hardcoded 'official_open' backfill default must stay equal to the
+    // TS constant the answer path filters through — this pin, not the comment in
+    // public-answer-log.ts, is what fails when the two drift apart.
+    expect(entries[0].clearanceApplied).toBe(PUBLIC_ANSWER_CLEARANCE_CEILING);
+
+    // The append-only triggers must abort on a table that actually went through
+    // the ALTER migration, not only on one created with the full schema (#160
+    // stop condition — the fresh-store variant is covered in its own test below).
+    expect(() => {
+      withDatabase(storePath, PASSPHRASE, true, (db) => {
+        db.exec("UPDATE public_answer_log SET text = 'rewritten' WHERE id = 'entry-pre-160'");
+      });
+    }).toThrow(/append-only/);
+    expect(() => {
+      withDatabase(storePath, PASSPHRASE, true, (db) => {
+        db.exec("DELETE FROM public_answer_log WHERE id = 'entry-pre-160'");
+      });
+    }).toThrow(/append-only/);
   });
 
-  it("still refuses UPDATE and DELETE after the migration — append-only semantics are unchanged (#160 stop condition)", () => {
+  it("still refuses UPDATE and DELETE — append-only semantics are unchanged (#160 stop condition)", () => {
     const storePath = initStore();
     const entryId = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
       question: "q",
