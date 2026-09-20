@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { withDatabase } from "../store/store.js";
 import {
+  getStandingOrderCandidate,
   listStandingOrderCandidates,
   requirePendingStandingOrderCandidate,
   setStandingOrderCandidateStatus,
@@ -12,6 +13,7 @@ import { listActiveRules, writeCorrectionRule } from "../derivation/rule-review.
 import type { Rule } from "../derivation/rules.js";
 import {
   CorrectionCandidateNotFoundError,
+  getCorrectionCandidate,
   listCorrectionCandidates,
   requirePendingCandidate,
   setCandidateStatus,
@@ -103,6 +105,31 @@ export function findConflictingActiveRule(candidate: PendingReviewCandidate, act
 export interface SubstanceConflict {
   readonly candidate: PendingReviewCandidate;
   readonly conflictingRule: Rule;
+}
+
+/** A review candidate in its current state — `PendingReviewCandidate` plus what a review action left behind (#173: "the updated candidate returns"). */
+export interface ReviewCandidate extends PendingReviewCandidate {
+  readonly status: "pending" | "approved" | "rejected";
+  readonly reviewedAt: string | null;
+}
+
+/**
+ * Reads one review candidate by id across both source tables (draft edits
+ * first, the same order `requirePendingReviewCandidate` searches), in
+ * whatever state it is in — the read that turns a review action into an
+ * updated candidate for the surface that asked for it (#173). Undefined
+ * when neither table holds the id.
+ */
+export function getReviewCandidate(storePath: string, passphrase: string, id: string): ReviewCandidate | undefined {
+  const correction = getCorrectionCandidate(storePath, passphrase, id);
+  if (correction) {
+    return { ...fromCorrectionCandidate(correction), status: correction.status, reviewedAt: correction.reviewedAt };
+  }
+  const standing = getStandingOrderCandidate(storePath, passphrase, id);
+  if (standing) {
+    return { ...fromStandingOrderCandidate(standing), status: standing.status, reviewedAt: standing.reviewedAt };
+  }
+  return undefined;
 }
 
 export interface PendingReview {

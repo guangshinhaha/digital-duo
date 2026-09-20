@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type { DuoConfig } from "../config.js";
 import { createLlmEditClassifier } from "../corrections/classify.js";
 import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
+import { approveCandidate, getReviewCandidate, rejectCandidate } from "../corrections/review.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
 import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
@@ -108,10 +109,21 @@ function statusForError(error: Error): number {
     case "StandingOrderCandidateNotFoundError":
     case "DeviceTokenNotFoundError":
     case "RuleNotFoundError":
+    // #173: the review layer's own not-found — it searched both source
+    // tables and found neither, which is a 404 for a client exactly like
+    // the single-table errors above it.
+    case "ReviewCandidateNotFoundError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
     case "DraftIsRefusedError":
+    // #173: the standing-order twin of CandidateAlreadyReviewedError —
+    // previously an anonymous Error here, which mapped to a 500.
+    case "StandingOrderCandidateAlreadyReviewedError":
+    // #173: approving a substance candidate that contradicts an active
+    // rule is a conflict the caller must resolve (supersedesRuleId), not a
+    // server error.
+    case "CandidateConflictError":
       return 409;
     case "BlankEditError":
       return 400;
@@ -371,6 +383,32 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
 
   app.get<{ Querystring: { status?: string } }>("/review", async (request) => {
     return listCorrectionCandidates(deps.storePath, deps.passphrase, request.query.status as CorrectionCandidateStatus | undefined);
+  });
+
+  // #173: thin wrappers over the same module functions `duo corrections
+  // approve`/`reject` call — approveCandidate/rejectCandidate own all the
+  // behaviour (voice.md/rules writes, conflict gate, finality); the route's
+  // only job is passing the id through and returning the updated candidate.
+  app.post<{ Params: { id: string }; Body: { supersedesRuleId?: string } | undefined }>("/review/:id/approve", async (request, reply) => {
+    try {
+      const result = approveCandidate(deps.storePath, deps.passphrase, deps.duoDir, request.params.id, {
+        supersedesRuleId: request.body?.supersedesRuleId,
+      });
+      const candidate = getReviewCandidate(deps.storePath, deps.passphrase, request.params.id);
+      return { candidate, result };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post<{ Params: { id: string } }>("/review/:id/reject", async (request, reply) => {
+    try {
+      rejectCandidate(deps.storePath, deps.passphrase, request.params.id);
+      const candidate = getReviewCandidate(deps.storePath, deps.passphrase, request.params.id);
+      return { candidate };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
   });
 
   app.get("/mirror/portrait", async () => buildInterruptionPortrait(deps.storePath, deps.passphrase, deps.duoDir));
