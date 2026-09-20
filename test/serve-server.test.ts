@@ -430,4 +430,64 @@ describe("createServer — routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([]);
   });
+
+  // Issue #169: provenance is on the wire as stored, so no client has to
+  // infer where a draft came from — the client cannot infer any of it
+  // without inventing behaviour a surface is forbidden from inventing.
+  it("GET /drafts/:id returns a channel draft's provenance verbatim", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I get deploy access?",
+      threadContext: null,
+      draftText: "point them at the runbook",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: {
+        origin: "channel",
+        channelKind: "slack",
+        askerRef: "directory.json#sam",
+        threadId: "C0123456789.1660000000",
+        permalink: "https://example.slack.com/archives/C0123456789/p1660000000000000",
+      },
+    });
+    const response = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().provenance).toEqual({
+      origin: "channel",
+      channelKind: "slack",
+      askerRef: "directory.json#sam",
+      threadId: "C0123456789.1660000000",
+      permalink: "https://example.slack.com/archives/C0123456789/p1660000000000000",
+    });
+  });
+
+  it("GET /drafts lists provenance on the wire, and a pre-provenance row reads as origin unknown", async () => {
+    appendDraft(storePath, PASSPHRASE, {
+      question: "legacy",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      // no provenance — reads as unknown, never throws
+    });
+    const response = await app.inject({ method: "GET", url: "/drafts", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toHaveLength(1);
+    expect(response.json()[0].provenance).toEqual({ origin: "unknown" });
+  });
+
+  it("POST /drafts — the owner asking their own duo — writes owner origin, no asker, no permalink", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/drafts",
+      headers: authHeader,
+      payload: { question: "what is the meaning of life" },
+    });
+    expect(created.statusCode).toBe(201);
+    const fetched = await app.inject({ method: "GET", url: `/drafts/${created.json().draftId}`, headers: authHeader });
+    expect(fetched.json().provenance).toEqual({ origin: "owner" });
+  });
 });

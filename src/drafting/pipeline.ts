@@ -42,6 +42,14 @@ export interface DraftEscalation {
 
 export type DraftPipelineResult = DraftAnswer | DraftEscalation;
 
+/**
+ * Every draft this pipeline writes was asked for by the owner — `duo
+ * draft`, POST /drafts, the eval harness (#169). A channel adapter asking
+ * on someone's behalf is a different caller that appends with its own
+ * channel provenance; it must never be silently folded into "owner".
+ */
+const OWNER_PROVENANCE = { origin: "owner" } as const;
+
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
@@ -127,6 +135,7 @@ export async function draftReply(
       sources: [],
       refused: true,
       escalationThreshold: confidenceConfig.escalationThreshold,
+      provenance: OWNER_PROVENANCE,
     });
     return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
   }
@@ -157,6 +166,7 @@ export async function draftReply(
       sources,
       refused: false,
       escalationThreshold: confidenceConfig.escalationThreshold,
+      provenance: OWNER_PROVENANCE,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence: undefined };
   }
@@ -207,6 +217,7 @@ export async function draftReply(
       sources,
       refused: false,
       escalationThreshold: confidenceConfig.escalationThreshold,
+      provenance: OWNER_PROVENANCE,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence };
   }
@@ -222,6 +233,7 @@ export async function draftReply(
     sources,
     refused: false,
     escalationThreshold: confidenceConfig.escalationThreshold,
+    provenance: OWNER_PROVENANCE,
   });
   return {
     kind: "draft",

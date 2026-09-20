@@ -347,3 +347,171 @@ describe("ensureDraftLogSchema — migrating a pre-existing drafts table", () =>
     });
   });
 });
+
+describe("draft provenance (#169) — where a draft came from, structured", () => {
+  it("round-trips an adapter-supplied channel provenance verbatim", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I get deploy access?",
+      threadContext: "thread text stays exactly what it is — grounding, not provenance",
+      draftText: "point them at the runbook",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: {
+        origin: "channel",
+        channelKind: "slack",
+        askerRef: "directory.json#sam",
+        threadId: "C0123456789.1660000000",
+        permalink: "https://example.slack.com/archives/C0123456789/p1660000000000000",
+      },
+    });
+
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.provenance).toEqual({
+      origin: "channel",
+      channelKind: "slack",
+      askerRef: "directory.json#sam",
+      threadId: "C0123456789.1660000000",
+      permalink: "https://example.slack.com/archives/C0123456789/p1660000000000000",
+    });
+    // threadContext is unchanged and separate: a free-text string cannot
+    // answer "which thread, in which channel, from whom" — that is the
+    // whole reason provenance is its own field.
+    expect(draft?.threadContext).toBe("thread text stays exactly what it is — grounding, not provenance");
+  });
+
+  it("round-trips a channel provenance whose adapter could not supply a thread id or permalink", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "email", askerRef: "directory.json#sam", threadId: null, permalink: null },
+    });
+    expect(getDraft(storePath, PASSPHRASE, id)?.provenance).toEqual({
+      origin: "channel",
+      channelKind: "email",
+      askerRef: "directory.json#sam",
+      threadId: null,
+      permalink: null,
+    });
+  });
+
+  it("records the owner origin for a draft the owner asked for — no asker ref, no permalink; it is not a reply to anybody", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "what do I think about X?",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "owner" },
+    });
+    expect(getDraft(storePath, PASSPHRASE, id)?.provenance).toEqual({ origin: "owner" });
+  });
+
+  it("a draft written without provenance reads as origin unknown", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+    expect(getDraft(storePath, PASSPHRASE, id)?.provenance).toEqual({ origin: "unknown" });
+  });
+
+  it("a row written before the provenance column existed migrates and reads as origin unknown, and nothing throws", () => {
+    const storePath = initStore();
+    // The drafts table exactly as it shipped after the refused/threshold
+    // migration but before provenance — a real store from an already-running
+    // daemon. CREATE TABLE IF NOT EXISTS alone will not add the column, so
+    // ensureDraftLogSchema's ALTER path is the only thing standing between
+    // this row and "table drafts has no column named provenance".
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      db.exec(`
+        CREATE TABLE drafts (
+          id TEXT PRIMARY KEY,
+          question TEXT NOT NULL,
+          thread_context TEXT,
+          draft_text TEXT,
+          escalated INTEGER NOT NULL,
+          escalation_reason TEXT,
+          confidence_score REAL NOT NULL,
+          sources TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          outcome TEXT,
+          outcome_recorded_at TEXT,
+          sent_text TEXT,
+          refused INTEGER NOT NULL DEFAULT 0,
+          escalation_threshold REAL NOT NULL DEFAULT 0.55
+        ) STRICT
+      `);
+      db.prepare(
+        `INSERT INTO drafts (id, question, thread_context, draft_text, escalated, confidence_score, sources, created_at, refused, escalation_threshold)
+         VALUES ('legacy-1', 'q', NULL, 'a', 0, 0.8, '[]', '2026-01-01T00:00:00.000Z', 0, 0.55)`,
+      ).run();
+    });
+
+    const draft = getDraft(storePath, PASSPHRASE, "legacy-1");
+    expect(draft?.provenance).toEqual({ origin: "unknown" });
+    // And the store keeps working: a fresh append after migration carries it.
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: "a2",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "owner" },
+    });
+    expect(getDraft(storePath, PASSPHRASE, id)?.provenance).toEqual({ origin: "owner" });
+  });
+
+  it("corrupt provenance JSON reads as unknown rather than throwing on every future read", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "owner" },
+    });
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      db.prepare(`UPDATE drafts SET provenance = '{not json' WHERE id = ?`).run(id);
+    });
+    expect(getDraft(storePath, PASSPHRASE, id)?.provenance).toEqual({ origin: "unknown" });
+  });
+
+  it("listDrafts carries provenance too — the Review surface reads the same field", () => {
+    const storePath = initStore();
+    appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "slack", askerRef: "directory.json#sam", threadId: "t1", permalink: null },
+    });
+    const listed = listDrafts(storePath, PASSPHRASE);
+    expect(listed).toHaveLength(1);
+    expect(listed[0].provenance).toMatchObject({ origin: "channel", channelKind: "slack", askerRef: "directory.json#sam" });
+  });
+});
