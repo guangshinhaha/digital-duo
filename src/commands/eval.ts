@@ -9,6 +9,7 @@ import {
   sanitizeFailure,
   type JevStage1Report,
 } from "../eval/jev-gate-eval.js";
+import { runJevTimingPass, runOllamaReferenceSection, type JevReferenceSection, type JevTimingSection } from "../eval/jev-timing-eval.js";
 import { runOfflineEval, type OfflineEvalOptions, type OfflineEvalReport } from "../eval/offline-eval.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
@@ -89,7 +90,23 @@ export async function runEvalJevStage1(
   };
 
   try {
-    const report = await runJevStage1Quality(provider, { labels, refusals, tasks, gatewayOrigin, fixtureHashes });
+    let report = await runJevStage1Quality(provider, { labels, refusals, tasks, gatewayOrigin, fixtureHashes });
+
+    // An earned R5 pass buys the timing/cost pass and the Ollama reference
+    // (F1). A failure in either section marks only that section failed or
+    // gapped — the quality verdict stands (KTD6); no timing code is
+    // reachable from a run whose quality section failed or did not pass.
+    if (report.quality.r5Passed) {
+      let timing: JevTimingSection;
+      try {
+        timing = await runJevTimingPass(provider, tasks, config.jev.inputPricePerMTok);
+      } catch (error) {
+        timing = { status: "failed", failureSummary: sanitizeFailure(error) };
+      }
+      const reference: JevReferenceSection = await runOllamaReferenceSection(config, labels, tasks);
+      report = { ...report, timing, reference };
+    }
+
     persistStage1Report(config.jev.runtimeDir, report);
     return report;
   } catch (error) {

@@ -155,7 +155,13 @@ describe("runEvalJevStage1 — head-to-head quality run (R3/R4/R5)", () => {
     let fake: FakeJevProvider;
     try {
       const { config } = tempRuntimeConfig({ DUO_DIR: duoDir });
-      fake = createFakeJevProvider(perfectScript());
+      // Quality script plus the timing pass's warmup + 20 measured answers,
+      // so the run reaches every request it can possibly build.
+      const timingAnswers = [
+        binaryResult(0.9),
+        ...REAL_LABELS.slice(0, 20).map(() => binaryResult(0.5)),
+      ];
+      fake = createFakeJevProvider([...perfectScript(), ...timingAnswers]);
       const report = await runEvalJevStage1(config, fake);
       expect(report.refusalsLoaded).toBe(1);
       expect(REFUSALS_PARITY_CAVEAT(1)).toMatch(/1 local refusal/i);
@@ -168,7 +174,8 @@ describe("runEvalJevStage1 — head-to-head quality run (R3/R4/R5)", () => {
     }
     // Deep audit of every request the eval built — containment would let a
     // smuggled field hide anywhere outside the matched substring (KTD10).
-    expect(fake!.calls.length).toBe(67);
+    // 67 quality calls + the timing pass's warmup and 20 measured calls.
+    expect(fake!.calls.length).toBe(88);
     for (const call of fake!.calls) {
       const serialized = JSON.stringify({ state: call.state, questions: call.questions });
       expect(serialized).not.toContain("CANARY-REFUSAL-HEADING");

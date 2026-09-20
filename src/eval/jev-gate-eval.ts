@@ -4,6 +4,7 @@ import type { GateLabelExample, GateLabelValue } from "./gate-labels.js";
 import { scoreRelevanceGate, type GateEvalReport } from "./gate-eval.js";
 import { binaryVerdict, choiceOutcome, gateLabelRequest, multiwayTaskRequest } from "./jev-encoding.js";
 import type { JevMultiwayTask } from "./jev-fixtures.js";
+import type { JevReferenceSection, JevTimingSection } from "./jev-timing-eval.js";
 import type { TypedDecisionProvider } from "../provider/types.js";
 
 /**
@@ -70,6 +71,9 @@ export interface JevStage1Report {
     readonly outOfMenuCount: number;
     readonly items: readonly JevMultiwayItem[];
   };
+  /** Present only on runs whose quality section completed and passed R5 (U5 chains them). */
+  readonly timing?: JevTimingSection;
+  readonly reference?: JevReferenceSection;
 }
 
 export interface JevStage1QualityInputs {
