@@ -33,9 +33,13 @@ import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, run
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
-import { runEvalGate, runEvalOffline } from "./commands/eval.js";
+import { runEvalGate, runEvalJevStage1, runEvalJevStage2, runEvalOffline } from "./commands/eval.js";
 import { assertPrecisionFloor } from "./eval/gate-eval.js";
 import { WOULD_HAVE_SENT_CAVEAT } from "./eval/offline-eval.js";
+import { createJevProvider } from "./provider/jev-provider.js";
+import { REFUSALS_PARITY_CAVEAT, assertStage1QualityPass, stage1ReportPath } from "./eval/jev-gate-eval.js";
+import { requireStage1Pass, stage2ReportPath } from "./eval/jev-trace-eval.js";
+import { runJevVerdict } from "./eval/jev-verdict.js";
 import { runHandoverCut, runHandoverGenerate, runHandoverShare } from "./commands/handover.js";
 import { runArchive, runDeclareOrphaned, runEnd, runTransferConfirm, runTransferInitiate, runTransferList } from "./commands/lifecycle.js";
 import { runImportClaude, runImportPaste } from "./commands/import.js";
@@ -2082,6 +2086,93 @@ evalCommand
       }
       assertPrecisionFloor(report, config.eval.gatePrecisionFloor);
       console.log(`Precision floor (${config.eval.gatePrecisionFloor}) met.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+// The Jev typed-decision spike (docs/plans/2026-09-20-1759-spike-jev-typed-decisions-plan.md):
+// staged evals against the hosted Jev gateway — synthetic fixtures only,
+// refusals and store content never leave the machine — then a written
+// verdict. Nothing here touches production paths.
+const jevCommand = evalCommand
+  .command("jev")
+  .description("The Jev typed-decision spike: staged evals (stage1 gate head-to-head, stage2 trace replay) and a written verdict");
+
+jevCommand
+  .command("stage1")
+  .description(
+    "Score Jev against the deterministic gate on the labelled set plus multi-way accuracy; on an R5 pass, timing/cost and the Ollama reference",
+  )
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      // The adapter is constructed at this process boundary on purpose: a
+      // missing key surfaces as a ProviderConfigError naming DUO_JEV_API_KEY
+      // before any fixture loads or request is built.
+      const provider = createJevProvider(config);
+      const report = await runEvalJevStage1(config, provider);
+      const jev = report.jev;
+      const multiway = report.multiway;
+      if (jev) {
+        console.log(
+          `Stage 1 quality: ${jev.total} labels — precision ${jev.precision.toFixed(3)}, recall ${jev.recall.toFixed(3)}; ` +
+            (multiway ? `multi-way accuracy ${multiway.accuracy.toFixed(3)} (${multiway.correctCount}/${multiway.total}).` : ""),
+        );
+        console.log(`Jev marked ${jev.answerableCount}/${jev.total} answerable.`);
+      }
+      if (report.timing?.status === "complete") {
+        console.log(
+          `Timing: mean ${report.timing.meanMsPerDecision?.toFixed(0)} ms, median ${report.timing.medianMsPerDecision?.toFixed(0)} ms ` +
+            `per decision; $${report.timing.totalDollars?.toFixed(6)} total.`,
+        );
+      }
+      if (report.reference?.status === "complete") {
+        console.log(`Ollama reference: accuracy ${report.reference.accuracy?.toFixed(3)} over ${report.reference.total} question(s).`);
+      }
+      if (report.refusalsLoaded > 0) {
+        console.log(REFUSALS_PARITY_CAVEAT(report.refusalsLoaded));
+      }
+      console.log(`Report persisted to ${stage1ReportPath(config.jev.runtimeDir)}.`);
+      // The full report prints before the R5 assertion — a failed run still
+      // reports its numbers (the `duo eval gate` ordering).
+      assertStage1QualityPass(report);
+      console.log("R5 met: Jev's precision is at or above the deterministic gate's on the same labels.");
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+jevCommand
+  .command("stage2")
+  .description("Replay the synthetic navigation traces per-step, gated on a passing persisted stage-1 report")
+  .action(async () => {
+    const config = loadConfig();
+    try {
+      // The gate runs before the provider is constructed, so an ungated
+      // invocation names the gate it failed, not the missing key.
+      requireStage1Pass(config.jev.runtimeDir);
+      const provider = createJevProvider(config);
+      const report = await runEvalJevStage2(config, provider);
+      console.log(
+        `Stage 2 replay: step accuracy ${report.stepAccuracy.toFixed(3)} (${report.correctSteps}/${report.totalSteps} steps), ` +
+          `${report.completedTraces}/${report.totalTraces} trace(s) completed.`,
+      );
+      console.log(`Report persisted to ${stage2ReportPath(config.jev.runtimeDir)}.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+jevCommand
+  .command("verdict")
+  .description("Assemble verdict.md from the persisted stage-1/stage-2 reports — aggregate fields only")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const result = runJevVerdict(config);
+      console.log(result.markdown);
+      console.log(`Verdict written to ${result.path}.`);
     } catch (error) {
       reportError(error);
     }
