@@ -48,9 +48,11 @@ function agreeingProvider(response: string): InferenceProvider {
   return { name: "fake", async complete() { return response; } };
 }
 
-async function seedConfirmedRule(storePath: string): Promise<void> {
+async function seedConfirmedRule(storePath: string, options: { answerText?: string; ruleText?: string } = {}): Promise<void> {
+  const answerText = options.answerText ?? "five days per quarter, per the vacation policy";
+  const ruleText = options.ruleText ?? "Standard leave is five days per quarter.";
   const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
-  const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "shared" });
+  const answer = record({ text: answerText, threadId: "shared" });
   writeRecords(storePath, PASSPHRASE, [question, answer]);
   const embeddingProvider = createFakeEmbeddingProvider();
   await embedRecords(storePath, PASSPHRASE, embeddingProvider);
@@ -62,7 +64,7 @@ async function seedConfirmedRule(storePath: string): Promise<void> {
       {
         id: "topic-leave",
         topicId: "topic-leave",
-        text: "Standard leave is five days per quarter.",
+        text: ruleText,
         status: "confirmed",
         supportCount: 3,
         consistency: 0.95,
@@ -142,9 +144,11 @@ describe("draftReply — the no-provider extractive fallback never echoes a raw 
     // Three marked answers and no rule: enough retrieval strength (3 = the
     // strong-evidence bar) to clear the escalation threshold with no rule
     // hit, so the draft that comes back is extractiveDraft(evidence[0]).
-    for (let i = 0; i < 3; i++) {
-      writeRecords(storePath, PASSPHRASE, [record({ text: MARKED_ANSWER_TEXT })]);
-    }
+    writeRecords(
+      storePath,
+      PASSPHRASE,
+      [record({ text: MARKED_ANSWER_TEXT }), record({ text: MARKED_ANSWER_TEXT }), record({ text: MARKED_ANSWER_TEXT })],
+    );
     const embeddingProvider = createFakeEmbeddingProvider();
     await embedRecords(storePath, PASSPHRASE, embeddingProvider);
 
@@ -163,41 +167,18 @@ describe("draftReply — the no-provider extractive fallback never echoes a raw 
     if (result.kind !== "draft") throw new Error("expected a draft");
     expect(result.text).toContain("five days per quarter, per the vacation policy");
     expect(result.text).not.toContain("OFFICIAL (OPEN)");
+    // The whole result object, not just its body: source labels quote the same
+    // record text, and public answering posts them (renderSourceAttribution).
+    expect(result.sources.some((source) => source.label.includes("five days per quarter"))).toBe(true);
+    expect(result.sources.some((source) => source.label.includes("OFFICIAL (OPEN)"))).toBe(false);
   });
 
   it("echoes a rule hit's text without its raw marking line — the no-provider default rule text is a marked answer copied verbatim", async () => {
     const storePath = initStore();
-    const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
-    const answer = record({ text: MARKED_ANSWER_TEXT, threadId: "shared" });
-    writeRecords(storePath, PASSPHRASE, [question, answer]);
-    const embeddingProvider = createFakeEmbeddingProvider();
-    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
-    const { pairs } = await extractQaPairs([question, answer]);
-    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave-marked" })));
-    withDatabase(storePath, PASSPHRASE, true, (db) => {
-      putRule(
-        db,
-        {
-          id: "topic-leave-marked",
-          topicId: "topic-leave-marked",
-          // Exactly what runRuleInduction + defaultRuleText store when no
-          // inference provider is configured: the most central answer's
-          // text, verbatim — marking line included.
-          text: MARKED_ANSWER_TEXT,
-          status: "confirmed",
-          supportCount: 3,
-          consistency: 0.95,
-          createdAt: new Date().toISOString(),
-          lastConfirmedAt: new Date().toISOString(),
-          reviewStatus: "approved",
-          origin: "derived",
-          supersededByRuleId: null,
-          correctionDraftId: null,
-          correctionQuestion: null,
-        },
-        pairs.map((pair) => pair.id),
-      );
-    });
+    // ruleText === answerText is exactly what runRuleInduction +
+    // defaultRuleText store when no inference provider is configured: the
+    // most central answer's text, verbatim — marking line included.
+    await seedConfirmedRule(storePath, { answerText: MARKED_ANSWER_TEXT, ruleText: MARKED_ANSWER_TEXT });
 
     const result = await draftReply(
       storePath,
@@ -205,7 +186,7 @@ describe("draftReply — the no-provider extractive fallback never echoes a raw 
       duoDir(),
       "how much vacation leave do I get",
       null,
-      embeddingProvider,
+      createFakeEmbeddingProvider(),
       undefined,
       CONFIDENCE_CONFIG,
     );
@@ -214,6 +195,9 @@ describe("draftReply — the no-provider extractive fallback never echoes a raw 
     if (result.kind !== "draft") throw new Error("expected a draft");
     expect(result.text).toContain("five days per quarter, per the vacation policy");
     expect(result.text).not.toContain("OFFICIAL (OPEN)");
+    // The rule's own source label quotes the same marked rule text.
+    expect(result.sources.some((source) => source.label.includes("five days per quarter"))).toBe(true);
+    expect(result.sources.some((source) => source.label.includes("OFFICIAL (OPEN)"))).toBe(false);
   });
 });
 
