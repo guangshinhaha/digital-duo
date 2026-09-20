@@ -949,3 +949,57 @@ describe("createServer — POST /ask asker identity (#159, U4)", () => {
     expect(entries[0].askerId).toBe("sam-carter");
   });
 });
+
+describe("createServer — POST /ask concurrency (#159, U5)", () => {
+  // No mutex exists here by design (the plan's KTD6): `withDatabase` is
+  // fully synchronous and every store mutation on the ask and hook paths
+  // is one top-level, self-contained call, so interleaved request handlers
+  // can only interleave at awaits — between whole store calls — and each
+  // append reads the current store. These tests pin that invariant so an
+  // async-store refactor cannot silently reintroduce a lost-write race
+  // (R11's named proof).
+
+  let storePath: string;
+  let app: FastifyInstance;
+  let askHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const link = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${link.token}` };
+  });
+
+  it("two personal asks in flight concurrently both land their log rows — no lost write (R11)", async () => {
+    const responses = await Promise.all([
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "first question" } }),
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "second question" } }),
+    ]);
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged).toHaveLength(2);
+    expect(new Set(logged.map((entry) => entry.question))).toEqual(new Set(["first question", "second question"]));
+  });
+
+  it("two shared asks in flight concurrently both land their usage entries (R11)", async () => {
+    const personaDir = join(tempDir(), "shared-duo");
+    mkdirSync(personaDir, { recursive: true });
+    writeFileSync(
+      join(personaDir, "persona.json"),
+      JSON.stringify({
+        id: "shared-duo",
+        owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
+        persona: { voice: "plain, procedural" },
+        standingOrders: ["answer only from the configured documents"],
+        refusals: ["does not decide anything on the team's behalf"],
+        knowledge: { kind: "authored", documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."] },
+      }),
+    );
+    const responses = await Promise.all([
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "leave requests", duo: "shared" } }),
+      app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "leave requests", duo: "shared" } }),
+    ]);
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
+    expect(loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"))).toHaveLength(2);
+  });
+});
