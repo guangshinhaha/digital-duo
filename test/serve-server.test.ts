@@ -6,6 +6,7 @@ import { createFakeEmbeddingProvider, createFailingEmbeddingProvider } from "./f
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
+import { muteChannel } from "../src/drafting/channel-mutes.js";
 import type { ChannelAdapter, ChannelDeliveryRequest } from "../src/drafting/delivery.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
@@ -252,6 +253,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/trust/grid" },
     { method: "GET", url: "/audit" },
     { method: "GET", url: "/devices" },
+    { method: "GET", url: "/channels" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -260,14 +262,14 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 15 refused requests from one IP
+    // Each request comes from its own IP: 16 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 15 sequential cache-miss verifies would each
+    // mid-verification — and 16 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -1108,6 +1110,10 @@ describe("POST /drafts/:id/outcome — delivery through the origin channel (#170
     adapters = [
       {
         channelKind: "slack",
+        label: "a channel",
+        async status() {
+          return { state: "connected", lastActivityAt: null };
+        },
         async deliver(request) {
           requests.push(request);
         },
@@ -1157,6 +1163,10 @@ describe("POST /drafts/:id/outcome — delivery through the origin channel (#170
     const draftId = appendChannelDraft();
     adapters[0] = {
       channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
       async deliver() {
         throw new Error("Slack API returned 500");
       },
@@ -1623,5 +1633,69 @@ describe("GET /devices and POST /devices/:id/revoke — paired devices over HTTP
     expect(fresh.statusCode).toBe(200);
     // The revoked row stays — plus the re-pair.
     expect(fresh.json()).toHaveLength(2);
+  });
+});
+
+describe("GET /channels — what this duo is reachable through (#171)", () => {
+  function adapter(kind: string, label: string, status: () => Promise<{ state: "connected" | "failed"; reason?: string; lastActivityAt: string | null }>): ChannelAdapter {
+    return { channelKind: kind, label, status, async deliver() {} };
+  }
+
+  it("returns one row per configured channel: kind, adapter-supplied label, state, last activity, mute state", async () => {
+    const storePath = initStore();
+    const app = createServer({
+      ...deps(storePath),
+      channelAdapters: [
+        adapter("slack", "Acme Slack", async () => ({ state: "connected", lastActivityAt: "2026-09-20T10:00:00.000Z" })),
+        adapter("email", "Work inbox", async () => ({ state: "failed", reason: "password rejected — re-authenticate where the credentials live", lastActivityAt: "2026-09-18T09:00:00.000Z" })),
+      ],
+    });
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const response = await app.inject({ method: "GET", url: "/channels", headers: { authorization: `Bearer ${paired.token}` } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      { kind: "slack", label: "Acme Slack", state: "connected", lastActivityAt: "2026-09-20T10:00:00.000Z", muted: false },
+      {
+        kind: "email",
+        label: "Work inbox",
+        state: "failed",
+        reason: "password rejected — re-authenticate where the credentials live",
+        lastActivityAt: "2026-09-18T09:00:00.000Z",
+        muted: false,
+      },
+    ]);
+  });
+
+  it("no channel configured is a 200 with an empty list — a supported configuration, not an error", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const response = await app.inject({ method: "GET", url: "/channels", headers: { authorization: `Bearer ${paired.token}` } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([]);
+  });
+
+  it("a mute made with the CLI's own function shows here — one store, not two", async () => {
+    const storePath = initStore();
+    const app = createServer({ ...deps(storePath), channelAdapters: [adapter("slack", "Acme Slack", async () => ({ state: "connected", lastActivityAt: null }))] });
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    const before = await app.inject({ method: "GET", url: "/channels", headers: authHeader });
+    expect(before.json()[0].muted).toBe(false);
+
+    // What `duo mentions mute slack` writes — same duoDir deps() hands the server.
+    muteChannel(join(tempDir(), "duo"), "slack");
+
+    const after = await app.inject({ method: "GET", url: "/channels", headers: authHeader });
+    expect(after.json()[0].muted).toBe(true);
+  });
+
+  it("is an owner route: an ask token is refused like any other", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const response = await app.inject({ method: "GET", url: "/channels", headers: { authorization: `Bearer ${minted.token}` } });
+    expect(response.statusCode).toBe(401);
   });
 });
