@@ -221,11 +221,20 @@ export interface SentEscalationDigest {
   readonly items: readonly EscalationDigestItem[];
 }
 
-/** Every digest actually sent, oldest first — the owner-facing "what have I already been shown" reconstruction. */
-export function listEscalationDigests(storePath: string, passphrase: string): SentEscalationDigest[] {
+/** Every digest actually sent, oldest first — the owner-facing "what have I already been shown" reconstruction. `paging` is #178's addition for the HTTP surface (limit/cursor, the same vocabulary /search set); omitted, it returns every row, which is what `duo escalations history` has always read. */
+export function listEscalationDigests(
+  storePath: string,
+  passphrase: string,
+  paging: { limit?: number; cursor?: number } = {},
+): SentEscalationDigest[] {
   return withDatabase(storePath, passphrase, false, (db) => {
     ensureEscalationDigestSchema(db);
-    const rows = db.prepare(`SELECT * FROM escalation_digests ORDER BY created_at, id`).all() as unknown as {
+    // SQLite's LIMIT -1 means "no cap", so an omitted limit pages by cursor
+    // alone and an omitted cursor reads from the top — the paging lives in
+    // this one query, never sliced in a caller.
+    const rows = db
+      .prepare(`SELECT * FROM escalation_digests ORDER BY created_at, id LIMIT ? OFFSET ?`)
+      .all(paging.limit ?? -1, paging.cursor ?? 0) as unknown as {
       id: string;
       created_at: string;
       item_count: number;
