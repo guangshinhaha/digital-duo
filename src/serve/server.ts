@@ -11,6 +11,7 @@ import { recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delive
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
+import { hybridSearch } from "../ingest/embeddings.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { loadDirectory, resolveAsker } from "../permissions/directory.js";
@@ -438,6 +439,36 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   });
 
   app.get("/trust/grid", async () => listGrid(deps.storePath, deps.passphrase, deps.duoDir));
+
+  // #174: the corpus, from a client — `duo search`'s own hybridSearch,
+  // verbatim (results/ranked order, usedEmbeddings, fallback warning). The
+  // route's only job is validating the query string; ranking, paging and
+  // the embeddings-down fallback all live in the module, where the CLI
+  // reaches them too.
+  app.get<{ Querystring: { q?: string; limit?: string; cursor?: string } }>("/search", async (request, reply) => {
+    const q = request.query.q;
+    if (typeof q !== "string" || q.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "q is required and must not be blank"));
+      return;
+    }
+    let limit = 10;
+    if (request.query.limit !== undefined) {
+      limit = Number.parseInt(request.query.limit, 10);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        reply.code(400).send(errorBody("bad_request", "limit must be an integer between 1 and 100"));
+        return;
+      }
+    }
+    let cursor = 0;
+    if (request.query.cursor !== undefined) {
+      cursor = Number.parseInt(request.query.cursor, 10);
+      if (!Number.isInteger(cursor) || cursor < 0) {
+        reply.code(400).send(errorBody("bad_request", "cursor must be a non-negative integer"));
+        return;
+      }
+    }
+    return hybridSearch(deps.storePath, deps.passphrase, q, deps.embeddingProvider, limit, cursor);
+  });
 
   app.get("/audit", async () => listAuditEntries(deps.storePath, deps.passphrase));
 }

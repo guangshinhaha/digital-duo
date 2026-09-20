@@ -175,6 +175,12 @@ export interface HybridSearchOutcome {
  * so via `warning`, per #20's acceptance criteria. An empty corpus
  * produces empty ranked lists from both `searchRecords` and the vector
  * scan, so `results` comes back `[]` with no error either way.
+ *
+ * `limit`/`offset` page the fused ranking (#174): candidates are gathered
+ * for the whole span (`offset + limit`) and the fused list is sliced to
+ * `[offset, offset + limit)`, so a second page is ranked against the same
+ * candidate universe as the first, not a truncated one. A result's `rank`
+ * is its position in the full fused list, stable across pages.
  */
 export async function hybridSearch(
   storePath: string,
@@ -182,6 +188,7 @@ export async function hybridSearch(
   query: string,
   provider: EmbeddingProvider,
   limit = 10,
+  offset = 0,
 ): Promise<HybridSearchOutcome> {
   let queryVector: readonly number[] | undefined;
   let warning: string | undefined;
@@ -193,7 +200,13 @@ export async function hybridSearch(
     }); falling back to full-text search only.`;
   }
 
-  const ftsMatches = searchRecords(storePath, passphrase, query, limit * 3);
+  // Both candidate lists must cover the whole span being paged into —
+  // gathering only `limit` deep and slicing the fused list afterwards would
+  // rank page two against a candidate set that never saw page one (#174).
+  // The ×3 headroom is the same over-gathering the unpaged path always did,
+  // applied to the full span instead of the single page.
+  const span = offset + limit;
+  const ftsMatches = searchRecords(storePath, passphrase, query, span * 3);
   const ftsIds = ftsMatches.map((match) => match.record.id);
   const byId = new Map(ftsMatches.map((match) => [match.record.id, match.record]));
 
@@ -202,7 +215,7 @@ export async function hybridSearch(
     const capturedVector = queryVector;
     vectorIds = withDatabase(storePath, passphrase, false, (db) => {
       ensureEmbeddingSchema(db);
-      return vectorSearchIds(db, capturedVector, provider.model, limit * 3);
+      return vectorSearchIds(db, capturedVector, provider.model, span * 3);
     });
     for (const id of vectorIds) {
       if (!byId.has(id)) {
@@ -214,11 +227,14 @@ export async function hybridSearch(
     }
   }
 
-  const fusedIds = fuseRankings([ftsIds, vectorIds]).slice(0, limit);
+  const fusedIds = fuseRankings([ftsIds, vectorIds]).slice(offset, offset + limit);
   const results: RankedRecord[] = fusedIds
     .map((id) => byId.get(id))
     .filter((record): record is IngestRecord => record !== undefined)
-    .map((record, rank) => ({ record, rank }));
+    // Rank is the position in the full fused list, not within this page —
+    // a page-two result keeps the rank it earned, so ranks stay stable
+    // identities across pages (and "cursor = last rank + 1" pages forward).
+    .map((record, index) => ({ record, rank: offset + index }));
 
   return { results, usedEmbeddings: queryVector !== undefined, warning };
 }

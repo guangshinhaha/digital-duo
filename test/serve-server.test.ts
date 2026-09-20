@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
+import { createFakeEmbeddingProvider, createFailingEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
@@ -11,7 +11,7 @@ import { writeRuleByHand } from "../src/derivation/rule-review.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
-import { embedRecords } from "../src/ingest/embeddings.js";
+import { embedRecords, hybridSearch } from "../src/ingest/embeddings.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
@@ -1293,5 +1293,123 @@ describe("POST /review/:id/approve and /review/:id/reject — acting on the corr
     });
     expect(resolved.statusCode).toBe(200);
     expect(resolved.json().result.rule).toMatchObject({ text: "office hours are now ten to six every weekday" });
+  });
+});
+
+describe("GET /search — the corpus, from a client (#174)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  /** Seeds a small indexed corpus: three vacation-leave answers (differing relevance) and one unrelated record. */
+  async function seedCorpus(): Promise<void> {
+    const records = [
+      record({ text: "five days of vacation leave per quarter", threadId: "a" }),
+      record({ text: "vacation leave accrues from day one", threadId: "b" }),
+      record({ text: "the vacation policy allows carry-over", threadId: "c" }),
+      record({ text: "the printer on floor two is broken", threadId: "d" }),
+    ];
+    writeRecords(storePath, PASSPHRASE, records);
+    await embedRecords(storePath, PASSPHRASE, createFakeEmbeddingProvider());
+  }
+
+  it("returns ranked results in the same shape and order runSearch produces, with each record's identity", async () => {
+    await seedCorpus();
+    const response = await app.inject({ method: "GET", url: "/search?q=vacation%20leave", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(body.usedEmbeddings).toBe(true);
+    expect(body.warning).toBeUndefined();
+    expect(body.results.length).toBe(3);
+    // Identity: every result carries the record's own id and text.
+    for (const result of body.results) {
+      expect(typeof result.record.id).toBe("string");
+      expect(result.record.text).toContain("vacation");
+    }
+    // Order: fused ranks are ascending from zero, and match what the module
+    // itself produces for the same query (the fake provider is deterministic).
+    expect(body.results.map((result: { rank: number }) => result.rank)).toEqual([0, 1, 2]);
+    const direct = await hybridSearch(storePath, PASSPHRASE, "vacation leave", createFakeEmbeddingProvider(), 10);
+    expect(body.results.map((result: { record: { id: string } }) => result.record.id)).toEqual(
+      direct.results.map((result) => result.record.id),
+    );
+  });
+
+  it("pages with limit and cursor without shipping the whole corpus", async () => {
+    await seedCorpus();
+    const first = await app.inject({ method: "GET", url: "/search?q=vacation%20leave&limit=2", headers: authHeader });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().results).toHaveLength(2);
+
+    // Cursor = the fused rank after the last result seen (rank + 1).
+    const second = await app.inject({
+      method: "GET",
+      url: `/search?q=vacation%20leave&limit=2&cursor=${first.json().results.length}`,
+      headers: authHeader,
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json().results).toHaveLength(1);
+
+    const firstIds = first.json().results.map((result: { record: { id: string } }) => result.record.id);
+    const secondIds = second.json().results.map((result: { record: { id: string } }) => result.record.id);
+    expect(firstIds).toHaveLength(2);
+    expect(secondIds).not.toHaveLength(0);
+    // Pages are disjoint and together cover exactly what an unpaged search returns.
+    expect(firstIds.filter((id: string) => secondIds.includes(id))).toEqual([]);
+    const direct = await hybridSearch(storePath, PASSPHRASE, "vacation leave", createFakeEmbeddingProvider(), 10);
+    expect([...firstIds, ...secondIds]).toEqual(direct.results.map((result) => result.record.id));
+
+    // A cursor past the end answers empty, not error.
+    const past = await app.inject({ method: "GET", url: "/search?q=vacation%20leave&limit=2&cursor=50", headers: authHeader });
+    expect(past.statusCode).toBe(200);
+    expect(past.json().results).toEqual([]);
+  });
+
+  it("an empty corpus returns an empty result, not an error", async () => {
+    const response = await app.inject({ method: "GET", url: "/search?q=anything%20at%20all", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ results: [], usedEmbeddings: true });
+  });
+
+  it("a query matching nothing indexed returns empty, not an error", async () => {
+    await seedCorpus();
+    const response = await app.inject({ method: "GET", url: "/search?q=quokka%20husbandry", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().results).toEqual([]);
+  });
+
+  it("validates its inputs: q required, limit 1–100, cursor a non-negative integer", async () => {
+    await seedCorpus();
+    const missingQ = await app.inject({ method: "GET", url: "/search", headers: authHeader });
+    expect(missingQ.statusCode).toBe(400);
+
+    for (const bad of ["limit=0", "limit=101", "limit=abc", "cursor=-1", "cursor=abc"]) {
+      const response = await app.inject({ method: "GET", url: `/search?q=vacation&${bad}`, headers: authHeader });
+      expect(response.statusCode, bad).toBe(400);
+      expect(response.json().error).toMatchObject({ code: "bad_request" });
+    }
+
+    const fine = await app.inject({ method: "GET", url: "/search?q=vacation&limit=100&cursor=0", headers: authHeader });
+    expect(fine.statusCode).toBe(200);
+  });
+
+  it("degrades to full-text results with a warning when the embedding provider is down — the module's own behaviour, unchanged", async () => {
+    await seedCorpus();
+    const appWithFailingEmbeddings = createServer(deps(storePath, { embeddingProvider: createFailingEmbeddingProvider() }));
+
+    const failing = await appWithFailingEmbeddings.inject({ method: "GET", url: "/search?q=vacation%20leave", headers: authHeader });
+    expect(failing.statusCode).toBe(200);
+    expect(failing.json().usedEmbeddings).toBe(false);
+    expect(failing.json().warning).toContain("full-text");
+    // Full-text still finds the vacation records.
+    expect(failing.json().results.map((result: { record: { text: string } }) => result.record.text).every((text: string) => text.includes("vacation"))).toBe(true);
   });
 });
