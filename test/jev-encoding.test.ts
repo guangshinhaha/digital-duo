@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { GateLabelExample } from "../src/eval/gate-labels.js";
 import type { JevMultiwayTask, JevTrace } from "../src/eval/jev-fixtures.js";
 import {
@@ -142,10 +142,6 @@ describe("decoding — threshold and out-of-menu rules (KTD4/AE3)", () => {
 });
 
 describe("fake Jev provider — the stand-in everything downstream tests through", () => {
-  afterEach(() => {
-    // state is module-local per factory; nothing global to restore
-  });
-
   it("scripts a full answer sequence, records every call, and carries model + usage forward", async () => {
     const fake = createFakeJevProvider([binaryResult(0.83), choiceResult("q3-budget-2026-final")]);
     const first = await fake.decide({ mention: "hi" }, [

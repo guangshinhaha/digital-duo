@@ -94,7 +94,7 @@ export async function runJevStage1Quality(
   provider: TypedDecisionProvider,
   inputs: JevStage1QualityInputs,
 ): Promise<JevStage1Report> {
-  const baseline = scoreRelevanceGate(inputs.labels, [...inputs.refusals]);
+  const baseline = scoreRelevanceGate(inputs.labels, inputs.refusals);
 
   const labelItems: JevLabelItem[] = [];
   let model = "unknown";
@@ -136,7 +136,7 @@ export async function runJevStage1Quality(
       trueNegatives += 1;
     }
   }
-  // Same zero-prediction convention as gate-eval.ts:71 — a run that marked
+  // Same zero-prediction convention as scoreRelevanceGate — a run that marked
   // nothing answerable made none of the mistakes precision measures.
   const precision = truePositives + falsePositives === 0 ? 1 : truePositives / (truePositives + falsePositives);
   const recall = truePositives + falseNegatives === 0 ? 0 : truePositives / (truePositives + falseNegatives);
@@ -221,9 +221,7 @@ export function stage1ReportPath(runtimeDir: string): string {
 }
 
 export function persistStage1Report(runtimeDir: string, report: JevStage1Report): string {
-  if (!existsSync(runtimeDir)) {
-    mkdirSync(runtimeDir, { recursive: true });
-  }
+  mkdirSync(runtimeDir, { recursive: true }); // recursive mkdir is a no-op on an existing dir
   const path = stage1ReportPath(runtimeDir);
   writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`);
   return path;

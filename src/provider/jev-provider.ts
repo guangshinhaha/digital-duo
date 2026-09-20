@@ -46,6 +46,11 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** A finite number or undefined — the one coercion every accounting field goes through. */
+function optionalFinite(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 /** The raw JSON shape of one wire answer, before validation. */
 interface WireAnswer {
   noul?: unknown;
@@ -132,12 +137,13 @@ class JevProvider implements TypedDecisionProvider {
       }
       const answer = wire as WireAnswer;
       if (question.kind === "binary") {
-        if (typeof answer.noul !== "number" || !Number.isFinite(answer.noul)) {
+        const probability = optionalFinite(answer.noul);
+        if (probability === undefined) {
           throw new ProviderError(
             `Jev gateway returned an unexpected response shape: question ${index} has no numeric noul answer`,
           );
         }
-        const binary: BinaryAnswer = { kind: "binary", probability: answer.noul };
+        const binary: BinaryAnswer = { kind: "binary", probability };
         return binary;
       }
       if (typeof answer.choice !== "string") {
@@ -148,13 +154,10 @@ class JevProvider implements TypedDecisionProvider {
       const probabilities =
         typeof answer.probabilities === "object" &&
         answer.probabilities !== null &&
-        Object.values(answer.probabilities).every((p) => typeof p === "number" && Number.isFinite(p))
+        Object.values(answer.probabilities).every((p) => optionalFinite(p) !== undefined)
           ? (answer.probabilities as Record<string, number>)
           : undefined;
-      const confidence =
-        typeof answer.confidence === "number" && Number.isFinite(answer.confidence)
-          ? answer.confidence
-          : undefined;
+      const confidence = optionalFinite(answer.confidence);
       const choice: ChoiceAnswer = {
         kind: "choice",
         pick: answer.choice,
@@ -167,9 +170,10 @@ class JevProvider implements TypedDecisionProvider {
     // Usage and model are accounting metadata, not the product — coerce
     // instead of failing a run whose answers were fine.
     const usage = (payload as { usage?: { input_tokens?: unknown; output_tokens?: unknown } }).usage;
-    const inputTokens = typeof usage?.input_tokens === "number" && Number.isFinite(usage.input_tokens) ? usage.input_tokens : 0;
-    const outputTokens = typeof usage?.output_tokens === "number" && Number.isFinite(usage.output_tokens) ? usage.output_tokens : 0;
-    const model = typeof (payload as { model?: unknown }).model === "string" ? (payload as { model: string }).model : "unknown";
+    const inputTokens = optionalFinite(usage?.input_tokens) ?? 0;
+    const outputTokens = optionalFinite(usage?.output_tokens) ?? 0;
+    const rawModel = (payload as { model?: unknown }).model;
+    const model = typeof rawModel === "string" ? rawModel : "unknown";
 
     return { answers: mapped, model, usage: { inputTokens, outputTokens } };
   }

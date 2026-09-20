@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { runEvalJevStage1 } from "../src/commands/eval.js";
-import { loadGateLabels } from "../src/eval/gate-labels.js";
+import { MULTIWAY_TASKS, REAL_LABELS, perfectScript } from "./helpers/jev-eval-scripts.js";
 import {
   JevStage1QualityError,
   REFUSALS_PARITY_CAVEAT,
@@ -33,24 +33,9 @@ function tempRuntimeConfig(extra: Record<string, string> = {}) {
 }
 
 function mktemp(label: string): string {
-  const dir = join(tmpdir(), `jev-stage1-${label}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
-  mkdirSync(dir, { recursive: true });
+  const dir = mkdtempSync(join(tmpdir(), `jev-stage1-${label}-`));
   tempDirs.push(dir);
   return dir;
-}
-
-const REAL_LABELS = loadGateLabels("eval/gate-labels.json");
-
-/** Scripts the fake to be perfect on the real label set and the real 20 tasks. */
-function perfectScript() {
-  const labelResults = REAL_LABELS.map((label) =>
-    binaryResult(label.expected === "answerable" ? 0.9 : 0.2),
-  );
-  const MULTIWAY = JSON.parse(readFileSync("eval/jev-multiway-tasks.json", "utf8")) as {
-    items: { correct: string }[];
-  };
-  const taskResults = MULTIWAY.items.map((task) => choiceResult(task.correct));
-  return [...labelResults, ...taskResults];
 }
 
 describe("runEvalJevStage1 — head-to-head quality run (R3/R4/R5)", () => {
@@ -106,8 +91,7 @@ describe("runEvalJevStage1 — head-to-head quality run (R3/R4/R5)", () => {
   it("degenerate all-negative run: precision stays 1.000 by the zero-prediction convention, R5 passes, and answerableCount 0 makes it visible", async () => {
     const { config } = tempRuntimeConfig();
     const allNegative = REAL_LABELS.map(() => binaryResult(0.2));
-    const MULTIWAY = JSON.parse(readFileSync("eval/jev-multiway-tasks.json", "utf8")) as { items: { correct: string }[] };
-    const tasks = MULTIWAY.items.map((task) => choiceResult(task.correct));
+    const tasks = MULTIWAY_TASKS.map((task) => choiceResult(task.correct));
     const report = await runEvalJevStage1(config, createFakeJevProvider([...allNegative, ...tasks]));
 
     expect(report.jev?.precision).toBe(1);

@@ -1,10 +1,16 @@
 import type { DuoConfig } from "../config.js";
-import type { GateLabelExample } from "./gate-labels.js";
+import { GATE_LABEL_VALUES, type GateLabelExample } from "./gate-labels.js";
 import { multiwayTaskRequest } from "./jev-encoding.js";
 import type { JevMultiwayTask } from "./jev-fixtures.js";
 import { sanitizeFailure } from "./jev-gate-eval.js";
 import { resolveProvider } from "../provider/registry.js";
-import { ProviderConfigError, ProviderError, type InferenceProvider, type TypedDecisionProvider } from "../provider/types.js";
+import {
+  ProviderConfigError,
+  ProviderError,
+  type InferenceProvider,
+  type TypedDecisionQuestion,
+  type TypedDecisionProvider,
+} from "../provider/types.js";
 
 /**
  * Stage 1's timing/cost pass and its Ollama reference (plan U5, R6, KTD9):
@@ -96,7 +102,7 @@ export async function runJevTimingPass(
   };
 }
 
-function requestFor(task: JevMultiwayTask): [Readonly<Record<string, unknown>>, Parameters<TypedDecisionProvider["decide"]>[1]] {
+function requestFor(task: JevMultiwayTask): [Readonly<Record<string, unknown>>, readonly TypedDecisionQuestion[]] {
   const { state, question } = multiwayTaskRequest(task);
   return [state, [question]];
 }
@@ -113,7 +119,7 @@ export function buildReferenceQuestions(
 ): ReferenceQuestion[] {
   const labelQuestions = labels.map((label) => ({
     promptBody: `Mention: ${label.text}`,
-    options: ["answerable", "not_answerable"] as const,
+    options: GATE_LABEL_VALUES,
     correct: label.expected,
   }));
   const taskQuestions = tasks.map((task) => ({

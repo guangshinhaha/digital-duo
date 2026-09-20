@@ -186,9 +186,7 @@ export function stage2ReportPath(runtimeDir: string): string {
 }
 
 export function persistStage2Report(runtimeDir: string, report: JevStage2Report): string {
-  if (!existsSync(runtimeDir)) {
-    mkdirSync(runtimeDir, { recursive: true });
-  }
+  mkdirSync(runtimeDir, { recursive: true }); // recursive mkdir is a no-op on an existing dir
   const path = stage2ReportPath(runtimeDir);
   writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`);
   return path;

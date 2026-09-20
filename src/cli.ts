@@ -2114,10 +2114,10 @@ jevCommand
       const report = await runEvalJevStage1(config, provider);
       const jev = report.jev;
       const multiway = report.multiway;
-      if (jev) {
+      if (jev && multiway) {
         console.log(
           `Stage 1 quality: ${jev.total} labels — precision ${jev.precision.toFixed(3)}, recall ${jev.recall.toFixed(3)}; ` +
-            (multiway ? `multi-way accuracy ${multiway.accuracy.toFixed(3)} (${multiway.correctCount}/${multiway.total}).` : ""),
+            `multi-way accuracy ${multiway.accuracy.toFixed(3)} (${multiway.correctCount}/${multiway.total}).`,
         );
         console.log(`Jev marked ${jev.answerableCount}/${jev.total} answerable.`);
       }

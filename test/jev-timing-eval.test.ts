@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { runEvalJevStage1 } from "../src/commands/eval.js";
-import { loadGateLabels } from "../src/eval/gate-labels.js";
 import {
   buildReferenceQuestions,
   runJevTimingPass,
@@ -10,7 +9,7 @@ import {
   runOllamaReferenceSection,
 } from "../src/eval/jev-timing-eval.js";
 import { binaryResult, choiceResult, createFakeJevProvider } from "./fixtures/fake-jev-provider.js";
-import type { JevMultiwayTask } from "../src/eval/jev-fixtures.js";
+import { MULTIWAY_TASKS, REAL_LABELS, perfectScript } from "./helpers/jev-eval-scripts.js";
 import type { InferenceProvider, TypedDecisionProvider } from "../src/provider/types.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,20 +23,9 @@ afterEach(() => {
 });
 
 function tempRuntimeConfig(extra: Record<string, string> = {}) {
-  const runtimeDir = join(tmpdir(), `jev-timing-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
-  mkdtempSync(runtimeDir, { recursive: true });
+  const runtimeDir = mkdtempSync(join(tmpdir(), "jev-timing-"));
   tempDirs.push(runtimeDir);
   return { config: loadConfig({ DUO_JEV_SPIKE_RUNTIME_DIR: runtimeDir, ...extra }), runtimeDir };
-}
-
-const REAL_LABELS = loadGateLabels("eval/gate-labels.json");
-const MULTIWAY = (JSON.parse(readFileSync("eval/jev-multiway-tasks.json", "utf8")) as { items: JevMultiwayTask[] }).items;
-
-function perfectScript() {
-  return [
-    ...REAL_LABELS.map((label) => binaryResult(label.expected === "answerable" ? 0.9 : 0.2)),
-    ...MULTIWAY.map((task) => choiceResult(task.correct)),
-  ];
 }
 
 /** A provider whose calls cost a scripted number of fake-clock milliseconds. */
@@ -47,14 +35,12 @@ function clockScriptedProvider(durationsMs: number[], result: () => ReturnType<t
 } {
   let clock = 1_000;
   let call = 0;
-  const elapsed: number[] = [];
   return {
     now: () => clock,
     provider: {
       name: "clock-jev",
       async decide() {
         const duration = durationsMs[Math.min(call, durationsMs.length - 1)] ?? 0;
-        elapsed.push(duration);
         call += 1;
         clock += duration; // the injected clock advances by exactly the scripted duration
         return result();
@@ -64,7 +50,7 @@ function clockScriptedProvider(durationsMs: number[], result: () => ReturnType<t
 }
 
 describe("runJevTimingPass — warmup excluded, median honest, dollars from the config constant (R6)", () => {
-  const FOUR_TASKS = MULTIWAY.slice(0, 4);
+  const FOUR_TASKS = MULTIWAY_TASKS.slice(0, 4);
 
   it("excludes the untimed warmup from both mean and median; the median averages the two middle values of an even sample", async () => {
     // Warmup (first call) takes 9_000ms; the four measured calls take
@@ -107,7 +93,7 @@ describe("runJevTimingPass — warmup excluded, median honest, dollars from the 
 
 describe("Ollama reference — strict prompts, wrong-not-aborted parsing, degrade to a gap (KTD9)", () => {
   it("scores exact option ids as correct and prose as wrong-plus-parse-failure", async () => {
-    const questions = buildReferenceQuestions(REAL_LABELS, MULTIWAY);
+    const questions = buildReferenceQuestions(REAL_LABELS, MULTIWAY_TASKS);
     expect(questions).toHaveLength(67);
 
     // complete() is awaited per question in order, so a queue maps cleanly.
@@ -136,7 +122,7 @@ describe("Ollama reference — strict prompts, wrong-not-aborted parsing, degrad
 
   it("records a named gap on ProviderConfigError instead of failing the run", async () => {
     // Nothing configured: resolveProvider names DUO_PROVIDER (or its model key) — the gap names it.
-    const section = await runOllamaReferenceSection(loadConfig({}), REAL_LABELS, MULTIWAY);
+    const section = await runOllamaReferenceSection(loadConfig({}), REAL_LABELS, MULTIWAY_TASKS);
     expect(section.status).toBe("gap");
     expect(section.gapReason ?? section.failureSummary ?? "").toMatch(/DUO_[A-Z_]+/);
     expect(section.accuracy).toBeUndefined();
@@ -148,7 +134,7 @@ describe("stage-1 wrapper chaining — timing and reference sections (KTD6)", ()
     const { config, runtimeDir } = tempRuntimeConfig();
     // No Ollama configured → the reference is a named gap, not a failure.
     // Script: 67 quality answers, then the timing pass's warmup + 20 measured answers.
-    const timingAnswers = [choiceResult(MULTIWAY[0].correct), ...MULTIWAY.map((task) => choiceResult(task.correct))];
+    const timingAnswers = [choiceResult(MULTIWAY_TASKS[0].correct), ...MULTIWAY_TASKS.map((task) => choiceResult(task.correct))];
     const report = await runEvalJevStage1(config, createFakeJevProvider([...perfectScript(), ...timingAnswers]));
 
     expect(report.quality.r5Passed).toBe(true);

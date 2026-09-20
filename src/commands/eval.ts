@@ -122,7 +122,7 @@ export async function runEvalJevStage1(
       gatewayOrigin,
       fixtureHashes,
       refusalsLoaded: refusals.length,
-      baseline: scoreRelevanceGate(labels, [...refusals]),
+      baseline: scoreRelevanceGate(labels, refusals),
       quality: { status: "failed", failureSummary: sanitizeFailure(error) },
     });
     throw error;
