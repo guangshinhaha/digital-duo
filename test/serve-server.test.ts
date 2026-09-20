@@ -61,6 +61,33 @@ function agreeingProvider(response: string): InferenceProvider {
   return { name: "fake", async complete() { return response; } };
 }
 
+/**
+ * shared-cli.test.ts's persona fixture, written to the exact path deps()
+ * points DUO_SHARED_PERSONA_PATH at. Malformed variants (a 404 test) are
+ * written by the tests themselves, on top of this helper's directory.
+ */
+function writeSharedPersona(overrides: Record<string, unknown> = {}): string {
+  const dir = join(tempDir(), "shared-duo");
+  const path = join(dir, "persona.json");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "shared-duo",
+      owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
+      persona: { voice: "plain, procedural" },
+      standingOrders: ["answer only from the configured documents"],
+      refusals: ["does not decide anything on the team's behalf"],
+      knowledge: {
+        kind: "authored",
+        documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."],
+      },
+      ...overrides,
+    }),
+  );
+  return path;
+}
+
 let recordCounter = 0;
 function record(overrides: Partial<RecordInput> & { text: string }) {
   recordCounter += 1;
@@ -764,35 +791,13 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
     askHeader = { authorization: `Bearer ${askToken.token}` };
   });
 
-  /** shared-cli.test.ts's persona fixture, written to the exact path deps() points DUO_SHARED_PERSONA_PATH at. */
-  function writePersona(overrides: Record<string, unknown> = {}): string {
-    const dir = join(tempDir(), "shared-duo");
-    const path = join(dir, "persona.json");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      path,
-      JSON.stringify({
-        id: "shared-duo",
-        owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
-        persona: { voice: "plain, procedural" },
-        standingOrders: ["answer only from the configured documents"],
-        refusals: ["does not decide anything on the team's behalf"],
-        knowledge: {
-          kind: "authored",
-          documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."],
-        },
-        ...overrides,
-      }),
-    );
-    return path;
-  }
-
+  /** Injects a POST /ask against this describe's app (or an override app for provider-substitution tests). */
   function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<{ statusCode: number; body: string; json(): any }> {
     return (appOverride ?? app).inject({ method: "POST", url: "/ask", headers, payload });
   }
 
   it("answers a covered question with citations and the attribution intact (R7)", async () => {
-    writePersona();
+    writeSharedPersona();
     // "leave requests" verbatim: AuthoredKnowledgeSource matches by
     // substring (the query must appear in the document), the exact shape
     // shared-cli.test.ts exercises.
@@ -807,7 +812,7 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
   });
 
   it("normalizes an out-of-scope decline to passed_on and keeps the declineReason (R7)", async () => {
-    writePersona();
+    writeSharedPersona();
     const response = await ask({ question: "what is the parking policy", duo: "shared" });
     expect(response.statusCode).toBe(200);
     const body = response.json();
@@ -817,7 +822,7 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
   });
 
   it("normalizes a decision request to declined_refused (R7)", async () => {
-    writePersona();
+    writeSharedPersona();
     const response = await ask({ question: "can you approve my leave request", duo: "shared" });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ duo: "shared", kind: "declined_refused", declineReason: "not_a_decision_maker" });
@@ -841,7 +846,7 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
   });
 
   it("writes exactly one usage-log entry per shared ask, under the asker's id (R6 log fidelity)", async () => {
-    writePersona();
+    writeSharedPersona();
     const response = await ask({ question: "leave requests", duo: "shared" });
     expect(response.statusCode).toBe(200);
     const entries = loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"));
@@ -850,7 +855,7 @@ describe("createServer — POST /ask shared branch (#159, U3)", () => {
   });
 
   it("returns byte-identical shared bodies to ask and device principals — the shared outcome carries no owner-only fields (R8)", async () => {
-    writePersona();
+    writeSharedPersona();
     const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
     const deviceHeader = { authorization: `Bearer ${paired.token}` };
     const asAsker = await ask({ question: "leave requests", duo: "shared" }, askHeader);
@@ -928,19 +933,7 @@ describe("createServer — POST /ask asker identity (#159, U4)", () => {
   });
 
   it("carries the resolved id into the shared usage log too", async () => {
-    const personaDir = join(tempDir(), "shared-duo");
-    mkdirSync(personaDir, { recursive: true });
-    writeFileSync(
-      join(personaDir, "persona.json"),
-      JSON.stringify({
-        id: "shared-duo",
-        owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
-        persona: { voice: "plain, procedural" },
-        standingOrders: ["answer only from the configured documents"],
-        refusals: ["does not decide anything on the team's behalf"],
-        knowledge: { kind: "authored", documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."] },
-      }),
-    );
+    writeSharedPersona();
     writeDirectory([{ id: "sam-carter", name: "Sam Carter" }]);
     const response = await mintAndAsk("sam-carter", { question: "leave requests", duo: "shared" });
     expect(response.statusCode).toBe(200);
@@ -982,19 +975,7 @@ describe("createServer — POST /ask concurrency (#159, U5)", () => {
   });
 
   it("two shared asks in flight concurrently both land their usage entries (R11)", async () => {
-    const personaDir = join(tempDir(), "shared-duo");
-    mkdirSync(personaDir, { recursive: true });
-    writeFileSync(
-      join(personaDir, "persona.json"),
-      JSON.stringify({
-        id: "shared-duo",
-        owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
-        persona: { voice: "plain, procedural" },
-        standingOrders: ["answer only from the configured documents"],
-        refusals: ["does not decide anything on the team's behalf"],
-        knowledge: { kind: "authored", documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."] },
-      }),
-    );
+    writeSharedPersona();
     const responses = await Promise.all([
       app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "leave requests", duo: "shared" } }),
       app.inject({ method: "POST", url: "/ask", headers: askHeader, payload: { question: "leave requests", duo: "shared" } }),
