@@ -42,8 +42,7 @@ is annoying.
 | [`docs/v1-spec.md`](docs/v1-spec.md) | v1 scope, what's deferred and why, sequencing, pilot success criteria |
 | [`docs/import-adapters.md`](docs/import-adapters.md) | The `Record` schema and adapter contract — how new sources slot in |
 | [`docs/v1-tech-design.md`](docs/v1-tech-design.md) | Technical design, the adversarial review that reshaped it, and build order |
-| [`docs/client-design.md`](docs/client-design.md) | The Mac and phone clients, the `duo serve` daemon behind them, and what that costs |
-| [`docs/client-tech-design.md`](docs/client-tech-design.md) | Route contracts, the daemon's seam with the core, pairing, and the design system |
+| The Mac/phone/web client | Moved to [guangshinhaha/duo](https://github.com/guangshinhaha/duo) — a separate repo, talking to `duo serve` below over HTTP only |
 
 Backlog: **13 epics, 72 issues** across phase 1 (private drafting), phase 1.5 (a shared
 document-grounded duo), phase 2 (public answering, permissions, trust) and phase 3 (actions,
