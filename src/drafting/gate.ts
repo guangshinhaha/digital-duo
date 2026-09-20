@@ -6,8 +6,10 @@ import { readRefusalsFile } from "./refusals.js";
 export interface Mention {
   readonly text: string;
   readonly from?: string;
-  /** Which channel/thread this arrived in — #47's own addition, for the per-channel mute setting; unused by the gate itself, which classifies text alone. */
+  /** Which channel this arrived in — #47's own addition, for the per-channel mute setting; unused by the gate itself, which classifies text alone. */
   readonly channel?: string;
+  /** The thread within `channel` this arrived in — #172's thread-scoped mute key, using the same id vocabulary provenance.threadId uses. Text context travels separately, as `threadContext`. */
+  readonly threadId?: string;
   /** Prior messages in the same thread, if any — the same optional context `duo draft` accepts via piped stdin (#32 AC4), here for a mention arriving mid-conversation. */
   readonly threadContext?: string | null;
 }

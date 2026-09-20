@@ -1,7 +1,7 @@
 import type { DuoConfig } from "../config.js";
 import { formatEvidenceAge } from "../permissions/attribution.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
-import { isChannelMuted } from "./channel-mutes.js";
+import { isChannelMuted, isThreadMuted } from "./channel-mutes.js";
 import type { ConfidenceResult } from "./confidence.js";
 import type { DraftSource } from "./draft-log.js";
 import { runRelevanceGate, type Mention } from "./gate.js";
@@ -27,7 +27,7 @@ import { draftReply } from "./pipeline.js";
  */
 
 export type ProactiveOfferOutcome =
-  | { readonly kind: "muted"; readonly channel: string }
+  | { readonly kind: "muted"; readonly channel: string; readonly threadId?: string }
   | { readonly kind: "gate_declined"; readonly reason: GateReason; readonly gateLogId: string }
   | { readonly kind: "no_draft"; readonly reason: string; readonly draftId: string; readonly gateLogId: string }
   | {
@@ -44,10 +44,12 @@ export type ProactiveOfferOutcome =
 /**
  * Checks the per-channel mute (#47 AC3, before anything else runs at all
  * — a muted channel produces no gate decision, no draft, nothing), then
- * the relevance gate (#31), then drafts exactly as `duo draft` would.
- * `mention.channel` is optional: a mention with no channel (e.g. a DM, or
- * a hand-supplied test mention) can never be muted, since there is
- * nothing to mute it *by*.
+ * the per-thread mute (#172 — same silent path, one scope lower: a muted
+ * thread never mutes its channel), then the relevance gate (#31), then
+ * drafts exactly as `duo draft` would. `mention.channel` is optional: a
+ * mention with no channel (e.g. a DM, or a hand-supplied test mention)
+ * can never be muted, since there is nothing to mute it *by*; a thread
+ * mute needs both ids, so it only applies when both are present.
  */
 export async function offerDraftForMention(
   storePath: string,
@@ -60,6 +62,9 @@ export async function offerDraftForMention(
 ): Promise<ProactiveOfferOutcome> {
   if (mention.channel !== undefined && isChannelMuted(duoDir, mention.channel)) {
     return { kind: "muted", channel: mention.channel };
+  }
+  if (mention.channel !== undefined && mention.threadId !== undefined && isThreadMuted(duoDir, mention.channel, mention.threadId)) {
+    return { kind: "muted", channel: mention.channel, threadId: mention.threadId };
   }
 
   const gateOutcome = runRelevanceGate(storePath, passphrase, duoDir, mention);

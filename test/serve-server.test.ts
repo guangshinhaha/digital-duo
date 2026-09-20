@@ -6,7 +6,7 @@ import { createFakeEmbeddingProvider, createFailingEmbeddingProvider } from "./f
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
-import { muteChannel } from "../src/drafting/channel-mutes.js";
+import { muteChannel, muteThread, readMutedChannels } from "../src/drafting/channel-mutes.js";
 import type { ChannelAdapter, ChannelDeliveryRequest } from "../src/drafting/delivery.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
@@ -254,22 +254,25 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/audit" },
     { method: "GET", url: "/devices" },
     { method: "GET", url: "/channels" },
+    { method: "GET", url: "/channels/policy" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
     { method: "POST", url: "/mirror/rules/some-rule-id/approve" },
     { method: "POST", url: "/devices/some-device-id/revoke" },
+    { method: "POST", url: "/channels/policy/mute", payload: { channel: "c" } },
+    { method: "POST", url: "/channels/policy/unmute", payload: { channel: "c" } },
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 16 refused requests from one IP
+    // Each request comes from its own IP: 19 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 16 sequential cache-miss verifies would each
+    // mid-verification — and 19 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -1697,5 +1700,102 @@ describe("GET /channels — what this duo is reachable through (#171)", () => {
     const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
     const response = await app.inject({ method: "GET", url: "/channels", headers: { authorization: `Bearer ${minted.token}` } });
     expect(response.statusCode).toBe(401);
+  });
+});
+
+describe("channel policy over HTTP — per-channel, per-thread (#172)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /channels/policy reads the one store — nothing muted is the honest empty policy", async () => {
+    const response = await app.inject({ method: "GET", url: "/channels/policy", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ muted: [], mutedThreads: [] });
+  });
+
+  it("a channel mute set over HTTP is the same mute the CLI reads — one store, both directions", async () => {
+    const muted = await app.inject({ method: "POST", url: "/channels/policy/mute", headers: authHeader, payload: { channel: "#eng-support" } });
+    expect(muted.statusCode).toBe(200);
+    expect(muted.json()).toEqual({ muted: ["#eng-support"], mutedThreads: [] });
+    // The CLI's own read of the one store (what `duo mentions muted` prints).
+    expect(readMutedChannels(join(tempDir(), "duo"))).toEqual(["#eng-support"]);
+
+    const unmuted = await app.inject({ method: "POST", url: "/channels/policy/unmute", headers: authHeader, payload: { channel: "#eng-support" } });
+    expect(unmuted.statusCode).toBe(200);
+    expect(unmuted.json()).toEqual({ muted: [], mutedThreads: [] });
+  });
+
+  it("mutes a thread within a channel without muting the channel, and reverses exactly that", async () => {
+    const muted = await app.inject({
+      method: "POST",
+      url: "/channels/policy/mute",
+      headers: authHeader,
+      payload: { channel: "#eng-support", threadId: "C0123456789.1660000000" },
+    });
+    expect(muted.statusCode).toBe(200);
+    expect(muted.json()).toEqual({ muted: [], mutedThreads: [{ channel: "#eng-support", threadId: "C0123456789.1660000000" }] });
+
+    // Unmuting the channel is an honest no-op — the thread mute is below it.
+    const channelUnmute = await app.inject({ method: "POST", url: "/channels/policy/unmute", headers: authHeader, payload: { channel: "#eng-support" } });
+    expect(channelUnmute.json()).toEqual({ muted: [], mutedThreads: [{ channel: "#eng-support", threadId: "C0123456789.1660000000" }] });
+
+    const threadUnmute = await app.inject({
+      method: "POST",
+      url: "/channels/policy/unmute",
+      headers: authHeader,
+      payload: { channel: "#eng-support", threadId: "C0123456789.1660000000" },
+    });
+    expect(threadUnmute.json()).toEqual({ muted: [], mutedThreads: [] });
+  });
+
+  it("mutes made by the CLI's own functions read back identically over HTTP", async () => {
+    const duoDir = join(tempDir(), "duo");
+    muteChannel(duoDir, "#general");
+    muteThread(duoDir, "#eng-support", "C0123456789.1660000000");
+
+    const response = await app.inject({ method: "GET", url: "/channels/policy", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      muted: ["#general"],
+      mutedThreads: [{ channel: "#eng-support", threadId: "C0123456789.1660000000" }],
+    });
+  });
+
+  it("rejects a malformed target: missing or non-string channel, or a \"/\" — the separator scopes a thread, it cannot also be data", async () => {
+    const missing = await app.inject({ method: "POST", url: "/channels/policy/mute", headers: authHeader, payload: {} });
+    expect(missing.statusCode).toBe(400);
+    const nonString = await app.inject({ method: "POST", url: "/channels/policy/mute", headers: authHeader, payload: { channel: 42 } });
+    expect(nonString.statusCode).toBe(400);
+    const slash = await app.inject({ method: "POST", url: "/channels/policy/mute", headers: authHeader, payload: { channel: "#eng/support" } });
+    expect(slash.statusCode).toBe(400);
+    expect(slash.json().error.message).toContain("/");
+
+    const threadSlash = await app.inject({
+      method: "POST",
+      url: "/channels/policy/mute",
+      headers: authHeader,
+      payload: { channel: "#eng-support", threadId: "C012/456789" },
+    });
+    expect(threadSlash.statusCode).toBe(400);
+    expect(readMutedChannels(join(tempDir(), "duo"))).toEqual([]);
+  });
+
+  it("is an owner route: an ask token is refused on the read and both writes", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const read = await app.inject({ method: "GET", url: "/channels/policy", headers: askHeader });
+    expect(read.statusCode).toBe(401);
+    const mute = await app.inject({ method: "POST", url: "/channels/policy/mute", headers: askHeader, payload: { channel: "c" } });
+    expect(mute.statusCode).toBe(401);
+    const unmute = await app.inject({ method: "POST", url: "/channels/policy/unmute", headers: askHeader, payload: { channel: "c" } });
+    expect(unmute.statusCode).toBe(401);
   });
 });
