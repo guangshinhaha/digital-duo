@@ -11,6 +11,9 @@ import { listAvailableDuos } from "../duo/registry.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { answerPublicly } from "../permissions/public-answer.js";
+import { answerSharedDuo } from "../shared-duo/answer.js";
+import { loadSharedDuoConfig } from "../shared-duo/config.js";
+import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
 import { registerAuth } from "./auth.js";
 
@@ -182,6 +185,42 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
     const askerRef = principal.kind === "ask" ? principal.name : "owner";
 
     try {
+      if (duo === "shared") {
+        // Mirrors `runSharedAsk`: the persona is loaded fresh on every
+        // request, so a hand-edited change takes effect on the very next
+        // ask. Unavailability (missing, malformed, or invalid persona) is
+        // the asker's only discovery surface — they cannot call GET /duos —
+        // so it is an explicit 404 naming the personal fallback, never a
+        // silent fallback to personal and never a 500 from a thrown load
+        // (R10).
+        const { personaPath, usageLogPath } = loadSharedDuoConfig(deps.env);
+        let sharedDuo;
+        try {
+          sharedDuo = loadSharedDuo(personaPath);
+        } catch {
+          reply.code(404).send(errorBody("shared_duo_unavailable", `The shared duo is not available right now; ask the personal duo instead (omit "duo": "shared").`));
+          return;
+        }
+        const answer = await answerSharedDuo(sharedDuo, trimmed, askerRef, usageLogPath);
+        // The shared path's flat declined/declineReason normalizes into the
+        // same three kinds every 200 carries (KTD4): out_of_scope is "I
+        // can't cover this, ask the owner" — a pass-on — while
+        // not_a_decision_maker is a refusal.
+        const envelope: Record<string, unknown> = {
+          duo: "shared",
+          kind: answer.declined ? (answer.declineReason === "not_a_decision_maker" ? "declined_refused" : "passed_on") : "answered",
+          text: answer.text,
+        };
+        if (!answer.declined) {
+          envelope.citations = answer.citations;
+        } else if (answer.declineReason !== undefined) {
+          envelope.declineReason = answer.declineReason;
+        }
+        // No owner-only projection: the shared outcome has none, so both
+        // principal kinds get this same envelope (R8).
+        return envelope;
+      }
+
       const outcome = await answerPublicly(
         deps.storePath,
         deps.passphrase,

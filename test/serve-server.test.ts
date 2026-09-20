@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
@@ -19,6 +20,7 @@ import { writeRefusalsFile } from "../src/trust/refusals.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
 import { createAskToken, createDeviceToken, revokeAskToken } from "../src/serve/tokens.js";
+import { loadUsageLog } from "../src/shared-duo/usage-log.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -746,5 +748,115 @@ describe("createServer — POST /ask personal branch (#159)", () => {
     expect(response.json()).toEqual({ error: { code: "internal_error", message: "Something went wrong answering that." } });
     expect(response.body).not.toContain(tempDir());
     expect(response.body).not.toContain("provider exploded");
+  });
+});
+
+describe("createServer — POST /ask shared branch (#159, U3)", () => {
+  let storePath: string;
+  let askToken: { id: string; name: string; token: string };
+  let askHeader: { authorization: string };
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    askToken = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    askHeader = { authorization: `Bearer ${askToken.token}` };
+  });
+
+  /** shared-cli.test.ts's persona fixture, written to the exact path deps() points DUO_SHARED_PERSONA_PATH at. */
+  function writePersona(overrides: Record<string, unknown> = {}): string {
+    const dir = join(tempDir(), "shared-duo");
+    const path = join(dir, "persona.json");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        id: "shared-duo",
+        owner: { kind: "person", id: "dana-cole", name: "Dana Cole" },
+        persona: { voice: "plain, procedural" },
+        standingOrders: ["answer only from the configured documents"],
+        refusals: ["does not decide anything on the team's behalf"],
+        knowledge: {
+          kind: "authored",
+          documents: ["Leave requests (updated 2026-06-01): submit through the HR portal at least 5 working days in advance."],
+        },
+        ...overrides,
+      }),
+    );
+    return path;
+  }
+
+  function ask(payload: unknown, headers: { authorization: string } = askHeader, appOverride?: FastifyInstance): Promise<{ statusCode: number; body: string; json(): any }> {
+    return (appOverride ?? app).inject({ method: "POST", url: "/ask", headers, payload });
+  }
+
+  it("answers a covered question with citations and the attribution intact (R7)", async () => {
+    writePersona();
+    // "leave requests" verbatim: AuthoredKnowledgeSource matches by
+    // substring (the query must appear in the document), the exact shape
+    // shared-cli.test.ts exercises.
+    const response = await ask({ question: "leave requests", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "shared", kind: "answered" });
+    expect(body.citations.length).toBeGreaterThan(0);
+    expect(body.citations[0].title).toBe("Leave requests");
+    expect(body.text).toContain("submit through the HR portal");
+    expect(body.text).toContain("source: Leave requests, updated 2026-06-01");
+  });
+
+  it("normalizes an out-of-scope decline to passed_on and keeps the declineReason (R7)", async () => {
+    writePersona();
+    const response = await ask({ question: "what is the parking policy", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({ duo: "shared", kind: "passed_on", declineReason: "out_of_scope" });
+    expect(body.text).toContain("Dana Cole");
+    expect(body).not.toHaveProperty("citations");
+  });
+
+  it("normalizes a decision request to declined_refused (R7)", async () => {
+    writePersona();
+    const response = await ask({ question: "can you approve my leave request", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ duo: "shared", kind: "declined_refused", declineReason: "not_a_decision_maker" });
+  });
+
+  it("404s with shared_duo_unavailable when no persona is configured, naming the personal fallback (R10)", async () => {
+    const response = await ask({ question: "q", duo: "shared" });
+    expect(response.statusCode).toBe(404);
+    const body = response.json();
+    expect(body.error.code).toBe("shared_duo_unavailable");
+    expect(body.error.message).toContain("personal");
+  });
+
+  it("404s identically on a malformed persona file — never a 500 from a thrown load (R10)", async () => {
+    const dir = join(tempDir(), "shared-duo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "persona.json"), "{ not json");
+    const response = await ask({ question: "q", duo: "shared" });
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.code).toBe("shared_duo_unavailable");
+  });
+
+  it("writes exactly one usage-log entry per shared ask, under the asker's id (R6 log fidelity)", async () => {
+    writePersona();
+    const response = await ask({ question: "leave requests", duo: "shared" });
+    expect(response.statusCode).toBe(200);
+    const entries = loadUsageLog(join(tempDir(), "shared-duo-runtime", "usage.json"));
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ question: "leave requests", askerId: "Sam", declined: false });
+  });
+
+  it("returns byte-identical shared bodies to ask and device principals — the shared outcome carries no owner-only fields (R8)", async () => {
+    writePersona();
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const deviceHeader = { authorization: `Bearer ${paired.token}` };
+    const asAsker = await ask({ question: "leave requests", duo: "shared" }, askHeader);
+    const asOwner = await ask({ question: "leave requests", duo: "shared" }, deviceHeader);
+    expect(asAsker.statusCode).toBe(200);
+    expect(asOwner.statusCode).toBe(200);
+    expect(asOwner.body).toBe(asAsker.body);
   });
 });
