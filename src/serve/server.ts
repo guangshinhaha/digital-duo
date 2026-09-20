@@ -17,6 +17,7 @@ import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
 import { hybridSearch } from "../ingest/embeddings.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
+import { hasRefusalsDecision, readRefusalsFile } from "../trust/refusals.js";
 import { loadDirectory, resolveAsker } from "../permissions/directory.js";
 import { answerPublicly, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
@@ -554,6 +555,15 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
   });
+
+  // #182: `duo mirror refusals list`'s own read — pure duo/refusals.md file
+  // state, the same two module functions the CLI command calls, so a
+  // refusal recorded at the terminal shows here and this is the same one
+  // file every refusal check already reads. `decided: false` (no file at
+  // all) is a 200 — "never asked" is onboarding state to show, not an
+  // error. add/confirm-none stay terminal-only: they are authoring acts,
+  // the same class as rule authoring (AR-18).
+  app.get("/mirror/refusals", async () => ({ decided: hasRefusalsDecision(deps.duoDir), refusals: readRefusalsFile(deps.duoDir) }));
 
   const RULE_ACTIONS = { approve: approveRule, reject: rejectRule, promote: promoteRule } as const;
   app.post<{ Params: { id: string; action: string } }>("/mirror/rules/:id/:action", async (request, reply) => {
