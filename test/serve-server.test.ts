@@ -113,36 +113,31 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // unknown device token on every owner route, whatever its own state.
   const ownerRoutes = ["/duos", "/drafts", "/review", "/mirror/portrait", "/trust/grid", "/audit"] as const;
 
-  it("refuses a fresh, valid ask token on every owner route exactly as it refuses an invalid device token", async () => {
+  async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" } });
-
-    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
     for (const url of ownerRoutes) {
-      const response = await app.inject({ method: "GET", url, headers: { authorization: `Bearer ${minted.token}` } });
+      const response = await app.inject({ method: "GET", url, headers: { authorization: `Bearer ${token}` } });
       expect(response.statusCode, url).toBe(401);
       // The hook rejects before routing, so the refusal body is
       // route-independent and identical to an invalid device token's.
       expect(response.body, url).toBe(invalid.body);
     }
+  }
+
+  it("refuses a fresh, valid ask token on every owner route exactly as it refuses an invalid device token", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    await expectRefusedOnAllOwnerRoutes(minted.token);
   });
 
   it("refuses an expired ask token the same way — nothing renews it", async () => {
     const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() - 60 * 60 * 1000).toISOString());
-    for (const url of ownerRoutes) {
-      const response = await app.inject({ method: "GET", url, headers: { authorization: `Bearer ${minted.token}` } });
-      expect(response.statusCode, url).toBe(401);
-      expect(response.json(), url).toMatchObject({ error: { code: "unauthorized" } });
-    }
+    await expectRefusedOnAllOwnerRoutes(minted.token);
   });
 
   it("refuses a revoked ask token the same way", async () => {
     const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
     revokeAskToken(storePath, PASSPHRASE, minted.id);
-    for (const url of ownerRoutes) {
-      const response = await app.inject({ method: "GET", url, headers: { authorization: `Bearer ${minted.token}` } });
-      expect(response.statusCode, url).toBe(401);
-      expect(response.json(), url).toMatchObject({ error: { code: "unauthorized" } });
-    }
+    await expectRefusedOnAllOwnerRoutes(minted.token);
   });
 });
 

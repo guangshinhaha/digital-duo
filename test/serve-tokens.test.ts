@@ -84,15 +84,16 @@ describe("device tokens (client-tech-design.md Part 2)", () => {
 });
 
 describe("ask links (issue #158)", () => {
+  const soonIso = new Date(Date.now() + 3_600_000).toISOString();
+
   it("mints an ask token that verifies, and never stores the raw token", () => {
     const storePath = initStore();
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const minted = createAskToken(storePath, PASSPHRASE, "Sam", expiresAt);
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", soonIso);
 
     const verified = verifyAskToken(storePath, PASSPHRASE, minted.token);
     expect(verified?.id).toBe(minted.id);
     expect(verified?.name).toBe("Sam");
-    expect(verified?.expiresAt).toBe(expiresAt);
+    expect(verified?.expiresAt).toBe(soonIso);
 
     const listed = listAskTokens(storePath, PASSPHRASE);
     expect(listed).toHaveLength(1);
@@ -106,7 +107,7 @@ describe("ask links (issue #158)", () => {
 
   it("rejects a revoked ask token immediately", () => {
     const storePath = initStore();
-    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", soonIso);
     revokeAskToken(storePath, PASSPHRASE, minted.id);
     expect(verifyAskToken(storePath, PASSPHRASE, minted.token)).toBeUndefined();
   });
@@ -128,7 +129,7 @@ describe("ask links (issue #158)", () => {
 
   it("minting an ask token creates no device token", () => {
     const storePath = initStore();
-    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", soonIso);
 
     expect(listDeviceTokens(storePath, PASSPHRASE)).toEqual([]);
     expect(verifyDeviceToken(storePath, PASSPHRASE, minted.token)).toBeUndefined();
@@ -136,22 +137,27 @@ describe("ask links (issue #158)", () => {
 
   it("revoking an already-revoked ask link is a no-op, not an error", () => {
     const storePath = initStore();
-    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", soonIso);
     revokeAskToken(storePath, PASSPHRASE, minted.id);
     expect(() => revokeAskToken(storePath, PASSPHRASE, minted.id)).not.toThrow();
   });
 
   it("revoking an unknown ask-link id fails loudly, naming it", () => {
     const storePath = initStore();
-    expect(() => revokeAskToken(storePath, PASSPHRASE, "not-a-real-id")).toThrow(AskTokenNotFoundError);
-    expect(() => revokeAskToken(storePath, PASSPHRASE, "not-a-real-id")).toThrow(/not-a-real-id/);
+    let caught: unknown;
+    try {
+      revokeAskToken(storePath, PASSPHRASE, "not-a-real-id");
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AskTokenNotFoundError);
+    expect((caught as Error).message).toContain("not-a-real-id");
   });
 
   it("lists ask links oldest first", () => {
     const storePath = initStore();
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const first = createAskToken(storePath, PASSPHRASE, "Sam", expiresAt);
-    const second = createAskToken(storePath, PASSPHRASE, "Rae", expiresAt);
+    const first = createAskToken(storePath, PASSPHRASE, "Sam", soonIso);
+    const second = createAskToken(storePath, PASSPHRASE, "Rae", soonIso);
     expect(listAskTokens(storePath, PASSPHRASE).map((l) => l.id)).toEqual([first.id, second.id]);
   });
 });
