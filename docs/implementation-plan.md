@@ -777,3 +777,48 @@ a wave, and (3) be aware `main` also carries the independent client-surface work
 
 *(This closing instruction applied while waves remained; it no longer does — see "Resume point,
 if this backlog is ever revisited" above.)*
+
+## 6. Status as of 2026-09-20 — read this first
+
+Everything in §1–5 above describes the original 72-issue backlog and how it was run. Since then:
+
+- **All 72 backlog issues shipped**, in a separate session that ran after this plan was written.
+  963+ tests exist. The issue tracker was out of sync with this (issues stayed open after
+  merging) — cleaned up 2026-09-20: 43 issues closed with a comment pointing at the merging PR.
+- **A circular dependency was found and fixed** in the original epic links: #9 (public-answering)
+  and #11 (trust) depended on each other. #11 only needs #3 (stable topic IDs); it doesn't need
+  #9 to exist to be built, only to be exercised later.
+- **The Mac/phone/web client moved to a separate repo**: [guangshinhaha/duo](https://github.com/guangshinhaha/duo),
+  commit `ad5ee47`. It was built inside this repo by an independent session
+  (`docs/client-design.md`, `docs/client-tech-design.md`, `client/`, `src/serve/`) — outside this
+  plan and never part of the 72-issue backlog. `client/` and the two design docs moved; `src/serve/`
+  (the daemon) **stayed here deliberately** — it imports directly from core modules (store,
+  derivation, drafting, permissions, trust) and isn't client code. The client talks to it over
+  HTTP only, per its own README.
+- **Two new issues filed 2026-09-20**, prompted by the owner's own reasoning: Slack (#8, blocked
+  on #15) was always the surface for someone else to consult the duo. It's staying blocked
+  indefinitely — the owner chose the client as the deliberately lower-resistance path instead.
+  But the client only served the owner's own paired devices; nobody else could reach the duo at
+  all. Filed to close that gap:
+  - [digital-duo#157](https://github.com/guangshinhaha/digital-duo/issues/157) — a scoped
+    ask-token type (not device pairing) and a `POST /ask` route wired to the answering logic
+    that already ships (`answerPublicly`, `answerSharedDuo`). Children: #158, #159, #160.
+  - [duo#1](https://github.com/guangshinhaha/duo/issues/1) — the no-install asker-facing page
+    that calls it. Child: #2.
+  - Scoped deliberately small: no new trust model. `duo/directory.json` already resolves asker
+    identity/clearance and already treats an unrecognised asker as unresolved-safe-default, which
+    covers "people outside the team or agency" without redesign — a teammate gets added with a
+    real clearance, an outsider just falls through to the same conservative default.
+- **A real, unresolved problem**: 325 of 921 tests fail in this environment right now. Root
+  cause: the store uses Node's built-in `node:sqlite`, and this machine's Node build (v23.11.0)
+  doesn't have FTS5 compiled in (`no such module: fts5`). Not necessarily a code regression —
+  the implementing session's own note claims tests were green at its own `main` tip — but it
+  doesn't reproduce here as-is, and nothing has been verified in this environment since. This
+  should be the first thing a resuming session checks, since it blocks trusting any test run
+  until it's resolved (a different Node build, a build flag, or a fallback in `store.ts`).
+- **Still genuinely open, not started**: #137 (relevance gate misclassifies rhetorical
+  questions), #155 (classification marking can leak through the no-provider draft fallback),
+  and all four issues under #157/#1 above.
+- **Still deliberately deferred, not a bug**: #14, #15 (the two gating decisions — real
+  inference provider, real Slack access), and everything under #8/#2/#22/#40/#41/#42 (Slack) —
+  the owner's explicit call, keep these open rather than resolving or working around them.
