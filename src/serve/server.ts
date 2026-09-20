@@ -1,3 +1,4 @@
+import cors from "@fastify/cors";
 import Fastify, { type FastifyInstance } from "fastify";
 import type { DuoConfig } from "../config.js";
 import { createLlmEditClassifier, recordDraftOutcomeAndClassify } from "../corrections/classify.js";
@@ -12,6 +13,7 @@ import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js"
 import { listAuditEntries } from "../permissions/audit.js";
 import { listGrid } from "../trust/grid.js";
 import { registerAuth } from "./auth.js";
+import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 
 /**
  * Everything a route needs, resolved once at boot (`client-tech-design.md`
@@ -231,6 +233,19 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps): void {
  */
 export function createServer(deps: ServeDeps): FastifyInstance {
   const app = Fastify({ logger: false });
+  // CORS registers *before* the auth hook on purpose: a browser preflight is
+  // an OPTIONS request the browser will not attach `Authorization` to, so if
+  // auth ran first every preflight would 401 and no browser-origin client
+  // could ever talk to this daemon. Ordering CORS first also puts the
+  // allow-origin header on error responses (401/404), which is what lets a
+  // browser read those bodies at all. An empty allowlist (resolveCorsOrigins
+  // → false) disables CORS outright: default-deny, never a wildcard.
+  const corsOrigins = resolveCorsOrigins(deps.env);
+  app.register(cors, {
+    origin: corsOrigins,
+    allowedHeaders: [...CORS_ALLOWED_HEADERS],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  });
   registerAuth(app, deps.storePath, deps.passphrase);
   registerRoutes(app, deps);
   return app;
