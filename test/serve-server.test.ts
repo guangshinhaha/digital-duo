@@ -6,6 +6,8 @@ import { createFakeEmbeddingProvider, createFailingEmbeddingProvider } from "./f
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
+import { draftReply } from "../src/drafting/pipeline.js";
+import { escalationUrgencyRate, listEscalationDigests } from "../src/escalation/digest.js";
 import { muteChannel, muteThread, readMutedChannels } from "../src/drafting/channel-mutes.js";
 import type { ChannelAdapter, ChannelDeliveryRequest } from "../src/drafting/delivery.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
@@ -234,9 +236,10 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
   // Issue #159 pins the FULL owner-route inventory (every method), not just
-  // the GETs: the five POSTs are owner-only surfaces too, and a seam bug
+  // the GETs: the eight POSTs are owner-only surfaces too, and a seam bug
   // that only leaked on POSTs would otherwise pass unnoticed. #177's two
-  // device routes extend the inventory the same way.
+  // device routes, #172's three channel-policy routes, and #178's three
+  // escalation routes extend the inventory the same way.
   interface OwnerRoute {
     readonly method: "GET" | "POST";
     readonly url: string;
@@ -255,6 +258,8 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/devices" },
     { method: "GET", url: "/channels" },
     { method: "GET", url: "/channels/policy" },
+    { method: "GET", url: "/escalations/history" },
+    { method: "GET", url: "/escalations/rate" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -262,17 +267,18 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/devices/some-device-id/revoke" },
     { method: "POST", url: "/channels/policy/mute", payload: { channel: "c" } },
     { method: "POST", url: "/channels/policy/unmute", payload: { channel: "c" } },
+    { method: "POST", url: "/escalations/digest" },
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 19 refused requests from one IP
+    // Each request comes from its own IP: 22 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 19 sequential cache-miss verifies would each
+    // mid-verification — and 22 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -1797,5 +1803,151 @@ describe("channel policy over HTTP — per-channel, per-thread (#172)", () => {
     expect(mute.statusCode).toBe(401);
     const unmute = await app.inject({ method: "POST", url: "/channels/policy/unmute", headers: askHeader, payload: { channel: "c" } });
     expect(unmute.statusCode).toBe(401);
+  });
+});
+
+describe("escalations over HTTP — digest, history, rate (#178)", () => {
+  const confidenceConfig = loadConfig().confidence;
+
+  /** Escalates unconditionally: no evidence and no rule exist for these questions in a fresh store, so draftReply always returns kind "escalation" — escalation-digest.test.ts's own helper, over the same fake provider deps() uses. */
+  async function escalate(storePath: string, question: string): Promise<string> {
+    const result = await draftReply(storePath, PASSPHRASE, join(tempDir(), "duo"), question, null, createFakeEmbeddingProvider(), undefined, confidenceConfig);
+    if (result.kind !== "escalation") {
+      throw new Error(`expected an escalation, got ${result.kind}`);
+    }
+    return result.draftId;
+  }
+
+  it("POST /escalations/digest returns what runEscalationsDigest produces — items in place, nothing sent when nothing is new", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    const empty = await app.inject({ method: "POST", url: "/escalations/digest", headers: authHeader, payload: {} });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json()).toEqual({ sent: false, items: [] });
+
+    await escalate(storePath, "how much vacation leave do I get");
+    await escalate(storePath, "what is the printer's IP address");
+
+    const sent = await app.inject({ method: "POST", url: "/escalations/digest", headers: authHeader, payload: {} });
+    expect(sent.statusCode).toBe(200);
+    const body = sent.json();
+    expect(body.sent).toBe(true);
+    expect(typeof body.digestId).toBe("string");
+    expect(body.items.map((item: { question: string }) => item.question)).toEqual(
+      expect.arrayContaining(["how much vacation leave do I get", "what is the printer's IP address"]),
+    );
+    for (const item of body.items) {
+      expect(item.escalationReason).toEqual(expect.any(String));
+      expect(item.escalationReason.length).toBeGreaterThan(0);
+    }
+
+    // The sent digest is a real row the CLI's own history reads — one
+    // store, one code path, not a route-side copy.
+    expect(listEscalationDigests(storePath, PASSPHRASE).map((digest) => digest.id)).toContain(body.digestId);
+
+    // Nothing new since: the honest empty result, nothing re-sent.
+    const again = await app.inject({ method: "POST", url: "/escalations/digest", headers: authHeader, payload: {} });
+    expect(again.json()).toEqual({ sent: false, items: [] });
+    expect(listEscalationDigests(storePath, PASSPHRASE)).toHaveLength(1);
+  });
+
+  it("GET /escalations/history pages with limit and cursor, oldest first", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    const sentIds: string[] = [];
+    for (const question of ["how much vacation leave do I get", "what is the printer's IP address", "which printer does floor 3 use"]) {
+      await escalate(storePath, question);
+      const sent = await app.inject({ method: "POST", url: "/escalations/digest", headers: authHeader, payload: {} });
+      sentIds.push(sent.json().digestId);
+    }
+    expect(sentIds).toHaveLength(3);
+
+    // Default: everything, oldest first (createdAt non-decreasing — the
+    // three digests share a table ordered by created_at, id).
+    const all = await app.inject({ method: "GET", url: "/escalations/history", headers: authHeader });
+    expect(all.statusCode).toBe(200);
+    const allBody = all.json();
+    expect(allBody.map((digest: { id: string }) => digest.id).sort()).toEqual([...sentIds].sort());
+    for (let i = 1; i < allBody.length; i += 1) {
+      expect(allBody[i].createdAt >= allBody[i - 1].createdAt).toBe(true);
+    }
+    expect(allBody.map((digest: { itemCount: number }) => digest.itemCount)).toEqual([1, 1, 1]);
+
+    // A page: limit respected. The two pages are disjoint and together are
+    // the whole set — cursor advances, no row repeats, none is lost.
+    const pageOne = await app.inject({ method: "GET", url: "/escalations/history?limit=2", headers: authHeader });
+    expect(pageOne.statusCode).toBe(200);
+    expect(pageOne.json()).toHaveLength(2);
+
+    const pageTwo = await app.inject({ method: "GET", url: "/escalations/history?limit=2&cursor=2", headers: authHeader });
+    expect(pageTwo.statusCode).toBe(200);
+    expect(pageTwo.json()).toHaveLength(1);
+
+    const pageOneIds = pageOne.json().map((digest: { id: string }) => digest.id);
+    const pageTwoIds = pageTwo.json().map((digest: { id: string }) => digest.id);
+    expect(pageOneIds.some((id: string) => pageTwoIds.includes(id))).toBe(false);
+    expect([...pageOneIds, ...pageTwoIds].sort()).toEqual([...sentIds].sort());
+
+    // Cursor past the end is an honest empty page, not an error.
+    const beyond = await app.inject({ method: "GET", url: "/escalations/history?limit=2&cursor=8", headers: authHeader });
+    expect(beyond.statusCode).toBe(200);
+    expect(beyond.json()).toEqual([]);
+  });
+
+  it("GET /escalations/history validates limit and cursor exactly like /search", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    for (const url of [
+      "/escalations/history?limit=0",
+      "/escalations/history?limit=101",
+      "/escalations/history?limit=abc",
+      "/escalations/history?cursor=-1",
+      "/escalations/history?cursor=abc",
+    ]) {
+      const response = await app.inject({ method: "GET", url, headers: authHeader });
+      expect(response.statusCode, url).toBe(400);
+      expect(response.json().error.message, url).toMatch(/limit|cursor/);
+    }
+  });
+
+  it("GET /escalations/rate returns the same figure the CLI reports", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    // Two ordinary escalations and one objectively-severe one ("production
+    // is down" is one of urgency.ts's own signals) — 1/3 urgent.
+    await escalate(storePath, "how much vacation leave do I get");
+    await escalate(storePath, "what is the printer's IP address");
+    await escalate(storePath, "what do I do — production is down");
+
+    const response = await app.inject({ method: "GET", url: "/escalations/rate", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    // Byte-identical to what `duo escalations rate` prints from — the same
+    // function, called now, over the same store.
+    expect(response.json()).toEqual(escalationUrgencyRate(storePath, PASSPHRASE));
+    expect(response.json()).toEqual({ total: 3, urgent: 1, rate: 1 / 3 });
+  });
+
+  it("all three routes are owner routes: an ask token is refused on each", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const authHeader = { authorization: `Bearer ${minted.token}` };
+    const digest = await app.inject({ method: "POST", url: "/escalations/digest", headers: authHeader, payload: {} });
+    const history = await app.inject({ method: "GET", url: "/escalations/history", headers: authHeader });
+    const rate = await app.inject({ method: "GET", url: "/escalations/rate", headers: authHeader });
+    expect(digest.statusCode).toBe(401);
+    expect(history.statusCode).toBe(401);
+    expect(rate.statusCode).toBe(401);
   });
 });

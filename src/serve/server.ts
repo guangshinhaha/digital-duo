@@ -5,6 +5,7 @@ import { createLlmEditClassifier } from "../corrections/classify.js";
 import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
 import { approveCandidate, getReviewCandidate, rejectCandidate } from "../corrections/review.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
+import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
 import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
@@ -599,6 +600,38 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     }
     return hybridSearch(deps.storePath, deps.passphrase, q, deps.embeddingProvider, limit, cursor);
   });
+
+  // #178: `duo escalations digest|history|rate` over HTTP — how the owner
+  // sees what their duo keeps having to ask about, thin over the same
+  // module functions those commands call. digest is a POST because
+  // assembling *is* the send: it writes the append-only escalation_digests
+  // row and marks its items digested, exactly as `duo escalations digest`
+  // does at the terminal. history validates limit/cursor with /search's
+  // own vocabulary and bounds; the paging itself lives in
+  // listEscalationDigests, where the CLI reads all rows by default.
+  app.post("/escalations/digest", async () => assembleEscalationDigest(deps.storePath, deps.passphrase));
+
+  app.get<{ Querystring: { limit?: string; cursor?: string } }>("/escalations/history", async (request, reply) => {
+    let limit = 10;
+    if (request.query.limit !== undefined) {
+      limit = Number.parseInt(request.query.limit, 10);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        reply.code(400).send(errorBody("bad_request", "limit must be an integer between 1 and 100"));
+        return;
+      }
+    }
+    let cursor = 0;
+    if (request.query.cursor !== undefined) {
+      cursor = Number.parseInt(request.query.cursor, 10);
+      if (!Number.isInteger(cursor) || cursor < 0) {
+        reply.code(400).send(errorBody("bad_request", "cursor must be a non-negative integer"));
+        return;
+      }
+    }
+    return listEscalationDigests(deps.storePath, deps.passphrase, { limit, cursor });
+  });
+
+  app.get("/escalations/rate", async () => escalationUrgencyRate(deps.storePath, deps.passphrase));
 
   app.get("/audit", async () => listAuditEntries(deps.storePath, deps.passphrase));
 }
