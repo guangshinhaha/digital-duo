@@ -11,6 +11,7 @@ import { recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delive
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
+import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
 import { hybridSearch } from "../ingest/embeddings.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
@@ -413,6 +414,23 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   });
 
   app.get("/mirror/portrait", async () => buildInterruptionPortrait(deps.storePath, deps.passphrase, deps.duoDir));
+
+  // #175: what this duo knows, in one read. A pure composition — every
+  // number comes from a module function that already existed or a fact the
+  // store already keeps; the route adds no behaviour of its own, it just
+  // says which providers the daemon was wired with.
+  app.get("/knowledge", async () =>
+    describeDuoKnowledge(
+      deps.storePath,
+      deps.passphrase,
+      deps.duoDir,
+      {
+        inference: deps.inferenceProvider?.name ?? null,
+        embedding: { name: deps.embeddingProvider.name, model: deps.embeddingProvider.model },
+      },
+      deps.env,
+    ),
+  );
 
   app.get("/mirror/rules", async () => listRulesForReview(deps.storePath, deps.passphrase));
 

@@ -12,6 +12,7 @@ import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
 import { embedRecords, hybridSearch } from "../src/ingest/embeddings.js";
+import { ingestRecords } from "../src/ingest/two-phase.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
@@ -1411,5 +1412,76 @@ describe("GET /search — the corpus, from a client (#174)", () => {
     expect(failing.json().warning).toContain("full-text");
     // Full-text still finds the vacation records.
     expect(failing.json().results.map((result: { record: { text: string } }) => result.record.text).every((text: string) => text.includes("vacation"))).toBe(true);
+  });
+});
+
+describe("GET /knowledge — what this duo knows (#175)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  /** A surviving Q/A pair from `source`, ingested through the real two-phase pipeline so an import run is recorded alongside it. */
+  function ingestQaThread(source: string, threadId: string, question: string, answer: string): void {
+    ingestRecords(storePath, PASSPHRASE, [
+      record({ source, kind: "question_to_me", author: "other", text: question, threadId }),
+      record({ source, kind: "my_answer", author: "me", text: answer, threadId }),
+    ]);
+  }
+
+  it("composes the stored facts on a populated store: counts by source, the recorded import, the portrait's corpus verdict, rules, providers, usage", async () => {
+    ingestQaThread("paste", "t1", "what is the leave policy?", "five days per quarter");
+    ingestQaThread("slack-export", "s1", "when do deploys freeze?", "deploys freeze on fridays");
+    const dir = join(tempDir(), "duo");
+    const { pairs } = await extractQaPairs([
+      record({ source: "paste", kind: "question_to_me", author: "other", text: "what is the leave policy?", threadId: "t1" }),
+      record({ source: "paste", kind: "my_answer", author: "me", text: "five days per quarter", threadId: "t1" }),
+    ]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+    writeTopicsFile(dir, [{ id: "topic-leave", label: "Leave policy", createdAt: new Date().toISOString() }]);
+    writeRuleByHand(storePath, PASSPHRASE, dir, "leave", "five days per quarter");
+
+    const response = await app.inject({ method: "GET", url: "/knowledge", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+
+    expect(body.records).toEqual({ total: 4, bySource: { paste: 2, "slack-export": 2 } });
+    // The last import is the second thread's run — the fact ingestRecords
+    // recorded, not a derived timestamp.
+    expect(body.lastImport).toMatchObject({ staged: 2, written: 2, alreadyPresent: 0 });
+    // The portrait's own verdict, not a recomputation: the corpus slice is
+    // byte-identical to GET /mirror/portrait's fields.
+    expect(body.corpus.totalQuestions).toBe(1);
+    expect(body.corpus.topicBreakdown).toEqual([{ topicId: "topic-leave", label: "Leave policy", count: 1, share: 1 }]);
+    expect(body.rules.byReviewStatus).toEqual({ pending: 0, approved: 1, rejected: 0, superseded: 0 });
+    // The daemon's configured providers, echoed — deps() wires the fake
+    // embedding provider and no inference provider.
+    expect(body.providers).toEqual({ inference: null, embedding: { name: "fake", model: "fake-embed" } });
+    expect(body.sharedUsage.totalQuestions).toBe(0);
+  });
+
+  it("a fresh store still answers 200 — the honest empty picture, thin corpus verdict included", async () => {
+    const response = await app.inject({ method: "GET", url: "/knowledge", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.records).toEqual({ total: 0, bySource: {} });
+    expect(body.lastImport).toBeNull();
+    expect(body.corpus.tooThin).toBe(true);
+    expect(typeof body.corpus.minimumQuestionsToCharacterize).toBe("number");
+    expect(body.corpus.topicBreakdown).toEqual([]);
+    expect(body.rules.byReviewStatus).toEqual({ pending: 0, approved: 0, rejected: 0, superseded: 0 });
+    expect(body.sharedUsage.summary).toBe("The shared duo is not being used.");
+  });
+
+  it("is an owner route: an ask token is refused like any other", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const response = await app.inject({ method: "GET", url: "/knowledge", headers: { authorization: `Bearer ${minted.token}` } });
+    expect(response.statusCode).toBe(401);
   });
 });

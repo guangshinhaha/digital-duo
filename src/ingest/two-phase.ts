@@ -2,9 +2,10 @@ import { randomBytes } from "node:crypto";
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CLASSIFICATION_CEILING, isWithinCeiling } from "../permissions/classification.js";
-import { createEncryptedStore, dataDirFor } from "../store/store.js";
+import { createEncryptedStore, dataDirFor, withDatabase } from "../store/store.js";
 import type { ClassificationLevel, IngestRecord } from "./record.js";
 import { listRecords, writeRecords } from "./record-store.js";
+import { recordImportRunOnHandle } from "./import-runs.js";
 
 /**
  * Where phase A's transient staging database lives for one ingest run:
@@ -115,7 +116,7 @@ export function ingestRecords(
 
     const writeResult = writeRecords(storePath, passphrase, withinCeiling);
 
-    return {
+    const outcome: IngestOutcome = {
       staged: staged.length,
       written: writeResult.written,
       alreadyPresent: writeResult.skipped,
@@ -123,6 +124,13 @@ export function ingestRecords(
       discardedOtherText,
       discardedAboveCeiling,
     };
+
+    // #175: record the run for later ("when did the last import run"), in a
+    // separate write *after* phase B succeeded — a crash in between loses
+    // only this advisory row, never a retained record.
+    withDatabase(storePath, passphrase, true, (db) => recordImportRunOnHandle(db, outcome));
+
+    return outcome;
   } finally {
     deleteStagingFile(stagingPath);
   }
