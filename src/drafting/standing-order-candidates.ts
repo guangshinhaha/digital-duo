@@ -172,6 +172,29 @@ export class StandingOrderCandidateNotFoundError extends Error {
   }
 }
 
+/**
+ * Thrown by requirePendingStandingOrderCandidate when the candidate exists
+ * but was already reviewed — the standing-order twin of queue.ts's
+ * `CandidateAlreadyReviewedError`. A named class, not an anonymous Error,
+ * so `duo serve`'s statusForError can map it to 409 (#173) the same way;
+ * an anonymous Error would surface as a 500.
+ */
+export class StandingOrderCandidateAlreadyReviewedError extends Error {
+  constructor(id: string, status: StandingOrderCandidateStatus) {
+    super(`Standing-order candidate "${id}" was already reviewed (status: "${status}")`);
+    this.name = "StandingOrderCandidateAlreadyReviewedError";
+  }
+}
+
+/** Reads one candidate by id, whatever its status — the read half of #173's "the updated candidate returns" after a review action. */
+export function getStandingOrderCandidate(storePath: string, passphrase: string, id: string): StandingOrderCandidate | undefined {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureStandingOrderCandidateSchema(db);
+    const row = db.prepare(`SELECT * FROM standing_order_candidates WHERE id = ?`).get(id) as StandingOrderCandidateRow | undefined;
+    return row ? rowToCandidate(row) : undefined;
+  });
+}
+
 /** Reads one candidate on an already-open handle, requiring it to still be pending — mirrors #37's queue.ts requirePendingCandidate for the same review precondition. */
 export function requirePendingStandingOrderCandidate(db: Database, id: string): StandingOrderCandidate {
   ensureStandingOrderCandidateSchema(db);
@@ -181,7 +204,7 @@ export function requirePendingStandingOrderCandidate(db: Database, id: string): 
   }
   const candidate = rowToCandidate(row);
   if (candidate.status !== "pending") {
-    throw new Error(`Standing-order candidate "${id}" was already reviewed (status: "${candidate.status}")`);
+    throw new StandingOrderCandidateAlreadyReviewedError(id, candidate.status);
   }
   return candidate;
 }

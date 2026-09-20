@@ -15,6 +15,8 @@ import { embedRecords } from "../src/ingest/embeddings.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
+import { queueCorrectionCandidate } from "../src/corrections/queue.js";
+import { queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { writeRefusalsFile } from "../src/trust/refusals.js";
@@ -1158,5 +1160,138 @@ describe("POST /drafts/:id/outcome — delivery through the origin channel (#170
 
     const fetched = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
     expect(fetched.json().delivery).toBeNull();
+  });
+});
+
+describe("POST /review/:id/approve and /review/:id/reject — acting on the correction queue (#173)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  function queueStyleCandidate(): string {
+    return queueCorrectionCandidate(storePath, PASSPHRASE, {
+      kind: "style",
+      draftId: "draft-1",
+      question: "when is the meeting?",
+      draftText: "the meeting is on tuesday",
+      sentText: "the meeting is on tuesday at 3pm",
+    }).id;
+  }
+
+  function queueEscalationCandidate(): string {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I expense conference travel?",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no supporting evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+    return queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "submit the pre-approval form two weeks ahead");
+  }
+
+  it("approves a draft-edit candidate and returns the updated candidate", async () => {
+    const candidateId = queueStyleCandidate();
+    const response = await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(body.candidate).toMatchObject({ id: candidateId, source: "draft_edit", status: "approved" });
+    expect(body.candidate.reviewedAt).not.toBeNull();
+    // JSON drops `rule: undefined` — a style approval writes no rule.
+    expect(body.result).toEqual({ kind: "style" });
+  });
+
+  it("approves an escalation candidate on the same path the CLI uses, writing its rule", async () => {
+    const candidateId = queueEscalationCandidate();
+    const response = await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(body.candidate).toMatchObject({ id: candidateId, source: "escalation", status: "approved" });
+    expect(body.result).toMatchObject({ kind: "substance" });
+    expect(body.result.rule).toMatchObject({ text: "submit the pre-approval form two weeks ahead" });
+  });
+
+  it("rejects a draft-edit candidate and returns the updated candidate", async () => {
+    const candidateId = queueStyleCandidate();
+    const response = await app.inject({ method: "POST", url: `/review/${candidateId}/reject`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().candidate).toMatchObject({ id: candidateId, status: "rejected" });
+    expect(response.json().candidate.reviewedAt).not.toBeNull();
+  });
+
+  it("rejects an escalation candidate too", async () => {
+    const candidateId = queueEscalationCandidate();
+    const response = await app.inject({ method: "POST", url: `/review/${candidateId}/reject`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().candidate).toMatchObject({ id: candidateId, source: "escalation", status: "rejected" });
+  });
+
+  it("an already-reviewed candidate conflicts: 409, whichever action is retried", async () => {
+    const candidateId = queueStyleCandidate();
+    await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+
+    const reApprove = await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+    expect(reApprove.statusCode).toBe(409);
+    expect(reApprove.json().error).toMatchObject({ code: "CandidateAlreadyReviewedError" });
+
+    const rejectAfter = await app.inject({ method: "POST", url: `/review/${candidateId}/reject`, headers: authHeader });
+    expect(rejectAfter.statusCode).toBe(409);
+  });
+
+  it("an already-reviewed escalation candidate conflicts with 409 as well, not a 500 from an anonymous error", async () => {
+    const candidateId = queueEscalationCandidate();
+    await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+
+    const retry = await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+    expect(retry.statusCode).toBe(409);
+    expect(retry.json().error.message).toContain("already reviewed");
+  });
+
+  it("an unknown id 404s on both routes, naming the id", async () => {
+    const approve = await app.inject({ method: "POST", url: "/review/not-a-real-id/approve", headers: authHeader });
+    expect(approve.statusCode).toBe(404);
+    expect(approve.json().error.message).toContain("not-a-real-id");
+
+    const reject = await app.inject({ method: "POST", url: "/review/not-a-real-id/reject", headers: authHeader });
+    expect(reject.statusCode).toBe(404);
+    expect(reject.json().error.message).toContain("not-a-real-id");
+  });
+
+  it("approving a substance candidate that conflicts with an active rule is refused with 409 until supersedesRuleId resolves it", async () => {
+    const oldRule = writeRuleByHand(storePath, PASSPHRASE, join(tempDir(), "duo"), "office hours", "office hours are nine to five, monday to friday");
+    const candidateId = queueCorrectionCandidate(storePath, PASSPHRASE, {
+      kind: "substance",
+      draftId: "draft-2",
+      question: "what are the office hours?",
+      draftText: "office hours are flexible this month",
+      sentText: "office hours are now ten to six every weekday",
+    }).id;
+
+    const refused = await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error).toMatchObject({ code: "CandidateConflictError" });
+
+    // Refused, not partially applied: still pending.
+    const listed = await app.inject({ method: "GET", url: "/review?status=pending", headers: authHeader });
+    expect(listed.json().some((candidate: { id: string }) => candidate.id === candidateId)).toBe(true);
+
+    const resolved = await app.inject({
+      method: "POST",
+      url: `/review/${candidateId}/approve`,
+      headers: authHeader,
+      payload: { supersedesRuleId: oldRule.id },
+    });
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json().result.rule).toMatchObject({ text: "office hours are now ten to six every weekday" });
   });
 });
