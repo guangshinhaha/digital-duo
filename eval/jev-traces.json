@@ -1,0 +1,408 @@
+{
+  "provenance": {
+    "synthetic": true,
+    "note": "Hand-authored synthetic navigation traces for the Jev typed-decision spike's stage-2 replay. Every page, menu, label, and date below is invented. These traces are fixtures, not recordings of real sessions, so the whole file is egress-eligible (R9) — never add real traces here; real recorded navigation belongs in a different path, never this egress-audited file (KTD10, R8).",
+    "authored": "2026-09-20",
+    "plan": "docs/plans/2026-09-20-1759-spike-jev-typed-decisions-plan.md"
+  },
+  "items": [
+    {
+      "id": "tr01",
+      "goal": "Find the renewal date of the Northwind Traders contract in the vendor portal.",
+      "steps": [
+        {
+          "page": "Vendor portal home — tiles: Dashboard, Contracts, Invoices, Support, Profile",
+          "candidates": [
+            { "id": "open-contracts", "description": "Open the Contracts section" },
+            { "id": "open-invoices", "description": "Open the Invoices section" },
+            { "id": "open-support", "description": "Open the Support section" },
+            { "id": "open-profile", "description": "Open account profile settings" }
+          ],
+          "correct": "open-contracts"
+        },
+        {
+          "page": "Contracts list — filters: Active (3), Expired (12), Drafts (1); search box empty",
+          "candidates": [
+            { "id": "filter-active", "description": "Filter the list to Active contracts" },
+            { "id": "filter-expired", "description": "Filter the list to Expired contracts" },
+            { "id": "filter-drafts", "description": "Filter the list to Draft contracts" },
+            { "id": "new-contract", "description": "Start a new contract draft" }
+          ],
+          "correct": "filter-active"
+        },
+        {
+          "page": "Active contracts — rows: Northwind Traders MSA, Contoso Support Agreement, Fabrikam NDA",
+          "candidates": [
+            { "id": "open-northwind-msa", "description": "Open the Northwind Traders MSA row" },
+            { "id": "open-contoso", "description": "Open the Contoso Support Agreement row" },
+            { "id": "open-fabrikam", "description": "Open the Fabrikam NDA row" },
+            { "id": "export-csv", "description": "Export the list as CSV" }
+          ],
+          "correct": "open-northwind-msa"
+        },
+        {
+          "page": "Northwind Traders MSA detail — tabs: Overview, Amendments, Files, History",
+          "candidates": [
+            { "id": "open-overview", "description": "Open the Overview tab with contract terms and dates" },
+            { "id": "open-amendments", "description": "Open the Amendments tab" },
+            { "id": "open-files", "description": "Open the Files tab with signed PDFs" },
+            { "id": "open-history", "description": "Open the audit History tab" }
+          ],
+          "correct": "open-overview"
+        },
+        {
+          "page": "Overview tab — fields include Term (Jan 1 2026), Renewal (auto-renew Jan 1 2027), Notice period (60 days); buttons: Edit, Download, Flag",
+          "candidates": [
+            { "id": "done-renewal-found", "description": "Goal met — renewal date is Jan 1 2027, stop here" },
+            { "id": "click-edit", "description": "Click Edit to change contract terms" },
+            { "id": "click-download", "description": "Download the contract PDF" },
+            { "id": "click-flag", "description": "Flag the contract for review" }
+          ],
+          "correct": "done-renewal-found"
+        }
+      ]
+    },
+    {
+      "id": "tr02",
+      "goal": "Submit last week's meal expense for the client dinner on Thursday.",
+      "steps": [
+        {
+          "page": "Expense app home — buttons: New Report, Drafts (2), Approved (0), Profile",
+          "candidates": [
+            { "id": "new-report", "description": "Start a new expense report" },
+            { "id": "open-drafts", "description": "Open existing draft reports" },
+            { "id": "open-approved", "description": "Open approved reports" },
+            { "id": "open-profile", "description": "Open profile and payment settings" }
+          ],
+          "correct": "new-report"
+        },
+        {
+          "page": "New report form — fields: Title (empty), Week (defaults to last week), Project (dropdown)",
+          "candidates": [
+            { "id": "fill-details", "description": "Fill title and confirm week, then continue to line items" },
+            { "id": "back-home", "description": "Discard and go back home" },
+            { "id": "copy-last-report", "description": "Copy line items from last month's report" },
+            { "id": "open-help", "description": "Open the expense policy help page" }
+          ],
+          "correct": "fill-details"
+        },
+        {
+          "page": "Line items — empty list; Add Expense button offers types: Meal, Travel, Lodging, Supplies",
+          "candidates": [
+            { "id": "add-meal", "description": "Add a Meal expense line item" },
+            { "id": "add-travel", "description": "Add a Travel expense line item" },
+            { "id": "add-lodging", "description": "Add a Lodging expense line item" },
+            { "id": "add-supplies", "description": "Add a Supplies expense line item" }
+          ],
+          "correct": "add-meal"
+        },
+        {
+          "page": "Meal detail — fields: Amount (empty), Date (empty), Attendees (empty), Receipt (not attached); button: Save line",
+          "candidates": [
+            { "id": "fill-and-attach", "description": "Enter amount 86.40, Thursday's date, attendee names, attach the receipt photo, save" },
+            { "id": "save-empty", "description": "Save the line with empty fields to fill later" },
+            { "id": "cancel-line", "description": "Cancel this line item" },
+            { "id": "add-another-meal", "description": "Add a second meal line immediately" }
+          ],
+          "correct": "fill-and-attach"
+        },
+        {
+          "page": "Report review — summary shows the meal line; buttons: Submit for approval, Save draft, Delete report",
+          "candidates": [
+            { "id": "submit", "description": "Submit the report for manager approval" },
+            { "id": "save-draft", "description": "Save as a draft and submit later" },
+            { "id": "delete-report", "description": "Delete the whole report" },
+            { "id": "back-to-lines", "description": "Go back and edit line items" }
+          ],
+          "correct": "submit"
+        }
+      ]
+    },
+    {
+      "id": "tr03",
+      "goal": "Find the rollback procedure in the October database migration runbook.",
+      "steps": [
+        {
+          "page": "Docs site home — nav: Home, Engineering, Runbooks, Postmortems, Onboarding",
+          "candidates": [
+            { "id": "open-runbooks", "description": "Open the Runbooks section" },
+            { "id": "open-engineering", "description": "Open the Engineering section" },
+            { "id": "open-postmortems", "description": "Open the Postmortems section" },
+            { "id": "open-onboarding", "description": "Open the Onboarding section" }
+          ],
+          "correct": "open-runbooks"
+        },
+        {
+          "page": "Runbooks index — folders: Databases, Networking, Deploys, Incidents",
+          "candidates": [
+            { "id": "open-databases", "description": "Open the Databases runbook folder" },
+            { "id": "open-networking", "description": "Open the Networking runbook folder" },
+            { "id": "open-deploys", "description": "Open the Deploys runbook folder" },
+            { "id": "open-incidents", "description": "Open the Incidents runbook folder" }
+          ],
+          "correct": "open-databases"
+        },
+        {
+          "page": "Databases runbooks — pages: Migration October 2026, Backup restore, Failover drill, Schema conventions",
+          "candidates": [
+            { "id": "open-migration-oct", "description": "Open the Migration October 2026 runbook" },
+            { "id": "open-backup-restore", "description": "Open the Backup restore runbook" },
+            { "id": "open-failover", "description": "Open the Failover drill runbook" },
+            { "id": "open-schema", "description": "Open the Schema conventions page" }
+          ],
+          "correct": "open-migration-oct"
+        },
+        {
+          "page": "Migration runbook — table of contents: Prep, Cutover, Rollback, Comms plan",
+          "candidates": [
+            { "id": "jump-rollback", "description": "Jump to the Rollback section" },
+            { "id": "jump-prep", "description": "Jump to the Prep section" },
+            { "id": "jump-cutover", "description": "Jump to the Cutover section" },
+            { "id": "jump-comms", "description": "Jump to the Comms plan section" }
+          ],
+          "correct": "jump-rollback"
+        }
+      ]
+    },
+    {
+      "id": "tr04",
+      "goal": "Change the notification setting so security alerts arrive by SMS as well as email.",
+      "steps": [
+        {
+          "page": "Account settings — nav: Profile, Notifications, Security, Connected apps",
+          "candidates": [
+            { "id": "open-notifications", "description": "Open Notification settings" },
+            { "id": "open-security", "description": "Open Security settings" },
+            { "id": "open-profile", "description": "Open Profile settings" },
+            { "id": "open-connected-apps", "description": "Open Connected apps settings" }
+          ],
+          "correct": "open-notifications"
+        },
+        {
+          "page": "Notifications — groups: Product updates, Security alerts, Billing, Weekly digest; each currently Email-only",
+          "candidates": [
+            { "id": "open-security-alerts", "description": "Open the Security alerts delivery options" },
+            { "id": "open-product-updates", "description": "Open the Product updates delivery options" },
+            { "id": "open-billing", "description": "Open the Billing delivery options" },
+            { "id": "open-weekly-digest", "description": "Open the Weekly digest delivery options" }
+          ],
+          "correct": "open-security-alerts"
+        },
+        {
+          "page": "Security alerts delivery — checkboxes: Email (checked), SMS (unchecked), Push (unchecked); Save button",
+          "candidates": [
+            { "id": "check-sms-and-save", "description": "Check SMS, keep Email checked, then Save" },
+            { "id": "check-push-and-save", "description": "Check Push only, then Save" },
+            { "id": "uncheck-email", "description": "Turn Email off and save" },
+            { "id": "cancel", "description": "Cancel without changing anything" }
+          ],
+          "correct": "check-sms-and-save"
+        },
+        {
+          "page": "Save confirmation — banner reads Saved; the Security alerts row now shows Email, SMS; prompt offers adding a backup phone number",
+          "candidates": [
+            { "id": "done-verified", "description": "Goal met — both channels listed and saved, stop here" },
+            { "id": "add-backup-phone", "description": "Add a backup phone number" },
+            { "id": "revert", "description": "Undo the change" },
+            { "id": "open-billing", "description": "Move on to Billing notification settings" }
+          ],
+          "correct": "done-verified"
+        }
+      ]
+    },
+    {
+      "id": "tr05",
+      "goal": "Find the approved final version of the Q3 board deck among shared files.",
+      "steps": [
+        {
+          "page": "File share root — folders: Finance, Marketing, Engineering, Board materials, Archive",
+          "candidates": [
+            { "id": "open-board-materials", "description": "Open the Board materials folder" },
+            { "id": "open-finance", "description": "Open the Finance folder" },
+            { "id": "open-marketing", "description": "Open the Marketing folder" },
+            { "id": "open-archive", "description": "Open the Archive folder" }
+          ],
+          "correct": "open-board-materials"
+        },
+        {
+          "page": "Board materials — files: Q3-board-deck-FINAL-v4.pptx, Q3-board-deck-v3-review.pptx, Q3-board-deck-v2-draft.pptx, notes-2026-09.txt",
+          "candidates": [
+            { "id": "open-final-v4", "description": "Open Q3-board-deck-FINAL-v4.pptx" },
+            { "id": "open-v3-review", "description": "Open Q3-board-deck-v3-review.pptx" },
+            { "id": "open-v2-draft", "description": "Open Q3-board-deck-v2-draft.pptx" },
+            { "id": "open-notes", "description": "Open notes-2026-09.txt" }
+          ],
+          "correct": "open-final-v4"
+        },
+        {
+          "page": "File preview — Q3-board-deck-FINAL-v4.pptx, 38 slides, modified 3 days ago; buttons: Download, Share, History",
+          "candidates": [
+            { "id": "download", "description": "Download the approved deck" },
+            { "id": "share", "description": "Create a share link for the deck" },
+            { "id": "history", "description": "View the file's version history" },
+            { "id": "back-folder", "description": "Go back to the folder listing" }
+          ],
+          "correct": "download"
+        },
+        {
+          "page": "Download complete — dialog offers: Open file, Show in folder, Done",
+          "candidates": [
+            { "id": "open-file", "description": "Open the downloaded deck" },
+            { "id": "show-in-folder", "description": "Reveal the file in the local folder" },
+            { "id": "done", "description": "Close the dialog — goal met, stop here" },
+            { "id": "download-again", "description": "Download a second copy" }
+          ],
+          "correct": "open-file"
+        }
+      ]
+    },
+    {
+      "id": "tr06",
+      "goal": "See why the nightly build's integration tests failed.",
+      "steps": [
+        {
+          "page": "CI dashboard — pipelines listed: main #4821 (failed), main #4820 (passed), release-2.3 #115 (passed), main #4819 (passed)",
+          "candidates": [
+            { "id": "open-4821", "description": "Open failed pipeline main #4821" },
+            { "id": "open-4820", "description": "Open passed pipeline main #4820" },
+            { "id": "open-release-115", "description": "Open passed pipeline release-2.3 #115" },
+            { "id": "new-pipeline", "description": "Trigger a new pipeline run" }
+          ],
+          "correct": "open-4821"
+        },
+        {
+          "page": "Pipeline main #4821 — jobs: lint (passed), unit (passed), integration (failed), package (skipped)",
+          "candidates": [
+            { "id": "open-integration", "description": "Open the failed integration job's log" },
+            { "id": "open-lint", "description": "Open the passed lint job's log" },
+            { "id": "open-unit", "description": "Open the passed unit job's log" },
+            { "id": "retry-pipeline", "description": "Retry the whole pipeline" }
+          ],
+          "correct": "open-integration"
+        },
+        {
+          "page": "Integration job log — summary at top: 3 failed, 214 passed; first failure: checkout_flow.spec.ts:88 timeout",
+          "candidates": [
+            { "id": "open-first-failure", "description": "Expand the first failure detail at checkout_flow.spec.ts:88" },
+            { "id": "open-artifacts", "description": "Browse the job's artifacts and screenshots" },
+            { "id": "retry-job", "description": "Retry just this job" },
+            { "id": "back-pipeline", "description": "Go back to the pipeline view" }
+          ],
+          "correct": "open-first-failure"
+        },
+        {
+          "page": "Failure detail — assertion timeout after 30s waiting for the confirmation page selector; screenshots and trace attached",
+          "candidates": [
+            { "id": "done-cause-found", "description": "Goal met — timeout waiting for the confirmation page, evidence attached; stop here" },
+            { "id": "open-screenshot", "description": "Open the failure screenshot full-size" },
+            { "id": "file-bug", "description": "File a bug from this failure" },
+            { "id": "back-log", "description": "Go back to the full log" }
+          ],
+          "correct": "done-cause-found"
+        }
+      ]
+    },
+    {
+      "id": "tr07",
+      "goal": "Confirm the delivery address for order #77829 and get the tracking link.",
+      "steps": [
+        {
+          "page": "Shop account — Orders page lists: #77829 (in transit), #77651 (delivered), #77310 (cancelled)",
+          "candidates": [
+            { "id": "open-77829", "description": "Open order #77829" },
+            { "id": "open-77651", "description": "Open order #77651" },
+            { "id": "open-77310", "description": "Open order #77310" },
+            { "id": "open-address-book", "description": "Open the address book" }
+          ],
+          "correct": "open-77829"
+        },
+        {
+          "page": "Order #77829 — sections: Items (2), Delivery (address hidden behind Reveal), Payment, Support",
+          "candidates": [
+            { "id": "reveal-delivery", "description": "Reveal the delivery address section" },
+            { "id": "open-items", "description": "Expand the Items list" },
+            { "id": "open-payment", "description": "Open the Payment section" },
+            { "id": "open-support", "description": "Open the Support section" }
+          ],
+          "correct": "reveal-delivery"
+        },
+        {
+          "page": "Delivery section — address shown; status In transit with Track shipment button",
+          "candidates": [
+            { "id": "open-tracking", "description": "Open the shipment tracking link" },
+            { "id": "change-address", "description": "Request an address change" },
+            { "id": "report-issue", "description": "Report a delivery issue" },
+            { "id": "back-orders", "description": "Go back to the orders list" }
+          ],
+          "correct": "open-tracking"
+        },
+        {
+          "page": "Carrier tracking page — status Out for delivery, map with ETA 4:30 PM, buttons: Notify me, Add note, Done",
+          "candidates": [
+            { "id": "done-goal-met", "description": "Goal met — address confirmed and tracking open, stop here" },
+            { "id": "notify-me", "description": "Sign up for delivery notifications" },
+            { "id": "add-note", "description": "Leave delivery instructions for the courier" },
+            { "id": "back-order", "description": "Go back to the order page" }
+          ],
+          "correct": "done-goal-met"
+        }
+      ]
+    },
+    {
+      "id": "tr08",
+      "goal": "Turn on two-factor authentication for the team chat account.",
+      "steps": [
+        {
+          "page": "Team chat app — sidebar: Home, Settings, Integrations, Admin",
+          "candidates": [
+            { "id": "open-settings", "description": "Open Settings" },
+            { "id": "open-integrations", "description": "Open Integrations" },
+            { "id": "open-admin", "description": "Open Admin" },
+            { "id": "open-home", "description": "Go to Home" }
+          ],
+          "correct": "open-settings"
+        },
+        {
+          "page": "Settings — sections: Account, Notifications, Accessibility, Security",
+          "candidates": [
+            { "id": "open-security", "description": "Open the Security section" },
+            { "id": "open-account", "description": "Open the Account section" },
+            { "id": "open-notifications", "description": "Open the Notifications section" },
+            { "id": "open-accessibility", "description": "Open the Accessibility section" }
+          ],
+          "correct": "open-security"
+        },
+        {
+          "page": "Security — rows: Password (Set), Two-factor (Off), Sessions (3 active), Recovery codes (not generated)",
+          "candidates": [
+            { "id": "enable-2fa", "description": "Turn on two-factor authentication" },
+            { "id": "change-password", "description": "Change the account password" },
+            { "id": "manage-sessions", "description": "Review active sessions" },
+            { "id": "generate-recovery", "description": "Generate recovery codes" }
+          ],
+          "correct": "enable-2fa"
+        },
+        {
+          "page": "Two-factor setup — method choices: Authenticator app, SMS, Security key",
+          "candidates": [
+            { "id": "choose-authenticator", "description": "Set up an authenticator app" },
+            { "id": "choose-sms", "description": "Set up SMS codes" },
+            { "id": "choose-key", "description": "Set up a hardware security key" },
+            { "id": "cancel-setup", "description": "Cancel two-factor setup" }
+          ],
+          "correct": "choose-authenticator"
+        },
+        {
+          "page": "Authenticator setup — QR code shown with a 6-digit verification field and Confirm button",
+          "candidates": [
+            { "id": "scan-and-confirm", "description": "Scan the QR code with the authenticator app, enter the current 6-digit code, confirm" },
+            { "id": "enter-wrong-code", "description": "Enter an old code to test rejection" },
+            { "id": "back-methods", "description": "Go back to method choices" },
+            { "id": "cancel-setup", "description": "Cancel two-factor setup" }
+          ],
+          "correct": "scan-and-confirm"
+        }
+      ]
+    }
+  ]
+}
