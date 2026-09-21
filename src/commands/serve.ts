@@ -65,6 +65,7 @@ export async function runServe(
     storePath: config.storePath,
     passphrase,
     duoDir: config.duoDir,
+    lifecycleLogPath: config.lifecycleLogPath,
     embeddingProvider,
     inferenceProvider,
     confidenceConfig: config.confidence,

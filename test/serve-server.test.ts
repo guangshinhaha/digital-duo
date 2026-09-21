@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
@@ -7,6 +7,8 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { listActionAttempts } from "../src/actions/attempt-log.js";
 import { registerAction } from "../src/actions/registry.js";
 import { confirmAndExecuteT4Request, createT4Request, NotAT4ActionError } from "../src/actions/t4-guard.js";
+import { loadLifecycleLog } from "../src/continuity/lifecycle-log.js";
+import { confirmTransfer, initiateTransfer } from "../src/continuity/transfer.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { draftReply } from "../src/drafting/pipeline.js";
@@ -48,6 +50,7 @@ function deps(storePath: string, overrides: Partial<ServeDeps> = {}): ServeDeps 
     storePath,
     passphrase: PASSPHRASE,
     duoDir: join(tempDir(), "duo"),
+    lifecycleLogPath: join(tempDir(), "lifecycle-runtime", "events.json"),
     embeddingProvider: createFakeEmbeddingProvider(),
     inferenceProvider: undefined,
     confidenceConfig: config.confidence,
@@ -249,12 +252,12 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
   // Issue #159 pins the FULL owner-route inventory (every method), not just
-  // the GETs: the nine POSTs are owner-only surfaces too, and a seam bug
+  // the GETs: the ten POSTs are owner-only surfaces too, and a seam bug
   // that only leaked on POSTs would otherwise pass unnoticed. #177's two
   // device routes, #172's three channel-policy routes, #178's three
-  // escalation routes, #182's refusals route, and #180's three actions
-  // routes extend the inventory
-  // the same way.
+  // escalation routes, #182's refusals route, #180's three actions
+  // routes, and #181's two lifecycle routes extend the inventory the same
+  // way.
   interface OwnerRoute {
     readonly method: "GET" | "POST";
     readonly url: string;
@@ -278,6 +281,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/escalations/rate" },
     { method: "GET", url: "/actions/t4/pending" },
     { method: "GET", url: "/actions/attempts" },
+    { method: "GET", url: "/lifecycle" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -287,17 +291,18 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/channels/policy/unmute", payload: { channel: "c" } },
     { method: "POST", url: "/escalations/digest" },
     { method: "POST", url: "/actions/t4/some-request-id/confirm" },
+    { method: "POST", url: "/lifecycle/end", payload: { decidedBy: "owner", confirmed: true } },
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 26 refused requests from one IP
+    // Each request comes from its own IP: 28 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 26 sequential cache-miss verifies would each
+    // mid-verification — and 28 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -2401,5 +2406,145 @@ describe("actions over HTTP — the T4 confirmation moment and the attempt log (
     expect(pending.statusCode).toBe(401);
     expect(attempts.statusCode).toBe(401);
     expect(confirm.statusCode).toBe(401);
+  });
+});
+
+describe("lifecycle and handover over HTTP — the kill switch outside the terminal (#181)", () => {
+  it("POST /lifecycle/end describes first, then ends the duo exactly as the CLI does — and the duo stops answering", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "phone");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    const lifecycleLogPath = join(tempDir(), "lifecycle-runtime", "events.json");
+
+    // Without the confirmation flag the route only describes what would go
+    // — `duo lifecycle end`'s own shape — and nothing is deleted.
+    const dryRun = await app.inject({ method: "POST", url: "/lifecycle/end", headers: authHeader, payload: { decidedBy: "shin" } });
+    expect(dryRun.statusCode).toBe(200);
+    expect(dryRun.json().confirmed).toBe(false);
+    expect(dryRun.json().storePaths.length).toBeGreaterThan(0);
+    expect(existsSync(storePath)).toBe(true);
+    expect(loadLifecycleLog(lifecycleLogPath)).toEqual([]);
+
+    // With it, the same lifecycle path the CLI runs: the store's whole data
+    // directory and duoDir deleted, the end recorded in the lifecycle log
+    // by name.
+    const ended = await app.inject({ method: "POST", url: "/lifecycle/end", headers: authHeader, payload: { decidedBy: "shin", confirmed: true } });
+    expect(ended.statusCode).toBe(200);
+    expect(ended.json().confirmed).toBe(true);
+    expect(existsSync(storePath)).toBe(false);
+    const events = loadLifecycleLog(lifecycleLogPath);
+    expect(events.at(-1)).toMatchObject({ eventType: "ended", actor: "shin" });
+
+    // And the duo stops answering: the same paired token that just ended it
+    // is now refused on every route, because the store it lived in — tokens
+    // and all — is gone. A clean refusal, not a 500.
+    const stopped = await app.inject({ method: "GET", url: "/drafts", headers: authHeader });
+    expect(stopped.statusCode).toBe(401);
+    expect(stopped.json().error.message).toContain("ended or deleted");
+  });
+
+  it("a cached client replaying any mutation after an end is refused, never served from the cache", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "phone");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    // Warm the token cache with an ordinary read, then end the duo — the
+    // deletion must drop the cached verification too, or the very next
+    // request would sail through on it.
+    const warm = await app.inject({ method: "GET", url: "/devices", headers: authHeader });
+    expect(warm.statusCode).toBe(200);
+    const ended = await app.inject({ method: "POST", url: "/lifecycle/end", headers: authHeader, payload: { decidedBy: "shin", confirmed: true } });
+    expect(ended.statusCode).toBe(200);
+
+    for (const [method, url, payload] of [
+      ["POST", "/drafts", { question: "are you still there" }],
+      ["POST", "/escalations/digest", {}],
+      ["POST", "/channels/policy/mute", { channel: "email" }],
+      ["GET", "/audit", undefined],
+    ] as const) {
+      const replayed = await app.inject({ method, url, headers: authHeader, ...(payload === undefined ? {} : { payload }) });
+      expect(replayed.statusCode, `${method} ${url}`).toBe(401);
+      expect(replayed.json().error.message, `${method} ${url}`).toContain("ended or deleted");
+    }
+  });
+
+  it("GET /lifecycle returns the lifecycle record and every transfer's state as it moves", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    const duoDir = join(tempDir(), "duo");
+    const lifecycleLogPath = join(tempDir(), "lifecycle-runtime", "events.json");
+
+    // A fresh duo: active, no handover ever requested — the honest defaults.
+    const fresh = await app.inject({ method: "GET", url: "/lifecycle", headers: authHeader });
+    expect(fresh.statusCode).toBe(200);
+    expect(fresh.json()).toEqual({
+      lifecycle: {
+        status: "active",
+        archivedBy: null,
+        archivedAt: null,
+        orphanedBy: null,
+        orphanedAt: null,
+        orphanReason: null,
+        transferredFrom: null,
+        transferredTo: null,
+        transferredAt: null,
+      },
+      transfers: [],
+    });
+
+    // An in-flight handover, staged the way `duo continuity transfer initiate` does.
+    const request = initiateTransfer(duoDir, lifecycleLogPath, "shin", "sam");
+    const staged = await app.inject({ method: "GET", url: "/lifecycle", headers: authHeader });
+    expect(staged.json().transfers).toHaveLength(1);
+    expect(staged.json().transfers[0]).toMatchObject({
+      id: request.id,
+      outgoingOwner: "shin",
+      receivingOwner: "sam",
+      outgoingConfirmed: false,
+      receivingConfirmed: false,
+      status: "pending",
+      completedAt: null,
+    });
+
+    // The outgoing owner confirms — half done, still pending.
+    confirmTransfer(duoDir, lifecycleLogPath, request.id, "shin");
+    const half = await app.inject({ method: "GET", url: "/lifecycle", headers: authHeader });
+    expect(half.json().transfers[0]).toMatchObject({ outgoingConfirmed: true, receivingConfirmed: false, status: "pending" });
+
+    // The receiving owner confirms — the handover completes, and the
+    // lifecycle record itself carries the transfer history from then on.
+    confirmTransfer(duoDir, lifecycleLogPath, request.id, "sam");
+    const done = await app.inject({ method: "GET", url: "/lifecycle", headers: authHeader });
+    expect(done.json().transfers[0]).toMatchObject({ status: "completed", completedAt: expect.any(String) });
+    expect(done.json().lifecycle).toMatchObject({ status: "active", transferredFrom: "shin", transferredTo: "sam", transferredAt: expect.any(String) });
+  });
+
+  it("ending requires naming who decided it — a blank decidedBy is a 400 that deletes nothing", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    const refused = await app.inject({ method: "POST", url: "/lifecycle/end", headers: authHeader, payload: { decidedBy: "   ", confirmed: true } });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().error.message).toContain("decidedBy");
+    expect(existsSync(storePath)).toBe(true);
+  });
+
+  it("both routes are owner routes: an ask token is refused on each", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const authHeader = { authorization: `Bearer ${minted.token}` };
+    const state = await app.inject({ method: "GET", url: "/lifecycle", headers: authHeader });
+    const end = await app.inject({ method: "POST", url: "/lifecycle/end", headers: authHeader, payload: { decidedBy: "Sam", confirmed: true } });
+    expect(state.statusCode).toBe(401);
+    expect(end.statusCode).toBe(401);
+    // And nothing was deleted by the refused end.
+    expect(existsSync(storePath)).toBe(true);
   });
 });

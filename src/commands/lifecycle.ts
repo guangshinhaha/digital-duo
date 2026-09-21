@@ -1,5 +1,5 @@
 import type { DuoConfig } from "../config.js";
-import { archiveDuo, declareOrphaned, endDuo, recordEndDuo, type DuoLifecycleRecord, type EndDuoResult } from "../continuity/lifecycle.js";
+import { archiveDuo, declareOrphaned, endDuoAndRecord, type DuoLifecycleRecord, type EndDuoResult } from "../continuity/lifecycle.js";
 import { confirmTransfer, initiateTransfer, listTransfers, type TransferRequest } from "../continuity/transfer.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
@@ -34,15 +34,11 @@ export function runTransferList(config: DuoConfig): TransferRequest[] {
 /**
  * Implements `duo continuity end [--yes] <decidedBy>` (#63 AC3). The
  * lifecycle event is recorded *after* `endDuo` returns, once it's known
- * for certain what was actually deleted (see `recordEndDuo`'s own doc
+ * for certain what was actually deleted (see `endDuoAndRecord`'s own doc
  * comment) — the log lives in its own directory, never inside the store
  * or `duoDir` being removed, so logging after deletion is exactly as safe
  * as logging before, and more honest about what actually happened.
  */
 export function runEnd(decidedBy: string, confirmed: boolean, config: DuoConfig): EndDuoResult {
-  const result = endDuo(config.storePath, config.duoDir, confirmed);
-  if (confirmed && (result.storePaths.length > 0 || result.duoDirPaths.length > 0)) {
-    recordEndDuo(config.lifecycleLogPath, decidedBy, result);
-  }
-  return result;
+  return endDuoAndRecord(config.storePath, config.duoDir, config.lifecycleLogPath, decidedBy, confirmed);
 }
