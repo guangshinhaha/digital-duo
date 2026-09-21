@@ -12,7 +12,7 @@ import { muteChannel, muteThread, readMutedChannels } from "../src/drafting/chan
 import type { ChannelAdapter, ChannelDeliveryRequest } from "../src/drafting/delivery.js";
 import { writeRuleByHand } from "../src/derivation/rule-review.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
-import { putRule } from "../src/derivation/rules.js";
+import { listRules, putRule, runRuleInduction } from "../src/derivation/rules.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
 import { embedRecords, hybridSearch } from "../src/ingest/embeddings.js";
 import { ingestRecords } from "../src/ingest/two-phase.js";
@@ -23,7 +23,7 @@ import { queueCorrectionCandidate } from "../src/corrections/queue.js";
 import { queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { grantAutonomy } from "../src/trust/grants.js";
-import { writeRefusalsFile } from "../src/trust/refusals.js";
+import { confirmNoRefusals, upsertRefusal, writeRefusalsFile } from "../src/trust/refusals.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
 import { createAskToken, createDeviceToken, listDeviceTokens, revokeAskToken } from "../src/serve/tokens.js";
@@ -238,8 +238,9 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // Issue #159 pins the FULL owner-route inventory (every method), not just
   // the GETs: the eight POSTs are owner-only surfaces too, and a seam bug
   // that only leaked on POSTs would otherwise pass unnoticed. #177's two
-  // device routes, #172's three channel-policy routes, and #178's three
-  // escalation routes extend the inventory the same way.
+  // device routes, #172's three channel-policy routes, #178's three
+  // escalation routes, and #182's refusals route extend the inventory
+  // the same way.
   interface OwnerRoute {
     readonly method: "GET" | "POST";
     readonly url: string;
@@ -253,6 +254,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/mirror/portrait" },
     { method: "GET", url: "/mirror/rules" },
     { method: "GET", url: "/mirror/rules/some-rule-id" },
+    { method: "GET", url: "/mirror/refusals" },
     { method: "GET", url: "/trust/grid" },
     { method: "GET", url: "/audit" },
     { method: "GET", url: "/devices" },
@@ -271,14 +273,14 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 22 refused requests from one IP
+    // Each request comes from its own IP: 23 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 22 sequential cache-miss verifies would each
+    // mid-verification — and 23 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -1949,5 +1951,102 @@ describe("escalations over HTTP — digest, history, rate (#178)", () => {
     expect(digest.statusCode).toBe(401);
     expect(history.statusCode).toBe(401);
     expect(rate.statusCode).toBe(401);
+  });
+});
+
+describe("GET /mirror/refusals and GET /mirror/rules/:id — refusals and rule evidence over HTTP (#182)", () => {
+  /** rule-review.test.ts's seedRule, over this file's own record() helper: three consistent exchanges under one topic, so induction derives a confirmed rule citing all three pairs. */
+  async function seedConfirmedRule(storePath: string, topicId: string): Promise<void> {
+    const answerText = "five days per quarter, vacation policy";
+    const records = [0, 1, 2].flatMap((i) => {
+      const question = record({ kind: "question_to_me", author: "other", text: "a question", threadId: `q-${topicId}-${i}` });
+      const answer = record({ kind: "my_answer", author: "me", text: answerText, threadId: question.threadId });
+      return [question, answer];
+    });
+    writeRecords(storePath, PASSPHRASE, records);
+    const { pairs } = await extractQaPairs(records);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId })));
+    await runRuleInduction(storePath, PASSPHRASE, createFakeEmbeddingProvider());
+  }
+
+  it("GET /mirror/refusals returns what `duo mirror refusals list` prints: the decided state plus every recorded refusal", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    // What `duo mirror refusals add` writes — the CLI's own function, over
+    // the same duoDir deps() hands the server.
+    upsertRefusal(join(tempDir(), "duo"), "Salary bands", "comp is between me and HR");
+    upsertRefusal(join(tempDir(), "duo"), "Performance reviews", "those conversations stay verbal");
+
+    const response = await app.inject({ method: "GET", url: "/mirror/refusals", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      decided: true,
+      refusals: [
+        { heading: "Salary bands", reason: "comp is between me and HR" },
+        { heading: "Performance reviews", reason: "those conversations stay verbal" },
+      ],
+    });
+  });
+
+  it("no refusals file at all is the undecided state — a 200, not an error — and confirm-none records the decision with zero entries", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    const undecided = await app.inject({ method: "GET", url: "/mirror/refusals", headers: authHeader });
+    expect(undecided.statusCode).toBe(200);
+    expect(undecided.json()).toEqual({ decided: false, refusals: [] });
+
+    // What `duo mirror refusals confirm-none` writes — the CLI's own function.
+    confirmNoRefusals(join(tempDir(), "duo"));
+
+    const decided = await app.inject({ method: "GET", url: "/mirror/refusals", headers: authHeader });
+    expect(decided.statusCode).toBe(200);
+    expect(decided.json()).toEqual({ decided: true, refusals: [] });
+  });
+
+  it("GET /mirror/rules/:id returns the rule with the evidence exchanges behind it — enough to show the owner why it exists", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    await seedConfirmedRule(storePath, "topic-leave");
+    const ruleId = listRules(storePath, PASSPHRASE)[0].id;
+
+    const response = await app.inject({ method: "GET", url: `/mirror/rules/${ruleId}`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.rule).toMatchObject({ id: ruleId, origin: "derived" });
+    // The exchanges its citations point to — the entire "why does my duo
+    // believe this" answer, on the wire, not left for a client to fetch
+    // record-by-record.
+    expect(body.evidence).toHaveLength(3);
+    for (const exchange of body.evidence) {
+      expect(exchange.qaPairId).toEqual(expect.any(String));
+      expect(exchange.questionText).toBe("a question");
+      expect(exchange.answerText).toBe("five days per quarter, vacation policy");
+    }
+  });
+
+  it("GET /mirror/rules/:id 404s naming the id for an unknown rule", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    const response = await app.inject({ method: "GET", url: "/mirror/rules/not-a-real-id", headers: authHeader });
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.message).toContain("not-a-real-id");
+  });
+
+  it("GET /mirror/refusals is an owner route: an ask token is refused", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const response = await app.inject({ method: "GET", url: "/mirror/refusals", headers: { authorization: `Bearer ${minted.token}` } });
+    expect(response.statusCode).toBe(401);
   });
 });
