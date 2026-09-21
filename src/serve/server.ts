@@ -1,5 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify, { type FastifyInstance } from "fastify";
+import { listActionAttempts } from "../actions/attempt-log.js";
+import { confirmAndExecuteT4Request, describePendingT4Requests } from "../actions/t4-guard.js";
 import type { DuoConfig } from "../config.js";
 import { createLlmEditClassifier } from "../corrections/classify.js";
 import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
@@ -155,10 +157,16 @@ function statusForError(error: Error): number {
     // tables and found neither, which is a 404 for a client exactly like
     // the single-table errors above it.
     case "ReviewCandidateNotFoundError":
+    // #180: confirming a T4 request that was never staged — the guard's
+    // own not-found, same class as the rest of this family.
+    case "NoPendingT4RequestError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
     case "DraftIsRefusedError":
+    // #180: a second confirmation of an executed T4 request — the guard's
+    // exactly-once refusal, a conflict and never a re-execution.
+    case "T4RequestAlreadyExecutedError":
     // #173: the standing-order twin of CandidateAlreadyReviewedError —
     // previously an anonymous Error here, which mapped to a 500.
     case "StandingOrderCandidateAlreadyReviewedError":
@@ -590,6 +598,34 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   });
 
   app.get("/trust/grid", async () => listGrid(deps.storePath, deps.passphrase, deps.duoDir));
+
+  // #180: the T4 confirmation moment, over HTTP — the owner is not sitting
+  // at the daemon's terminal when their duo reaches an irreversible step
+  // (concept.md §6: "never autonomous"), so the staged requests are listed
+  // and confirmed from a paired device. Three thin reads/writes over the
+  // same module functions the CLI commands call; the two-step
+  // create-then-confirm sequence itself is untouched — confirming is this
+  // route and only this route, and staging stays a module call no HTTP
+  // route exposes.
+  app.get("/actions/t4/pending", async () => describePendingT4Requests(deps.storePath, deps.passphrase));
+
+  // The confirmation itself: the same `confirmAndExecuteT4Request` call
+  // `duo actions t4 confirm` makes (same no-op execute placeholder — there
+  // is genuinely nothing to execute yet — same exactly-once), plus the one
+  // thing only an authenticated caller can supply: the device giving it,
+  // recorded in the attempt log entry. #160's `tokenId` carries exactly
+  // that — on a device principal it is the paired device's id.
+  app.post<{ Params: { id: string } }>("/actions/t4/:id/confirm", async (request, reply) => {
+    try {
+      return confirmAndExecuteT4Request(deps.storePath, deps.passphrase, request.params.id, () => {}, request.principal?.tokenId);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // Every attempt, refused or resolved — `duo actions attempts`' own read,
+  // verbatim, so the owner can audit the guard's refusals from a client.
+  app.get("/actions/attempts", async () => listActionAttempts(deps.storePath, deps.passphrase));
 
   // #174: the corpus, from a client — `duo search`'s own hybridSearch,
   // verbatim (results/ranked order, usedEmbeddings, fallback warning). The

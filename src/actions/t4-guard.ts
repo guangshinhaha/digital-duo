@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 import { appendActionAttempt, ensureActionAttemptLogSchema } from "./attempt-log.js";
-import { ensureActionRegistrySchema, getActionRow } from "./registry.js";
+import { ensureActionRegistrySchema, getActionRow, type RegisteredAction } from "./registry.js";
 
 /**
  * `docs/concept.md` §6: "Never autonomous. Product principle, not a
@@ -133,6 +133,36 @@ export function listPendingT4Requests(storePath: string, passphrase: string): Pe
   });
 }
 
+export interface PendingT4RequestForJudgement extends PendingT4Request {
+  /**
+   * The registered action this request names, read from the same registry
+   * row the guard checked at staging — the owner judging a confirmation
+   * needs what will happen (`description`), to what (`topicId`, on the
+   * request itself), and irreversibly or not (`reversible`), not just the
+   * request row. Null only if the registry row is gone, which no code path
+   * in this repo can do (there is no unregister); degraded to null rather
+   * than thrown for a hand-edited store.
+   */
+  readonly action: RegisteredAction | null;
+}
+
+/**
+ * #180: the pending request rows joined with the registry facts the owner
+ * needs to judge each one — the same read `duo actions t4 pending`'s raw
+ * list feeds, shaped for the moment of confirmation instead of the
+ * terminal. A composition over two store tables belongs in the module
+ * (`describeDuoKnowledge`'s #175 precedent), never in a route handler, and
+ * one `withDatabase` handle joins both — no nested store call.
+ */
+export function describePendingT4Requests(storePath: string, passphrase: string): PendingT4RequestForJudgement[] {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureActionRegistrySchema(db);
+    ensurePendingT4Schema(db);
+    const rows = db.prepare(`SELECT * FROM pending_t4_requests WHERE executed_at IS NULL ORDER BY created_at ASC`).all() as unknown as PendingT4Row[];
+    return rows.map((row) => ({ ...rowToRequest(row), action: getActionRow(db, row.action_id) ?? null }));
+  });
+}
+
 export class NoPendingT4RequestError extends Error {
   constructor(requestId: string) {
     super(`No pending T4 request with id "${requestId}".`);
@@ -157,7 +187,20 @@ export class T4RequestAlreadyExecutedError extends Error {
  * it twice by calling this function twice either (the second call throws
  * before `execute` is ever reached).
  */
-export function confirmAndExecuteT4Request(storePath: string, passphrase: string, requestId: string, execute: () => void): PendingT4Request {
+export function confirmAndExecuteT4Request(
+  storePath: string,
+  passphrase: string,
+  requestId: string,
+  execute: () => void,
+  /**
+   * #180: who confirmed, when the confirmation arrives over HTTP — the
+   * paired device's id, recorded in the `t4_executed` attempt entry so the
+   * log names the device that gave the confirmation. Omitted by the CLI
+   * path (the owner at the terminal); the log entry is byte-identical to
+   * before when absent.
+   */
+  confirmedBy?: string,
+): PendingT4Request {
   return withDatabase(storePath, passphrase, true, (db) => {
     ensurePendingT4Schema(db);
     ensureActionAttemptLogSchema(db);
@@ -174,7 +217,13 @@ export function confirmAndExecuteT4Request(storePath: string, passphrase: string
 
     const executedAt = new Date().toISOString();
     db.prepare(`UPDATE pending_t4_requests SET executed_at = ? WHERE id = ?`).run(executedAt, requestId);
-    appendActionAttempt(db, { actionId: row.action_id, topicId: row.topic_id, tier: "T4", outcome: "t4_executed", detail: { requestId } });
+    appendActionAttempt(db, {
+      actionId: row.action_id,
+      topicId: row.topic_id,
+      tier: "T4",
+      outcome: "t4_executed",
+      detail: { requestId, ...(confirmedBy !== undefined ? { confirmedBy } : {}) },
+    });
     return rowToRequest({ ...row, executed_at: executedAt });
   });
 }
