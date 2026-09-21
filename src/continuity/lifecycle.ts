@@ -262,3 +262,18 @@ export function recordEndDuo(lifecycleLogPath: string, decidedBy: string, result
   });
 }
 
+/**
+ * #181: `endDuo` plus the audit event, as one act — the exact composition
+ * `duo lifecycle end` performs, in the module so the HTTP surface calls
+ * the same two steps in the same order rather than a route re-deriving
+ * the "log only what actually got deleted" sequencing. The audit is
+ * written only when the deletion really ran *and* really deleted
+ * something, mirroring the command wiring exactly.
+ */
+export function endDuoAndRecord(storePath: string, duoDir: string, lifecycleLogPath: string, decidedBy: string, confirmed: boolean): EndDuoResult {
+  const result = endDuo(storePath, duoDir, confirmed);
+  if (confirmed && (result.storePaths.length > 0 || result.duoDirPaths.length > 0)) {
+    recordEndDuo(lifecycleLogPath, decidedBy, result);
+  }
+  return result;
+}

@@ -2,6 +2,8 @@ import cors from "@fastify/cors";
 import Fastify, { type FastifyInstance } from "fastify";
 import { listActionAttempts } from "../actions/attempt-log.js";
 import { confirmAndExecuteT4Request, describePendingT4Requests } from "../actions/t4-guard.js";
+import { endDuoAndRecord, readLifecycle } from "../continuity/lifecycle.js";
+import { listTransfers } from "../continuity/transfer.js";
 import type { DuoConfig } from "../config.js";
 import { createLlmEditClassifier } from "../corrections/classify.js";
 import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
@@ -41,6 +43,13 @@ export interface ServeDeps {
   readonly storePath: string;
   readonly passphrase: string;
   readonly duoDir: string;
+  /**
+   * Where lifecycle events are audited (`config.lifecycleLogPath`) — its
+   * own directory, deliberately outside both the store's data directory and
+   * `duoDir`, because #181's end route deletes those two and the "ended"
+   * event must outlive what it records the deletion of.
+   */
+  readonly lifecycleLogPath: string;
   readonly embeddingProvider: EmbeddingProvider;
   readonly inferenceProvider: InferenceProvider | undefined;
   readonly confidenceConfig: DuoConfig["confidence"];
@@ -626,6 +635,35 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   // Every attempt, refused or resolved — `duo actions attempts`' own read,
   // verbatim, so the owner can audit the guard's refusals from a client.
   app.get("/actions/attempts", async () => listActionAttempts(deps.storePath, deps.passphrase));
+
+  // #181: lifecycle and handover, over HTTP — "instantly killable" is a
+  // stated product principle (concept.md §11), and a kill switch reachable
+  // only from the machine running the daemon is weaker than the principle
+  // reads. GET is the state a client needs to show it (the lifecycle
+  // record plus every transfer's state, both the CLI's own reads,
+  // verbatim); POST /lifecycle/end is the kill switch itself.
+  app.get("/lifecycle", async () => ({ lifecycle: readLifecycle(deps.duoDir), transfers: listTransfers(deps.duoDir) }));
+
+  // The end, with the same two protections the CLI command carries: it
+  // only describes what would go until `confirmed` is true (`duo lifecycle
+  // end`'s own --yes), and it names who decided it. The deletion and its
+  // audit event are one module call (endDuoAndRecord) — the same two
+  // steps, in the same order, `duo lifecycle end` runs. After a confirmed
+  // end the whole token cache is dropped: every token lived in the store
+  // that just got deleted, so the next request from any cached client is
+  // a clean 401 from the auth hook rather than a 500 from a missing file.
+  app.post<{ Body: { decidedBy?: unknown; confirmed?: unknown } }>("/lifecycle/end", async (request, reply) => {
+    const { decidedBy, confirmed } = request.body ?? {};
+    if (typeof decidedBy !== "string" || decidedBy.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "Ending a duo requires naming who decided it (decidedBy, a non-empty string)."));
+      return;
+    }
+    const result = endDuoAndRecord(deps.storePath, deps.duoDir, deps.lifecycleLogPath, decidedBy, confirmed === true);
+    if (result.confirmed) {
+      auth.evictAll();
+    }
+    return result;
+  });
 
   // #174: the corpus, from a client — `duo search`'s own hybridSearch,
   // verbatim (results/ranked order, usedEmbeddings, fallback warning). The

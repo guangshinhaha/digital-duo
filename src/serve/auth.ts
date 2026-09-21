@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { StoreNotInitializedError } from "../store/store.js";
 import { touchLastSeen, verifyAskToken, verifyDeviceToken } from "./tokens.js";
 
 /** How often (ms) a given device's `last_seen_at` is allowed to trigger a write — see `verifyDeviceToken`'s doc comment on why an unthrottled write-per-request would be expensive. */
@@ -22,6 +23,16 @@ const RATE_LIMIT_MAX_FAILURES = 10;
 
 /** Shared by the hook's missing-token 401 and the /ask route's defensive fallback for a request the hook somehow passed through unauthenticated (#159) — one literal so the two can never drift. */
 export const MISSING_TOKEN_MESSAGE = "Missing bearer token.";
+
+/**
+ * #181: ending the duo deletes the store itself (`POST /lifecycle/end`,
+ * `duo lifecycle end`), and every token — ask or device — lived inside it.
+ * A store that no longer exists therefore means every cached client's
+ * token is permanently unverifiable, which is a refusal, not a crash: the
+ * same body for both kinds, never distinguishing what was presented (the
+ * same no-oracle rule the invalid-token paths follow).
+ */
+const ENDED_STORE_MESSAGE = "This duo's store no longer exists — the duo was ended or deleted. Nothing further can be served.";
 
 /** Issue #159: who is making this request — an ask-link holder (ask-only powers) or a paired device (the owner's superset). Every route decides authorization against `principal.kind`; `/ask` is the only route that accepts both kinds. */
 type PrincipalKind = "ask" | "device";
@@ -71,6 +82,14 @@ export interface AuthCache {
    * rides, never looser; the TTL expiry path itself is unchanged.
    */
   evictDevice(deviceId: string): void;
+  /**
+   * Drops every cached verification, same-tick (#181's `POST
+   * /lifecycle/end`) — ending the duo deletes the store, and no token in
+   * it may keep working on the strength of a verification cached before
+   * the deletion. Strictly tighter than the documented staleness window
+   * the TTL expiry path rides, never looser.
+   */
+  evictAll(): void;
 }
 
 function unauthorized(reply: FastifyReply, message: string): void {
@@ -191,7 +210,19 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
     // only after both kinds miss — the single failure path below serves
     // both routes, differing only in its two message strings.
     if (isAskRoute && verified === undefined) {
-      const ask = verifyAskToken(storePath, passphrase, token);
+      let ask: ReturnType<typeof verifyAskToken>;
+      try {
+        ask = verifyAskToken(storePath, passphrase, token);
+      } catch (error) {
+        // #181: the store this daemon served is gone (the duo was ended) —
+        // every ask link in it is as unverifiable as every device token.
+        if (error instanceof StoreNotInitializedError) {
+          request.log.warn({ ip }, "auth: store no longer exists — duo ended or deleted");
+          unauthorized(reply, ENDED_STORE_MESSAGE);
+          return;
+        }
+        throw error;
+      }
       if (ask) {
         request.principal = { kind: "ask", name: ask.name, tokenId: ask.id };
         return;
@@ -199,7 +230,19 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
     }
 
     if (verified === undefined) {
-      const device = verifyDeviceToken(storePath, passphrase, token);
+      let device: ReturnType<typeof verifyDeviceToken>;
+      try {
+        device = verifyDeviceToken(storePath, passphrase, token);
+      } catch (error) {
+        // #181, same refusal on the device path: a deleted store revokes
+        // every device token in it, cache included (see evictAll).
+        if (error instanceof StoreNotInitializedError) {
+          request.log.warn({ ip }, "auth: store no longer exists — duo ended or deleted");
+          unauthorized(reply, ENDED_STORE_MESSAGE);
+          return;
+        }
+        throw error;
+      }
       if (!device) {
         verifiedTokens.delete(token);
         const limited = recordFailure(ip);
@@ -242,6 +285,16 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
           verifiedTokens.delete(token);
         }
       }
+    },
+    // #181: `POST /lifecycle/end` deletes the whole store, revoking every
+    // token in it — including any this process cached within
+    // TOKEN_CACHE_TTL_MS. The end route drops the entire cache so a cached
+    // client's very next request re-verifies against a store that no
+    // longer exists and is cleanly refused (401, above) instead of sailing
+    // through on a stale verification into a 500. evictDevice's
+    // same-process, strictly-tighter-than-the-TTL idiom, at full scale.
+    evictAll(): void {
+      verifiedTokens.clear();
     },
   };
 }
