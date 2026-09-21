@@ -818,9 +818,59 @@ Everything in §1–5 above describes the original 72-issue backlog and how it w
   the code was never regressed. Pinned durably: `.nvmrc` (22.22.3), `engines.node >=22.5`, and a
   Development section in README. No fallback in `store.ts` was built — one working Node build
   beats a permanent second search path.
-- **Still genuinely open, not started**: #137 (relevance gate misclassifies rhetorical
+- **Still genuinely open, not started**: ~~#137 (relevance gate misclassifies rhetorical
   questions), #155 (classification marking can leak through the no-provider draft fallback),
-  and all four issues under #157/#1 above.
+  and all four issues under #157/#1 above.~~ **All shipped 2026-09-20/21 — see §7.**
 - **Still deliberately deferred, not a bug**: #14, #15 (the two gating decisions — real
   inference provider, real Slack access), and everything under #8/#2/#22/#40/#41/#42 (Slack) —
   the owner's explicit call, keep these open rather than resolving or working around them.
+
+## 7. The 2026-09-20/21 ask-link run — everything in §6's open list, shipped
+
+Ran 2026-09-20→21, one lfg pipeline per issue (compound-engineering plugin v3.27.0), squash-merged
+after each pipeline's own review passed, per §2's no-CI policy. All issues auto-closed via
+`Closes #n` in the PR body.
+
+- **#137** — relevance-gate rhetorical questions. PR
+  [#163](https://github.com/guangshinhaha/digital-duo/pull/163) (squash `a0c9493`): deterministic
+  `RHETORICAL_PATTERNS`/`looksRhetorical` in `src/drafting/relevance-gate.ts` routes rhetorical
+  phrasing to the silent `ambiguous` branch. Fixture precision **0.750 → 1.000** (0.95 floor met,
+  exit 0), `genuine_question` recall held at 1.000; tripwire re-pinned. Review caught a curly-
+  apostrophe (U+2019) bypass before merge; fixture label r005 added.
+- **#155** — extractive-fallback marking leak. PR
+  [#164](https://github.com/guangshinhaha/digital-duo/pull/164) (squash `b5b335d`): the strip
+  landed in the one shared place (`extractiveDraft`), with `DraftEvidenceItem` now carrying
+  `classification` through retrieval; review also caught the Sources block echoing markings on
+  the public path — fixed in `pipeline.ts` in the same PR.
+- **#157 ask-link epic** (closed with a summary comment once all children merged):
+  - **#158** — ask-token type + `duo ask-link new/list/revoke`. PR
+    [#165](https://github.com/guangshinhaha/digital-duo/pull/165) (squash `37311aa`). Tokens are
+    short-lived, ask-scope-only, never `PairedDevice`s, refused on every owner route; review
+    fixed an expiry-overflow crash in `--expires-in-hours`.
+  - **#159** — `POST /ask` wired to `answerPublicly`/`answerSharedDuo`. PR
+    [#197](https://github.com/guangshinhaha/digital-duo/pull/197) (squash `7704511`). Thin HTTP
+    wrapper; asker resolved via `directory.json` (unresolved → existing conservative default);
+    device tokens may ask (owner superset), ask tokens never authorize owner routes. Review fixed
+    a swallowed error log (`request.log` is a no-op under `logger:false`).
+  - **#160** — audit trail records ask-link asker context. PR
+    [#211](https://github.com/guangshinhaha/digital-duo/pull/211) (squash `26fbdc4`). Extended
+    the two logs POST /ask actually writes (`public_answer_log` +3 columns: `ask_link_id` (id,
+    never the secret), tri-state `asker_resolved`, `clearance_applied`; shared usage-log JSON
+    gains `askLinkId`/`askerResolved`) — `audit_log` deliberately untouched. Append-only triggers
+    hold on the migrated table. Revoked tokens' past answers stay in the log unchanged.
+- **duo#1/#2** — the no-install asker page (`ask.html` → `src/routes/Ask.tsx`, hash-based link,
+  honest dead-link state). The client repo's own chains shipped it (duo PRs #4 and the
+  contract-drift fix #75, squash `7a99ef3`); both issues closed there.
+- **End-to-end verified on merged main** (`7704511`): mint → list (id only, token never shown
+  again) → `duo serve` → `POST /ask` returns the exact three-outcome envelope the client pins
+  (`duo`/`kind`/`text`, attribution footer in `text`; 401 `{"error":{"code":"unauthorized"}}` on
+  invalid or revoked) → revocation refuses the very next use.
+- **Also this run**: the FTS5 environment resolution (§6, commit `8a39388` + lockfile sync
+  `5e98b48`), and `.nvmrc`/engines/README pinning so no session re-diagnoses it.
+- **Concurrent-session note**: a second Claude session shipped alongside this run throughout
+  (#161/#162/#185-and-friends, CORS allowlist #195, WebSocket channel #196, and more) — its work
+  is intentional and untouched by this run; main carried both streams throughout (suite 957 →
+  **1153 tests** at `26fbdc4`, all green under pinned Node).
+- **Still open after this run, unchanged in intent**: the Slack set (#8, #14, #15, #22, #40-42)
+  — deliberately deferred — plus whatever the concurrent session's tracker now holds (#161,
+  #162, #185 and children), which belongs to that stream, not this plan.
