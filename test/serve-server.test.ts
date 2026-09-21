@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { createFakeEmbeddingProvider, createFailingEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
+import { listActionAttempts } from "../src/actions/attempt-log.js";
+import { registerAction } from "../src/actions/registry.js";
+import { confirmAndExecuteT4Request, createT4Request, NotAT4ActionError } from "../src/actions/t4-guard.js";
 import { loadConfig } from "../src/config.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { draftReply } from "../src/drafting/pipeline.js";
@@ -246,10 +249,11 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
   // Issue #159 pins the FULL owner-route inventory (every method), not just
-  // the GETs: the eight POSTs are owner-only surfaces too, and a seam bug
+  // the GETs: the nine POSTs are owner-only surfaces too, and a seam bug
   // that only leaked on POSTs would otherwise pass unnoticed. #177's two
   // device routes, #172's three channel-policy routes, #178's three
-  // escalation routes, and #182's refusals route extend the inventory
+  // escalation routes, #182's refusals route, and #180's three actions
+  // routes extend the inventory
   // the same way.
   interface OwnerRoute {
     readonly method: "GET" | "POST";
@@ -272,6 +276,8 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/channels/policy" },
     { method: "GET", url: "/escalations/history" },
     { method: "GET", url: "/escalations/rate" },
+    { method: "GET", url: "/actions/t4/pending" },
+    { method: "GET", url: "/actions/attempts" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -280,17 +286,18 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/channels/policy/mute", payload: { channel: "c" } },
     { method: "POST", url: "/channels/policy/unmute", payload: { channel: "c" } },
     { method: "POST", url: "/escalations/digest" },
+    { method: "POST", url: "/actions/t4/some-request-id/confirm" },
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 23 refused requests from one IP
+    // Each request comes from its own IP: 26 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 23 sequential cache-miss verifies would each
+    // mid-verification — and 26 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -2107,7 +2114,6 @@ describe("escalations over HTTP — digest, history, rate (#178)", () => {
     expect(rate.statusCode).toBe(401);
   });
 });
-
 describe("GET /mirror/refusals and GET /mirror/rules/:id — refusals and rule evidence over HTTP (#182)", () => {
   /** rule-review.test.ts's seedRule, over this file's own record() helper: three consistent exchanges under one topic, so induction derives a confirmed rule citing all three pairs. */
   async function seedConfirmedRule(storePath: string, topicId: string): Promise<void> {
@@ -2202,5 +2208,198 @@ describe("GET /mirror/refusals and GET /mirror/rules/:id — refusals and rule e
     const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
     const response = await app.inject({ method: "GET", url: "/mirror/refusals", headers: { authorization: `Bearer ${minted.token}` } });
     expect(response.statusCode).toBe(401);
+  });
+});
+
+describe("actions over HTTP — the T4 confirmation moment and the attempt log (#180)", () => {
+  /** What `duo actions register` writes for the one tier that can never be autonomous: audience "external" classifies T4 whatever the other properties say (registry.ts's own decisive rule). */
+  function registerT4Action(storePath: string): void {
+    registerAction(storePath, PASSPHRASE, {
+      id: "file-court-response",
+      description: "File a response with the court on the owner's behalf",
+      reversible: false,
+      obligates: true,
+      audience: "external",
+      topicIds: ["evictions"],
+    });
+  }
+
+  /** What `duo actions t4 request` writes — the CLI's own function, over the same store the server reads. */
+  function stageT4Request(storePath: string, reasoning: string): string {
+    return createT4Request(storePath, PASSPHRASE, { actionId: "file-court-response", topicId: "evictions", reasoning }).id;
+  }
+
+  it("GET /actions/t4/pending returns each awaiting request with everything the owner needs to judge it — what will happen, to what, irreversibly or not", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+
+    // Nothing staged: the honest empty list, not an error.
+    const empty = await app.inject({ method: "GET", url: "/actions/t4/pending", headers: authHeader });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json()).toEqual([]);
+
+    registerT4Action(storePath);
+    const staged = stageT4Request(storePath, "the filing deadline is tomorrow and the owner said to handle it");
+
+    const response = await app.inject({ method: "GET", url: "/actions/t4/pending", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toHaveLength(1);
+    const body = response.json()[0];
+    expect(body).toMatchObject({
+      id: staged,
+      actionId: "file-court-response",
+      topicId: "evictions",
+      reasoning: "the filing deadline is tomorrow and the owner said to handle it",
+      createdAt: expect.any(String),
+      executedAt: null,
+    });
+    // The judgement facts, joined from the same registry row the guard
+    // checked at staging: what will happen (description), to what
+    // (topicId, above), and irreversibly or not (reversible).
+    expect(body.action).toMatchObject({
+      id: "file-court-response",
+      description: "File a response with the court on the owner's behalf",
+      reversible: false,
+      obligates: true,
+      audience: "external",
+      tier: "T4",
+    });
+  });
+
+  it("POST /actions/t4/:id/confirm proceeds exactly as the CLI confirmation does — and is recorded against the device that gave it", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "phone");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    registerT4Action(storePath);
+    const httpRequestId = stageT4Request(storePath, "confirmed from the phone");
+    const cliRequestId = stageT4Request(storePath, "confirmed at the Mac");
+
+    const confirmed = await app.inject({ method: "POST", url: `/actions/t4/${httpRequestId}/confirm`, headers: authHeader });
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json()).toMatchObject({ id: httpRequestId, executedAt: expect.any(String) });
+
+    // Confirmed means no longer awaiting confirmation.
+    const pending = await app.inject({ method: "GET", url: "/actions/t4/pending", headers: authHeader });
+    expect(pending.json().map((request: { id: string }) => request.id)).toEqual([cliRequestId]);
+
+    // The CLI's own confirmation — the exact call `duo actions t4 confirm`
+    // makes — on the other request. Same mechanism, same exactly-once.
+    const cliConfirmed = confirmAndExecuteT4Request(storePath, PASSPHRASE, cliRequestId, () => {});
+    expect(cliConfirmed.executedAt).not.toBeNull();
+
+    // Both executions logged one t4_executed attempt each; the only
+    // difference between them is that the HTTP confirmation is recorded
+    // against the device that gave it.
+    const executions = listActionAttempts(storePath, PASSPHRASE).filter((attempt) => attempt.outcome === "t4_executed");
+    expect(executions).toHaveLength(2);
+    expect(executions.find((attempt) => attempt.detail.requestId === httpRequestId)?.detail).toEqual({ requestId: httpRequestId, confirmedBy: paired.id });
+    expect(executions.find((attempt) => attempt.detail.requestId === cliRequestId)?.detail).toEqual({ requestId: cliRequestId });
+  });
+
+  it("confirming an unknown request 404s naming it; a second confirmation is refused, never a re-execution", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    registerT4Action(storePath);
+    const requestId = stageT4Request(storePath, "once is all it takes");
+
+    const missing = await app.inject({ method: "POST", url: "/actions/t4/not-a-real-id/confirm", headers: authHeader });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().error.message).toContain("not-a-real-id");
+
+    const first = await app.inject({ method: "POST", url: `/actions/t4/${requestId}/confirm`, headers: authHeader });
+    expect(first.statusCode).toBe(200);
+    const second = await app.inject({ method: "POST", url: `/actions/t4/${requestId}/confirm`, headers: authHeader });
+    expect(second.statusCode).toBe(409);
+    expect(second.json().error.message).toContain("already executed");
+
+    // Exactly one execution was recorded — the guard's exactly-once holds
+    // over HTTP exactly as it does at the terminal.
+    const executions = listActionAttempts(storePath, PASSPHRASE).filter((attempt) => attempt.outcome === "t4_executed");
+    expect(executions).toHaveLength(1);
+  });
+
+  it("no other route confirms a T4 request as a side effect — the guard's separateness survives the whole HTTP surface", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    registerT4Action(storePath);
+    const requestId = stageT4Request(storePath, "untouched by every other route");
+
+    // Every other owner POST that takes an id, fed the T4 request id: each
+    // refuses for its own reason — a different table's not-found — and none
+    // of them is a confirmation.
+    const review = await app.inject({ method: "POST", url: `/review/${requestId}/approve`, headers: authHeader });
+    expect(review.statusCode).toBe(404);
+    const outcome = await app.inject({ method: "POST", url: `/drafts/${requestId}/outcome`, headers: authHeader, payload: { outcome: "sent" } });
+    expect(outcome.statusCode).toBe(404);
+    const ruleApprove = await app.inject({ method: "POST", url: `/mirror/rules/${requestId}/approve`, headers: authHeader });
+    expect(ruleApprove.statusCode).toBe(404);
+    const deviceRevoke = await app.inject({ method: "POST", url: `/devices/${requestId}/revoke`, headers: authHeader });
+    expect(deviceRevoke.statusCode).toBe(404);
+
+    // The id-less owner POSTs do their own work and touch nothing else.
+    const digest = await app.inject({ method: "POST", url: "/escalations/digest", headers: authHeader, payload: {} });
+    expect(digest.statusCode).toBe(200);
+
+    // Still pending, still never executed.
+    const pending = await app.inject({ method: "GET", url: "/actions/t4/pending", headers: authHeader });
+    expect(pending.json().map((request: { id: string }) => request.id)).toEqual([requestId]);
+    expect(listActionAttempts(storePath, PASSPHRASE).some((attempt) => attempt.outcome === "t4_executed")).toBe(false);
+  });
+
+  it("GET /actions/attempts returns exactly what `duo actions attempts` reports, device attribution included", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    const authHeader = { authorization: `Bearer ${paired.token}` };
+    registerT4Action(storePath);
+    const requestId = stageT4Request(storePath, "an ordinary confirmed request");
+    const confirmed = await app.inject({ method: "POST", url: `/actions/t4/${requestId}/confirm`, headers: authHeader });
+    expect(confirmed.statusCode).toBe(200);
+    // A bypass attempt, so the log spans the guard's outcomes: staging a
+    // non-T4 action as T4 is refused and recorded (the module's own
+    // refusal — what `duo actions t4 request` on a T2 action hits).
+    registerAction(storePath, PASSPHRASE, {
+      id: "announce-in-channel",
+      description: "Post an announcement in the team channel",
+      reversible: true,
+      obligates: false,
+      audience: "internal",
+      topicIds: ["general"],
+    });
+    expect(() =>
+      createT4Request(storePath, PASSPHRASE, { actionId: "announce-in-channel", topicId: "general", reasoning: "trying to jump the gate" }),
+    ).toThrow(NotAT4ActionError);
+
+    const response = await app.inject({ method: "GET", url: "/actions/attempts", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    // Byte-identical to what `duo actions attempts` prints from — the same
+    // function, called now, over the same store.
+    expect(response.json()).toEqual(listActionAttempts(storePath, PASSPHRASE));
+    // And the log genuinely spans the guard's outcomes: the staged request,
+    // its device-attributed execution, and the refused bypass.
+    const outcomes = response.json().map((attempt: { outcome: string }) => attempt.outcome);
+    expect(outcomes).toContain("requires_human_confirmation");
+    expect(outcomes).toContain("t4_executed");
+    expect(outcomes).toContain("refused_t4_bypass");
+  });
+
+  it("all three routes are owner routes: an ask token is refused on each", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const authHeader = { authorization: `Bearer ${minted.token}` };
+    const pending = await app.inject({ method: "GET", url: "/actions/t4/pending", headers: authHeader });
+    const attempts = await app.inject({ method: "GET", url: "/actions/attempts", headers: authHeader });
+    const confirm = await app.inject({ method: "POST", url: "/actions/t4/some-request-id/confirm", headers: authHeader });
+    expect(pending.statusCode).toBe(401);
+    expect(attempts.statusCode).toBe(401);
+    expect(confirm.statusCode).toBe(401);
   });
 });
