@@ -13,8 +13,8 @@ import { writeRecords } from "../src/ingest/record-store.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { writeRefusalsFile } from "../src/trust/refusals.js";
 import { listGrid } from "../src/trust/grid.js";
-import { answerPublicly, PUBLIC_PASSED_ON_MESSAGE, PUBLIC_REFUSAL_MESSAGE } from "../src/permissions/public-answer.js";
-import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
+import { answerPublicly, PUBLIC_ANSWER_CLEARANCE_CEILING, PUBLIC_PASSED_ON_MESSAGE, PUBLIC_REFUSAL_MESSAGE, type AskerContext } from "../src/permissions/public-answer.js";
+import { appendPublicAnswerLogEntry, ensurePublicAnswerLogSchema, getPublicAnswerLogEntry, listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
@@ -50,6 +50,11 @@ function record(overrides: Partial<RecordInput> & { text: string }) {
 
 function agreeingProvider(response: string): InferenceProvider {
   return { name: "fake", async complete() { return response; } };
+}
+
+/** The CLI-shaped asker context every non-route writer supplies (#160): no link, no lookup. */
+function cliAsker(ref: string): AskerContext {
+  return { ref, resolved: null, askLinkId: null };
 }
 
 /** A confirmed, approved rule on "topic-leave", the corpus's answer publicly markable (or not) via `markPublic`. */
@@ -102,7 +107,7 @@ describe("answerPublicly — a granted topic is answered directly (#43 AC1)", ()
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-1",
+      cliAsker("colleague-1"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -117,7 +122,16 @@ describe("answerPublicly — a granted topic is answered directly (#43 AC1)", ()
 
     const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
     expect(logged).toHaveLength(1);
-    expect(logged[0]).toMatchObject({ outcome: "answered", askerRef: "colleague-1", topicId: "topic-leave" });
+    // #160: the CLI path records no link and no lookup, and the personal
+    // branch's one uniform ceiling.
+    expect(logged[0]).toMatchObject({
+      outcome: "answered",
+      askerRef: "colleague-1",
+      topicId: "topic-leave",
+      askLinkId: null,
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
   });
 });
 
@@ -134,7 +148,7 @@ describe("answerPublicly — an ungranted topic is not answered (#43 AC2)", () =
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-2",
+      cliAsker("colleague-2"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -173,7 +187,7 @@ describe("answerPublicly — a refused subject is declined visibly (#43 AC3)", (
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-3",
+      cliAsker("colleague-3"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -226,7 +240,7 @@ describe("answerPublicly — low confidence escalates instead of hedging (#43 AC
       PASSPHRASE,
       dir,
       "third floor printer broken, who do I call",
-      "colleague-4",
+      cliAsker("colleague-4"),
       embeddingProvider,
       disagreeingProvider,
       CONFIDENCE_CONFIG,
@@ -252,7 +266,7 @@ describe("answerPublicly — never exposes unmarked ('unknown') material, even t
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-5",
+      cliAsker("colleague-5"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -281,7 +295,7 @@ describe("answerPublicly — every public answer is labelled, never as the owner
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-6",
+      cliAsker("colleague-6"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -315,7 +329,7 @@ describe("answerPublicly — every public answer is labelled, never as the owner
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-7",
+      cliAsker("colleague-7"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -331,7 +345,7 @@ describe("answerPublicly — every public answer is labelled, never as the owner
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-8",
+      cliAsker("colleague-8"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -354,7 +368,7 @@ describe("answerPublicly — every public answer is labelled, never as the owner
       PASSPHRASE,
       dir,
       "how much vacation leave do I get",
-      "colleague-9",
+      cliAsker("colleague-9"),
       createFakeEmbeddingProvider(),
       agreeingProvider("Five days per quarter, per policy."),
       CONFIDENCE_CONFIG,
@@ -363,5 +377,199 @@ describe("answerPublicly — every public answer is labelled, never as the owner
     if (outcome.kind !== "answered") throw new Error("expected an answered outcome");
     expect(outcome.text).toContain("Priya Nair");
     expect(outcome.text).not.toContain(OWNER_NAME);
+  });
+});
+
+describe("public_answer_log — ask-link asker context (#160)", () => {
+  it("stores and reads back the link id, the tri-state resolution, and the ceiling — never a raw secret", () => {
+    const storePath = initStore();
+    const throughLink = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "how much vacation leave do I get",
+      askerRef: "jdoe",
+      topicId: "topic-leave",
+      outcome: "passed_on",
+      text: "passed on",
+      draftId: "draft-1",
+      askLinkId: "0193c0ff-1000-7000-8000-000000000001",
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
+    const unresolvedLink = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "where is the offsite",
+      askerRef: "unknown.person@example.com",
+      topicId: null,
+      outcome: "passed_on",
+      text: "passed on",
+      draftId: "draft-2",
+      askLinkId: "0193c0ff-1000-7000-8000-000000000001",
+      askerResolved: false,
+      clearanceApplied: "official_open",
+    });
+    const noLink = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "who owns the release train",
+      askerRef: "owner",
+      topicId: null,
+      outcome: "declined_refused",
+      text: "refused",
+      draftId: "draft-3",
+      askLinkId: null,
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
+
+    const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(entries.map((entry) => entry.id)).toEqual([throughLink, unresolvedLink, noLink]);
+    expect(entries[0]).toMatchObject({ askLinkId: "0193c0ff-1000-7000-8000-000000000001", askerResolved: true, clearanceApplied: "official_open" });
+    expect(entries[1]).toMatchObject({ askLinkId: "0193c0ff-1000-7000-8000-000000000001", askerResolved: false, clearanceApplied: "official_open" });
+    expect(entries[2]).toMatchObject({ askLinkId: null, askerResolved: null, clearanceApplied: "official_open" });
+
+    // The full row round-trips by id too, naming only the link's id — the
+    // no-raw-secret pin against a genuinely minted token lives at the serve level.
+    const single = getPublicAnswerLogEntry(storePath, PASSPHRASE, throughLink);
+    expect(single?.askLinkId).toBe("0193c0ff-1000-7000-8000-000000000001");
+  });
+
+  it("threads a link's AskerContext through answerPublicly into the logged entry", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      { ref: "jdoe", resolved: true, askLinkId: "0193c0ff-1000-7000-8000-000000000002" },
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+    if (outcome.kind !== "answered") throw new Error("expected an answered outcome");
+
+    const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      askerRef: "jdoe",
+      askLinkId: "0193c0ff-1000-7000-8000-000000000002",
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
+  });
+
+  it("migrates a pre-#160 table in place: old rows read null/null/official_open and stay otherwise untouched", () => {
+    const storePath = initStore();
+    // A log exactly as #45 left it: no ask_link_id, no asker_resolved, no clearance_applied.
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      db.exec(`
+        CREATE TABLE public_answer_log (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          question TEXT NOT NULL,
+          asker_ref TEXT NOT NULL,
+          topic_id TEXT,
+          outcome TEXT NOT NULL,
+          text TEXT NOT NULL,
+          draft_id TEXT NOT NULL,
+          corrects_entry_id TEXT
+        ) STRICT
+      `);
+      db.exec(`
+        INSERT INTO public_answer_log (id, created_at, question, asker_ref, topic_id, outcome, text, draft_id, corrects_entry_id)
+        VALUES ('entry-pre-160', '2026-09-01T00:00:00.000Z', 'old question', 'colleague-0', NULL, 'passed_on', 'passed on', 'draft-pre', NULL)
+      `);
+    });
+
+    // Any next write drives the additive migration, then succeeds with the new columns.
+    const appended = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "new question",
+      askerRef: "jdoe",
+      topicId: null,
+      outcome: "passed_on",
+      text: "passed on",
+      draftId: "draft-post",
+      askLinkId: "0193c0ff-1000-7000-8000-000000000003",
+      askerResolved: false,
+      clearanceApplied: "official_open",
+    });
+
+    const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(entries.map((entry) => entry.id)).toEqual(["entry-pre-160", appended]);
+    // The pre-#160 row: not recorded, not fabricated — null link, null lookup,
+    // and the ceiling every public answer has always been filtered through.
+    expect(entries[0]).toMatchObject({
+      question: "old question",
+      askerRef: "colleague-0",
+      outcome: "passed_on",
+      text: "passed on",
+      draftId: "draft-pre",
+      correctsEntryId: null,
+      askLinkId: null,
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
+    expect(entries[1]).toMatchObject({ askLinkId: "0193c0ff-1000-7000-8000-000000000003", askerResolved: false, clearanceApplied: "official_open" });
+    // The DDL's hardcoded 'official_open' backfill default must stay equal to the
+    // TS constant the answer path filters through — this pin, not the comment in
+    // public-answer-log.ts, is what fails when the two drift apart.
+    expect(entries[0].clearanceApplied).toBe(PUBLIC_ANSWER_CLEARANCE_CEILING);
+
+    // The append-only triggers must abort on a table that actually went through
+    // the ALTER migration, not only on one created with the full schema (#160
+    // stop condition — the fresh-store variant is covered in its own test below).
+    expect(() => {
+      withDatabase(storePath, PASSPHRASE, true, (db) => {
+        db.exec("UPDATE public_answer_log SET text = 'rewritten' WHERE id = 'entry-pre-160'");
+      });
+    }).toThrow(/append-only/);
+    expect(() => {
+      withDatabase(storePath, PASSPHRASE, true, (db) => {
+        db.exec("DELETE FROM public_answer_log WHERE id = 'entry-pre-160'");
+      });
+    }).toThrow(/append-only/);
+  });
+
+  it("still refuses UPDATE and DELETE — append-only semantics are unchanged (#160 stop condition)", () => {
+    const storePath = initStore();
+    const entryId = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "q",
+      askerRef: "jdoe",
+      topicId: null,
+      outcome: "passed_on",
+      text: "passed on",
+      draftId: "draft-1",
+      askLinkId: "0193c0ff-1000-7000-8000-000000000004",
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
+
+    expect(() => {
+      withDatabase(storePath, PASSPHRASE, true, (db) => {
+        db.exec(`UPDATE public_answer_log SET text = 'rewritten' WHERE id = '${entryId}'`);
+      });
+    }).toThrow(/append-only/);
+    expect(() => {
+      withDatabase(storePath, PASSPHRASE, true, (db) => {
+        db.exec(`DELETE FROM public_answer_log WHERE id = '${entryId}'`);
+      });
+    }).toThrow(/append-only/);
+
+    const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].text).toBe("passed on");
+  });
+
+  it("is idempotent: a second ensure pass adds no duplicate columns", () => {
+    const storePath = initStore();
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      ensurePublicAnswerLogSchema(db);
+      ensurePublicAnswerLogSchema(db);
+      const columns = (db.prepare(`PRAGMA table_info(public_answer_log)`).all() as unknown as { name: string }[]).map((row) => row.name);
+      expect(columns.filter((name) => name === "ask_link_id")).toHaveLength(1);
+      expect(columns.filter((name) => name === "asker_resolved")).toHaveLength(1);
+      expect(columns.filter((name) => name === "clearance_applied")).toHaveLength(1);
+    });
   });
 });

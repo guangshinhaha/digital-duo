@@ -29,6 +29,13 @@ type PrincipalKind = "ask" | "device";
 export interface Principal {
   readonly kind: PrincipalKind;
   readonly name: string;
+  /**
+   * #160: the verified token's id — the ask link's id for an ask principal,
+   * the paired device's id for a device one — carried so the answering
+   * routes can name the link by id in the audit trail, never the raw
+   * secret (the raw token never leaves the hook).
+   */
+  readonly tokenId: string;
 }
 
 declare module "fastify" {
@@ -186,7 +193,7 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
     if (isAskRoute && verified === undefined) {
       const ask = verifyAskToken(storePath, passphrase, token);
       if (ask) {
-        request.principal = { kind: "ask", name: ask.name };
+        request.principal = { kind: "ask", name: ask.name, tokenId: ask.id };
         return;
       }
     }
@@ -216,7 +223,7 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
       verified = { deviceId: device.id, name: device.name };
       verifiedTokens.set(token, { deviceId: verified.deviceId, name: verified.name, verifiedAt: now });
     }
-    request.principal = { kind: "device", name: verified.name };
+    request.principal = { kind: "device", name: verified.name, tokenId: verified.deviceId };
 
     const last = lastTouch.get(verified.deviceId) ?? 0;
     if (now - last > LAST_SEEN_THROTTLE_MS) {

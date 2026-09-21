@@ -1,5 +1,6 @@
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { answerSharedDuo, type SharedDuoAnswer } from "../shared-duo/answer.js";
+import { cliAskerContext } from "../permissions/public-answer.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { loadUsageLog, unresolvedQuestionGaps, type QuestionGap } from "../shared-duo/usage-log.js";
 import { buildUsageReport, type SharedDuoUsageReport } from "../shared-duo/usage-report.js";
@@ -15,7 +16,8 @@ export async function runSharedAsk(
 ): Promise<SharedDuoAnswer> {
   const { personaPath, usageLogPath } = loadSharedDuoConfig(env);
   const duo = loadSharedDuo(personaPath);
-  return answerSharedDuo(duo, question, askerId, usageLogPath);
+  // #160: no link, no lookup — see cliAskerContext.
+  return answerSharedDuo(duo, question, cliAskerContext(askerId), usageLogPath);
 }
 
 /** Implements `duo shared gaps` (#69 AC4): the out-of-scope questions the shared duo has been asked, most-repeated first. */

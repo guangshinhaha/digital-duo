@@ -4,7 +4,7 @@ import { tryResolveProvider } from "../provider/registry.js";
 import { type EnforceCeilingOutcome, enforceClassificationCeiling, parseClassificationCeiling } from "../permissions/classification.js";
 import { answerForAsker, type AnswerForAskerResult } from "../permissions/answer.js";
 import { type AuditEntry, getAuditEntry, listAuditEntries } from "../permissions/audit.js";
-import { answerPublicly, type PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { answerPublicly, cliAskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { listPublicAnswerLogEntries, type PublicAnswerLogEntry } from "../permissions/public-answer-log.js";
 import { correctPublicAnswer, type CorrectPublicAnswerResult } from "../permissions/public-correction.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
@@ -61,7 +61,8 @@ export async function runAnswerPublicly(
     passphrase,
     config.duoDir,
     question,
-    askerRef,
+    // #160: no link, no lookup — see cliAskerContext.
+    cliAskerContext(askerRef),
     embeddingProvider,
     inferenceProvider,
     config.confidence,

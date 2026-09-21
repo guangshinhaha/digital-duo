@@ -581,7 +581,7 @@ permissionsCommand
 
 permissionsCommand
   .command("log")
-  .description("List every public-answer-log entry (oldest first) — every question a colleague asked publicly, and how it was handled (#43/#45)")
+  .description("List every public-answer-log entry (oldest first) — every question a colleague asked publicly, and how it was handled (#43/#45), with each ask's link and clearance context (#160)")
   .action(() => {
     const config = loadConfig();
     try {
@@ -593,7 +593,11 @@ permissionsCommand
       for (const entry of entries) {
         console.log(
           `[${entry.id}] ${entry.createdAt} asker=${entry.askerRef} outcome=${entry.outcome}` +
-            `${entry.topicId ? ` topic=${entry.topicId}` : ""}${entry.correctsEntryId ? ` corrects=${entry.correctsEntryId}` : ""} ` +
+            `${entry.topicId ? ` topic=${entry.topicId}` : ""}${entry.correctsEntryId ? ` corrects=${entry.correctsEntryId}` : ""}` +
+            // #160: the ceiling every entry was filtered through, always, and
+            // the ask link by id when the ask came through one — never the
+            // raw secret. Same `clearance=` convention as `duo permissions audit`.
+            `${entry.askLinkId ? ` link=${entry.askLinkId}` : ""} clearance=${entry.clearanceApplied} ` +
             `question="${entry.question}"`,
         );
       }

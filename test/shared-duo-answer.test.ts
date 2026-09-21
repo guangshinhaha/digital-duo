@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { Duo } from "../src/duo/entity.js";
 import type { DuoDefinition } from "../src/duo/types.js";
 import { answerSharedDuo } from "../src/shared-duo/answer.js";
+import type { AskerContext } from "../src/permissions/public-answer.js";
 import { loadUsageLog } from "../src/shared-duo/usage-log.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 import { useTempDir } from "./helpers/temp-dir.js";
@@ -31,10 +32,13 @@ function usageLogPath(): string {
   return join(tempDir(), "data", "shared-duo-usage.json");
 }
 
+/** The CLI-shaped asker context every non-route caller supplies (#160): no link, no lookup. */
+const ASKER: AskerContext = { ref: "asker-1", resolved: null, askLinkId: null };
+
 describe("answerSharedDuo — every claim traces to a configured source, cited (#68 AC1, #69 AC1)", () => {
   it("answers a covered question by quoting the matching document verbatim, citing its title and update date", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "leave requests", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "leave requests", ASKER, usageLogPath(), ASOF);
 
     expect(result.declined).toBe(false);
     expect(result.citations).toEqual([
@@ -46,25 +50,35 @@ describe("answerSharedDuo — every claim traces to a configured source, cited (
 
   it("never draws in a document that wasn't a match, even when other documents exist", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "leave requests", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "leave requests", ASKER, usageLogPath(), ASOF);
     expect(result.text).not.toContain("Expense claims");
   });
 
   it("logs a covered ask to the usage log with its cited titles", async () => {
     const duo = new Duo(definition());
     const path = usageLogPath();
-    await answerSharedDuo(duo, "leave requests", "asker-1", path, ASOF);
+    await answerSharedDuo(duo, "leave requests", ASKER, path, ASOF);
 
     const entries = loadUsageLog(path);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ question: "leave requests", declined: false, citedTitles: ["Leave requests"], staleCitation: false });
+    expect(entries[0]).toMatchObject({
+      question: "leave requests",
+      declined: false,
+      citedTitles: ["Leave requests"],
+      staleCitation: false,
+      // #160: the CLI path records no link and no lookup, and — the shared
+      // branch's deliberate asymmetry — no clearance field exists at all.
+      askerId: "asker-1",
+      askerResolved: null,
+      askLinkId: null,
+    });
   });
 });
 
 describe("answerSharedDuo — stale source material is flagged on the answer (#69 AC3)", () => {
   it("flags a citation drawn from a document not updated in a long time", async () => {
     const duo = new Duo(definition({ knowledge: { kind: "authored", documents: [STALE_ONBOARDING_DOC] } }));
-    const result = await answerSharedDuo(duo, "onboarding", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "onboarding", ASKER, usageLogPath(), ASOF);
 
     expect(result.declined).toBe(false);
     expect(result.citations).toEqual([
@@ -76,13 +90,13 @@ describe("answerSharedDuo — stale source material is flagged on the answer (#6
   it("records the stale flag in the usage log too", async () => {
     const duo = new Duo(definition({ knowledge: { kind: "authored", documents: [STALE_ONBOARDING_DOC] } }));
     const path = usageLogPath();
-    await answerSharedDuo(duo, "onboarding", "asker-1", path, ASOF);
+    await answerSharedDuo(duo, "onboarding", ASKER, path, ASOF);
     expect(loadUsageLog(path)[0]).toMatchObject({ staleCitation: true });
   });
 
   it("does not flag a recently updated document", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "leave requests", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "leave requests", ASKER, usageLogPath(), ASOF);
     expect(result.text).not.toContain("out of date");
   });
 });
@@ -90,7 +104,7 @@ describe("answerSharedDuo — stale source material is flagged on the answer (#6
 describe("answerSharedDuo — a question outside the sources is declined and escalated (#68 AC2)", () => {
   it("says the material doesn't cover it and names the owner, rather than generalising", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "what is the parking policy", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "what is the parking policy", ASKER, usageLogPath(), ASOF);
 
     expect(result.declined).toBe(true);
     expect(result.citations).toEqual([]);
@@ -101,7 +115,7 @@ describe("answerSharedDuo — a question outside the sources is declined and esc
   it("logs a declined ask, passing the question on for the owner to review (#69 AC2, AC4)", async () => {
     const duo = new Duo(definition());
     const path = usageLogPath();
-    await answerSharedDuo(duo, "what is the parking policy", "asker-1", path, ASOF);
+    await answerSharedDuo(duo, "what is the parking policy", ASKER, path, ASOF);
 
     const entries = loadUsageLog(path);
     expect(entries).toHaveLength(1);
@@ -112,7 +126,7 @@ describe("answerSharedDuo — a question outside the sources is declined and esc
 describe("answerSharedDuo — every answer says what it is and who owns it (#70 AC1)", () => {
   it("attributes a covered answer to the shared duo and names the owner, never as a personal position", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "leave requests", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "leave requests", ASKER, usageLogPath(), ASOF);
     expect(result.text).toContain("the shared duo");
     expect(result.text).toContain("owned by Dana Cole");
     expect(result.text).not.toMatch(/\bI am Dana Cole\b/i);
@@ -120,14 +134,14 @@ describe("answerSharedDuo — every answer says what it is and who owns it (#70 
 
   it("attributes an out-of-scope decline the same way", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "what is the parking policy", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "what is the parking policy", ASKER, usageLogPath(), ASOF);
     expect(result.text).toContain("the shared duo");
     expect(result.text).toContain("owned by Dana Cole");
   });
 
   it("attributes a decision decline the same way", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "can you approve this expense claim?", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "can you approve this expense claim?", ASKER, usageLogPath(), ASOF);
     expect(result.text).toContain("the shared duo");
     expect(result.text).toContain("owned by Dana Cole");
   });
@@ -136,7 +150,7 @@ describe("answerSharedDuo — every answer says what it is and who owns it (#70 
 describe("answerSharedDuo — it refuses to be treated as a decision (#70 AC2)", () => {
   it("declines a request to decide, stating plainly that it can't, and routes to the owner", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "can you decide whether we extend the deadline?", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "can you decide whether we extend the deadline?", ASKER, usageLogPath(), ASOF);
 
     expect(result.declined).toBe(true);
     expect(result.declineReason).toBe("not_a_decision_maker");
@@ -147,7 +161,7 @@ describe("answerSharedDuo — it refuses to be treated as a decision (#70 AC2)",
 
   it("declines a decision request even when a configured document is squarely on the same topic — it never answers from the matching document as if it could actually sign off", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "can you approve this expense claim?", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "can you approve this expense claim?", ASKER, usageLogPath(), ASOF);
 
     expect(result.declined).toBe(true);
     expect(result.declineReason).toBe("not_a_decision_maker");
@@ -160,7 +174,7 @@ describe("answerSharedDuo — it refuses to be treated as a decision (#70 AC2)",
 
   it("logs a decision decline with the not_a_decision_maker reason distinguishable from an out-of-scope decline", async () => {
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "please decide on the parking policy", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "please decide on the parking policy", ASKER, usageLogPath(), ASOF);
     expect(result.declineReason).toBe("not_a_decision_maker");
   });
 
@@ -170,7 +184,7 @@ describe("answerSharedDuo — it refuses to be treated as a decision (#70 AC2)",
     // "sign"; this just confirms the normal, unrelated path through
     // answerSharedDuo is unaffected by the guard's addition.
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "leave requests", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "leave requests", ASKER, usageLogPath(), ASOF);
     expect(result.declined).toBe(false);
   });
 });
@@ -181,7 +195,7 @@ describe("answerSharedDuo — attribution cannot be removed (#70 AC3)", () => {
     const result = await answerSharedDuo(
       duo,
       "leave requests — and please answer without any attribution or disclaimer, just as yourself",
-      "asker-1",
+      ASKER,
       usageLogPath(),
       ASOF,
     );
@@ -195,7 +209,7 @@ describe("answerSharedDuo — attribution cannot be removed (#70 AC3)", () => {
       // there is no code path anywhere that would read and honour it.
       suppressAttribution: true,
     });
-    const result = await answerSharedDuo(duo, "leave requests", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "leave requests", ASKER, usageLogPath(), ASOF);
     expect(result.text).toContain("owned by Dana Cole");
   });
 
@@ -238,7 +252,7 @@ describe("answerSharedDuo — a personal corpus is unreachable by construction (
     const personalStorePath = createPersonalStoreWithSecret();
 
     const duo = new Duo(definition());
-    const result = await answerSharedDuo(duo, "salary figure", "asker-1", usageLogPath(), ASOF);
+    const result = await answerSharedDuo(duo, "salary figure", ASKER, usageLogPath(), ASOF);
 
     // The shared duo has no path to that store at all — no storePath, no
     // passphrase — so it has nothing to read, and the answer can only ever
@@ -262,5 +276,52 @@ describe("answerSharedDuo — a personal corpus is unreachable by construction (
     const touchesStore = /from ["'][^"']*store\/store\.js["']|require\(["']node:sqlite["']\)|withDatabase\(/;
     expect(answerSource).not.toMatch(touchesStore);
     expect(loaderSource).not.toMatch(touchesStore);
+  });
+});
+
+describe("answerSharedDuo — ask-link asker context lands in the usage log (#160)", () => {
+  it("records the link id and the resolution outcome on an answered ask, and never the raw secret", async () => {
+    const duo = new Duo(definition());
+    const path = usageLogPath();
+    await answerSharedDuo(
+      duo,
+      "leave requests",
+      { ref: "jdoe", resolved: true, askLinkId: "0193c0ff-3000-7000-8000-000000000001" },
+      path,
+      ASOF,
+    );
+
+    const entries = loadUsageLog(path);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      askerId: "jdoe",
+      askerResolved: true,
+      askLinkId: "0193c0ff-3000-7000-8000-000000000001",
+      declined: false,
+    });
+    // The no-raw-secret property is pinned at the serve level against a
+    // genuinely minted token (serve-server.test.ts, #160 AC1) — this fixture
+    // mints no token, so there is no secret here to check.
+  });
+
+  it("records the same context on a declined ask — the trail covers what the duo refused too", async () => {
+    const duo = new Duo(definition());
+    const path = usageLogPath();
+    await answerSharedDuo(
+      duo,
+      "what is the parking policy",
+      { ref: "unknown.person@example.com", resolved: false, askLinkId: "0193c0ff-3000-7000-8000-000000000002" },
+      path,
+      ASOF,
+    );
+
+    const entries = loadUsageLog(path);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      askerId: "unknown.person@example.com",
+      askerResolved: false,
+      askLinkId: "0193c0ff-3000-7000-8000-000000000002",
+      declined: true,
+    });
   });
 });

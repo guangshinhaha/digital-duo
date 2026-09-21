@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCli } from "./helpers/run-cli.js";
 import { useTempDir } from "./helpers/temp-dir.js";
+import { appendPublicAnswerLogEntry } from "../src/permissions/public-answer-log.js";
+import { resolveOrCreatePassphrase } from "../src/store/passphrase.js";
 
 const tempDir = useTempDir();
 
@@ -174,6 +176,40 @@ describe("duo permissions log / correct (#45)", () => {
     });
     expect(correctResult.exitCode).not.toBe(0);
     expect(correctResult.stderr).toMatch(/not.*"answered"/i);
+  });
+
+  it("prints link= on ask-link entries and omits it otherwise, with clearance= on every line (#160)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+
+    // One non-link entry through the real CLI path…
+    await runCli(["permissions", "ask-public", "what is the vacation policy?", "--as", "colleague"], {
+      cwd: tempDir(),
+      env: { DUO_STORE_PATH: storePath },
+    });
+    // …and one ask-link entry, as POST /ask writes them (#160).
+    appendPublicAnswerLogEntry(storePath, resolveOrCreatePassphrase(storePath), {
+      question: "how much vacation leave do I get",
+      askerRef: "sam-carter",
+      topicId: null,
+      outcome: "passed_on",
+      text: "passed on",
+      draftId: "00000000-0000-4000-8000-000000000000",
+      askLinkId: "0193c0ff-4000-7000-8000-000000000001",
+      askerResolved: true,
+      clearanceApplied: "official_open",
+    });
+
+    const logResult = await runCli(["permissions", "log"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(logResult.exitCode).toBe(0);
+    const lines = logResult.stdout.trim().split("\n");
+    expect(lines).toHaveLength(2);
+    // Oldest first: the CLI ask, then the link ask.
+    expect(lines[0]).not.toMatch(/link=/);
+    expect(lines[0]).toMatch(/clearance=official_open/);
+    expect(lines[1]).toMatch(/link=0193c0ff-4000-7000-8000-000000000001 clearance=official_open/);
+    // The link is named by id only; the no-raw-secret property is pinned at the
+    // serve level against a genuinely minted token (serve-server.test.ts, #160 AC1).
   });
 });
 
