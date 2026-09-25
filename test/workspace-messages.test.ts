@@ -332,7 +332,7 @@ describe("messagesFromTimeline — messages are first-class (#189 AC 'messages a
     textEvent({ id: "$a1", sender: DUO_ALICE, body: "Approved on 2026-08-14.", at: ts(2000) }),
   ];
 
-  it("returns each message with author, body, time, edit state and a null thread parent", () => {
+  it("returns each message with author, body, time, edit state, a null thread parent and a null file (#190)", () => {
     expect(messagesFromTimeline("!dm:workspace", timeline)).toEqual([
       {
         id: "$q1",
@@ -342,6 +342,7 @@ describe("messagesFromTimeline — messages are first-class (#189 AC 'messages a
         sentAt: iso(1000),
         edit: { kind: "original" },
         threadParentId: null,
+        file: null,
       },
       {
         id: "$a1",
@@ -351,6 +352,7 @@ describe("messagesFromTimeline — messages are first-class (#189 AC 'messages a
         sentAt: iso(2000),
         edit: { kind: "original" },
         threadParentId: null,
+        file: null,
       },
     ]);
   });
@@ -442,6 +444,7 @@ describe("messagesFromTimeline — messages are first-class (#189 AC 'messages a
         sentAt: iso(2000),
         edit: { kind: "original" },
         threadParentId: null,
+        file: null,
       },
     ]);
   });
@@ -691,5 +694,106 @@ describe("invitesFromSync — the invite section is the consent question's wire 
     expect(invitesFromSync({}, DUO_ALICE)).toEqual([]);
     expect(invitesFromSync({ invite: {} }, DUO_ALICE)).toEqual([]);
     expect(invitesFromSync({ invite: { "!nothing:workspace": inviteRoom([]) } }, DUO_ALICE)).toEqual([]);
+  });
+});
+
+describe("messagesFromTimeline — files in a conversation (#190, attachments.md §8)", () => {
+  function fileEvent(init: { id: string; sender?: string; at?: number; content: Record<string, unknown> }): RawMatrixEvent {
+    return {
+      type: "m.room.message",
+      sender: init.sender ?? BOB,
+      event_id: init.id,
+      origin_server_ts: init.at ?? ts(1000),
+      content: init.content,
+    };
+  }
+
+  it("parses an m.file into a message carrying its file facts — the wire's own conventions, nothing more", () => {
+    const messages = messagesFromTimeline("!dm:workspace", [
+      fileEvent({
+        id: "$f1",
+        at: ts(0),
+        content: {
+          msgtype: "m.file",
+          body: "notes.txt",
+          filename: "launch-notes.txt",
+          url: "mxc://workspace/abc123",
+          info: { mimetype: "text/plain", size: 32844 },
+        },
+      }),
+    ]);
+    expect(messages).toEqual([
+      {
+        id: "$f1",
+        conversationId: "!dm:workspace",
+        author: { kind: "person", userId: BOB },
+        body: "notes.txt",
+        file: { name: "launch-notes.txt", mimeType: "text/plain", size: 32844, reference: "mxc://workspace/abc123" },
+        sentAt: iso(0),
+        edit: { kind: "original" },
+        threadParentId: null,
+      },
+    ]);
+  });
+
+  it("falls back to the body as the name and to null facts when the sender declared nothing", () => {
+    const messages = messagesFromTimeline("!dm:workspace", [
+      fileEvent({ id: "$f2", at: ts(0), content: { msgtype: "m.file", body: "mystery.bin", url: "mxc://workspace/noinfo" } }),
+    ]);
+    expect(messages[0]!.file).toEqual({ name: "mystery.bin", mimeType: null, size: null, reference: "mxc://workspace/noinfo" });
+  });
+
+  it("reads an m.image without a declared type as image/* — the msgtype is the sender's own declaration", () => {
+    const messages = messagesFromTimeline("!dm:workspace", [
+      fileEvent({ id: "$i1", at: ts(0), content: { msgtype: "m.image", body: "photo.png", url: "mxc://workspace/img1" } }),
+    ]);
+    expect(messages[0]!.file).toEqual({ name: "photo.png", mimeType: "image/*", size: null, reference: "mxc://workspace/img1" });
+  });
+
+  it("skips a file event with no content reference — a dead card is not a message", () => {
+    const messages = messagesFromTimeline("!dm:workspace", [
+      fileEvent({ id: "$dead", content: { msgtype: "m.file", body: "notes.txt", info: { mimetype: "text/plain", size: 10 } } }),
+      textEvent({ id: "$ok", sender: BOB, body: "still here", at: ts(2000) }),
+    ]);
+    expect(messages.map((message) => message.id)).toEqual(["$ok"]);
+  });
+
+  it("folds an edit of a file message: the body updates, the file facts stand — an edit renames, it does not re-upload", () => {
+    const messages = messagesFromTimeline("!dm:workspace", [
+      fileEvent({
+        id: "$f3",
+        at: ts(0),
+        content: { msgtype: "m.file", body: "draft.txt", filename: "draft-v1.txt", url: "mxc://workspace/f3", info: { mimetype: "text/plain", size: 12 } },
+      }),
+      {
+        type: "m.room.message",
+        sender: BOB,
+        event_id: "$f3-edit",
+        origin_server_ts: ts(1000),
+        content: {
+          msgtype: "m.file",
+          body: "* draft-v2.txt",
+          url: "mxc://workspace/different",
+          "m.new_content": { msgtype: "m.file", body: "renamed-draft.txt" },
+          "m.relates_to": { rel_type: "m.replace", event_id: "$f3" },
+        },
+      },
+    ]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.id).toBe("$f3");
+    expect(messages[0]!.body).toBe("renamed-draft.txt");
+    expect(messages[0]!.edit).toEqual({ kind: "edited", editedAt: iso(1000) });
+    // The facts of the event that was shared are the facts that stand: the
+    // reference the room dereferences is the one the file event carried, not
+    // one an edit claims — a replacement pointing at a whole new file is a
+    // new file event, and the #190 door grounds what rides the question.
+    expect(messages[0]!.file).toEqual({ name: "draft-v1.txt", mimeType: "text/plain", size: 12, reference: "mxc://workspace/f3" });
+  });
+
+  it("serializes a file message with exactly one file field — no second place a client could read a different file", () => {
+    const message = messagesFromTimeline("!dm:workspace", [
+      fileEvent({ id: "$f4", at: ts(0), content: { msgtype: "m.file", body: "a.txt", url: "mxc://workspace/f4" } }),
+    ])[0]!;
+    expect(JSON.parse(JSON.stringify(message)).file).toEqual({ name: "a.txt", mimeType: null, size: null, reference: "mxc://workspace/f4" });
   });
 });

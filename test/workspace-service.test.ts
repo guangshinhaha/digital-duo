@@ -1,13 +1,21 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { attachmentGroundingDoor } from "../src/drafting/attachment-grounding.js";
 import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../src/permissions/public-answer.js";
 import { readRoomConsent, RoomConsentNotFoundError, type RoomConsentEntry } from "../src/workspace/consent.js";
 import type { DuoReadState } from "../src/workspace/read-state.js";
 import type { RoomInvite } from "../src/workspace/messages.js";
 import { availabilityOfState, NoPendingInviteError, reconnectDelayMs, RecentlySeenEventIds, WorkspaceService, type WorkspaceServiceState } from "../src/workspace/service.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
-import { WorkspaceTokenRevokedError, type WorkspaceQuestion, type WorkspaceTransport, type WorkspaceMemberIdentityListing } from "../src/workspace/transport.js";
+import {
+  WorkspaceTokenRevokedError,
+  type WorkspaceAttachmentDoor,
+  type WorkspaceFileReference,
+  type WorkspaceQuestion,
+  type WorkspaceTransport,
+  type WorkspaceMemberIdentityListing,
+} from "../src/workspace/transport.js";
 import { FakeWorkspaceTransport } from "./helpers/fake-workspace-transport.js";
 import { memberOf } from "./helpers/workspace-member.js";
 import { useTempDir } from "./helpers/temp-dir.js";
@@ -50,7 +58,13 @@ interface Harness {
   states: WorkspaceServiceState[];
 }
 
-function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>, readState?: DuoReadState, consentDir?: string): Harness {
+function harness(
+  harnessSettings: WorkspaceSettings = settings(),
+  answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>,
+  readState?: DuoReadState,
+  consentDir?: string,
+  attachmentDoor?: WorkspaceAttachmentDoor,
+): Harness {
   const transport = new FakeWorkspaceTransport();
   const answers: WorkspaceQuestion[] = [];
   const service = new WorkspaceService({
@@ -62,13 +76,14 @@ function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (
     }),
     readState,
     consent: consentDir === undefined ? undefined : { duoDir: consentDir },
+    attachmentDoor,
   });
   const states: WorkspaceServiceState[] = [];
   service.onState((state) => states.push(state));
   return { transport, service, answers, states };
 }
 
-function dm(message: { eventId: string; body: string; senderId?: string; originServerTs?: number }) {
+function dm(message: { eventId: string; body: string; senderId?: string; originServerTs?: number; attachments?: WorkspaceFileReference[] }) {
   return {
     eventId: message.eventId,
     roomId: "!dm:workspace",
@@ -76,6 +91,7 @@ function dm(message: { eventId: string; body: string; senderId?: string; originS
     body: message.body,
     originServerTs: message.originServerTs ?? Date.now(),
     joinedMemberIds: [SELF, "@bob:workspace"],
+    ...(message.attachments && message.attachments.length > 0 ? { attachments: message.attachments } : {}),
   };
 }
 
@@ -110,6 +126,10 @@ class HangingConnectTransport implements WorkspaceTransport {
   }
 
   async listMemberIdentities(): Promise<never> {
+    throw new Error("fake: never reached — the connect never settles");
+  }
+
+  async fetchFile(): Promise<never> {
     throw new Error("fake: never reached — the connect never settles");
   }
 
@@ -1613,3 +1633,130 @@ describe("WorkspaceService — the consent record's edges (#192)", () => {
 function loggedLines(consoleError: { mock: { calls: unknown[][] } }): string[] {
   return consoleError.mock.calls.map((call) => `${call[0]} ${call[1] ?? ""}`);
 }
+
+describe("WorkspaceService — the attachment grounding door (#190)", () => {
+  /** A DuoReadState that records what was marked — the refusal accounting assertions below read this. */
+  class RecordingReadState implements DuoReadState {
+    readonly marked: { roomId: string; eventId: string; originServerTs: number }[] = [];
+    private readonly ids = new Set<string>();
+
+    hasRead(eventId: string): boolean {
+      return this.ids.has(eventId);
+    }
+
+    markRead(roomId: string, eventId: string, originServerTs: number): void {
+      this.ids.add(eventId);
+      this.marked.push({ roomId, eventId, originServerTs });
+    }
+  }
+
+  function fileRef(overrides: Partial<WorkspaceFileReference> = {}): WorkspaceFileReference {
+    return { reference: "mxc://workspace/f1", name: "notes.txt", mimeType: "text/plain", size: 10, ...overrides };
+  }
+
+  /** The real door at the shipped default ceiling — these tests exercise the composition, not a stand-in. */
+  const door = attachmentGroundingDoor("official_open");
+
+  it("grounds a door-passed attachment: the answer pipeline sees grounding, the asker sees the answer", async () => {
+    const readState = new RecordingReadState();
+    const { transport, service, answers } = harness(settings(), undefined, readState, undefined, door);
+    service.start();
+    await flush();
+    transport.setFile("mxc://workspace/f1", "the launch date is March 3rd");
+    const at = Date.now();
+    transport.deliver(dm({ eventId: "$q1", body: "when do we launch?", originServerTs: at, attachments: [fileRef()] }));
+    await flush();
+    expect(answers).toHaveLength(1);
+    expect(answers[0]!.grounding).toEqual([
+      { reference: "mxc://workspace/f1", name: "notes.txt", mimeType: "text/plain", text: "the launch date is March 3rd" },
+    ]);
+    // The one dereference, bounded by the door's constant.
+    expect(transport.fetchFileCalls).toEqual([{ reference: "mxc://workspace/f1", maxBytes: 32 * 1024 }]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to when do we launch?"]);
+    expect(readState.marked).toEqual([{ roomId: "!dm:workspace", eventId: "$q1", originServerTs: at }]);
+    await service.stop();
+  });
+
+  it("sends the door's refusal as its own event, answers nothing, and still accounts for the question normally", async () => {
+    const readState = new RecordingReadState();
+    const { transport, service, answers } = harness(settings(), undefined, readState, undefined, door);
+    service.start();
+    await flush();
+    const at = Date.now();
+    // A declared size over the bound: the door refuses before any body is
+    // read, so the media store is never even asked.
+    transport.deliver(
+      dm({ eventId: "$q2", body: "summarize this?", originServerTs: at, attachments: [fileRef({ size: 45 * 1024 })] }),
+    );
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.fetchFileCalls).toEqual([]);
+    const bodies = transport.sentAnswers.map((sent) => sent.content.body);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain("32.0 KiB");
+    expect(bodies[0]).toContain("notes.txt");
+    // A refusal is a handled question, not a dropped one: durable mark,
+    // so a restart does not re-ask the asker to re-share.
+    expect(readState.marked).toEqual([{ roomId: "!dm:workspace", eventId: "$q2", originServerTs: at }]);
+    await service.stop();
+  });
+
+  it("refuses an above-ceiling attachment naming the marking — the composition, end to end", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, undefined, door);
+    service.start();
+    await flush();
+    transport.setFile("mxc://workspace/f1", "secret\nthe launch date is March 3rd");
+    transport.deliver(dm({ eventId: "$q3", body: "when do we launch?", attachments: [fileRef()] }));
+    await flush();
+    expect(answers).toEqual([]);
+    const body = transport.sentAnswers.map((sent) => sent.content.body)[0]!;
+    expect(body).toContain("marked secret");
+    expect(body).toContain("official_open");
+    await service.stop();
+  });
+
+  it("refuses a file the media store no longer has with a recoverable reason", async () => {
+    const { transport, service, answers } = harness(settings(), undefined, undefined, undefined, door);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$q4", body: "when do we launch?", attachments: [fileRef()] }));
+    await flush();
+    expect(answers).toEqual([]);
+    const body = transport.sentAnswers.map((sent) => sent.content.body)[0]!;
+    expect(body).toContain(`couldn't retrieve "notes.txt"`);
+    expect(body).toContain("deleted");
+    await service.stop();
+  });
+
+  it("answers text-only, with an owner-side log, when no door is configured — never a silent grounding, never a dropped question", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, undefined);
+    service.start();
+    await flush();
+    transport.setFile("mxc://workspace/f1", "the launch date is March 3rd");
+    transport.deliver(dm({ eventId: "$q5", body: "when do we launch?", attachments: [fileRef()] }));
+    await flush();
+    expect(answers).toHaveLength(1);
+    expect(answers[0]!.grounding).toEqual([]);
+    expect(transport.fetchFileCalls).toEqual([]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to when do we launch?"]);
+    const logged = consoleError.mock.calls.map((call) => String(call[0]));
+    expect(logged.some((line) => line.includes("text-only"))).toBe(true);
+    await service.stop();
+  });
+
+  it("answers a text-only question without touching the door — the pre-#190 path, byte-identical", async () => {
+    const { transport, service, answers } = harness(settings(), undefined, undefined, undefined, door);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$q6", body: "plain question" }));
+    await flush();
+    expect(answers).toHaveLength(1);
+    expect(answers[0]!.attachments).toEqual([]);
+    expect(answers[0]!.grounding).toBeUndefined();
+    expect(transport.fetchFileCalls).toEqual([]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to plain question"]);
+    await service.stop();
+  });
+});

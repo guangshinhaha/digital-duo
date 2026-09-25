@@ -1,13 +1,37 @@
 import { detectClassification, stripMarkingLine } from "../ingest/record.js";
+import type { WorkspaceGroundedAttachment } from "../workspace/transport.js";
 import type { DraftContext } from "./context.js";
 
 /**
- * Builds the completion prompt for one draft sample. Includes the
- * standing order (if any), the top evidence, the voice profile, and the
- * piped-in thread context (#32 AC4) ahead of the question itself, so the
- * model answers with that context rather than the last line in isolation.
+ * Renders one door-passed attachment into the prompt's attachment section.
+ * The text is already marking-stripped at the door (#190 — the strip
+ * happens before the prompt is built, not only after, closing #164's
+ * recorded residual for this path), so this adds provenance the model can
+ * cite and nothing it could echo as a raw marking.
  */
-export function buildDraftPrompt(question: string, threadContext: string | null, context: DraftContext): string {
+function attachmentSection(attachments: readonly WorkspaceGroundedAttachment[]): string[] {
+  const parts: string[] = [];
+  for (const attachment of attachments) {
+    parts.push(`--- ${attachment.name} (${attachment.mimeType}) ---`);
+    parts.push(attachment.text);
+  }
+  return parts;
+}
+
+/**
+ * Builds the completion prompt for one draft sample. Includes the
+ * standing order (if any), the top evidence, the voice profile, the
+ * asker's attachments (#190 — provided material, placed just ahead of the
+ * question it rode with), and the piped-in thread context (#32 AC4) ahead
+ * of the question itself, so the model answers with that context rather
+ * than the last line in isolation.
+ */
+export function buildDraftPrompt(
+  question: string,
+  threadContext: string | null,
+  context: DraftContext,
+  attachments: readonly WorkspaceGroundedAttachment[] = [],
+): string {
   const parts: string[] = [];
   parts.push("You are drafting a reply in this person's own voice, for them to review before sending. Never invent facts.");
   parts.push("");
@@ -24,6 +48,11 @@ export function buildDraftPrompt(question: string, threadContext: string | null,
       parts.push(`- ${item.text}`);
     }
   }
+  if (attachments.length > 0) {
+    parts.push("");
+    parts.push("Material the asker attached to this question (ground your answer in it where relevant):");
+    parts.push(...attachmentSection(attachments));
+  }
   if (threadContext) {
     parts.push("");
     parts.push("Preceding thread context (most recent question is what you're answering):");
@@ -38,25 +67,33 @@ export function buildDraftPrompt(question: string, threadContext: string | null,
 
 /**
  * No-provider / degrade fallback: the standing order's own text if one
- * directly covers the question, else the single closest piece of past
- * evidence, verbatim except for a leading classification marking
- * (stripMarkingLine, #155) — no synthesis, same "degrade rather than fail"
- * shape as src/permissions/answer.ts's extractiveAnswer, which strips the
- * same marking for the same reason: whoever reads the draft was already
- * allowed the content (by clearance, or by being the owner), so the raw
- * stamp adds nothing but noise. Fixing it here, the one fallback every
- * draftReply surface shares, covers `duo draft`, public answering, and
- * predecessor consultation at once. Returns undefined only when there's
- * truly nothing to draft from, which is exactly the signal the pipeline
- * uses to skip generation and go straight to composing an escalation.
+ * directly covers the question, else the asker's first attachment if the
+ * question rode with one (#190 — provided material, kin to a rule hit, so
+ * it outranks retrieved evidence for the question it rode with), else the
+ * single closest piece of past evidence, verbatim except for a leading
+ * classification marking (stripMarkingLine, #155) — no synthesis, same
+ * "degrade rather than fail" shape as src/permissions/answer.ts's
+ * extractiveAnswer, which strips the same marking for the same reason:
+ * whoever reads the draft was already allowed the content (by clearance,
+ * or by being the owner), so the raw stamp adds nothing but noise. Fixing
+ * it here, the one fallback every draftReply surface shares, covers `duo
+ * draft`, public answering, and predecessor consultation at once.
+ * Attachment text needs no strip here — the door already stripped it once,
+ * at the boundary (#190). Returns undefined only when there's truly
+ * nothing to draft from, which is exactly the signal the pipeline uses to
+ * skip generation and go straight to composing an escalation.
  */
-export function extractiveDraft(context: DraftContext): string | undefined {
+export function extractiveDraft(context: DraftContext, attachments: readonly WorkspaceGroundedAttachment[] = []): string | undefined {
   if (context.ruleHit) {
     // A rule row carries no classification of its own (rules.ts), but the
     // no-provider default rule text is a marked answer copied verbatim — so
     // read the marking back off the rule's own first line, the same read
     // detectClassification made at ingest, and strip only that.
     return stripMarkingLine({ text: context.ruleHit.text, classification: detectClassification(context.ruleHit.text) });
+  }
+  const attachment = attachments[0];
+  if (attachment !== undefined) {
+    return attachment.text;
   }
   const best = context.evidence[0];
   return best ? stripMarkingLine(best) : undefined;

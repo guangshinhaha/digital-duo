@@ -2,6 +2,7 @@ import type { DuoConfig } from "../config.js";
 import { detectClassification, stripMarkingLine } from "../ingest/record.js";
 import type { ClassificationLevel } from "../ingest/record.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
+import type { WorkspaceGroundedAttachment } from "../workspace/transport.js";
 import {
   computeRecencyDecay,
   computeRetrievalStrength,
@@ -54,7 +55,7 @@ function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-function buildSources(context: DraftContext): DraftSource[] {
+function buildSources(context: DraftContext, attachments: readonly WorkspaceGroundedAttachment[]): DraftSource[] {
   const sources: DraftSource[] = [];
   if (context.ruleHit) {
     // Same strip as extractiveDraft's rule branch (#155): the label quotes
@@ -65,6 +66,18 @@ function buildSources(context: DraftContext): DraftSource[] {
       kind: "rule",
       id: context.ruleHit.id,
       label: `standing order: ${truncate(stripMarkingLine({ text: context.ruleHit.text, classification: detectClassification(context.ruleHit.text) }), 80)}`,
+    });
+  }
+  for (const attachment of attachments) {
+    // #190/#183 §3: the attachment source carries the workspace's own file
+    // reference as its id plus a filename/type/preview label — the same
+    // truncate(…, 80) idiom the other labels use. No strip is needed here
+    // because the door already stripped the text once, at the boundary,
+    // before anything downstream (this label included) could echo it.
+    sources.push({
+      kind: "attachment",
+      id: attachment.reference,
+      label: `attachment ${attachment.name} (${attachment.mimeType}): ${truncate(attachment.text, 80)}`,
     });
   }
   for (const item of context.evidence) {
@@ -116,6 +129,17 @@ export async function draftReply(
   confidenceConfig: DuoConfig["confidence"],
   /** Passed straight through to `gatherDraftContext` — see that function's own doc comment. Omitted by every existing caller (the owner's own `duo draft`, the eval harness); public answering (#43) is the one caller that sets it. */
   publicClearanceCeiling?: ClassificationLevel,
+  /**
+   * #190/#183: attachments that passed the grounding door — provided
+   * material for exactly this draft call, already marking-stripped at the
+   * door. The one caller that sets it is public answering, fed by the
+   * workspace service; the corpus-clearance ceiling above deliberately
+   * does NOT filter them (the asker supplied the file and the room it was
+   * shared in can already see it — #183 §6's argument), and they are never
+   * written anywhere: not to `threadContext` (which IS persisted on the
+   * draft row — the record's stated guard), not to any record or embedding.
+   */
+  attachments?: readonly WorkspaceGroundedAttachment[],
 ): Promise<DraftPipelineResult> {
   // Checked first, before any retrieval or generation: a refused subject
   // escalates "without reasoning about it" (#34 AC2) — there is no
@@ -141,20 +165,28 @@ export async function draftReply(
   }
 
   const context = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider, undefined, publicClearanceCeiling);
-  const sources = buildSources(context);
+  const providedAttachments = attachments ?? [];
+  const sources = buildSources(context, providedAttachments);
 
   // Nothing to ground a draft in at all: no rule hit, no retrieved
-  // evidence. Escalate immediately, before ever asking a model to
-  // generate anything — buildDraftPrompt tells the model "never invent
-  // facts", but a model asked to answer with zero context can still
-  // return something confident-sounding and wrong, and #33's default
-  // weights only guarantee escalation for this case at the *scoring*
-  // step (retrievalStrength + ruleHit's combined weight matches the
-  // default threshold exactly) — a reconfigured eval sweep could weaken
-  // that guarantee. Checking here instead means a groundless draft is
-  // never generated in the first place, under any weight configuration,
+  // evidence, no attachment. An attachment that passed the door DOES count
+  // as grounding here (#183 §3's exact requirement — otherwise a fresh duo
+  // escalates every attachment question as groundless), which is the whole
+  // of its influence on this pipeline's decisions: the confidence signals
+  // below stay corpus-honest, because provided material is kin to a rule
+  // hit, not retrieved evidence — retrievalStrength still measures only
+  // what the corpus returned, and a duo with an empty corpus still scores
+  // like one. Escalate immediately when there is nothing, before ever
+  // asking a model to generate anything — buildDraftPrompt tells the model
+  // "never invent facts", but a model asked to answer with zero context
+  // can still return something confident-sounding and wrong, and #33's
+  // default weights only guarantee escalation for this case at the
+  // *scoring* step (retrievalStrength + ruleHit's combined weight matches
+  // the default threshold exactly) — a reconfigured eval sweep could
+  // weaken that guarantee. Checking here instead means a groundless draft
+  // is never generated in the first place, under any weight configuration,
   // and it also skips a wasted inference call.
-  if (context.ruleHit === undefined && context.evidence.length === 0) {
+  if (context.ruleHit === undefined && context.evidence.length === 0 && providedAttachments.length === 0) {
     const reason = noEvidenceEscalationReason();
     const draftId = appendDraft(storePath, passphrase, {
       question,
@@ -176,7 +208,7 @@ export async function draftReply(
   let selfConsistencyAgreement: number;
 
   if (inferenceProvider) {
-    const prompt = buildDraftPrompt(question, threadContext, context);
+    const prompt = buildDraftPrompt(question, threadContext, context, providedAttachments);
     const sampling = await runSelfConsistencySampling(
       prompt,
       confidenceConfig.selfConsistencySamples,
@@ -188,8 +220,8 @@ export async function draftReply(
     selfConsistencyAgreement = sampling.agreement;
   } else {
     // extractiveDraft is guaranteed defined here: the groundless case
-    // (no rule, no evidence) already returned above.
-    samples = [extractiveDraft(context) as string];
+    // (no rule, no evidence, no attachment) already returned above.
+    samples = [extractiveDraft(context, providedAttachments) as string];
     sampleEmbeddings = [];
     selfConsistencyAgreement = 1;
   }

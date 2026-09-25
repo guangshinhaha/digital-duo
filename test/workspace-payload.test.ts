@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { ConfidenceResult } from "../src/drafting/confidence.js";
-import { buildAnswerEvent, buildFailedAnswerEvent } from "../src/workspace/payload.js";
+import { buildAnswerEvent, buildAttachmentRefusalEvent, buildFailedAnswerEvent } from "../src/workspace/payload.js";
 import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../src/permissions/public-answer.js";
 
 // Markers planted in every owner-facing or corpus-shaped field of a poisoned
@@ -79,6 +79,29 @@ describe("buildAnswerEvent — the corpus never crosses (#186 AC5, decision reco
     expect(serialized).toContain("Approved on 2026-08-14.");
   });
 
+  it("serializes none of an attachment-grounded answer's structured sources either (#190) — the file reference and preview label stay owner-side", () => {
+    // The #190 addition to the same rule: a draft grounded on an asker's
+    // file cites the workspace's file reference as its source id and a
+    // stripped preview as its label — both must stay off the wire exactly
+    // like evidence ids and labels. What crosses is the answer text alone
+    // (and the answer text is legitimately allowed to speak about the
+    // file's contents — the asker shared them).
+    const outcome: PublicAnswerOutcome = {
+      kind: "answered",
+      draftId: POISON.draftId,
+      logEntryId: POISON.logEntryId,
+      text: "The launch date is March 3rd, per the notes you attached.",
+      sources: [{ kind: "attachment", id: "mxc://workspace/f1", label: "attachment notes.txt (text/plain): restricted" }],
+      confidence: confidence(),
+      topicId: POISON.topicId,
+      evidenceAgeDays: null,
+    };
+    const serialized = JSON.stringify(buildAnswerEvent(outcome));
+    expect(serialized).not.toContain("mxc://workspace/f1");
+    expect(serialized).not.toContain("attachment notes.txt");
+    expect(serialized).toContain("The launch date is March 3rd");
+  });
+
   it("carries the passed-on message, not the escalation internals, on a passed_on outcome", () => {
     const outcome: PublicAnswerOutcome = {
       kind: "passed_on",
@@ -126,6 +149,19 @@ describe("buildAnswerEvent — the corpus never crosses (#186 AC5, decision reco
     expect(JSON.stringify(buildAnswerEvent({ kind: "declined_refused", draftId: "d", logEntryId: "l", message: "m" }))).not.toContain(
       POISON.passphrase,
     );
+  });
+
+  it("builds an attachment refusal (#190) in the same one shape — the door's message as body, and nothing else it could carry", () => {
+    // The door's message is a plain string that names the limit broken;
+    // the builder's entire input is that string, so there is no path from
+    // file bytes, file references, or marking-bearing text into the event
+    // that the door's own message doesn't already state deliberately.
+    const message = '"notes.txt" is 45.0 KiB — over the 32.0 KiB per attachment I can ground on.';
+    const event = buildAttachmentRefusalEvent(message);
+    expect(event).toEqual({ msgtype: "m.text", body: message });
+    expect(Object.keys(event).sort()).toEqual(["body", "msgtype"]);
+    expect(JSON.stringify(event)).not.toContain(POISON.passphrase);
+    expect(JSON.stringify(event)).not.toContain("mxc://");
   });
 });
 

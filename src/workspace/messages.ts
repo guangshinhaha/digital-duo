@@ -45,14 +45,42 @@
  * ## v1 parsing scope (deliberate)
  *
  * Parsed: `m.room.message` with `msgtype: "m.text"` (the same filter the
- * daemon's seam applies), `m.replace` edits, `m.thread` parents,
- * `m.receipt`/`m.read` read positions, `m.room.member` membership states,
- * `m.room.name`, `m.room.create`, and the sync's `invite` section as
- * `RoomInvite`s (#192 — an invitation is a consent question, so the contract
- * states its facts). Not parsed, by decision: files and other msgtypes
- * (#190), redactions, E2EE content (#191), left rooms and room governance.
- * Non-`m.text` message events and events without a parseable sender or body
+ * daemon's seam applies for questions), `m.file` and `m.image` (#190 — a
+ * message can carry file content; see `MessageFile`), `m.replace` edits,
+ * `m.thread` parents, `m.receipt`/`m.read` read positions, `m.room.member`
+ * membership states, `m.room.name`, `m.room.create`, and the sync's
+ * `invite` section as `RoomInvite`s (#192 — an invitation is a consent
+ * question, so the contract states its facts). Not parsed, by decision:
+ * other msgtypes (`m.audio`, `m.video`, …), redactions, E2EE content
+ * (#191), left rooms and room governance. Message events without a
+ * parseable sender or body — and file events without a content reference —
  * are skipped by the parser, never guessed at.
+ *
+ * ## Files (#190): what the platform gives, what this contract states
+ *
+ * Matrix keeps files out of rooms: an upload lands in the homeserver's
+ * media store and returns a stable content URI (`mxc://…`), and the room
+ * event *references* it. Serving, then, is two platform facts, stated here
+ * so the client builds on them rather than on inference:
+ *
+ * - **The file message is served to members of that conversation.** The
+ *   event — filename, type, size, reference — is room history: the
+ *   homeserver delivers it under the room's history visibility, so only
+ *   members see it, exactly as for text.
+ * - **The bytes are served to authenticated users of the workspace
+ *   homeserver, not to the room.** Authenticated media (MSC3916) requires
+ *   an access token on every download, but Synapse does not bind an mxc
+ *   URI to a room: any authenticated user of the homeserver who holds the
+ *   reference can dereference it. On this deployment — the org's own
+ *   homeserver, federation off — that population is the org, which is the
+ *   read model files inherit wholesale (docs/workspace/org-read.md §4).
+ *   What our side adds is the rest of that record's shape: the daemon
+ *   dereferences only as the duo's own user over its outbound connection,
+ *   never republishes bytes (an answer is text, and text only — the
+ *   payload boundary), and gates any *duo-side use* at the attachment
+ *   door (docs/workspace/attachments.md), which is where classification
+ *   is decided — the workspace itself never classifies and never strips
+ *   (§6), so what the contract carries is the file verbatim.
  */
 
 /**
@@ -160,6 +188,26 @@ export interface ReadPosition {
 /** A message's edit state: untouched, or edited (the body is the latest text either way). */
 export type MessageEditState = { readonly kind: "original" } | { readonly kind: "edited"; readonly editedAt: string };
 
+/**
+ * #190: the file a message carries — everything a client needs to render
+ * it and everything the duo's side needs to reference it. See the module
+ * doc's "Files" section for who may dereference `reference` and under what
+ * model; the short form is that the reference is stable, asker-
+ * dereferenceable through authenticated media, and doubles as the id the
+ * duo's draft sources cite when an attachment grounds a draft
+ * (docs/workspace/attachments.md §8's contract dependency).
+ */
+export interface MessageFile {
+  /** The filename as sent — the event's `filename`, falling back to its `body` (Matrix's own convention for m.file). */
+  readonly name: string;
+  /** The declared MIME type (`info.mimetype`), null when the sender didn't declare one. An `m.image` without one reads as `"image/*"`. */
+  readonly mimeType: string | null;
+  /** The declared size in bytes (`info.size`), null when undeclared — a hint from the sender, checked before it is trusted anywhere. */
+  readonly size: number | null;
+  /** The Matrix content URI (`mxc://…`) — the stable reference to the bytes in the homeserver's media store. */
+  readonly reference: string;
+}
+
 /** A message in a conversation, as both the daemon and the client see it. */
 export interface Message {
   /** Matrix event id — stable, unique, and the paging cursor. */
@@ -167,7 +215,14 @@ export interface Message {
   readonly conversationId: string;
   /** Structural: a person or a duo, derived from the sending user id. */
   readonly author: MessageAuthor;
+  /**
+   * The message's body text — the text for `m.text`, the filename for
+   * `m.file`/`m.image` (Matrix's own convention: the body is the fallback
+   * name a client renders when it cannot preview the file).
+   */
   readonly body: string;
+  /** The file this message carries (#190) — null on text messages. */
+  readonly file: MessageFile | null;
   /** ISO-8601 instant of the homeserver's `origin_server_ts` — the ordering component. */
   readonly sentAt: string;
   readonly edit: MessageEditState;
@@ -400,6 +455,35 @@ interface RelatesTo {
   readonly eventId?: string;
 }
 
+/**
+ * Reads a file message's content into a `MessageFile` — the one place an
+ * `m.file`/`m.image` event becomes contract file facts. Undefined (skip the
+ * event) when the content carries no usable content reference: without a
+ * reference there is nothing to render or dereference, and guessing a
+ * filename-only "file" would hand a client a dead card it can neither
+ * preview nor download. An `m.image` that declares no MIME type still reads
+ * as `image/*` — the msgtype itself is the sender's own type declaration.
+ * Exported for the seam adapter (#190's association walk), which feeds it
+ * the same content shape off a live SDK event — one parsing layer, stated
+ * rule of this module.
+ */
+export function fileFromContent(msgtype: string, content: Record<string, unknown>): MessageFile | undefined {
+  const reference = stringOrUndefined(content.url);
+  if (reference === undefined) {
+    return undefined;
+  }
+  const info = content.info !== null && typeof content.info === "object" ? (content.info as Record<string, unknown>) : {};
+  const body = stringOrUndefined(content.body);
+  const filename = stringOrUndefined(content.filename);
+  const size = typeof info.size === "number" && Number.isFinite(info.size) ? info.size : null;
+  return {
+    name: filename !== undefined && filename.length > 0 ? filename : (body ?? reference),
+    mimeType: stringOrUndefined(info.mimetype) ?? (msgtype === "m.image" ? "image/*" : null),
+    size,
+    reference,
+  };
+}
+
 function relatesToOf(content: Record<string, unknown>): RelatesTo {
   const relatesTo = content["m.relates_to"];
   if (relatesTo === null || typeof relatesTo !== "object") {
@@ -446,7 +530,9 @@ export function messagesFromTimeline(conversationId: string, events: readonly Ra
       continue;
     }
     const content = contentOf(event);
-    if (content === undefined || content.msgtype !== "m.text") {
+    const msgtype = content?.msgtype;
+    const isFileMessage = msgtype === "m.file" || msgtype === "m.image";
+    if (content === undefined || (msgtype !== "m.text" && !isFileMessage)) {
       continue;
     }
     const sentAt = isoFromTs(event.origin_server_ts);
@@ -460,6 +546,17 @@ export function messagesFromTimeline(conversationId: string, events: readonly Ra
     const relatesTo = relatesToOf(content);
     const sender = event.sender;
     const eventId = event.event_id;
+    // A file message is only a message if its content reference parsed —
+    // see fileFromContent. A file event without a reference is skipped,
+    // exactly like a text event without a body.
+    let file: MessageFile | null = null;
+    if (isFileMessage) {
+      const parsed = fileFromContent(msgtype as string, content);
+      if (parsed === undefined) {
+        continue;
+      }
+      file = parsed;
+    }
     if (messages.has(eventId)) {
       // A duplicated event id inside one slice is wire malformity; the
       // first copy stands and the second must not emit twice.
@@ -488,7 +585,12 @@ export function messagesFromTimeline(conversationId: string, events: readonly Ra
           continue;
         }
         // Fold: the original event id, time, thread and author all stand —
-        // an edit is not a new message, it is a new state of one.
+        // an edit is not a new message, it is a new state of one. A file
+        // message's edit folds the same way: the body (the filename)
+        // updates, the file facts stand — an edit renames, it does not
+        // re-upload; a replacement event carrying a whole new file is a new
+        // file event, and the #190 door treats whatever reference actually
+        // rides the question, not what an edit claims.
         messages.set(original.id, {
           ...original,
           body,
@@ -501,6 +603,7 @@ export function messagesFromTimeline(conversationId: string, events: readonly Ra
         conversationId,
         author: authorFromUserId(sender),
         body,
+        file,
         sentAt,
         edit: { kind: "original" },
         threadParentId: null,
@@ -518,6 +621,7 @@ export function messagesFromTimeline(conversationId: string, events: readonly Ra
       conversationId,
       author: authorFromUserId(sender),
       body,
+      file,
       sentAt,
       edit: { kind: "original" },
       threadParentId: relatesTo.relType === "m.thread" && relatesTo.eventId !== undefined ? relatesTo.eventId : null,

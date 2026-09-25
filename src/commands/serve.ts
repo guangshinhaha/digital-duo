@@ -1,4 +1,6 @@
 import type { DuoConfig } from "../config.js";
+import { attachmentGroundingDoor } from "../drafting/attachment-grounding.js";
+import { parseClassificationCeiling } from "../permissions/classification.js";
 import { answerPublicly } from "../permissions/public-answer.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
@@ -108,6 +110,15 @@ export async function runServe(
         // and not the store). Wired whenever a workspace exists at all, so
         // the owner surface is never half-configured.
         consent: { duoDir: config.duoDir },
+        // #190: the attachment grounding door, wired with the owner's own
+        // classification ceiling — the same parsed value every ingest
+        // boundary reads, because this is the same policy applied at a
+        // different door. Parsed here, at wiring, in the boot-refusal
+        // family: a workspace-configured daemon with an unparseable
+        // DUO_CLASSIFICATION_CEILING must not come up guessing what a door
+        // should admit (every other surface already fails the same value
+        // at its own point of use).
+        attachmentDoor: attachmentGroundingDoor(parseClassificationCeiling(config.classificationCeiling)),
         // THE answering pipeline, not a workspace twin: the identical
         // answerPublicly call POST /ask makes, argument for argument, with
         // the asking Matrix user resolved through the same directory
@@ -132,6 +143,11 @@ export async function runServe(
             inferenceProvider,
             config.confidence,
             config.ownerName,
+            // #190: what the door admitted — the asker's files, decoded
+            // and marking-stripped, grounding this one draft call. The
+            // door refused, or the question rode with nothing, and this is
+            // undefined — the pre-#190 call shape, byte-identical.
+            question.grounding,
           ),
       })
     : undefined;

@@ -1,6 +1,7 @@
 import { CLASSIFICATION_LEVELS } from "../ingest/record.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import type { DuoConfig } from "../config.js";
+import type { WorkspaceGroundedAttachment } from "../workspace/transport.js";
 import type { DraftSource } from "../drafting/draft-log.js";
 import type { ConfidenceResult } from "../drafting/confidence.js";
 import { draftReply } from "../drafting/pipeline.js";
@@ -150,6 +151,15 @@ export async function answerPublicly(
   inferenceProvider: InferenceProvider | undefined,
   confidenceConfig: DuoConfig["confidence"],
   ownerName: string,
+  /**
+   * #190: attachments that passed the grounding door — the workspace
+   * service's one addition to this call. They ground the draft (and appear
+   * in its sources, so provenance stays honest) without ever being logged
+   * here: the public answer log below records the question and the posted
+   * text, never the attachment bytes, which live for the one draft call
+   * and are gone (#183 §3).
+   */
+  attachments?: readonly WorkspaceGroundedAttachment[],
 ): Promise<PublicAnswerOutcome> {
   // The asker-context fields every one of the three log appends below
   // carries identically — only topicId/outcome/text/draftId vary by branch.
@@ -169,6 +179,7 @@ export async function answerPublicly(
     inferenceProvider,
     confidenceConfig,
     PUBLIC_ANSWER_CLEARANCE_CEILING,
+    attachments,
   );
 
   if (pipelineResult.kind === "escalation") {

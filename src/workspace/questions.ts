@@ -46,6 +46,12 @@ export function directQuestionFrom(message: WorkspaceCandidateMessage, selfUserI
     senderId: message.senderId,
     body: message.body,
     receivedAt: new Date().toISOString(),
+    // #190: attachments ride the question, raw and unjudged — whether any
+    // of them may ground a draft is the attachment door's decision (the
+    // door runs between this filter and the answering pipeline), never the
+    // filter's. An empty list is the pre-#190 shape, normalized here so
+    // every consumer downstream can rely on the field.
+    attachments: message.attachments ?? [],
   };
 }
 
@@ -129,5 +135,9 @@ export function answerableQuestionFrom(
     senderId: message.senderId,
     body: message.body,
     receivedAt: new Date().toISOString(),
+    // #190: attachments ride consented-room questions exactly as they ride
+    // direct ones (see directQuestionFrom) — the door judges them, never
+    // the filter, and never the room's consent state.
+    attachments: message.attachments ?? [],
   };
 }

@@ -2,6 +2,7 @@ import type { RoomInvite } from "../../src/workspace/messages.js";
 import type {
   AnswerEventContent,
   WorkspaceCandidateMessage,
+  WorkspaceFileBody,
   WorkspaceMemberIdentityListing,
   WorkspaceMemberListing,
   WorkspaceTransport,
@@ -47,6 +48,8 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
   readonly sentAnswers: { roomId: string; content: AnswerEventContent }[] = [];
   /** The membership the fake homeserver holds — what a join added and a leave removed. */
   readonly joinedRooms = new Set<string>();
+  /** Every fetchFile call, in order — the door's "was the body read at all" evidence (#190). */
+  readonly fetchFileCalls: { reference: string; maxBytes: number }[] = [];
 
   private failNextConnects = 0;
   private connected = false;
@@ -58,6 +61,8 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
   private listMembersError: Error | undefined;
   private nextConnectError: Error | undefined;
   private nextLeaveError: Error | undefined;
+  private readonly fileBodies = new Map<string, Uint8Array>();
+  private readonly fileErrors = new Map<string, Error>();
 
   /** Makes the next `n` connect() calls reject, like an unreachable homeserver. */
   failNextNConnects(n: number): void {
@@ -77,6 +82,20 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
   /** Makes listMembers() reject, like a homeserver refusing the directory query. */
   failListMembers(error: Error): void {
     this.listMembersError = error;
+  }
+
+  /**
+   * The media store's answer for one content reference (#190): the bytes a
+   * `GET /…/download` would serve. Text in, bytes out — the encoding the
+   * door's TextDecoder undoes.
+   */
+  setFile(reference: string, body: string): void {
+    this.fileBodies.set(reference, new TextEncoder().encode(body));
+  }
+
+  /** The media store's answer for a reference it no longer has — a deleted file. */
+  failFileFetch(reference: string, error: Error): void {
+    this.fileErrors.set(reference, error);
   }
 
   /** Simulates the held outbound connection dropping (the SDK's own retries exhausted). */
@@ -147,6 +166,29 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
 
   async markAlive(): Promise<void> {
     this.markAliveCalls += 1;
+  }
+
+  async fetchFile(reference: string, options: { readonly maxBytes: number }): Promise<WorkspaceFileBody> {
+    // The media-download role (#190), with the real adapter's semantics:
+    // only over the held connection, one recorded call per dereference,
+    // and the Range cut honored the way a compliant homeserver honors it —
+    // an inclusive `bytes=0-maxBytes` serves at most maxBytes+1 bytes,
+    // which is exactly enough for the caller to tell "at most maxBytes"
+    // from "more than maxBytes".
+    this.fetchFileCalls.push({ reference, maxBytes: options.maxBytes });
+    if (!this.connected) {
+      throw new Error("fake: not connected");
+    }
+    const error = this.fileErrors.get(reference);
+    if (error) {
+      throw error;
+    }
+    const body = this.fileBodies.get(reference);
+    if (body === undefined) {
+      throw new Error(`fake: no such file ${reference}`);
+    }
+    const bytes = body.byteLength > options.maxBytes ? body.slice(0, options.maxBytes + 1) : body;
+    return { bytes, exceededMaxBytes: bytes.byteLength > options.maxBytes };
   }
 
   async listMembers(): Promise<WorkspaceMemberListing> {
