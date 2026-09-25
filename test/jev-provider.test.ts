@@ -190,6 +190,86 @@ describe("JevProvider.decide — failure paths (KTD2 taxonomy)", () => {
   });
 });
 
+describe("JevProvider.decide — answer-shape edges and accounting coercion (wire-contract boundaries)", () => {
+  const config = loadConfig({ DUO_JEV_API_KEY: "sk-test-123" });
+
+  it("throws ProviderError naming the question index when an answer is missing or not an object", async () => {
+    // Two questions asked, only q0 answered → q1 is missing.
+    vi.stubGlobal(
+      "fetch",
+      stubFetchWith(JSON.stringify({ model: "jev-1.13.0", answers: { q0: { noul: 0.9 } } })),
+    );
+    const provider = createJevProvider(config);
+    await expect(
+      provider.decide({ mention: "hi" }, [
+        { kind: "binary", instructions: "q1?" },
+        { kind: "binary", instructions: "q2?" },
+      ]),
+    ).rejects.toThrow(/no answer for question 1/);
+
+    vi.stubGlobal("fetch", stubFetchWith(JSON.stringify({ model: "jev-1.13.0", answers: { q0: 42 } })));
+    const provider2 = createJevProvider(config);
+    await expect(
+      provider2.decide({ mention: "hi" }, [{ kind: "binary", instructions: "q?" }]),
+    ).rejects.toThrow(/no answer for question 0/);
+  });
+
+  it("throws ProviderError when a choice answer carries no string pick", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetchWith(JSON.stringify({ model: "jev-1.13.0", answers: { q0: { noul: 0.5 } } })),
+    );
+    const provider = createJevProvider(config);
+    await expect(
+      provider.decide({ page: "menu" }, [
+        { kind: "choice", instructions: "which?", criteria: { a: "A", b: "B" } },
+      ]),
+    ).rejects.toThrow(ProviderError);
+    await expect(
+      provider.decide({ page: "menu" }, [
+        { kind: "choice", instructions: "which?", criteria: { a: "A", b: "B" } },
+      ]),
+    ).rejects.toThrow(/no string choice answer/);
+  });
+
+  it("keeps the pick and drops non-numeric probabilities/confidence instead of failing the run", async () => {
+    // probabilities has one non-finite value → the whole map is dropped;
+    // confidence is a string → dropped. The pick stands.
+    vi.stubGlobal(
+      "fetch",
+      stubFetchWith(
+        JSON.stringify({
+          model: "jev-1.13.0",
+          answers: { q0: { choice: "open-settings", probabilities: { "open-settings": "high", "search-again": 0.3 }, confidence: "sure" } },
+        }),
+      ),
+    );
+    const provider = createJevProvider(config);
+    const result = await provider.decide({ page: "menu" }, [
+      { kind: "choice", instructions: "which?", criteria: { "open-settings": "Opens settings", "search-again": "Repeats" } },
+    ]);
+    expect(result.answers).toEqual([{ kind: "choice", pick: "open-settings" }]);
+  });
+
+  it("coerces absent/non-numeric usage to zeros and a non-string model to 'unknown' — accounting never fails a good answer", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetchWith(
+        JSON.stringify({
+          model: 42,
+          answers: { q0: { noul: 0.7 } },
+          usage: { input_tokens: "many" },
+        }),
+      ),
+    );
+    const provider = createJevProvider(config);
+    const result = await provider.decide({ mention: "hi" }, [{ kind: "binary", instructions: "q?" }]);
+    expect(result.answers).toEqual([{ kind: "binary", probability: 0.7 }]);
+    expect(result.model).toBe("unknown");
+    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0 });
+  });
+});
+
 describe("registry guard — Jev never enters the production registry (KTD3/G1)", () => {
   it("defaultRegistry keys remain exactly ['ollama']", () => {
     expect(Object.keys(defaultRegistry)).toEqual(["ollama"]);

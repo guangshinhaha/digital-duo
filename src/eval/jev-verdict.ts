@@ -74,7 +74,7 @@ export function recommendJevVerdict(
   }
   const reference = stage1.reference;
   if (reference?.status === "gap") {
-    conditions.push(`No local-model reference: ${reference.gapReason ?? "unnamed gap"}.`);
+    conditions.push(`No local-model reference: ${reference.gapReason ?? reference.failureSummary ?? "unnamed gap"}.`);
   } else if (reference?.status === "failed") {
     conditions.push(`The local-model reference failed: ${reference.failureSummary ?? "no summary recorded"}.`);
   }
@@ -132,7 +132,7 @@ function referenceLine(stage1: JevStage1Report): string {
     return "- Local reference (Ollama): not recorded on this report.";
   }
   if (reference.status === "gap") {
-    return `- Local reference (Ollama): gap — ${reference.gapReason ?? "unnamed gap"}.`;
+    return `- Local reference (Ollama): gap — ${reference.gapReason ?? reference.failureSummary ?? "unnamed gap"}.`;
   }
   if (reference.status === "failed") {
     return `- Local reference (Ollama): failed — ${reference.failureSummary ?? "no summary recorded"}.`;

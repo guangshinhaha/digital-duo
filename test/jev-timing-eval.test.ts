@@ -127,6 +127,24 @@ describe("Ollama reference — strict prompts, wrong-not-aborted parsing, degrad
     expect(section.gapReason ?? section.failureSummary ?? "").toMatch(/DUO_[A-Z_]+/);
     expect(section.accuracy).toBeUndefined();
   });
+
+  it("degrades to a gap carrying failureSummary when a configured provider's calls fail (ProviderError path)", async () => {
+    // A resolvable-but-unreachable loopback endpoint: the network denial
+    // permits loopback, so the real fetch runs and the Ollama provider
+    // wraps ECONNREFUSED as ProviderError — the degrade path a config gap
+    // never exercises. Stage 1 still completes; the verdict names the gap.
+    const { config } = tempRuntimeConfig({
+      DUO_PROVIDER: "ollama",
+      DUO_OLLAMA_MODEL: "llama3",
+      DUO_OLLAMA_HOST: "https://127.0.0.1:1",
+    });
+    const section = await runOllamaReferenceSection(config, REAL_LABELS.slice(0, 1), MULTIWAY_TASKS.slice(0, 1));
+    expect(section.status).toBe("gap");
+    expect(section.gapReason).toBeUndefined(); // a call-failure gap carries failureSummary, not gapReason
+    expect(section.failureSummary ?? "").toMatch(/ProviderError/);
+    expect(section.total).toBe(2);
+    expect(section.accuracy).toBeUndefined();
+  });
 });
 
 describe("stage-1 wrapper chaining — timing and reference sections (KTD6)", () => {

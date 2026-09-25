@@ -128,6 +128,23 @@ describe("jev verdict assembler — recommended-verdict mapping (in-process)", (
     expect(joined).toMatch(/duo eval jev stage2/);
   });
 
+  it("a call-failure gap names its failureSummary; 'unnamed gap' is reserved for a gap carrying neither field", () => {
+    // The ProviderError degrade path sets failureSummary only — the verdict's
+    // fallback chain must surface it rather than collapsing to "unnamed gap".
+    const gapped = stage1Report({ reference: { status: "gap", total: 67, failureSummary: "ProviderError: HTTP 503" } });
+    const named = recommendJevVerdict(gapped, stage2Report());
+    expect(named.verdict).toBe("adopt-with-conditions");
+    expect(named.conditions.join(" ")).toMatch(/No local-model reference: ProviderError: HTTP 503/);
+    expect(named.conditions.join(" ")).not.toMatch(/unnamed gap/);
+    const markdown = buildJevVerdictMarkdown(gapped, stage2Report(), named.verdict, named.conditions, "2026-09-25T00:00:00.000Z");
+    expect(markdown).toMatch(/gap — ProviderError: HTTP 503/);
+    expect(markdown).not.toMatch(/unnamed gap/);
+
+    const unnamed = recommendJevVerdict(stage1Report({ reference: { status: "gap", total: 67 } }), stage2Report());
+    expect(unnamed.conditions.join(" ")).toMatch(/unnamed gap/);
+    expect(buildJevVerdictMarkdown(stage1Report({ reference: { status: "gap", total: 67 } }), stage2Report(), unnamed.verdict, unnamed.conditions, "2026-09-25T00:00:00.000Z")).toMatch(/unnamed gap/);
+  });
+
   it("keeps an earned quality pass decisive but names every gapped, failed, or degenerate headline (KTD6)", () => {
     const { verdict, conditions } = recommendJevVerdict(
       stage1Report({

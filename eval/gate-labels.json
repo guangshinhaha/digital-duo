@@ -1,55 +1,290 @@
-[
-  { "id": "g001", "mentionType": "genuine_question", "expected": "answerable", "text": "Hey, can you review the Q3 budget doc before EOD?" },
-  { "id": "g002", "mentionType": "genuine_question", "expected": "answerable", "text": "What's the status on the vendor contract renewal?" },
-  { "id": "g003", "mentionType": "genuine_question", "expected": "answerable", "text": "Do we still need sign-off from Legal on this one?" },
-  { "id": "g004", "mentionType": "genuine_question", "expected": "answerable", "text": "Could you confirm the meeting time for tomorrow's steering committee?" },
-  { "id": "g005", "mentionType": "genuine_question", "expected": "answerable", "text": "Is the migration window still Friday night?" },
-  { "id": "g006", "mentionType": "genuine_question", "expected": "answerable", "text": "When are you free to walk through the incident report?" },
-  { "id": "g007", "mentionType": "genuine_question", "expected": "answerable", "text": "Which approach do you want for the rollout, phased or big bang" },
-  { "id": "g008", "mentionType": "genuine_question", "expected": "answerable", "text": "Would you be able to join the call at 3pm to unblock this?" },
-  { "id": "g009", "mentionType": "genuine_question", "expected": "answerable", "text": "How should I handle the escalation from the client on pricing?" },
-  { "id": "g010", "mentionType": "genuine_question", "expected": "answerable", "text": "Are we still on track for the Friday deadline?" },
-  { "id": "g011", "mentionType": "genuine_question", "expected": "answerable", "text": "Can you send over the latest headcount numbers for the review?" },
-  { "id": "g012", "mentionType": "genuine_question", "expected": "answerable", "text": "What did we decide about the offsite budget last week?" },
-
-  { "id": "f001", "mentionType": "fyi", "expected": "not_answerable", "text": "FYI, the server migration finished overnight without issues." },
-  { "id": "f002", "mentionType": "fyi", "expected": "not_answerable", "text": "Just letting you know the vendor invoice was paid this morning." },
-  { "id": "f003", "mentionType": "fyi", "expected": "not_answerable", "text": "Heads up, the meeting room's been changed to 4B." },
-  { "id": "f004", "mentionType": "fyi", "expected": "not_answerable", "text": "No action needed, just flagging the ticket got auto-closed." },
-  { "id": "f005", "mentionType": "fyi", "expected": "not_answerable", "text": "Adding you to this thread so you have visibility." },
-  { "id": "f006", "mentionType": "fyi", "expected": "not_answerable", "text": "Just so you know, I already looped in Legal on this." },
-
-  { "id": "t001", "mentionType": "thanks", "expected": "not_answerable", "text": "Thanks so much for pushing that through so quickly!" },
-  { "id": "t002", "mentionType": "thanks", "expected": "not_answerable", "text": "Thank you, that really helped clear things up." },
-  { "id": "t003", "mentionType": "thanks", "expected": "not_answerable", "text": "Cheers for the quick turnaround on this." },
-  { "id": "t004", "mentionType": "thanks", "expected": "not_answerable", "text": "Thanks, appreciate you covering the meeting for me." },
-  { "id": "t005", "mentionType": "thanks", "expected": "not_answerable", "text": "Thx for the update, all good on my end." },
-  { "id": "t006", "mentionType": "thanks", "expected": "not_answerable", "text": "No worries, thanks for flagging it." },
-
-  { "id": "s001", "mentionType": "social", "expected": "not_answerable", "text": "Congrats on the promotion, well deserved!" },
-  { "id": "s002", "mentionType": "social", "expected": "not_answerable", "text": "Haha that's a great catch, nice work team." },
-  { "id": "s003", "mentionType": "social", "expected": "not_answerable", "text": "Welcome aboard! Excited to have you on the team." },
-  { "id": "s004", "mentionType": "social", "expected": "not_answerable", "text": "Sounds good, catch you at the offsite next week." },
-  { "id": "s005", "mentionType": "social", "expected": "not_answerable", "text": "Nice one, that demo went really well." },
-  { "id": "s006", "mentionType": "social", "expected": "not_answerable", "text": "Lol yeah that meeting could have been an email." },
-
-  { "id": "m001", "mentionType": "mixed_signal", "expected": "not_answerable", "text": "Thanks for the update! Also, is the deploy still happening tonight?" },
-  { "id": "m002", "mentionType": "mixed_signal", "expected": "not_answerable", "text": "Congrats on shipping that! By the way, do you know who owns the follow-up ticket?" },
-  { "id": "m003", "mentionType": "mixed_signal", "expected": "not_answerable", "text": "No worries about the delay, but can we still make the Friday deadline?" },
-  { "id": "m004", "mentionType": "mixed_signal", "expected": "not_answerable", "text": "Cheers for covering yesterday. Quick one though, did the client get the invoice?" },
-  { "id": "m005", "mentionType": "mixed_signal", "expected": "not_answerable", "text": "Nice work on the launch! Also wondering if you saw my email about budget?" },
-  { "id": "m006", "mentionType": "mixed_signal", "expected": "not_answerable", "text": "Thanks, appreciate it. One more thing, should we push the release to Monday?" },
-
-  { "id": "a001", "mentionType": "ambiguous_no_signal", "expected": "not_answerable", "text": "The client mentioned something about the timeline again." },
-  { "id": "a002", "mentionType": "ambiguous_no_signal", "expected": "not_answerable", "text": "Saw your comment on the doc, makes sense." },
-  { "id": "a003", "mentionType": "ambiguous_no_signal", "expected": "not_answerable", "text": "There's a thread going on about the outage from last night." },
-  { "id": "a004", "mentionType": "ambiguous_no_signal", "expected": "not_answerable", "text": "The numbers in the report don't quite match what I expected." },
-  { "id": "a005", "mentionType": "ambiguous_no_signal", "expected": "not_answerable", "text": "Circling back on the earlier point about staffing." },
-  { "id": "a006", "mentionType": "ambiguous_no_signal", "expected": "not_answerable", "text": "Not totally sure what happened with the ticket after that." },
-
-  { "id": "r001", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Who even reviews these tickets anymore, right?" },
-  { "id": "r002", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Isn't it wild how long that outage went on?" },
-  { "id": "r003", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Can you believe they pushed the deadline again?" },
-  { "id": "r004", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Why does this always happen on a Friday?" },
-  { "id": "r005", "mentionType": "rhetorical_question", "expected": "not_answerable", "text": "Isn’t it wild how long that outage went on?" }
-]
+{
+  "provenance": {
+    "synthetic": true,
+    "note": "Hand-authored synthetic mentions for the relevance-gate label set (#36) and the Jev typed-decision spike. Every name, project, and date below is invented. The Jev stage-1 path sends this text to the hosted gateway, so the file is egress-eligible (R9) precisely because it contains no owner or user content — never add real material here (KTD10)."
+  },
+  "items": [
+    {
+      "id": "g001",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Hey, can you review the Q3 budget doc before EOD?"
+    },
+    {
+      "id": "g002",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "What's the status on the vendor contract renewal?"
+    },
+    {
+      "id": "g003",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Do we still need sign-off from Legal on this one?"
+    },
+    {
+      "id": "g004",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Could you confirm the meeting time for tomorrow's steering committee?"
+    },
+    {
+      "id": "g005",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Is the migration window still Friday night?"
+    },
+    {
+      "id": "g006",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "When are you free to walk through the incident report?"
+    },
+    {
+      "id": "g007",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Which approach do you want for the rollout, phased or big bang"
+    },
+    {
+      "id": "g008",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Would you be able to join the call at 3pm to unblock this?"
+    },
+    {
+      "id": "g009",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "How should I handle the escalation from the client on pricing?"
+    },
+    {
+      "id": "g010",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Are we still on track for the Friday deadline?"
+    },
+    {
+      "id": "g011",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "Can you send over the latest headcount numbers for the review?"
+    },
+    {
+      "id": "g012",
+      "mentionType": "genuine_question",
+      "expected": "answerable",
+      "text": "What did we decide about the offsite budget last week?"
+    },
+    {
+      "id": "f001",
+      "mentionType": "fyi",
+      "expected": "not_answerable",
+      "text": "FYI, the server migration finished overnight without issues."
+    },
+    {
+      "id": "f002",
+      "mentionType": "fyi",
+      "expected": "not_answerable",
+      "text": "Just letting you know the vendor invoice was paid this morning."
+    },
+    {
+      "id": "f003",
+      "mentionType": "fyi",
+      "expected": "not_answerable",
+      "text": "Heads up, the meeting room's been changed to 4B."
+    },
+    {
+      "id": "f004",
+      "mentionType": "fyi",
+      "expected": "not_answerable",
+      "text": "No action needed, just flagging the ticket got auto-closed."
+    },
+    {
+      "id": "f005",
+      "mentionType": "fyi",
+      "expected": "not_answerable",
+      "text": "Adding you to this thread so you have visibility."
+    },
+    {
+      "id": "f006",
+      "mentionType": "fyi",
+      "expected": "not_answerable",
+      "text": "Just so you know, I already looped in Legal on this."
+    },
+    {
+      "id": "t001",
+      "mentionType": "thanks",
+      "expected": "not_answerable",
+      "text": "Thanks so much for pushing that through so quickly!"
+    },
+    {
+      "id": "t002",
+      "mentionType": "thanks",
+      "expected": "not_answerable",
+      "text": "Thank you, that really helped clear things up."
+    },
+    {
+      "id": "t003",
+      "mentionType": "thanks",
+      "expected": "not_answerable",
+      "text": "Cheers for the quick turnaround on this."
+    },
+    {
+      "id": "t004",
+      "mentionType": "thanks",
+      "expected": "not_answerable",
+      "text": "Thanks, appreciate you covering the meeting for me."
+    },
+    {
+      "id": "t005",
+      "mentionType": "thanks",
+      "expected": "not_answerable",
+      "text": "Thx for the update, all good on my end."
+    },
+    {
+      "id": "t006",
+      "mentionType": "thanks",
+      "expected": "not_answerable",
+      "text": "No worries, thanks for flagging it."
+    },
+    {
+      "id": "s001",
+      "mentionType": "social",
+      "expected": "not_answerable",
+      "text": "Congrats on the promotion, well deserved!"
+    },
+    {
+      "id": "s002",
+      "mentionType": "social",
+      "expected": "not_answerable",
+      "text": "Haha that's a great catch, nice work team."
+    },
+    {
+      "id": "s003",
+      "mentionType": "social",
+      "expected": "not_answerable",
+      "text": "Welcome aboard! Excited to have you on the team."
+    },
+    {
+      "id": "s004",
+      "mentionType": "social",
+      "expected": "not_answerable",
+      "text": "Sounds good, catch you at the offsite next week."
+    },
+    {
+      "id": "s005",
+      "mentionType": "social",
+      "expected": "not_answerable",
+      "text": "Nice one, that demo went really well."
+    },
+    {
+      "id": "s006",
+      "mentionType": "social",
+      "expected": "not_answerable",
+      "text": "Lol yeah that meeting could have been an email."
+    },
+    {
+      "id": "m001",
+      "mentionType": "mixed_signal",
+      "expected": "not_answerable",
+      "text": "Thanks for the update! Also, is the deploy still happening tonight?"
+    },
+    {
+      "id": "m002",
+      "mentionType": "mixed_signal",
+      "expected": "not_answerable",
+      "text": "Congrats on shipping that! By the way, do you know who owns the follow-up ticket?"
+    },
+    {
+      "id": "m003",
+      "mentionType": "mixed_signal",
+      "expected": "not_answerable",
+      "text": "No worries about the delay, but can we still make the Friday deadline?"
+    },
+    {
+      "id": "m004",
+      "mentionType": "mixed_signal",
+      "expected": "not_answerable",
+      "text": "Cheers for covering yesterday. Quick one though, did the client get the invoice?"
+    },
+    {
+      "id": "m005",
+      "mentionType": "mixed_signal",
+      "expected": "not_answerable",
+      "text": "Nice work on the launch! Also wondering if you saw my email about budget?"
+    },
+    {
+      "id": "m006",
+      "mentionType": "mixed_signal",
+      "expected": "not_answerable",
+      "text": "Thanks, appreciate it. One more thing, should we push the release to Monday?"
+    },
+    {
+      "id": "a001",
+      "mentionType": "ambiguous_no_signal",
+      "expected": "not_answerable",
+      "text": "The client mentioned something about the timeline again."
+    },
+    {
+      "id": "a002",
+      "mentionType": "ambiguous_no_signal",
+      "expected": "not_answerable",
+      "text": "Saw your comment on the doc, makes sense."
+    },
+    {
+      "id": "a003",
+      "mentionType": "ambiguous_no_signal",
+      "expected": "not_answerable",
+      "text": "There's a thread going on about the outage from last night."
+    },
+    {
+      "id": "a004",
+      "mentionType": "ambiguous_no_signal",
+      "expected": "not_answerable",
+      "text": "The numbers in the report don't quite match what I expected."
+    },
+    {
+      "id": "a005",
+      "mentionType": "ambiguous_no_signal",
+      "expected": "not_answerable",
+      "text": "Circling back on the earlier point about staffing."
+    },
+    {
+      "id": "a006",
+      "mentionType": "ambiguous_no_signal",
+      "expected": "not_answerable",
+      "text": "Not totally sure what happened with the ticket after that."
+    },
+    {
+      "id": "r001",
+      "mentionType": "rhetorical_question",
+      "expected": "not_answerable",
+      "text": "Who even reviews these tickets anymore, right?"
+    },
+    {
+      "id": "r002",
+      "mentionType": "rhetorical_question",
+      "expected": "not_answerable",
+      "text": "Isn't it wild how long that outage went on?"
+    },
+    {
+      "id": "r003",
+      "mentionType": "rhetorical_question",
+      "expected": "not_answerable",
+      "text": "Can you believe they pushed the deadline again?"
+    },
+    {
+      "id": "r004",
+      "mentionType": "rhetorical_question",
+      "expected": "not_answerable",
+      "text": "Why does this always happen on a Friday?"
+    },
+    {
+      "id": "r005",
+      "mentionType": "rhetorical_question",
+      "expected": "not_answerable",
+      "text": "Isn’t it wild how long that outage went on?"
+    }
+  ]
+}

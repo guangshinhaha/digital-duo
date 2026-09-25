@@ -1,7 +1,7 @@
 import type { DuoConfig } from "../config.js";
 import { readRefusalsFile } from "../drafting/refusals.js";
 import { scoreRelevanceGate, type GateEvalReport } from "../eval/gate-eval.js";
-import { loadGateLabels } from "../eval/gate-labels.js";
+import { loadGateLabels, loadGateLabelsForEgress } from "../eval/gate-labels.js";
 import { fixtureSha256, loadJevMultiwayTasks, loadJevTraces } from "../eval/jev-fixtures.js";
 import {
   JevStage2AbortedError,
@@ -87,7 +87,10 @@ export async function runEvalJevStage1(
   config: DuoConfig,
   provider: TypedDecisionProvider,
 ): Promise<JevStage1Report> {
-  const labels = loadGateLabels(config.eval.gateLabelsPath);
+  // Egress-gated load (R9): stage 1 sends label text to the hosted gateway,
+  // so the label file must declare itself synthetic the way the other Jev
+  // fixtures do — a real-content label set can never slip onto this path.
+  const labels = loadGateLabelsForEgress(config.eval.gateLabelsPath);
   const refusals = readRefusalsFile(config.duoDir);
   const tasks = loadJevMultiwayTasks(config.eval.jevMultiwayTasksPath);
   const gatewayOrigin = new URL(config.jev.gatewayUrl).origin;
