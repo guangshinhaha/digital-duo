@@ -290,6 +290,14 @@ Local-only means no drafts overnight. For private drafting this is fine: if you 
 were not answering either. It becomes real the moment the duo answers others directly.
 **→ Accepted for v1. Flagged as the forcing function for v2's hosting question.**
 
+**Decided 2026-09-25, not repealed (#188):** with the workspace product the risk arrived, and it
+is accepted-and-made-honest rather than solved. A question to an offline duo is an ordinary
+message — held by the workspace, delivered when the daemon reconnects, answered then — and the
+asker is told the duo is offline. Drafts and duo actions remain disabled-when-offline, never
+queued. Org-hosted daemons (#161) remain a deployment option, not a default. The replacement
+wording for this entry and the full reasoning are in
+[`workspace/asleep-duo.md`](workspace/asleep-duo.md); #193 applies the wording.
+
 ### AR-11 · Personal AI chat history may not be about work — MEDIUM
 `concept.md` bets heavily on LLM history as the densest record of reasoning. If the exportable
 history is personal use, much of it is irrelevant to work judgement and will dilute derivation.
