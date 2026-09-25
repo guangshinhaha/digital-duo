@@ -17,7 +17,17 @@
  * sides already hold (settings.userId), and the one consumer — the direct-
  * question filter — reads it from there. An adapter that disagreed with its
  * own settings would be a bug, not a fallback.
+ *
+ * #192 adds the room-membership operations consent is built from — `onInvite`
+ * (someone else's room add reaching this account; held for the owner's
+ * decision, never auto-joined), `joinRoom` and `leaveRoom` (the mechanical
+ * consequences of an allow and of a refusal/withdrawal; on Matrix a leave is
+ * also how an invite is rejected). The invite shape itself is the message
+ * contract's own `RoomInvite` (messages.ts) — imported type-only below so the
+ * seam and the contract cannot drift apart on what an invitation is.
  */
+import type { RoomInvite } from "./messages.js";
+
 export interface WorkspaceTransport {
   /**
    * Dial out, authenticate, and resolve only once the first sync has
@@ -89,6 +99,36 @@ export interface WorkspaceTransport {
    * blips the SDK absorbs internally never reach here.
    */
   onDisconnected(handler: () => void): void;
+
+  /**
+   * #192: an invitation to this account arrived — someone else's act of
+   * adding the duo to a room, live or replayed by the sync catch-up that
+   * `connect()` resolves on (an invite held while the Mac slept surfaces on
+   * wake, the same held-not-lost recovery a question gets). Delivered as a
+   * fact, nothing more: the seam has no join-on-invite, and nothing above
+   * it may build one — the duo joins only on its owner's explicit allow,
+   * recorded through the consent surface (consent.ts). A repeated delivery
+   * of a still-live invite (sync replays it until it is joined or left) is
+   * the caller's to dedupe by room id.
+   */
+  onInvite(handler: (invite: RoomInvite) => void): void;
+
+  /**
+   * Joins the room — the mechanical half of the owner's allow (#192). Only
+   * the consented path calls this; it is the sole join primitive in
+   * `src/workspace/`, so "a duo is never conscripted into a room" is
+   * structural: no other code path can put the duo in a room. Resolves when
+   * the homeserver accepts the membership.
+   */
+  joinRoom(roomId: string): Promise<void>;
+
+  /**
+   * Leaves the room — the mechanical half of a refusal (on Matrix, leaving
+   * is how an invite is rejected: the homeserver drops it and stops
+   * replaying it in sync) and of a withdrawal (#192). Resolves when the
+   * homeserver accepts the exit.
+   */
+  leaveRoom(roomId: string): Promise<void>;
 }
 
 /**

@@ -1,11 +1,16 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../src/permissions/public-answer.js";
+import { readRoomConsent, RoomConsentNotFoundError, type RoomConsentEntry } from "../src/workspace/consent.js";
 import type { DuoReadState } from "../src/workspace/read-state.js";
-import { availabilityOfState, reconnectDelayMs, RecentlySeenEventIds, WorkspaceService, type WorkspaceServiceState } from "../src/workspace/service.js";
+import type { RoomInvite } from "../src/workspace/messages.js";
+import { availabilityOfState, NoPendingInviteError, reconnectDelayMs, RecentlySeenEventIds, WorkspaceService, type WorkspaceServiceState } from "../src/workspace/service.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
 import { WorkspaceTokenRevokedError, type WorkspaceQuestion, type WorkspaceTransport, type WorkspaceMemberIdentityListing } from "../src/workspace/transport.js";
 import { FakeWorkspaceTransport } from "./helpers/fake-workspace-transport.js";
 import { memberOf } from "./helpers/workspace-member.js";
+import { useTempDir } from "./helpers/temp-dir.js";
 
 const SELF = "@duo-alice:workspace";
 
@@ -45,7 +50,7 @@ interface Harness {
   states: WorkspaceServiceState[];
 }
 
-function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>, readState?: DuoReadState): Harness {
+function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>, readState?: DuoReadState, consentDir?: string): Harness {
   const transport = new FakeWorkspaceTransport();
   const answers: WorkspaceQuestion[] = [];
   const service = new WorkspaceService({
@@ -56,6 +61,7 @@ function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (
       return answered(`answer to ${question.body}`);
     }),
     readState,
+    consent: consentDir === undefined ? undefined : { duoDir: consentDir },
   });
   const states: WorkspaceServiceState[] = [];
   service.onState((state) => states.push(state));
@@ -110,6 +116,12 @@ class HangingConnectTransport implements WorkspaceTransport {
   onMessage(): void {}
 
   onDisconnected(): void {}
+
+  onInvite(): void {}
+
+  async joinRoom(): Promise<void> {}
+
+  async leaveRoom(): Promise<void> {}
 }
 
 /**
@@ -1083,3 +1095,521 @@ describe("WorkspaceService — durable read state and the backlog policies (#189
     await service.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// #192: consent for a duo in a shared conversation. The record under test is
+// a real `duo/room-consent.json` in a fresh temp dir per test — the same
+// file the module ships, not a stub of it.
+// ---------------------------------------------------------------------------
+
+const consentTempDir = useTempDir("duo-consent-test-");
+
+/** The per-test `duo/` directory the consent record lives in. */
+function duoDir(): string {
+  const dir = join(consentTempDir(), "duo");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Writes the record file directly — the owner's hand, or a previous process. */
+function writeConsent(entries: readonly RoomConsentEntry[]): string {
+  const dir = duoDir();
+  writeFileSync(join(dir, "room-consent.json"), `${JSON.stringify([...entries].sort((a, b) => (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0)), null, 2)}\n`, "utf8");
+  return dir;
+}
+
+/** An invitation as the adapter would normalize it off the sync slice. */
+function invite(overrides: Partial<RoomInvite> = {}): RoomInvite {
+  return { roomId: "!room:workspace", inviterId: "@bob:workspace", name: "Launch planning", joinedMemberCount: 3, ...overrides };
+}
+
+/** A message in a shared (3+ member) room, both the duo and the sender joined. */
+function roomMessage(message: { eventId: string; body: string; senderId?: string; roomId?: string; originServerTs?: number; joinedMemberIds?: string[] }) {
+  return {
+    eventId: message.eventId,
+    roomId: message.roomId ?? "!room:workspace",
+    senderId: message.senderId ?? "@bob:workspace",
+    body: message.body,
+    originServerTs: message.originServerTs ?? Date.now(),
+    joinedMemberIds: message.joinedMemberIds ?? [SELF, "@bob:workspace", "@carol:workspace"],
+  };
+}
+
+/** One `allowed` entry, the shape an allow writes — for seeding a record by hand. */
+function allowedEntry(roomId: string, overrides: Partial<RoomConsentEntry> = {}): RoomConsentEntry {
+  return { roomId, status: "allowed", name: "Launch planning", inviterId: "@bob:workspace", joinedMemberCount: 3, decidedAt: "2026-09-25T12:00:00.000Z", ...overrides };
+}
+
+describe("WorkspaceService — someone else's invite is held, never joined (#192)", () => {
+  it("holds the invitation with its facts and joins nothing — reachable only on the owner's allow", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    const held = service.pendingInvites();
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({ roomId: "!room:workspace", inviterId: "@bob:workspace", name: "Launch planning", joinedMemberCount: 3 });
+    expect(held[0]!.receivedAt).toBeTruthy();
+    // Nothing was joined, and the surfacing carries the facts the owner decides on.
+    expect(transport.joinCalls).toEqual([]);
+    const logged = consoleError.mock.calls.map((call) => `${call[0]} ${call[1]}`);
+    expect(logged.some((line) => line.includes("workspace invitation held for the owner's decision — room !room:workspace") && line.includes("named \"Launch planning\"") && line.includes("invited by @bob:workspace") && line.includes("3 joined member(s) visible"))).toBe(true);
+    await service.stop();
+  });
+
+  it("a question from the invited-but-unallowed room is not work — the invite alone never makes the duo reachable", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    transport.deliver(roomMessage({ eventId: "$q", body: "What did Alice decide?" }));
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    expect(transport.joinCalls).toEqual([]);
+    await service.stop();
+  });
+
+  it("dedupes a still-live invite's sync replays by room id — one held entry, one surfacing per replay", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    transport.deliverInvite(invite());
+    transport.deliverInvite(invite({ name: null, inviterId: null, joinedMemberCount: 1 }));
+    await flush();
+    expect(service.pendingInvites()).toHaveLength(1);
+    // Every replay is re-surfaced (the invite is still live), the entry is not.
+    const heldCount = consoleError.mock.calls.filter((call) => String(call[0]).includes("invitation held")).length;
+    expect(heldCount).toBe(3);
+    await service.stop();
+  });
+
+  it("holds nothing when no consent surface is configured — the pre-#192 daemon, invite inert", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service } = harness();
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    expect(service.pendingInvites()).toEqual([]);
+    expect(service.consentedRooms()).toEqual([]);
+    expect(consoleError).not.toHaveBeenCalled();
+    await service.stop();
+  });
+
+  it("drops held invitations on stop — the homeserver re-delivers a still-live one on the next connect", async () => {
+    const { transport, service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    expect(service.pendingInvites()).toHaveLength(1);
+    await service.stop();
+    expect(service.pendingInvites()).toEqual([]);
+    await expect(service.allowInvite("!room:workspace")).rejects.toThrow(NoPendingInviteError);
+  });
+});
+
+describe("WorkspaceService — the owner's allow is the only join (#192)", () => {
+  it("joins on allow, records the decision with the invite's provenance, and the room becomes answerable", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service, answers } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    const entry = await service.allowInvite("!room:workspace");
+    expect(entry).toMatchObject({ roomId: "!room:workspace", status: "allowed", name: "Launch planning", inviterId: "@bob:workspace", joinedMemberCount: 3 });
+    expect(entry.decidedAt).toBeTruthy();
+    expect(transport.joinCalls).toEqual(["!room:workspace"]);
+    expect(transport.joinedRooms.has("!room:workspace")).toBe(true);
+    expect(service.pendingInvites()).toEqual([]);
+    expect(readRoomConsent(dir)).toEqual([entry]);
+    expect(service.consentedRooms().map((room) => room.roomId)).toEqual(["!room:workspace"]);
+    // And the gate opens: a question in that room is answered like a DM is.
+    transport.deliver(roomMessage({ eventId: "$q", body: "What did Alice decide?" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["What did Alice decide?"]);
+    expect(transport.sentAnswers).toEqual([{ roomId: "!room:workspace", content: { msgtype: "m.text", body: "answer to What did Alice decide?" } }]);
+    await service.stop();
+  });
+
+  it("refuses an allow on a room whose invitation is not held — 404-shaped, not a guessed join", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    await expect(service.allowInvite("!never-invited:workspace")).rejects.toThrow(NoPendingInviteError);
+    await service.stop();
+  });
+
+  it("keeps the invitation held and records nothing when the join fails — the owner's retry is a real retry", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    transport.dropConnection();
+    await flush();
+    await expect(service.allowInvite("!room:workspace")).rejects.toThrow(/outbound workspace connection is not live/);
+    expect(readRoomConsent(dir)).toEqual([]);
+    // The connection returns; the invite is still held and still decidable.
+    await vi.advanceTimersByTimeAsync(1000);
+    await flush();
+    expect(service.pendingInvites()).toHaveLength(1);
+    const entry = await service.allowInvite("!room:workspace");
+    expect(readRoomConsent(dir)).toEqual([entry]);
+    await service.stop();
+  });
+
+  it("records only the decided room — another room's questions stay gated while the allowed one answers", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite({ roomId: "!allowed:workspace" }));
+    await flush();
+    await service.allowInvite("!allowed:workspace");
+    transport.deliver(roomMessage({ eventId: "$in", body: "in the allowed room", roomId: "!allowed:workspace" }));
+    transport.deliver(roomMessage({ eventId: "$out", body: "in another room", roomId: "!other:workspace" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["in the allowed room"]);
+    expect(transport.sentAnswers.map((sent) => sent.roomId)).toEqual(["!allowed:workspace"]);
+    await service.stop();
+  });
+
+  it("never answers another duo in the consented room either — the loop guard holds wherever consent reaches (#219's note)", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$duo", body: "fellow duo speaking", senderId: "@duo-bob:workspace", joinedMemberIds: [SELF, "@duo-bob:workspace", "@bob:workspace"] }));
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    await service.stop();
+  });
+
+  it("ignores a sender who has left even the consented room — consent makes a room reachable, not ex-members", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$gone", body: "asked after leaving", senderId: "@bob:workspace", joinedMemberIds: [SELF, "@carol:workspace"] }));
+    await flush();
+    expect(answers).toEqual([]);
+    await service.stop();
+  });
+
+  it("keeps the direct-room posture for rooms the record has never spoken about — and answers DMs exactly as before", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$dm", body: "still answerable without any record" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["still answerable without any record"]);
+    await service.stop();
+  });
+});
+
+describe("WorkspaceService — refusal is explicit and remembered only until executed (#192)", () => {
+  it("records the refusal, rejects the invite over the seam, and deletes the entry once the leave lands", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.refuseInvite("!room:workspace");
+    expect(transport.leaveCalls).toEqual(["!room:workspace"]);
+    expect(transport.joinedRooms.has("!room:workspace")).toBe(false);
+    expect(service.pendingInvites()).toEqual([]);
+    // Executed exit: nothing left standing — a re-invite is a fresh decision.
+    expect(readRoomConsent(dir)).toEqual([]);
+    await service.stop();
+  });
+
+  it("refusing a room whose invitation is not held is the same 404-shaped error", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    await expect(service.refuseInvite("!never-invited:workspace")).rejects.toThrow(NoPendingInviteError);
+    await service.stop();
+  });
+
+  it("a re-invite after a refused-and-executed one is a fresh decision — no standing refusal answers it", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.refuseInvite("!room:workspace");
+    // A NEW invite act (only that can re-open the room — the leave rejected
+    // the old one server-side): held again, decidable again, allowable again.
+    transport.deliverInvite(invite({ inviterId: "@carol:workspace" }));
+    await flush();
+    expect(service.pendingInvites()).toHaveLength(1);
+    expect(service.pendingInvites()[0]!.inviterId).toBe("@carol:workspace");
+    const entry = await service.allowInvite("!room:workspace");
+    expect(entry.status).toBe("allowed");
+    expect(readRoomConsent(duoDir())).toEqual([entry]);
+    await service.stop();
+  });
+
+  it("keeps the refusal recorded when the leave cannot land — the memory of an unfinished exit", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    transport.rejectNextLeave(new Error("fake: homeserver refused the leave"));
+    await service.refuseInvite("!room:workspace");
+    const [recorded] = readRoomConsent(dir);
+    expect(recorded).toMatchObject({ roomId: "!room:workspace", status: "refused" });
+    expect(loggedLines(consoleError).some((line) => line.includes("leaving workspace room !room:workspace failed"))).toBe(true);
+    await service.stop();
+  });
+});
+
+describe("WorkspaceService — withdrawal is immediate and instantly killable (#192)", () => {
+  it("stops answering the room the moment it is withdrawn — no pipeline call, no send, and the exit follows", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service, answers } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$before", body: "answered while consented" }));
+    await flush();
+    expect(answers).toHaveLength(1);
+    const withdrawn = await service.withdrawRoom("!room:workspace");
+    expect(withdrawn.status).toBe("withdrawn");
+    expect(transport.leaveCalls).toEqual(["!room:workspace"]);
+    // The record is deleted once the leave lands — and the room is no longer
+    // reachable either way: no record means a shared room is gated shut.
+    transport.deliver(roomMessage({ eventId: "$after", body: "asked after withdrawal" }));
+    await flush();
+    expect(answers).toHaveLength(1);
+    expect(transport.sentAnswers).toHaveLength(1);
+    await service.stop();
+  });
+
+  it("kills even an in-flight answer: a draft underway when consent was withdrawn sends nothing — not even the failure event", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const releaseAnswer = { resolve: (() => {}) as () => void };
+    const transport = new FakeWorkspaceTransport();
+    const answersSeen: string[] = [];
+    const gated = new WorkspaceService({
+      settings: settings(),
+      transportFactory: () => (transport as WorkspaceTransport),
+      answer: async (question) => {
+        answersSeen.push(question.body);
+        await new Promise<void>((resolve) => {
+          releaseAnswer.resolve = resolve;
+        });
+        return answered(`late answer to ${question.body}`);
+      },
+      consent: { duoDir: dir },
+    });
+    gated.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await gated.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$mid", body: "asked just before withdrawal" }));
+    await flush();
+    expect(answersSeen).toEqual(["asked just before withdrawal"]);
+    await gated.withdrawRoom("!room:workspace");
+    releaseAnswer.resolve();
+    await flush();
+    expect(transport.sentAnswers).toEqual([]);
+    expect(loggedLines(consoleError).some((line) => line.includes("not sending the answer to workspace question $mid") && line.includes("withdrawn while the answer was being drafted"))).toBe(true);
+    await gated.stop();
+  });
+
+  it("refuses re-join without a fresh consent act: a post-withdrawal question is not work even while the record is gone", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    await service.withdrawRoom("!room:workspace");
+    // Even a message that still claims the duo is joined: the executed exit
+    // left the room, and the deleted record leaves the shared room gated.
+    transport.deliver(roomMessage({ eventId: "$rejoin", body: "let yourself back in" }));
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.joinCalls).toEqual(["!room:workspace"]);
+    await service.stop();
+  });
+
+  it("a fresh allow on a re-invite retires the withdrawal — the room answers again, a re-allow is not a one-way door", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service, answers } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    await service.withdrawRoom("!room:workspace");
+    // Only a new invitation act can re-open the room — and the owner allows
+    // it again. The earlier withdrawal's in-flight memory (withdrawnRoomIds,
+    // what keeps a mid-draft answer dead after the record deletes itself)
+    // must not outlive the owner's newer word.
+    transport.deliverInvite(invite({ inviterId: "@carol:workspace" }));
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$re-allowed", body: "asked after the fresh allow" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["asked after the fresh allow"]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to asked after the fresh allow"]);
+    await service.stop();
+  });
+
+  it("a withdrawal naming a room with no record is an error, not a no-op", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    await expect(service.withdrawRoom("!never-consented:workspace")).rejects.toThrow(RoomConsentNotFoundError);
+    await service.stop();
+  });
+
+  it("retries an exit the withdrawal recorded but could not execute — settled on the next successful connect", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.rejectNextLeave(new Error("fake: homeserver refused the leave"));
+    await service.withdrawRoom("!room:workspace");
+    expect(readRoomConsent(dir)).toHaveLength(1);
+    // The next successful connect settles the unfinished exit… (the first,
+    // refused leave never landed, so the one recorded call IS the retry)
+    transport.dropConnection();
+    await flush();
+    await vi.advanceTimersByTimeAsync(1000);
+    await flush();
+    expect(transport.leaveCalls).toEqual(["!room:workspace"]);
+    // …and once it lands, the entry is deleted — the decision is fully carried out.
+    expect(readRoomConsent(dir)).toEqual([]);
+    await service.stop();
+  });
+
+  it("settles an exit that predates the connection — a withdrawal while offline executes on dial", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The record written by hand (the owner at their own machine) marks one
+    // room withdrawn while the daemon is down; dialing settles it and leaves
+    // the allowed room untouched.
+    const dir = writeConsent([allowedEntry("!offline:workspace", { status: "withdrawn" }), allowedEntry("!stays:workspace")]);
+    const { transport, service } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    expect(transport.leaveCalls).toEqual(["!offline:workspace"]);
+    expect(readRoomConsent(dir)).toHaveLength(1);
+    expect(readRoomConsent(dir)[0]).toMatchObject({ roomId: "!stays:workspace", status: "allowed" });
+    await service.stop();
+  });
+});
+
+describe("WorkspaceService — the consent record's edges (#192)", () => {
+  it("fails closed on shared rooms and leaves direct rooms alone when the record is unreadable", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    writeFileSync(join(dir, "room-consent.json"), "{\"not\":\"an array\"}", "utf8");
+    const { transport, service, answers } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliver(roomMessage({ eventId: "$shared", body: "in a room the record cannot speak about" }));
+    transport.deliver(dm({ eventId: "$dm", body: "a direct room is the default posture" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["a direct room is the default posture"]);
+    expect(transport.sentAnswers).toHaveLength(1);
+    expect(loggedLines(consoleError).some((line) => line.includes("reading the room consent record") && line.includes("Malformed room consent record"))).toBe(true);
+    await service.stop();
+  });
+
+  it("propagates a malformed record loudly out of an allow — disk trouble is loud, and the invite stays held", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    // The owner's own hand corrupts the record between the invite and the allow.
+    writeFileSync(join(dir, "room-consent.json"), "{\"not\":\"an array\"}", "utf8");
+    await expect(service.allowInvite("!room:workspace")).rejects.toThrow(/Malformed room consent record/);
+    expect(service.pendingInvites()).toHaveLength(1);
+    // The join landed (Matrix joins are idempotent) — the record is what failed;
+    // the gate still refuses the room, the safe direction.
+    expect(transport.joinCalls).toEqual(["!room:workspace"]);
+    // And the rooms read stays loud about it: an unreadable record is a 500
+    // naming the file, never a silent empty list the owner could mistake for
+    // "nothing consented".
+    expect(() => service.consentedRooms()).toThrow(/Malformed room consent record/);
+    await service.stop();
+  });
+
+  it("an explicit withdrawal decision vetoes the direct posture too — the owner's latest word outranks the default", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = duoDir();
+    const { transport, service, answers } = harness(settings(), undefined, undefined, dir);
+    service.start();
+    await flush();
+    transport.deliverInvite(invite({ roomId: "!dm-room:workspace", name: null, joinedMemberCount: 2 }));
+    await flush();
+    await service.allowInvite("!dm-room:workspace");
+    // The exit cannot land yet, so the withdrawn entry is still standing when
+    // a two-member-room question arrives — exactly the window where the v1
+    // posture alone would have answered it.
+    transport.rejectNextLeave(new Error("fake: homeserver refused the leave"));
+    await service.withdrawRoom("!dm-room:workspace");
+    transport.deliver({
+      eventId: "$vetoed",
+      roomId: "!dm-room:workspace",
+      senderId: "@bob:workspace",
+      body: "still two of us here",
+      originServerTs: Date.now(),
+      joinedMemberIds: [SELF, "@bob:workspace"],
+    });
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    await service.stop();
+  });
+});
+
+/** Flattens the spy's calls into one string per call, message plus detail. */
+function loggedLines(consoleError: { mock: { calls: unknown[][] } }): string[] {
+  return consoleError.mock.calls.map((call) => `${call[0]} ${call[1] ?? ""}`);
+}

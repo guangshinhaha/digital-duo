@@ -29,6 +29,7 @@ import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
+import type { WorkspaceService } from "../workspace/service.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 import { EmbedJob } from "./embed-job.js";
@@ -73,6 +74,15 @@ export interface ServeDeps {
    * was delivered.
    */
   readonly channelAdapters?: readonly ChannelAdapter[];
+  /**
+   * #192: the outbound workspace connection's service, when the daemon was
+   * started with a workspace configured. The consent routes below are this
+   * service's owner surface — held invitations, allowed rooms, withdrawal —
+   * and are absent (undefined) exactly when there is no workspace, where the
+   * GETs read as empty state and the POSTs refuse: there is no connection to
+   * join or leave through.
+   */
+  readonly workspace?: WorkspaceService;
 }
 
 function errorBody(code: string, message: string) {
@@ -167,6 +177,11 @@ function statusForError(error: Error): number {
     // #180: confirming a T4 request that was never staged — the guard's
     // own not-found, same class as the rest of this family.
     case "NoPendingT4RequestError":
+    // #192: deciding on an invitation this daemon is not holding, or
+    // withdrawing a room no record speaks about — both "nothing to act on"
+    // for a client, like the not-found family above.
+    case "NoPendingInviteError":
+    case "RoomConsentNotFoundError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
@@ -248,6 +263,61 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
         reply.code(400).send(errorBody("bad_request", error.message));
         return;
       }
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // #192: the consent surface — where this duo is allowed to be reachable,
+  // decided by its owner alone. Four thin wrappers over the workspace
+  // service's own methods (the service holds every behavior: the held
+  // invitation, the join-on-allow, the gate); the routes add nothing but
+  // HTTP shapes. Device-token gated by the auth hook like every non-/ask
+  // route — consent is the owner's act, never an asker's. A daemon with no
+  // workspace configured reads these as empty state and refuses the POSTs:
+  // there is no connection to join or leave through.
+  app.get("/workspace/invites", async () => ({ invites: deps.workspace?.pendingInvites() ?? [] }));
+
+  app.get("/workspace/rooms", async () => ({ rooms: deps.workspace?.consentedRooms() ?? [] }));
+
+  app.post<{ Params: { roomId: string } }>("/workspace/invites/:roomId/allow", async (request, reply) => {
+    const workspace = deps.workspace;
+    if (workspace === undefined) {
+      reply.code(503).send(errorBody("workspace_not_configured", "Allowing a room invitation needs the workspace connection; this daemon has no workspace configured."));
+      return;
+    }
+    try {
+      return await workspace.allowInvite(request.params.roomId);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post<{ Params: { roomId: string } }>("/workspace/invites/:roomId/refuse", async (request, reply) => {
+    const workspace = deps.workspace;
+    if (workspace === undefined) {
+      reply.code(503).send(errorBody("workspace_not_configured", "Refusing a room invitation needs the workspace connection; this daemon has no workspace configured."));
+      return;
+    }
+    try {
+      await workspace.refuseInvite(request.params.roomId);
+      // 204, not 200-with-body: a refusal that landed has nothing left to
+      // say — no held invitation, no standing record (the executed exit
+      // deleted it). What remains is a fresh GET /workspace/invites.
+      reply.code(204).send();
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/withdraw", async (request, reply) => {
+    const workspace = deps.workspace;
+    if (workspace === undefined) {
+      reply.code(503).send(errorBody("workspace_not_configured", "Withdrawing room consent needs the workspace connection; this daemon has no workspace configured."));
+      return;
+    }
+    try {
+      return await workspace.withdrawRoom(request.params.roomId);
+    } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
   });

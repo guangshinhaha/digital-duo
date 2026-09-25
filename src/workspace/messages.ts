@@ -47,10 +47,12 @@
  * Parsed: `m.room.message` with `msgtype: "m.text"` (the same filter the
  * daemon's seam applies), `m.replace` edits, `m.thread` parents,
  * `m.receipt`/`m.read` read positions, `m.room.member` membership states,
- * `m.room.name`, `m.room.create`. Not parsed, by decision: files and other
- * msgtypes (#190), redactions, E2EE content (#191), invite/left rooms and
- * room governance (#192). Non-`m.text` message events and events without a
- * parseable sender or body are skipped by the parser, never guessed at.
+ * `m.room.name`, `m.room.create`, and the sync's `invite` section as
+ * `RoomInvite`s (#192 — an invitation is a consent question, so the contract
+ * states its facts). Not parsed, by decision: files and other msgtypes
+ * (#190), redactions, E2EE content (#191), left rooms and room governance.
+ * Non-`m.text` message events and events without a parseable sender or body
+ * are skipped by the parser, never guessed at.
  */
 
 /**
@@ -202,9 +204,21 @@ export interface RawSyncRoom {
   readonly ephemeral?: { readonly events: readonly RawMatrixEvent[] };
 }
 
-/** The rooms section of a `/sync` response — v1 reads joined rooms only (invite/leave are #192). */
+/** One room's slice of the sync's `invite` section — Matrix stripped state: the events the homeserver judged an invitee needs to see the invitation in context. */
+export interface RawSyncInviteRoom {
+  readonly invite_state?: { readonly events: readonly RawMatrixEvent[] };
+}
+
+/**
+ * The rooms section of a `/sync` response — v1 reads joined rooms and, since
+ * #192, the invite section (left rooms remain unparsed). The invite section
+ * is what makes "a duo joins by invitation, the same as a person"
+ * (docs/workspace-platform.md §6) a consent question: it is the only wire
+ * form in which someone else's room add reaches this account at all.
+ */
 export interface RawSyncRooms {
   readonly join?: Readonly<Record<string, RawSyncRoom>>;
+  readonly invite?: Readonly<Record<string, RawSyncInviteRoom>>;
 }
 
 function isoFromTs(ts: number | undefined): string | null {
@@ -325,6 +339,60 @@ export function readPositionsFromEphemeral(events: readonly RawMatrixEvent[]): R
     }
   }
   return [...latest.values()].sort((a, b) => (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0));
+}
+
+/**
+ * #192: an invitation to this account, as the sync's invite section carries
+ * it — the facts the owner decides on when allowing or refusing a room, and
+ * (on the daemon side) the payload the transport seam's `onInvite` delivers.
+ * Defined here, beside the parsing that produces it, so the contract and the
+ * seam share one shape instead of two drifting copies of the same wire fact.
+ *
+ * `joinedMemberCount` is what the invite's stripped state shows, which on
+ * Matrix is heroes-limited — the honest count visible at invitation time,
+ * never an inflated "everyone". `inviterId`/`name` are null when the wire
+ * did not carry them; a fact missing is a fact missing.
+ */
+export interface RoomInvite {
+  readonly roomId: string;
+  /** The sender of the `m.room.member` event that invited this account, or null when the slice did not carry it. */
+  readonly inviterId: string | null;
+  /** The room's `m.room.name` from the stripped state, or null. */
+  readonly name: string | null;
+  /** `m.room.member` events in `join` state within the stripped state — heroes-limited, stated as such. */
+  readonly joinedMemberCount: number;
+}
+
+/**
+ * Parses the sync's invite section into `RoomInvite`s, ordered by room id
+ * for determinism. A room in the invite section with no `m.room.member`
+ * invite event for `selfUserId` is not an invitation to this account —
+ * skipped rather than guessed at (the parser's floor, applied here too).
+ */
+export function invitesFromSync(rooms: RawSyncRooms, selfUserId: string): RoomInvite[] {
+  return Object.keys(rooms.invite ?? {})
+    .sort()
+    .map((roomId) => {
+      const events = rooms.invite![roomId]!.invite_state?.events ?? [];
+      const inviteEvent = events.find(
+        (event) => event.type === "m.room.member" && event.state_key === selfUserId && stringOrUndefined(contentOf(event)?.membership) === "invite",
+      );
+      if (inviteEvent === undefined) {
+        return null;
+      }
+      const nameEvent = events.find((event) => event.type === "m.room.name" && event.state_key === "");
+      const joinedMemberCount = events.filter(
+        (event) => event.type === "m.room.member" && stringOrUndefined(contentOf(event)?.membership) === "join",
+      ).length;
+      const roomInvite: RoomInvite = {
+        roomId,
+        inviterId: inviteEvent.sender ?? null,
+        name: stringOrUndefined(contentOf(nameEvent)?.name) ?? null,
+        joinedMemberCount,
+      };
+      return roomInvite;
+    })
+    .filter((invite): invite is RoomInvite => invite !== null);
 }
 
 interface RelatesTo {

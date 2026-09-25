@@ -3,12 +3,14 @@ import {
   authorFromUserId,
   compareMessages,
   conversationsFromSync,
+  invitesFromSync,
   isDuoAuthor,
   messagesFromTimeline,
   pageMessages,
   readPositionsFromEphemeral,
   type Message,
   type RawMatrixEvent,
+  type RawSyncInviteRoom,
   type RawSyncRoom,
   type RawSyncRooms,
 } from "../src/workspace/messages.js";
@@ -613,5 +615,81 @@ describe("compareMessages + pageMessages — ordering and paging are total and s
     // instead of duplicating history it already rendered.
     const page = pageMessages(many, { before: "$never-seen", limit: 2 });
     expect(page).toEqual({ messages: [], hasMoreBefore: false });
+  });
+});
+
+describe("invitesFromSync — the invite section is the consent question's wire form (#192)", () => {
+  /** A stripped invite slice as Synapse sends it for one room. */
+  function inviteRoom(events: readonly RawMatrixEvent[]): RawSyncInviteRoom {
+    return { invite_state: { events } };
+  }
+
+  function invitedMemberEvent(init: { stateKey?: string; membership?: string; sender?: string } = {}): RawMatrixEvent {
+    return {
+      type: "m.room.member",
+      state_key: init.stateKey ?? DUO_ALICE,
+      sender: init.sender ?? BOB,
+      event_id: `$invite:${init.stateKey ?? DUO_ALICE}`,
+      origin_server_ts: ts(10),
+      content: { membership: init.membership ?? "invite" },
+    };
+  }
+
+  it("parses an invitation with the owner's decision facts: inviter, name, joined count", () => {
+    const rooms: RawSyncRooms = {
+      invite: {
+        "!planning:workspace": inviteRoom([
+          invitedMemberEvent(),
+          memberEvent(ALICE, "join", 11),
+          memberEvent(BOB, "join", 12),
+          nameEvent("Launch planning", 13),
+        ]),
+      },
+    };
+    expect(invitesFromSync(rooms, DUO_ALICE)).toEqual([
+      { roomId: "!planning:workspace", inviterId: BOB, name: "Launch planning", joinedMemberCount: 2 },
+    ]);
+  });
+
+  it("is room-id ordered and carries the honest count only — non-join memberships never inflate it", () => {
+    const rooms: RawSyncRooms = {
+      invite: {
+        "!z:workspace": inviteRoom([invitedMemberEvent({ sender: ALICE }), memberEvent(ALICE, "join", 11)]),
+        "!a:workspace": inviteRoom([
+          invitedMemberEvent(),
+          memberEvent(ALICE, "join", 11),
+          memberEvent("@dana:workspace", "leave", 12),
+          memberEvent("@erin:workspace", "ban", 13),
+          invitedMemberEvent({ stateKey: "@someone-else:workspace", sender: ALICE }),
+        ]),
+      },
+    };
+    expect(invitesFromSync(rooms, DUO_ALICE)).toEqual([
+      { roomId: "!a:workspace", inviterId: BOB, name: null, joinedMemberCount: 1 },
+      { roomId: "!z:workspace", inviterId: ALICE, name: null, joinedMemberCount: 1 },
+    ]);
+  });
+
+  it("degrades a missing inviter to null — a fact missing is a fact missing", () => {
+    const bare = invitedMemberEvent();
+    delete (bare as { sender?: string }).sender;
+    const invites = invitesFromSync({ invite: { "!bare:workspace": inviteRoom([bare]) } }, DUO_ALICE);
+    expect(invites).toEqual([{ roomId: "!bare:workspace", inviterId: null, name: null, joinedMemberCount: 0 }]);
+  });
+
+  it("skips an invite-section room with no invite membership event for THIS account — not an invitation to us", () => {
+    const rooms: RawSyncRooms = {
+      invite: {
+        "!not-ours:workspace": inviteRoom([memberEvent(ALICE, "join", 11), nameEvent("somewhere", 12)]),
+        "!already-left:workspace": inviteRoom([invitedMemberEvent({ membership: "leave" })]),
+      },
+    };
+    expect(invitesFromSync(rooms, DUO_ALICE)).toEqual([]);
+  });
+
+  it("reads an empty or absent invite section as no invitations", () => {
+    expect(invitesFromSync({}, DUO_ALICE)).toEqual([]);
+    expect(invitesFromSync({ invite: {} }, DUO_ALICE)).toEqual([]);
+    expect(invitesFromSync({ invite: { "!nothing:workspace": inviteRoom([]) } }, DUO_ALICE)).toEqual([]);
   });
 });

@@ -89,19 +89,6 @@ export async function runServe(
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
 
-  const deps: ServeDeps = {
-    storePath: config.storePath,
-    passphrase,
-    duoDir: config.duoDir,
-    lifecycleLogPath: config.lifecycleLogPath,
-    embeddingProvider,
-    inferenceProvider,
-    confidenceConfig: config.confidence,
-    classificationCeiling: config.classificationCeiling,
-    ownerName: config.ownerName,
-    env,
-  };
-
   // Annotated, not inferred: the answer closure below reaches back into
   // `workspace` for the member cache (the #187 feed), and a self-referencing
   // initializer is exactly the shape TS refuses to infer through.
@@ -115,6 +102,12 @@ export async function runServe(
         // src/serve/ (the workspace boundary scan forbids the store import
         // there); its retention is the backlog age window, one concept.
         readState: durableDuoReadState(config.storePath, passphrase, workspaceSettings.backlog.maxAgeMs),
+        // #192: the consent surface — held invitations, the shared-room
+        // gate, allow/refuse/withdrawal — over the same `duo/` directory
+        // every other owner policy lives in (consent.ts states why a file
+        // and not the store). Wired whenever a workspace exists at all, so
+        // the owner surface is never half-configured.
+        consent: { duoDir: config.duoDir },
         // THE answering pipeline, not a workspace twin: the identical
         // answerPublicly call POST /ask makes, argument for argument, with
         // the asking Matrix user resolved through the same directory
@@ -142,6 +135,22 @@ export async function runServe(
           ),
       })
     : undefined;
+
+  const deps: ServeDeps = {
+    storePath: config.storePath,
+    passphrase,
+    duoDir: config.duoDir,
+    lifecycleLogPath: config.lifecycleLogPath,
+    embeddingProvider,
+    inferenceProvider,
+    confidenceConfig: config.confidence,
+    classificationCeiling: config.classificationCeiling,
+    ownerName: config.ownerName,
+    env,
+    // #192: the consent routes' service — present exactly when the workspace
+    // is (the consent surface is wired with it, one configuration).
+    workspace,
+  };
 
   const app = createServer(deps);
   const address = await app.listen({ host: options.host, port: options.port });

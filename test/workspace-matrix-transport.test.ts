@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ClientEvent, RoomEvent, SyncState } from "matrix-js-sdk";
 import { createMatrixTransport } from "../src/workspace/matrix-transport.js";
+import type { RoomInvite } from "../src/workspace/messages.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
 import { WorkspaceTokenRevokedError, type WorkspaceCandidateMessage } from "../src/workspace/transport.js";
 
@@ -67,6 +68,27 @@ class StubMatrixClient {
     }
   }
 
+  /** The rooms the fake homeserver has accepted this account into (#192). */
+  readonly joinedRooms = new Set<string>();
+  readonly joinCalls: string[] = [];
+  readonly leaveCalls: string[] = [];
+  leaveError: Error | undefined;
+
+  async joinRoom(roomId: string): Promise<void> {
+    this.joinCalls.push(roomId);
+    this.joinedRooms.add(roomId);
+  }
+
+  async leave(roomId: string): Promise<void> {
+    if (this.leaveError) {
+      const error = this.leaveError;
+      this.leaveError = undefined;
+      throw error;
+    }
+    this.leaveCalls.push(roomId);
+    this.joinedRooms.delete(roomId);
+  }
+
   stopClient(): void {
     this.stopCalls += 1;
   }
@@ -109,8 +131,8 @@ vi.mock("matrix-js-sdk", () => ({
   // values match the real enums, and the tests emit through these same
   // mocked constants so there is no literal drift between the two sides.
   ClientEvent: { Sync: "sync" },
-  RoomEvent: { Timeline: "Room.timeline" },
-  EventType: { RoomMessage: "m.room.message" },
+  RoomEvent: { Timeline: "Room.timeline", MyMembership: "Room.myMembership" },
+  EventType: { RoomMessage: "m.room.message", RoomName: "m.room.name" },
   MsgType: { Text: "m.text" },
   SetPresence: { Online: "online" },
   SyncState: { Error: "Error", Prepared: "Prepared", Stopped: "Stopped" },
@@ -154,6 +176,29 @@ function room(members: readonly string[] = ["@duo-alice:workspace", "@bob:worksp
   return {
     roomId: "!room:workspace",
     getJoinedMembers: () => members.map((userId) => ({ userId })),
+  };
+}
+
+/**
+ * A room as the SDK hands it over on `Room.myMembership === "invite"`: the
+ * membership state events the stripped invite slice carries, and nothing
+ * more — no joined-member roster beyond what the heroes make visible.
+ */
+function inviteRoom(init: { roomId?: string; inviterId?: string | null; name?: string | null; memberships?: string[] } = {}) {
+  const roomId = init.roomId ?? "!invited:workspace";
+  const memberships = init.memberships ?? ["invite", "join", "join"];
+  const stateEvents: Record<string, { getContent: () => unknown; getSender: () => string | undefined }[]> = {};
+  if (init.name !== null) {
+    stateEvents["m.room.name"] = [{ getContent: () => (init.name === null ? {} : { name: init.name }), getSender: () => "@bob:workspace" }];
+  }
+  return {
+    roomId,
+    currentState: { getStateEvents: (type: string, key: string) => stateEvents[type]?.[Number(key)] ?? null },
+    getMember: (userId: string) =>
+      init.inviterId === null
+        ? undefined
+        : { userId, events: { member: { getSender: () => init.inviterId ?? "@bob:workspace" } } },
+    getMembers: () => memberships.map((membership, index) => ({ membership, userId: `@member${index}:workspace` })),
   };
 }
 
@@ -433,8 +478,7 @@ describe("Matrix adapter — listMemberIdentities is the member read without the
   });
 });
 
-describe("Matrix adapter — a rejected token is a distinct, terminal-shaped error (#187, M_UNKNOWN_TOKEN)", () => {
-  function matrixTokenError(): Error & { errcode: string } {
+describe("Matrix adapter — a rejected token is a distinct, terminal-shaped error (#187, M_UNKNOWN_TOKEN)", () => {  function matrixTokenError(): Error & { errcode: string } {
     const error = new Error("Invalid access token passed.") as Error & { errcode: string };
     error.errcode = "M_UNKNOWN_TOKEN";
     return error;
@@ -461,5 +505,68 @@ describe("Matrix adapter — a rejected token is a distinct, terminal-shaped err
     client.emit(ClientEvent.Sync, SyncState.Error, "Syncing", { error: notAToken });
     await expect(connecting).rejects.not.toBeInstanceOf(WorkspaceTokenRevokedError);
     await expect(connecting).rejects.toThrow(/workspace sync failed: synapse is down/);
+  });
+});
+
+describe("Matrix adapter — the invite surface: normalize, never join (#192)", () => {
+  it("delivers an invite with the facts the stripped room knows: inviter from the membership event, name from state, joined count from the slice", () => {
+    const transport = createMatrixTransport(settings());
+    const invites: RoomInvite[] = [];
+    transport.onInvite((invite) => invites.push(invite));
+    client.emit(RoomEvent.MyMembership, inviteRoom({ inviterId: "@carol:workspace", name: "Launch planning", memberships: ["invite", "join", "join", "leave"] }), "invite", "leave");
+    expect(invites).toEqual([
+      { roomId: "!invited:workspace", inviterId: "@carol:workspace", name: "Launch planning", joinedMemberCount: 2 },
+    ]);
+    // The adapter only translated: nothing joined.
+    expect(client.joinCalls).toEqual([]);
+  });
+
+  it("degrades each missing fact to null instead of inventing it — no inviter event, no name state, empty slice", () => {
+    const transport = createMatrixTransport(settings());
+    const invites: RoomInvite[] = [];
+    transport.onInvite((invite) => invites.push(invite));
+    client.emit(RoomEvent.MyMembership, inviteRoom({ inviterId: null, name: null, memberships: ["invite"] }), "invite", undefined);
+    expect(invites).toEqual([{ roomId: "!invited:workspace", inviterId: null, name: null, joinedMemberCount: 0 }]);
+  });
+
+  it("ignores every membership change that is not an invite — joins, leaves, bans, knocks are not invitations", () => {
+    const transport = createMatrixTransport(settings());
+    const invites: RoomInvite[] = [];
+    transport.onInvite((invite) => invites.push(invite));
+    for (const membership of ["join", "leave", "ban", "knock"]) {
+      client.emit(RoomEvent.MyMembership, inviteRoom(), membership, "invite");
+    }
+    expect(invites).toEqual([]);
+  });
+
+  it("is silent after stop() — a late invite delivery never reaches a handler", async () => {
+    const transport = createMatrixTransport(settings());
+    const invites: RoomInvite[] = [];
+    transport.onInvite((invite) => invites.push(invite));
+    await transport.stop();
+    client.emit(RoomEvent.MyMembership, inviteRoom(), "invite", undefined);
+    expect(invites).toEqual([]);
+  });
+});
+
+describe("Matrix adapter — join and leave are plain membership calls (#192)", () => {
+  it("joinRoom asks the client to join and leaves it at that", async () => {
+    const transport = createMatrixTransport(settings());
+    await transport.joinRoom("!room:workspace");
+    expect(client.joinCalls).toEqual(["!room:workspace"]);
+    expect(client.joinedRooms.has("!room:workspace")).toBe(true);
+  });
+
+  it("leaveRoom asks the client to leave — the same primitive a refusal's invite rejection rides", async () => {
+    const transport = createMatrixTransport(settings());
+    await transport.leaveRoom("!room:workspace");
+    expect(client.leaveCalls).toEqual(["!room:workspace"]);
+  });
+
+  it("propagates the homeserver's refusal of either, unchanged — the service owns the retry story", async () => {
+    client.leaveError = new Error("M_FORBIDDEN: you are not in this room");
+    const transport = createMatrixTransport(settings());
+    await expect(transport.leaveRoom("!room:workspace")).rejects.toThrow(/M_FORBIDDEN/);
+    expect(client.leaveCalls).toEqual([]);
   });
 });
