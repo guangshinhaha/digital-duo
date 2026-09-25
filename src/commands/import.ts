@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import type { DuoConfig } from "../config.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { MalformedTranscriptError, parsePastedTranscript } from "../ingest/adapters/paste.js";
+import { importPastedRecords, NOT_WORK_RELEVANT_SUMMARY, type PasteImportSummary } from "../ingest/paste-import.js";
 import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
@@ -56,25 +57,19 @@ export function runImportClaude(path: string, config: DuoConfig, env: NodeJS.Pro
   };
 }
 
-export interface PasteImportSummary {
-  workRelevant: boolean;
-  written: number;
-  skipped: number;
-  discardedAboveCeiling: number;
-}
+export type { PasteImportSummary } from "../ingest/paste-import.js";
 
 export function runImportPaste(path: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): PasteImportSummary {
   const raw = readSourceFile(path, MalformedTranscriptError);
   const { records, workRelevant } = parsePastedTranscript(raw);
 
   if (!workRelevant) {
-    return { workRelevant: false, written: 0, skipped: 0, discardedAboveCeiling: 0 };
+    return NOT_WORK_RELEVANT_SUMMARY;
   }
 
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  const ceiling = parseClassificationCeiling(config.classificationCeiling);
-  const outcome = ingestRecords(config.storePath, passphrase, records, { ceiling });
-
-  return { workRelevant: true, written: outcome.written, skipped: outcome.alreadyPresent, discardedAboveCeiling: outcome.discardedAboveCeiling };
+  // The ingest-and-summarize tail is the module function POST
+  // /corpus/import-paste (#176) also feeds — one import path, two surfaces.
+  return importPastedRecords(config.storePath, passphrase, records, config.classificationCeiling);
 }

@@ -19,6 +19,7 @@ import { queueStandingOrderCandidate } from "../drafting/standing-order-candidat
 import { listAvailableDuos } from "../duo/registry.js";
 import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
 import { hybridSearch } from "../ingest/embeddings.js";
+import { importPastedTranscript } from "../ingest/paste-import.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { hasRefusalsDecision, readRefusalsFile } from "../trust/refusals.js";
@@ -30,6 +31,7 @@ import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
+import { EmbedJob } from "./embed-job.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
 
@@ -53,6 +55,13 @@ export interface ServeDeps {
   readonly embeddingProvider: EmbeddingProvider;
   readonly inferenceProvider: InferenceProvider | undefined;
   readonly confidenceConfig: DuoConfig["confidence"];
+  /**
+   * The classification ceiling exactly as config carries it (the raw
+   * string) — the paste-import path (#176) parses it inside the module
+   * function, the same call `duo import paste` makes, rather than the
+   * route re-deriving a parsed value.
+   */
+  readonly classificationCeiling: DuoConfig["classificationCeiling"];
   /** Whose duo this is — flows into `answerPublicly` exactly as `runAnswerPublicly` passes `config.ownerName`, for the public attribution line every asker-visible text carries (#159). */
   readonly ownerName: string;
   readonly env: NodeJS.ProcessEnv;
@@ -188,6 +197,9 @@ function statusForError(error: Error): number {
     // #172: a channel/thread mute key containing the "/" separator — the
     // entry would be ambiguous in the one mute store, so it is refused.
     case "InvalidMuteKeyError":
+    // #176: a pasted transcript with no recognisable turn — the paste
+    // adapter's own error names the format it expected.
+    case "MalformedTranscriptError":
       return 400;
     default:
       return 500;
@@ -195,7 +207,7 @@ function statusForError(error: Error): number {
 }
 
 /** Registers every route on an already-constructed Fastify instance. Split out so `createServer` can add auth first and routes after, without routes needing to know that ordering exists. */
-function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: DraftReadyHub, auth: AuthCache): void {
+function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: DraftReadyHub, auth: AuthCache, embedJob: EmbedJob): void {
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/duos", async () => listAvailableDuos(deps.env));
@@ -665,6 +677,48 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     return result;
   });
 
+  // #176: the pasted-history import, from a client. The body carries the
+  // transcript TEXT itself (file upload of arbitrary documents is out of
+  // scope by the issue's own line), and it goes down the exact path `duo
+  // import paste` runs: the module function owns the parse, the
+  // work-relevance gate (and its zero summary), and the two-phase ingest —
+  // the route adds no import behaviour of its own, and invents no dedupe
+  // rule: a second import of the same text does exactly what the CLI's
+  // second import does, because the only dedupe that exists
+  // (ingestRecords' alreadyPresent) already lives in the shared module.
+  app.post<{ Body: { transcript?: unknown } }>("/corpus/import-paste", async (request, reply) => {
+    const body = request.body;
+    const transcript = typeof body === "object" && body !== null ? body.transcript : undefined;
+    if (typeof transcript !== "string" || transcript.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "transcript is required and must be a non-empty string"));
+      return;
+    }
+    try {
+      return importPastedTranscript(deps.storePath, deps.passphrase, transcript, deps.classificationCeiling);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // #176: embedding, triggered and watched from a client. Embedding a real
+  // corpus is minutes of provider round-trips — not a request-response
+  // shape — so POST starts the daemon's one embed job and answers 202 with
+  // its starting status, and GET reports progress. The job is process-bound
+  // runtime state (like the draft-ready hub; no CLI twin — `duo embed`
+  // remains the terminal's own direct run) driving the same embedRecords in
+  // batches, so the count climbs observably and each step is persisted
+  // before the next begins.
+  app.post("/corpus/embed", async (request, reply) => {
+    if (!embedJob.start(deps.storePath, deps.passphrase, deps.embeddingProvider)) {
+      reply.code(409).send(errorBody("embed_already_running", "An embed is already running for this corpus; watch GET /corpus/embed for its progress."));
+      return;
+    }
+    reply.code(202);
+    return embedJob.current();
+  });
+
+  app.get("/corpus/embed", async () => embedJob.current());
+
   // #174: the corpus, from a client — `duo search`'s own hybridSearch,
   // verbatim (results/ranked order, usedEmbeddings, fallback warning). The
   // route's only job is validating the query string; ranking, paging and
@@ -754,6 +808,7 @@ export function createServer(deps: ServeDeps): FastifyInstance {
   });
   const auth = registerAuth(app, deps.storePath, deps.passphrase);
   const draftReady = registerDraftReadySocket(app, deps);
-  registerRoutes(app, deps, draftReady, auth);
+  const embedJob = new EmbedJob();
+  registerRoutes(app, deps, draftReady, auth, embedJob);
   return app;
 }

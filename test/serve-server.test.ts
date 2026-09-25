@@ -10,6 +10,7 @@ import { confirmAndExecuteT4Request, createT4Request, NotAT4ActionError } from "
 import { loadLifecycleLog } from "../src/continuity/lifecycle-log.js";
 import { confirmTransfer, initiateTransfer } from "../src/continuity/transfer.js";
 import { loadConfig } from "../src/config.js";
+import { runImportPaste } from "../src/commands/import.js";
 import { appendDraft, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { draftReply } from "../src/drafting/pipeline.js";
 import { escalationUrgencyRate, listEscalationDigests } from "../src/escalation/digest.js";
@@ -22,14 +23,14 @@ import { writeTopicsFile } from "../src/derivation/topics.js";
 import { embedRecords, hybridSearch } from "../src/ingest/embeddings.js";
 import { ingestRecords } from "../src/ingest/two-phase.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
-import { writeRecords } from "../src/ingest/record-store.js";
+import { ensureRecordsSchema, writeRecords } from "../src/ingest/record-store.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import { queueCorrectionCandidate } from "../src/corrections/queue.js";
 import { queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { confirmNoRefusals, upsertRefusal, writeRefusalsFile } from "../src/trust/refusals.js";
-import type { InferenceProvider } from "../src/provider/types.js";
+import type { EmbeddingProvider, InferenceProvider } from "../src/provider/types.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
 import { createAskToken, createDeviceToken, listDeviceTokens, revokeAskToken } from "../src/serve/tokens.js";
 import { loadUsageLog } from "../src/shared-duo/usage-log.js";
@@ -54,6 +55,7 @@ function deps(storePath: string, overrides: Partial<ServeDeps> = {}): ServeDeps 
     embeddingProvider: createFakeEmbeddingProvider(),
     inferenceProvider: undefined,
     confidenceConfig: config.confidence,
+    classificationCeiling: config.classificationCeiling,
     ownerName: config.ownerName,
     // Isolated from the real environment: this repo's own checked-in
     // shared-duo/persona.json is a real file at the default relative
@@ -252,12 +254,12 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
   // Issue #159 pins the FULL owner-route inventory (every method), not just
-  // the GETs: the ten POSTs are owner-only surfaces too, and a seam bug
+  // the GETs: the twelve POSTs are owner-only surfaces too, and a seam bug
   // that only leaked on POSTs would otherwise pass unnoticed. #177's two
   // device routes, #172's three channel-policy routes, #178's three
   // escalation routes, #182's refusals route, #180's three actions
-  // routes, and #181's two lifecycle routes extend the inventory the same
-  // way.
+  // routes, #181's two lifecycle routes, and #176's three corpus routes
+  // extend the inventory the same way.
   interface OwnerRoute {
     readonly method: "GET" | "POST";
     readonly url: string;
@@ -282,6 +284,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/actions/t4/pending" },
     { method: "GET", url: "/actions/attempts" },
     { method: "GET", url: "/lifecycle" },
+    { method: "GET", url: "/corpus/embed" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -292,17 +295,19 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/escalations/digest" },
     { method: "POST", url: "/actions/t4/some-request-id/confirm" },
     { method: "POST", url: "/lifecycle/end", payload: { decidedBy: "owner", confirmed: true } },
+    { method: "POST", url: "/corpus/import-paste", payload: { transcript: "Human: hi" } },
+    { method: "POST", url: "/corpus/embed" },
   ];
 
   async function expectRefusedOnAllOwnerRoutes(token: string): Promise<void> {
-    // Each request comes from its own IP: 28 refused requests from one IP
+    // Each request comes from its own IP: 31 refused requests from one IP
     // would cross the per-IP 10-failure rate-limit cap mid-loop and turn
     // the tail of the inventory into 429s — a different (also correct)
     // behavior than the byte-identical 401 this helper exists to pin.
     const invalid = await app.inject({ method: "GET", url: "/duos", headers: { authorization: "Bearer not-a-real-token" }, remoteAddress: "10.0.0.250" });
     // Concurrent injects are safe here: every store call the hook makes is
     // fully synchronous (KTD6), so no two requests can interleave
-    // mid-verification — and 28 sequential cache-miss verifies would each
+    // mid-verification — and 31 sequential cache-miss verifies would each
     // pay a full store decrypt for no behavioral reason.
     await Promise.all(
       ownerRoutes.map(async (route, i) => {
@@ -2546,5 +2551,242 @@ describe("lifecycle and handover over HTTP — the kill switch outside the termi
     expect(end.statusCode).toBe(401);
     // And nothing was deleted by the refused end.
     expect(existsSync(storePath)).toBe(true);
+  });
+});
+
+// #176: the first run, from a client — both steps that previously required
+// a terminal (`duo import paste`, `duo embed`) become owner routes. The
+// import takes the transcript TEXT (file upload is out of scope by the
+// issue's own line) down the same parse → work-relevance gate → two-phase
+// ingest path the CLI command runs — pinned here by importing the identical
+// text through both surfaces and demanding equal summaries, twice, which is
+// also AC3's "no new dedupe rule invented at the route". Embedding is not
+// request-response-shaped, so POST starts a daemon-held job and GET reports
+// its progress; the job drives the same embedRecords the CLI calls, in
+// batches, so `embedded` climbs observably instead of jumping once at the
+// end.
+describe("corpus import and embed over HTTP — the first run without a terminal (#176)", () => {
+  // transcript-work.txt's own text, inline: three turns (its continuation
+  // line folds into the second turn), judged work-relevant by the same
+  // keyword gate every import passes through.
+  const WORK_TRANSCRIPT = [
+    "Human: Can you help me write the on-call runbook update for the billing outage postmortem?",
+    "Assistant: Sure — let's list the incident timeline first, then draft the remediation steps",
+    "for the manager review before the deadline.",
+    "Human: Good, add a section on the escalation policy too.",
+  ].join("\n");
+
+  // transcript-personal.txt's own text — no work signal anywhere.
+  const PERSONAL_TRANSCRIPT = [
+    "Human: What's a good recipe for a vegan lasagna for my birthday dinner this weekend?",
+    "Assistant: Here's a great recipe for a birthday lasagna, plus a wedding cake idea for the honeymoon trip.",
+  ].join("\n");
+
+  /** 25 one-line turns → 25 records: the embed job works in batches of 10, so finishing means looping, not one call. */
+  function longWorkTranscript(): string {
+    const turns: string[] = [];
+    for (let i = 0; i < 25; i++) {
+      turns.push(`Human: Deadline question ${i} about the billing runbook and the incident escalation policy?`);
+    }
+    return turns.join("\n");
+  }
+
+  function ownerApp(storePath: string, overrides: Partial<ServeDeps> = {}) {
+    const app = createServer(deps(storePath, overrides));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    return { app, auth: { authorization: `Bearer ${paired.token}` } };
+  }
+
+  /** Polls GET /corpus/embed until `state` appears (the deadline failing the test, not hanging it) — the job advances on its own schedule, never inline in the POST. */
+  async function pollEmbedStatus(app: FastifyInstance, auth: { authorization: string }, state: string) {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const response = await app.inject({ method: "GET", url: "/corpus/embed", headers: auth });
+      const status = response.json();
+      if (status.state === state) {
+        return status;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`embed job never reached state "${state}"`);
+  }
+
+  it("AC1: imports a pasted transcript over HTTP, returns the count summary, and the records are really in the corpus", async () => {
+    const storePath = initStore();
+    const { app, auth } = ownerApp(storePath);
+    const response = await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: WORK_TRANSCRIPT } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ workRelevant: true, written: 3, skipped: 0, discardedAboveCeiling: 0 });
+
+    // "Imported" means searchable, not just counted — /search finds the runbook turn.
+    const search = await app.inject({ method: "GET", url: "/search?q=runbook", headers: auth });
+    expect(search.statusCode).toBe(200);
+    expect(search.json().results.length).toBeGreaterThan(0);
+  });
+
+  it("AC1/AC3: the route is the same import runImportPaste performs — identical text, identical summary, on the first import and the second", async () => {
+    const storePath = initStore();
+    const { app, auth } = ownerApp(storePath);
+
+    // The CLI's own surface, on its own store, fed the identical text from a file.
+    const parityDir = join(tempDir(), "parity");
+    mkdirSync(parityDir, { recursive: true });
+    const transcriptPath = join(parityDir, "transcript.txt");
+    writeFileSync(transcriptPath, WORK_TRANSCRIPT, "utf8");
+    const cliStorePath = join(parityDir, "duo.db");
+    createEncryptedStore(cliStorePath, PASSPHRASE);
+    const cliConfig = {
+      ...loadConfig({ DUO_PASSPHRASE: PASSPHRASE }),
+      storePath: cliStorePath,
+      duoDir: join(parityDir, "duo"),
+      lifecycleLogPath: join(parityDir, "lifecycle-runtime", "events.json"),
+    };
+
+    const firstViaRoute = (await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: WORK_TRANSCRIPT } })).json();
+    const secondViaRoute = (await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: WORK_TRANSCRIPT } })).json();
+    const firstViaCli = runImportPaste(transcriptPath, cliConfig, { DUO_PASSPHRASE: PASSPHRASE });
+    const secondViaCli = runImportPaste(transcriptPath, cliConfig, { DUO_PASSPHRASE: PASSPHRASE });
+
+    expect(firstViaRoute).toEqual(firstViaCli);
+    expect(secondViaRoute).toEqual(secondViaCli);
+    // AC3, made concrete — and pinned as equality, not as an invented rule:
+    // a re-pasted transcript is re-parsed, and the paste adapter timestamps
+    // turns at parse time, so each parse produces fresh content-hash ids and
+    // ingestRecords' own alreadyPresent never fires — the CLI's second
+    // import re-writes, and the route does exactly what the CLI does. The
+    // day the adapter pins timestamps (making ids stable), both surfaces
+    // start skipping together, because the dedupe lives in the module this
+    // route and that command both feed, not at the route.
+    expect(firstViaRoute).toEqual({ workRelevant: true, written: 3, skipped: 0, discardedAboveCeiling: 0 });
+    expect(secondViaRoute).toEqual({ workRelevant: true, written: 3, skipped: 0, discardedAboveCeiling: 0 });
+    expect(secondViaRoute).toEqual(secondViaCli);
+  });
+
+  it("AC1: a transcript with no recognisable turn is a 400 naming the expected format; a non-work transcript imports nothing and says so", async () => {
+    const storePath = initStore();
+    const { app, auth } = ownerApp(storePath);
+
+    const malformed = await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: "just some prose\nwith no turn markers at all" } });
+    expect(malformed.statusCode).toBe(400);
+    expect(malformed.json().error.code).toBe("MalformedTranscriptError");
+    expect(malformed.json().error.message).toContain("Expected a pasted transcript");
+
+    const personal = await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: PERSONAL_TRANSCRIPT } });
+    expect(personal.statusCode).toBe(200);
+    expect(personal.json()).toEqual({ workRelevant: false, written: 0, skipped: 0, discardedAboveCeiling: 0 });
+  });
+
+  it("AC1: a missing or blank transcript is a 400, importing nothing", async () => {
+    const storePath = initStore();
+    const { app, auth } = ownerApp(storePath);
+    const missing = await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: {} });
+    expect(missing.statusCode).toBe(400);
+    const blank = await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: "   " } });
+    expect(blank.statusCode).toBe(400);
+  });
+
+  it("AC2: an unstarted job reports idle; embedding an empty corpus starts and finishes at zero", async () => {
+    const storePath = initStore();
+    const { app, auth } = ownerApp(storePath);
+
+    const idle = await app.inject({ method: "GET", url: "/corpus/embed", headers: auth });
+    expect(idle.statusCode).toBe(200);
+    expect(idle.json()).toEqual({ state: "idle", startedAt: null, finishedAt: null, embedded: 0, total: 0, error: null });
+
+    const started = await app.inject({ method: "POST", url: "/corpus/embed", headers: auth });
+    expect(started.statusCode).toBe(202);
+    const done = await pollEmbedStatus(app, auth, "done");
+    expect(done).toMatchObject({ state: "done", embedded: 0, total: 0, error: null });
+  });
+
+  it("AC2: embedding runs as a job whose progress is observable mid-run, one job at a time", async () => {
+    const storePath = initStore();
+    // A provider whose 11th call — the first call of the job's second
+    // batch, batches being 10 — signals that it has started and then
+    // blocks until the test releases it. The 11th call can only happen
+    // after batch one fully computed AND persisted, so once the signal
+    // fires, the mid-run status below is deterministic, not a race.
+    let calls = 0;
+    let signalBatch2!: () => void;
+    const batch2Started = new Promise<void>((resolve) => {
+      signalBatch2 = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gated: EmbeddingProvider = {
+      name: "gated",
+      model: "gated-embed",
+      async embed(text: string) {
+        calls += 1;
+        if (calls === 11) {
+          signalBatch2();
+          await gate;
+        }
+        return [text.length % 5, 1, 0];
+      },
+    };
+    const { app, auth } = ownerApp(storePath, { embeddingProvider: gated });
+    await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: longWorkTranscript() } });
+
+    const started = await app.inject({ method: "POST", url: "/corpus/embed", headers: auth });
+    expect(started.statusCode).toBe(202);
+    expect(started.json().state).toBe("running");
+
+    await batch2Started;
+    const midRun = await app.inject({ method: "GET", url: "/corpus/embed", headers: auth });
+    expect(midRun.json()).toMatchObject({ state: "running", embedded: 10, total: 25 });
+
+    // One embed at a time: a second trigger while one runs is a 409 naming
+    // the running job — never a silent second job racing the store.
+    const second = await app.inject({ method: "POST", url: "/corpus/embed", headers: auth });
+    expect(second.statusCode).toBe(409);
+
+    release();
+    const done = await pollEmbedStatus(app, auth, "done");
+    expect(done).toMatchObject({ state: "done", embedded: 25, total: 25, error: null });
+    expect(done.finishedAt).toBeTruthy();
+
+    // Once finished, a new job may start (and immediately finishes — every
+    // record already has a vector under this model).
+    const again = await app.inject({ method: "POST", url: "/corpus/embed", headers: auth });
+    expect(again.statusCode).toBe(202);
+    await pollEmbedStatus(app, auth, "done");
+  });
+
+  it("AC2: a failing embedding provider ends the job in an error state carrying the message — observable, not a hung 202", async () => {
+    const storePath = initStore();
+    const { app, auth } = ownerApp(storePath, { embeddingProvider: createFailingEmbeddingProvider() });
+    await app.inject({ method: "POST", url: "/corpus/import-paste", headers: auth, payload: { transcript: WORK_TRANSCRIPT } });
+
+    const started = await app.inject({ method: "POST", url: "/corpus/embed", headers: auth });
+    expect(started.statusCode).toBe(202);
+    const errored = await pollEmbedStatus(app, auth, "error");
+    expect(errored.state).toBe("error");
+    expect(errored.error).toContain("embedding service unreachable (fake)");
+  });
+
+  it("all three routes are owner routes: an ask token is refused on each, importing and embedding nothing", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const authHeader = { authorization: `Bearer ${minted.token}` };
+    const importRefused = await app.inject({ method: "POST", url: "/corpus/import-paste", headers: authHeader, payload: { transcript: WORK_TRANSCRIPT } });
+    const startRefused = await app.inject({ method: "POST", url: "/corpus/embed", headers: authHeader });
+    const statusRefused = await app.inject({ method: "GET", url: "/corpus/embed", headers: authHeader });
+    expect(importRefused.statusCode).toBe(401);
+    expect(startRefused.statusCode).toBe(401);
+    expect(statusRefused.statusCode).toBe(401);
+    // And nothing happened: no records were imported and no job was started.
+    // (ensureRecordsSchema first: a store nothing ever imported into has no
+    // records table yet — its absence IS the zero being asserted.)
+    const recordCount = withDatabase(storePath, PASSPHRASE, false, (db) => {
+      ensureRecordsSchema(db);
+      return (db.prepare("SELECT COUNT(*) AS count FROM records").get() as { count: number }).count;
+    });
+    expect(recordCount).toBe(0);
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    const status = await app.inject({ method: "GET", url: "/corpus/embed", headers: { authorization: `Bearer ${paired.token}` } });
+    expect(status.json().state).toBe("idle");
   });
 });
