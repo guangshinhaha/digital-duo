@@ -27,15 +27,20 @@ describe("structural egress scan (R2/KTD10)", () => {
   const FETCH_CALL_RE = /\bfetch\s*\(/;
   const WEBSOCKET_USE_RE = /\bnew\s+WebSocket\b|\bWebSocket\s*\(/;
 
-  it("has no network primitive outside src/provider/ — the adapter-only Jev footprint", () => {
+  it("has no network primitive outside src/provider/ and src/serve/ — the adapter-only Jev footprint", () => {
     const srcRoot = fileURLToPath(new URL("../src", import.meta.url));
     const offenders: string[] = [];
+    // src/provider/ is the sanctioned adapter boundary; src/serve/ is the
+    // daemon, a network surface by design (HTTP + WebSocket serving is its
+    // documented function, client-tech-design.md Part 2). Everything else —
+    // drafting, derivation, store, permissions, eval, corrections — must stay
+    // free of network primitives so corpus paths have no unplanned egress.
+    const sanctioned = new Set(["provider", "serve"]);
     const walk = (dir: string, isSrcRoot: boolean): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const path = join(dir, entry.name);
         if (entry.isDirectory()) {
-          // src/provider/ is the sanctioned boundary; everything under it is exempt.
-          if (isSrcRoot && entry.name === "provider") {
+          if (isSrcRoot && sanctioned.has(entry.name)) {
             continue;
           }
           walk(path, false);
