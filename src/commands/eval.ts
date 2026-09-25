@@ -1,10 +1,26 @@
 import type { DuoConfig } from "../config.js";
 import { readRefusalsFile } from "../drafting/refusals.js";
 import { scoreRelevanceGate, type GateEvalReport } from "../eval/gate-eval.js";
-import { loadGateLabels } from "../eval/gate-labels.js";
+import { loadGateLabels, loadGateLabelsForEgress } from "../eval/gate-labels.js";
+import { fixtureSha256, loadJevMultiwayTasks, loadJevTraces } from "../eval/jev-fixtures.js";
+import {
+  JevStage2AbortedError,
+  persistStage2Report,
+  requireStage1Pass,
+  runJevStage2Replay,
+  type JevStage2Report,
+} from "../eval/jev-trace-eval.js";
+import {
+  persistStage1Report,
+  runJevStage1Quality,
+  sanitizeFailure,
+  type JevStage1Report,
+} from "../eval/jev-gate-eval.js";
+import { runJevTimingPass, runOllamaReferenceSection, type JevReferenceSection, type JevTimingSection } from "../eval/jev-timing-eval.js";
 import { runOfflineEval, type OfflineEvalOptions, type OfflineEvalReport } from "../eval/offline-eval.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
+import type { TypedDecisionProvider } from "../provider/types.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists } from "../store/store.js";
 
@@ -52,4 +68,105 @@ export function runEvalGate(config: DuoConfig): GateEvalReport {
   const labels = loadGateLabels(config.eval.gateLabelsPath);
   const refusals = readRefusalsFile(config.duoDir);
   return scoreRelevanceGate(labels, refusals);
+}
+
+/**
+ * Implements the Jev spike's `duo eval jev stage1` (plan U4): runs the
+ * quality head-to-head and persists `stage1-report.json` under the
+ * configured runtime dir — always, including on failure, because a failed
+ * run's evidence must outlive the abort (KTD5/KTD6). Like runEvalGate,
+ * this never asserts R5 itself: the CLI action prints the full report
+ * first and only then decides whether to fail on it.
+ *
+ * The provider is injected rather than constructed here so the checked-in
+ * suite runs this whole path offline through the fake; `src/cli.ts`
+ * constructs the real adapter (and gets its ProviderConfigError) at the
+ * process boundary.
+ */
+export async function runEvalJevStage1(
+  config: DuoConfig,
+  provider: TypedDecisionProvider,
+): Promise<JevStage1Report> {
+  // Egress-gated load (R9): stage 1 sends label text to the hosted gateway,
+  // so the label file must declare itself synthetic the way the other Jev
+  // fixtures do — a real-content label set can never slip onto this path.
+  const labels = loadGateLabelsForEgress(config.eval.gateLabelsPath);
+  const refusals = readRefusalsFile(config.duoDir);
+  const tasks = loadJevMultiwayTasks(config.eval.jevMultiwayTasksPath);
+  const gatewayOrigin = new URL(config.jev.gatewayUrl).origin;
+  const fixtureHashes = {
+    gateLabels: fixtureSha256(config.eval.gateLabelsPath),
+    multiwayTasks: fixtureSha256(config.eval.jevMultiwayTasksPath),
+  };
+
+  try {
+    let report = await runJevStage1Quality(provider, { labels, refusals, tasks, gatewayOrigin, fixtureHashes });
+
+    // An earned R5 pass buys the timing/cost pass and the Ollama reference
+    // (F1). A failure in either section marks only that section failed or
+    // gapped — the quality verdict stands (KTD6); no timing code is
+    // reachable from a run whose quality section failed or did not pass.
+    if (report.quality.r5Passed) {
+      let timing: JevTimingSection;
+      try {
+        timing = await runJevTimingPass(provider, tasks, config.jev.inputPricePerMTok);
+      } catch (error) {
+        timing = { status: "failed", failureSummary: sanitizeFailure(error) };
+      }
+      const reference: JevReferenceSection = await runOllamaReferenceSection(config, labels, tasks);
+      report = { ...report, timing, reference };
+    }
+
+    persistStage1Report(config.jev.runtimeDir, report);
+    return report;
+  } catch (error) {
+    persistStage1Report(config.jev.runtimeDir, {
+      generatedAt: new Date().toISOString(),
+      gatewayOrigin,
+      fixtureHashes,
+      refusalsLoaded: refusals.length,
+      baseline: scoreRelevanceGate(labels, refusals),
+      quality: { status: "failed", failureSummary: sanitizeFailure(error) },
+    });
+    throw error;
+  }
+}
+
+/**
+ * Implements the Jev spike's `duo eval jev stage2` (plan U6): the offline
+ * trace replay, gated on the persisted stage-1 pass. The gate refusal fires
+ * before any fixture load or request is built, so an ungated run costs
+ * nothing and egresses nothing. An aborted replay persists its partial
+ * report before the provider error propagates (KTD6) — the stage-1 numbers
+ * stay exactly as they were, and the verdict can report "navigation unknown".
+ *
+ * Provider injection matches runEvalJevStage1: the checked-in suite drives
+ * this whole path offline through the fake; `src/cli.ts` constructs the
+ * real adapter at the process boundary.
+ */
+export async function runEvalJevStage2(
+  config: DuoConfig,
+  provider: TypedDecisionProvider,
+): Promise<JevStage2Report> {
+  const stage1 = requireStage1Pass(config.jev.runtimeDir);
+  const traces = loadJevTraces(config.eval.jevTracesPath);
+
+  try {
+    const report = await runJevStage2Replay(provider, {
+      traces,
+      gatewayOrigin: new URL(config.jev.gatewayUrl).origin,
+      tracesHash: fixtureSha256(config.eval.jevTracesPath),
+      stage1,
+    });
+    persistStage2Report(config.jev.runtimeDir, report);
+    return report;
+  } catch (error) {
+    if (error instanceof JevStage2AbortedError) {
+      persistStage2Report(config.jev.runtimeDir, error.partial);
+      // Rethrow the underlying provider error, not the carrier — the CLI's
+      // error reporting (and callers) branch on the provider error class.
+      throw error.cause ?? error;
+    }
+    throw error;
+  }
 }

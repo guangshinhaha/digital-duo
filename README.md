@@ -64,6 +64,10 @@ needs it. Verified: official Node **22.22.x LTS** (`.nvmrc` pins it). Not every 
 Homebrew's `node` 23.x is compiled without FTS5 (`no such module: fts5`), and Node < 22.5 has
 no `node:sqlite` at all. Run `nvm use` before `npm test`.
 
+For running the full suite under load (the CLI-only `--testTimeout=60000` flag) and the
+pre-ship full-suite gate, see
+[`docs/solutions/tooling-decisions/vitest-suite-invocation-nvm-timeout.md`](docs/solutions/tooling-decisions/vitest-suite-invocation-nvm-timeout.md).
+
 ### Known limitations
 
 - **One writer at a time, per process.** `withDatabase` (`src/store/store.ts`) is synchronous

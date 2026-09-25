@@ -23,8 +23,16 @@ describe("loadConfig", () => {
       holdoutDays: 42,
       gateLabelsPath: "eval/gate-labels.json",
       gatePrecisionFloor: 0.95,
+      jevMultiwayTasksPath: "eval/jev-multiway-tasks.json",
+      jevTracesPath: "eval/jev-traces.json",
     });
     expect(config.lifecycleLogPath).toBe("duo-lifecycle-runtime/events.json");
+    expect(config.jev).toEqual({
+      gatewayUrl: "https://api.typesafe.ai",
+      apiKey: undefined,
+      inputPricePerMTok: 0.042,
+      runtimeDir: "jev-spike-runtime",
+    });
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -49,6 +57,12 @@ describe("loadConfig", () => {
       DUO_EVAL_GATE_PRECISION_FLOOR: "0.9",
       DUO_OWNER_NAME: "Priya Nair",
       DUO_LIFECYCLE_LOG_PATH: "/tmp/lifecycle.json",
+      DUO_EVAL_JEV_MULTIWAY_TASKS_PATH: "/tmp/tasks.json",
+      DUO_EVAL_JEV_TRACES_PATH: "/tmp/traces.json",
+      DUO_JEV_GATEWAY_URL: "https://jev.example.internal",
+      DUO_JEV_API_KEY: "sk-live",
+      DUO_JEV_INPUT_PRICE_PER_MTOK: "0.05",
+      DUO_JEV_SPIKE_RUNTIME_DIR: "/tmp/jev-runtime",
     });
     expect(config).toEqual({
       providerName: "ollama",
@@ -67,8 +81,16 @@ describe("loadConfig", () => {
         holdoutDays: 21,
         gateLabelsPath: "/tmp/labels.json",
         gatePrecisionFloor: 0.9,
+        jevMultiwayTasksPath: "/tmp/tasks.json",
+        jevTracesPath: "/tmp/traces.json",
       },
       lifecycleLogPath: "/tmp/lifecycle.json",
+      jev: {
+        gatewayUrl: "https://jev.example.internal",
+        apiKey: "sk-live",
+        inputPricePerMTok: 0.05,
+        runtimeDir: "/tmp/jev-runtime",
+      },
     });
   });
 
