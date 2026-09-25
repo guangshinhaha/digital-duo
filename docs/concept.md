@@ -128,6 +128,16 @@ Learned trust is slow, so the owner can write plain-English overrides:
 
 Two routes to autonomy — **earned** (ledger) and **granted** (standing orders).
 
+**Decision 2026-09-25, proposed (#179, pending ratification):** the properties that govern a
+trust write are *who* (the owner only — enforced by the auth seam, not by the terminal),
+*how deliberately* (never silently; an explicit tap; ambiguity refuses and shows candidates),
+and *with what record* (every event in the reconstructible ledger) — not *where it is typed*.
+A paired device is the owner's own remote and already carries heavier acts (confirming a T4
+action, ending the duo outright), so trust writes are exposeable over HTTP under the shared
+one-module-path, T4-stays-absent, provenance-recorded requirements written down in
+[`trust-surface.md`](trust-surface.md). Until ratified and built, the terminal remains the
+only surface that moves a tier or level.
+
 ## 7. Onboarding: The Mirror
 
 Nobody will sit and describe their own personality. The duo must arrive already knowing them.
