@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ClientEvent, RoomEvent, SyncState } from "matrix-js-sdk";
 import { createMatrixTransport } from "../src/workspace/matrix-transport.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
-import type { WorkspaceCandidateMessage } from "../src/workspace/transport.js";
+import { WorkspaceTokenRevokedError, type WorkspaceCandidateMessage } from "../src/workspace/transport.js";
 
 /**
  * Pins the adapter's contract at the seam, with matrix-js-sdk mocked into a
@@ -17,13 +17,23 @@ import type { WorkspaceCandidateMessage } from "../src/workspace/transport.js";
 
 type Listener = (...args: unknown[]) => void;
 
-/** The SDK surface the adapter touches: an emitter plus the five calls it makes. */
+/** The SDK surface the adapter touches: an emitter plus the calls it makes. */
 class StubMatrixClient {
   startCalls = 0;
   stopCalls = 0;
   presenceReports = 0;
+  directorySearches = 0;
+  presenceLookups = 0;
+  /** Concurrency the fan-out actually reached — read after the call settles to pin the pace. */
+  maxPresenceInFlight = 0;
+  private presenceInFlight = 0;
   readonly sentMessages: { roomId: string; content: unknown }[] = [];
   startClientError: Error | undefined;
+  /** What searchUserDirectory returns for listMembers — the homeserver's user directory page. */
+  directoryResults: { user_id: string; display_name?: string }[] = [];
+  directoryLimited = false;
+  /** Per-user presence the stub serves getPresence with; users absent from it get a rejection. */
+  readonly presenceByUser = new Map<string, { presence?: string; last_active_ago?: number }>();
   private readonly listeners = new Map<string, Set<Listener>>();
 
   on(event: string, listener: Listener): this {
@@ -69,6 +79,26 @@ class StubMatrixClient {
   async setPresence(): Promise<unknown> {
     this.presenceReports += 1;
     return {};
+  }
+
+  async searchUserDirectory(): Promise<{ results: { user_id: string; display_name?: string }[]; limited: boolean }> {
+    this.directorySearches += 1;
+    return { results: this.directoryResults, limited: this.directoryLimited };
+  }
+
+  async getPresence(userId: string): Promise<{ presence?: string; last_active_ago?: number }> {
+    this.presenceLookups += 1;
+    this.presenceInFlight += 1;
+    this.maxPresenceInFlight = Math.max(this.maxPresenceInFlight, this.presenceInFlight);
+    // A real presence request takes a tick; the await is what makes the
+    // fan-out's concurrency observable.
+    await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+    this.presenceInFlight -= 1;
+    const status = this.presenceByUser.get(userId);
+    if (!status) {
+      throw new Error(`fake: no presence for ${userId}`);
+    }
+    return status;
   }
 }
 
@@ -162,6 +192,15 @@ describe("Matrix adapter — stop() is a shutdown, not a suggestion", () => {
     expect(client.stopCalls).toBe(1);
   });
 
+  it("refuses member reads after stop() — a read rides the held connection or refuses, never the torn-down client", async () => {
+    client.directoryResults = [{ user_id: "@alice:workspace", display_name: "Alice" }];
+    const transport = createMatrixTransport(settings());
+    await transport.stop();
+    await expect(transport.listMembers()).rejects.toThrow(/stopped — the member read needs the held connection/);
+    await expect(transport.listMemberIdentities()).rejects.toThrow(/stopped — the member read needs the held connection/);
+    expect(client.directorySearches).toBe(0);
+  });
+
   it("silences the sync and timeline handlers afterwards — no disconnect, no message, after stop()", async () => {
     const transport = createMatrixTransport(settings());
     const connecting = transport.connect();
@@ -249,5 +288,139 @@ describe("Matrix adapter — outbound calls", () => {
     const transport = createMatrixTransport(settings());
     await transport.markAlive();
     expect(client.presenceReports).toBe(1);
+  });
+});
+
+describe("Matrix adapter — listMembers reads the directory the platform decision says the workspace holds (#187 AC1)", () => {
+  it("maps the user directory page into seam members: ids, display names, presence per user", async () => {
+    client.directoryResults = [
+      { user_id: "@alice:workspace", display_name: "Alice" },
+      { user_id: "@duo-alice:workspace", display_name: "Alice's duo" },
+    ];
+    client.presenceByUser.set("@alice:workspace", { presence: "online", last_active_ago: 5000 });
+    client.presenceByUser.set("@duo-alice:workspace", { presence: "offline", last_active_ago: 3_600_000 });
+    const transport = createMatrixTransport(settings());
+    const listing = await transport.listMembers();
+    expect(listing).toEqual({
+      members: [
+        { userId: "@alice:workspace", displayName: "Alice", presence: { online: true, lastActiveAgoMs: 5000 } },
+        { userId: "@duo-alice:workspace", displayName: "Alice's duo", presence: { online: false, lastActiveAgoMs: 3_600_000 } },
+      ],
+      truncated: false,
+    });
+    expect(client.directorySearches).toBe(1);
+  });
+
+  it("falls back to the localpart when the profile has no display name — never an empty name", async () => {
+    client.directoryResults = [{ user_id: "@bob:workspace" }, { user_id: "@carol:workspace", display_name: "" }];
+    client.presenceByUser.set("@bob:workspace", { presence: "offline" });
+    client.presenceByUser.set("@carol:workspace", { presence: "offline" });
+    const listing = await createMatrixTransport(settings()).listMembers();
+    expect(listing.members.map((member) => member.displayName)).toEqual(["bob", "carol"]);
+  });
+
+  it("treats any non-online server presence as offline, and a missing last_active_ago as never seen", async () => {
+    client.directoryResults = [{ user_id: "@alice:workspace", display_name: "Alice" }];
+    client.presenceByUser.set("@alice:workspace", { presence: "unavailable" });
+    expect((await createMatrixTransport(settings()).listMembers()).members[0]!.presence).toEqual({
+      online: false,
+      lastActiveAgoMs: null,
+    });
+  });
+
+  it("fails soft per user: a presence the server will not state is offline-never-seen, not a failed read", async () => {
+    client.directoryResults = [
+      { user_id: "@alice:workspace", display_name: "Alice" },
+      { user_id: "@bob:workspace", display_name: "Bob" },
+    ];
+    client.presenceByUser.set("@alice:workspace", { presence: "online" });
+    // @bob has no presence entry — the stub rejects, like a server refusing the query.
+    const listing = await createMatrixTransport(settings()).listMembers();
+    expect(listing.members.map((member) => member.presence)).toEqual([
+      { online: true, lastActiveAgoMs: null },
+      { online: false, lastActiveAgoMs: null },
+    ]);
+  });
+
+  it("carries the server's truncation signal as the listing's truncated flag", async () => {
+    client.directoryResults = [{ user_id: "@alice:workspace", display_name: "Alice" }];
+    client.directoryLimited = true;
+    client.presenceByUser.set("@alice:workspace", { presence: "online" });
+    expect((await createMatrixTransport(settings()).listMembers()).truncated).toBe(true);
+  });
+
+  it("paces the per-user presence fan-out — bounded in flight, order preserved", async () => {
+    for (let i = 0; i < 25; i += 1) {
+      const userId = `@user${i}:workspace`;
+      client.directoryResults.push({ user_id: userId, display_name: `User ${i}` });
+      client.presenceByUser.set(userId, { presence: i % 2 === 0 ? "online" : "offline", last_active_ago: 1000 });
+    }
+    const listing = await createMatrixTransport(settings()).listMembers();
+    // The server's order survives the chunked fan-out, all 25 presences
+    // were read, and the concurrency the homeserver saw stayed bounded —
+    // a burst of 25 simultaneous requests is what this pins out.
+    expect(listing.members.map((member) => member.userId)).toEqual(client.directoryResults.map((result) => result.user_id));
+    expect(client.presenceLookups).toBe(25);
+    expect(client.maxPresenceInFlight).toBeGreaterThanOrEqual(2);
+    expect(client.maxPresenceInFlight).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("Matrix adapter — listMemberIdentities is the member read without the presence fan-out (#187 AC3's feed)", () => {
+  it("maps the directory page to identity facts and never asks for a single presence", async () => {
+    client.directoryResults = [
+      { user_id: "@alice:workspace", display_name: "Alice" },
+      { user_id: "@duo-alice:workspace", display_name: "Alice's duo" },
+      { user_id: "@bob:workspace" },
+    ];
+    const listing = await createMatrixTransport(settings()).listMemberIdentities();
+    expect(listing).toEqual({
+      members: [
+        { userId: "@alice:workspace", displayName: "Alice" },
+        { userId: "@duo-alice:workspace", displayName: "Alice's duo" },
+        // The localpart fallback, same as the full read.
+        { userId: "@bob:workspace", displayName: "bob" },
+      ],
+      truncated: false,
+    });
+    expect(client.directorySearches).toBe(1);
+    expect(client.presenceLookups).toBe(0);
+  });
+
+  it("carries the server's truncation signal exactly like the full read", async () => {
+    client.directoryResults = [{ user_id: "@alice:workspace", display_name: "Alice" }];
+    client.directoryLimited = true;
+    expect((await createMatrixTransport(settings()).listMemberIdentities()).truncated).toBe(true);
+  });
+});
+
+describe("Matrix adapter — a rejected token is a distinct, terminal-shaped error (#187, M_UNKNOWN_TOKEN)", () => {
+  function matrixTokenError(): Error & { errcode: string } {
+    const error = new Error("Invalid access token passed.") as Error & { errcode: string };
+    error.errcode = "M_UNKNOWN_TOKEN";
+    return error;
+  }
+
+  it("rejects connect() with WorkspaceTokenRevokedError when sync fails with M_UNKNOWN_TOKEN", async () => {
+    const transport = createMatrixTransport(settings());
+    const connecting = transport.connect();
+    client.emit(ClientEvent.Sync, SyncState.Error, "Syncing", { error: matrixTokenError() });
+    await expect(connecting).rejects.toBeInstanceOf(WorkspaceTokenRevokedError);
+    await expect(connecting).rejects.toThrow(/M_UNKNOWN_TOKEN.*Invalid access token passed\./s);
+  });
+
+  it("rejects connect() with WorkspaceTokenRevokedError when startClient itself fails with M_UNKNOWN_TOKEN", async () => {
+    client.startClientError = matrixTokenError();
+    await expect(createMatrixTransport(settings()).connect()).rejects.toBeInstanceOf(WorkspaceTokenRevokedError);
+  });
+
+  it("keeps every other sync failure a plain error — only a dead credential is terminal", async () => {
+    const transport = createMatrixTransport(settings());
+    const connecting = transport.connect();
+    const notAToken = new Error("synapse is down") as Error & { errcode?: string };
+    notAToken.errcode = "M_LIMIT_EXCEEDED";
+    client.emit(ClientEvent.Sync, SyncState.Error, "Syncing", { error: notAToken });
+    await expect(connecting).rejects.not.toBeInstanceOf(WorkspaceTokenRevokedError);
+    await expect(connecting).rejects.toThrow(/workspace sync failed: synapse is down/);
   });
 });

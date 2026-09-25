@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { askerContextForSender, localpartOf } from "../src/workspace/asker.js";
+import { memberOf } from "./helpers/workspace-member.js";
 
 const tempDir = useTempDir();
 
@@ -17,6 +18,9 @@ describe("localpartOf", () => {
   it("extracts the localpart of a Matrix user id", () => {
     expect(localpartOf("@alice:workspace")).toBe("alice");
     expect(localpartOf("@duo-alice:workspace.example")).toBe("duo-alice");
+    // The deliberately loose grammar directory.ts documents: a serverless
+    // id still yields its localpart exactly as #219 shipped it.
+    expect(localpartOf("@alice:")).toBe("alice");
   });
 
   it("passes anything un-shaped through unchanged, to simply fail resolution downstream", () => {
@@ -58,5 +62,47 @@ describe("askerContextForSender — the asking Matrix user through the EXISTING 
   it("never carries an ask link — workspace asks are not ask-link asks", () => {
     const duoDir = writeDirectory([{ id: "bob", name: "Bob", clearance: "official_open", groups: [] }]);
     expect(askerContextForSender("@bob:workspace", duoDir).askLinkId).toBeNull();
+  });
+});
+
+describe("askerContextForSender with the workspace member record — the #187 feed, one resolver either way (AC3)", () => {
+  it("produces identical outcomes fed and unfed — the existing permissions path is unchanged, pinned", () => {
+    const duoDir = writeDirectory([{ id: "bob", name: "Bob", clearance: "official_open", groups: [] }]);
+    for (const sender of ["@bob:workspace", "@BOB:workspace", "@stranger:workspace"]) {
+      const fed = askerContextForSender(sender, duoDir, memberOf(sender, "Whatever the profile says"));
+      const unfed = askerContextForSender(sender, duoDir);
+      expect(fed).toEqual(unfed);
+    }
+  });
+
+  it("never resolves through the member's display name — an asker must not choose their own log identity", () => {
+    // The directory knows asker id "bob"; the workspace member is a
+    // DIFFERENT user whose self-service display name says "Bob". The
+    // display name is not a lookup key, so the ask logs as who they are
+    // (unresolved, their full Matrix user id), not as bob.
+    const duoDir = writeDirectory([{ id: "bob", name: "Bob", clearance: "official_open", groups: [] }]);
+    expect(askerContextForSender("@mallory:workspace", duoDir, memberOf("@mallory:workspace", "Bob"))).toEqual({
+      ref: "@mallory:workspace",
+      resolved: false,
+      askLinkId: null,
+    });
+  });
+
+  it("a duo-shaped sender resolves as itself or not at all — never credited to its owner (AR-13's direction, inbound)", () => {
+    const duoDir = writeDirectory([{ id: "carol", name: "Carol", clearance: "official_open", groups: [] }]);
+    expect(askerContextForSender("@duo-carol:workspace", duoDir, memberOf("@duo-carol:workspace", "Carol's duo"))).toEqual({
+      ref: "@duo-carol:workspace",
+      resolved: false,
+      askLinkId: null,
+    });
+  });
+
+  it("a fed call resolves exactly as the unfed path does — the member record is the feed's surface, not a second resolver", () => {
+    const duoDir = writeDirectory([{ id: "bob", name: "Bob", clearance: "official_open", groups: [] }]);
+    expect(askerContextForSender("@bob:workspace", duoDir, memberOf("@bob:workspace", "Bob from the directory"))).toEqual({
+      ref: "bob",
+      resolved: true,
+      askLinkId: null,
+    });
   });
 });

@@ -1,11 +1,26 @@
 import type { PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
 import { buildAnswerEvent, buildFailedAnswerEvent } from "./payload.js";
 import { directQuestionFrom } from "./questions.js";
-import type { WorkspaceCandidateMessage, WorkspaceQuestion, WorkspaceTransport, WorkspaceTransportFactory } from "./transport.js";
+import type {
+  WorkspaceCandidateMessage,
+  WorkspaceMemberIdentity,
+  WorkspaceQuestion,
+  WorkspaceTransport,
+  WorkspaceTransportFactory,
+} from "./transport.js";
+import { WorkspaceTokenRevokedError } from "./transport.js";
 import type { WorkspaceSettings } from "./settings.js";
 
-/** The connection phases #187's availability states will read. */
-export type WorkspacePhase = "stopped" | "connecting" | "connected";
+/**
+ * The connection phases #187's availability states read. `revoked` is
+ * terminal: the homeserver rejected the access token (`M_UNKNOWN_TOKEN`,
+ * carried as `WorkspaceTokenRevokedError`), no retry can fix a dead
+ * credential, and the service stops dialing until an explicit `start()` —
+ * the re-pairing that fixes it happens on the owner's machine, in the
+ * environment the token came from, not in this loop.
+ */
+export type WorkspacePhase = "stopped" | "connecting" | "connected" | "revoked";
 
 /**
  * #186 AC4: disconnection as a recorded state, not an error. `phase` is the
@@ -13,7 +28,10 @@ export type WorkspacePhase = "stopped" | "connecting" | "connected";
  * successfully reported liveness to the homeserver (the server-side
  * presence/last-seen the asker side eventually sees); `attempts` counts
  * consecutive failed dials so an observer can tell "connecting" (fresh)
- * from "connecting" (backing off after the ninth try).
+ * from "connecting" (backing off after the ninth try). The terminal phases
+ * (`stopped`, `revoked`) reset it to 0 — once dialing has ended for good,
+ * there is no streak left to describe, and an explicit later `start()`
+ * begins a fresh one.
  */
 export interface WorkspaceServiceState {
   readonly phase: WorkspacePhase;
@@ -25,6 +43,21 @@ export interface WorkspaceServiceState {
 
 /** The answering pipeline, injected — in production the exact `answerPublicly` call `POST /ask` makes (no second path; see commands/serve.ts). */
 export type WorkspaceAnswerPipeline = (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>;
+
+/**
+ * The service's own connection state → #187's availability, asleep-duo.md §6
+ * exactly: `online` iff the outbound connection is live (phase `connected`);
+ * otherwise offline with `lastAliveAt` — the most recent liveness the
+ * homeserver accepted — as the last-seen time (null when it never got one).
+ * Exported (and the only spelling — the service keeps no `availability()`
+ * twin) because the duo's own availability is a directory-shaped fact: the
+ * same `WorkspaceAvailability` `directory.ts` composes for everyone else,
+ * read here off the one connection this process holds, over `state()` /
+ * `onState()`.
+ */
+export function availabilityOfState(state: WorkspaceServiceState): WorkspaceAvailability {
+  return { online: state.phase === "connected", lastSeenAt: state.phase === "connected" ? null : state.lastAliveAt };
+}
 
 export interface WorkspaceServiceOptions {
   readonly settings: WorkspaceSettings;
@@ -90,9 +123,11 @@ export class RecentlySeenEventIds {
 
 /**
  * Owns the outbound workspace connection's lifecycle for `duo serve`:
- * dial-and-hold, reconnect with backoff, presence reporting, and the
- * question→answer loop. Everything above the transport seam — this class —
- * is transport-agnostic and fully covered by tests against a fake.
+ * dial-and-hold, reconnect with backoff, presence reporting, the
+ * question→answer loop, and — #187 — the workspace member cache that feeds
+ * asker resolution, the `directory()` read, and the terminal revoked phase
+ * a dead access token ends in. Everything above the transport seam — this
+ * class — is transport-agnostic and fully covered by tests against a fake.
  *
  * Held-not-lost needs no queue here, and none is built (docs/workspace-
  * platform.md: Matrix gives sync/queueing as library capability). The
@@ -114,6 +149,7 @@ export class WorkspaceService {
   private stateValue: WorkspaceServiceState;
   private readonly stateHandlers = new Set<(state: WorkspaceServiceState) => void>();
   private readonly seenEventIds = new RecentlySeenEventIds(10_000);
+  private membersById = new Map<string, WorkspaceMemberIdentity>();
   private answerChain: Promise<void> = Promise.resolve();
 
   constructor(options: WorkspaceServiceOptions) {
@@ -128,6 +164,40 @@ export class WorkspaceService {
 
   onState(handler: (state: WorkspaceServiceState) => void): void {
     this.stateHandlers.add(handler);
+  }
+
+  /**
+   * The workspace member record for a Matrix user id, from the listing read
+   * at the last successful connect — or undefined when the sender wasn't
+   * listed (or no read has succeeded yet). Identity facts only (id, display
+   * name): presence is never served from this cache, because a cache read at
+   * connect time is stale the moment anyone's connection changes. Callers
+   * wanting availability read `directory()`.
+   */
+  memberFor(userId: string): WorkspaceMemberIdentity | undefined {
+    return this.membersById.get(userId);
+  }
+
+  /**
+   * Reads the workspace directory over the live connection (#187 AC1/AC2):
+   * one fresh `listMembers` + compose, so what it returns is what the
+   * homeserver says now — people with stable ids, display names, and §6
+   * availability, their duos attached and attributed. Refuses with a plain
+   * error when the connection is not live: a directory read is a read over
+   * the held connection, not a best-effort cache serve. A server-capped
+   * listing is surfaced (logged), never silently swallowed — the entries
+   * returned are correct, the entries absent are unknown.
+   */
+  async directory(): Promise<readonly WorkspaceDirectoryEntry[]> {
+    const transport = this.transport;
+    if (transport === undefined || this.stateValue.phase !== "connected") {
+      throw new Error("the workspace directory can only be read while the outbound connection is live");
+    }
+    const listing = await transport.listMembers();
+    if (listing.truncated) {
+      this.consoleError("the workspace directory listing was truncated by the homeserver's limit", `the server capped the listing at ${listing.members.length} members`);
+    }
+    return workspaceDirectoryFrom(listing);
   }
 
   /**
@@ -147,13 +217,26 @@ export class WorkspaceService {
   /** Stops the connection and cancels any pending reconnect. Idempotent. */
   async stop(): Promise<void> {
     this.running = false;
+    await this.terminate("stopped");
+  }
+
+  /**
+   * The one teardown every terminal end shares: cancel the pending
+   * reconnect, stop the presence interval, reset the failure count, drop the
+   * member cache, emit exactly one terminal state (keeping `lastAliveAt` —
+   * the offline-with-last-seen story still holds), and detach + stop the
+   * transport. stop() lands in "stopped"; the revoked-token path in
+   * "revoked" — the state they land in is the only difference between them.
+   */
+  private async terminate(phase: "stopped" | "revoked"): Promise<void> {
     if (this.reconnectTimer !== undefined) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
     this.stopPresenceRefresh();
     this.consecutiveFailures = 0;
-    this.setState({ phase: "stopped", lastAliveAt: this.stateValue.lastAliveAt, attempts: 0 });
+    this.membersById = new Map();
+    this.setState({ phase, lastAliveAt: this.stateValue.lastAliveAt, attempts: 0 });
     const transport = this.transport;
     this.transport = undefined;
     await transport?.stop();
@@ -197,6 +280,24 @@ export class WorkspaceService {
         // adapter rejects it from stop()) — shutdown, not a failure.
         return;
       }
+      if (error instanceof WorkspaceTokenRevokedError) {
+        // Fail-fast, not fail-forever (#219's successor note): a revoked
+        // token is a dead credential, and dialing it on a backoff schedule
+        // is a loop that can never succeed — it would also keep hammering
+        // the homeserver with auth failures it has already answered. So:
+        // terminal (the shared teardown lands in "revoked", keeping
+        // lastAliveAt), and say how it's fixed — re-pairing on the owner's
+        // machine, the only place duo credentials are ever created. An
+        // explicit later start() may re-dial and re-discover the revocation;
+        // nothing automatic does.
+        this.consoleError(
+          "workspace access token rejected — not retrying; re-pair the duo on the owner's machine (DUO_WORKSPACE_ACCESS_TOKEN) and restart duo serve",
+          error,
+        );
+        this.running = false;
+        await this.terminate("revoked");
+        return;
+      }
       this.consoleError("workspace connection failed", error);
       this.scheduleReconnect();
       return;
@@ -211,6 +312,42 @@ export class WorkspaceService {
       return;
     }
     this.startPresenceRefresh();
+    void this.refreshMembers();
+  }
+
+  /**
+   * Re-reads the workspace member listing into the identity cache (#187's
+   * asker feed) — the identity-only read: the cache serves identity facts,
+   * so paying the presence fan-out `listMembers` carries would buy nothing
+   * on every connect. Fail-soft by design: a directory read failing
+   * degrades the asker mapping to its parse-only fallback (and
+   * `directory()` callers to an error they already have to handle), never
+   * the connection and never an answer — identity resolution must not turn
+   * an answerable question into an error (directory.ts's own rule). A read
+   * that resolves after the transport it read from was replaced (re-dial)
+   * or stopped is discarded: it describes a connection this service no
+   * longer holds.
+   */
+  private async refreshMembers(): Promise<void> {
+    const transport = this.transport;
+    if (transport === undefined) {
+      return;
+    }
+    try {
+      const listing = await transport.listMemberIdentities();
+      if (this.transport !== transport) {
+        return;
+      }
+      if (listing.truncated) {
+        this.consoleError(
+          "the workspace directory listing was truncated by the homeserver's limit — members beyond it are missing from the cached asker feed",
+          `the server capped the listing at ${listing.members.length} members`,
+        );
+      }
+      this.membersById = new Map(listing.members.map((member) => [member.userId, member]));
+    } catch (error) {
+      this.consoleError("workspace member listing failed", error);
+    }
   }
 
   private scheduleReconnect(): void {

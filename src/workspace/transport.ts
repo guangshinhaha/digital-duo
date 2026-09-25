@@ -30,6 +30,31 @@ export interface WorkspaceTransport {
    */
   connect(): Promise<void>;
 
+  /**
+   * Reads the workspace's members from the homeserver over the held
+   * connection (#187): stable ids, display names, and server-side presence
+   * — the raw facts the directory is composed from (`directory.ts`). A
+   * read, nothing more: nothing in this interface can create, modify, or
+   * remove a workspace member (the no-provisioning principle, pinned by
+   * test/workspace-payload.test.ts's scan), so a member joining the
+   * workspace gets no duo from us and nobody else gets one either.
+   *
+   * `truncated` says the server capped the listing (`limited` in Matrix's
+   * user-directory response): the members present are correct, the members
+   * absent are unknown — surfaced rather than swallowed so a caller can
+   * refuse to reason over a partial directory.
+   */
+  listMembers(): Promise<WorkspaceMemberListing>;
+
+  /**
+   * The identity-only half of the member read: same listing, no presence.
+   * Presence on Matrix is one request per user (there is no bulk API), so
+   * `listMembers` pays a fan-out this method skips — the asker feed's
+   * connect-time refresh wants identity facts only and must not cost a
+   * presence round-trip per workspace member on every reconnect.
+   */
+  listMemberIdentities(): Promise<WorkspaceMemberIdentityListing>;
+
   /** Stop the outbound connection. Idempotent; does not fire `onDisconnected`. */
   stop(): Promise<void>;
 
@@ -79,6 +104,73 @@ export interface WorkspaceCandidateMessage {
   readonly body: string;
   /** User ids of the room's joined members, including the duo itself. */
   readonly joinedMemberIds: readonly string[];
+}
+
+/**
+ * #187: one workspace user's presence as the homeserver knows it —
+ * server-side state, never daemon-local truth. Raw on purpose: `lastActiveAgoMs`
+ * stays relative (the server's clock, not ours) so the seam carries facts and
+ * the composer (`directory.ts`) does the one clock conversion. Null when the
+ * server has never seen the user active — a fact missing is a fact missing.
+ */
+export interface WorkspacePresence {
+  /** Whether the user has a live connection reporting liveness ("online" server-side). */
+  readonly online: boolean;
+  /** How long ago, in ms, the user was last seen — null when the server has never seen them. */
+  readonly lastActiveAgoMs: number | null;
+}
+
+/**
+ * #187: one member of the workspace as read from the homeserver. The Matrix
+ * user id is the stable id — the protocol's own, never reassigned; the display
+ * name is the profile's, falling back to the localpart when none is set (the
+ * adapter normalizes; the composer trusts it). People and duo users both
+ * appear here; which is which, and whose duo is whose, is `directory.ts`'s
+ * derivation over the `@duo-<name>` convention.
+ */
+export interface WorkspaceMemberIdentity {
+  readonly userId: string;
+  readonly displayName: string;
+}
+
+export interface WorkspaceMember extends WorkspaceMemberIdentity {
+  readonly presence: WorkspacePresence;
+}
+
+/** The raw result of one member read: the members the server returned, and whether it capped the listing. */
+export interface WorkspaceMemberListing {
+  readonly members: readonly WorkspaceMember[];
+  readonly truncated: boolean;
+}
+
+/** The identity-only member read's result — same shape, no presence facts. */
+export interface WorkspaceMemberIdentityListing {
+  readonly members: readonly WorkspaceMemberIdentity[];
+  readonly truncated: boolean;
+}
+
+/**
+ * #187 (from #219's successor notes): the homeserver rejected the duo's
+ * access token — Matrix `M_UNKNOWN_TOKEN`, i.e. the token was revoked or
+ * replaced, which no retry can fix. Adapters throw this (the Matrix adapter
+ * recognizes the errcode on its connect-failure paths); the service answers
+ * it by stopping the retry loop and recording the terminal `revoked` phase
+ * rather than dialing a dead credential forever. The fix is re-pairing on
+ * the owner's machine — the only place duo credentials are ever created
+ * (docs/workspace-platform.md §6).
+ */
+export class WorkspaceTokenRevokedError extends Error {
+  constructor(detail: string) {
+    // `detail` is homeserver-controlled text whose only destination is the
+    // owner-side console (service logs the error): control characters are
+    // stripped and the length capped, so a hostile or compromised
+    // homeserver can neither paint the terminal nor launder anything long
+    // through this message. It cannot echo the access token — the server
+    // knows it, but this string is its error text, not our credential.
+    const safeDetail = detail.replace(/\p{C}/gu, "").slice(0, 300);
+    super(`The workspace homeserver rejected the duo's access token (M_UNKNOWN_TOKEN): ${safeDetail}`);
+    this.name = "WorkspaceTokenRevokedError";
+  }
 }
 
 /** A question that passed the direct-question filter, ready for the answering pipeline. */
