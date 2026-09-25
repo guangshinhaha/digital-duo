@@ -3,9 +3,19 @@ import { DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD } from "../config.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 
-/** One source a draft (or its escalation explanation) cites — a rule or a piece of retrieved evidence, rendered as a short, human-readable link. */
+/**
+ * One source a draft (or its escalation explanation) cites — a standing
+ * order, a piece of retrieved evidence, or (#190) a file the asker
+ * attached to the question — rendered as a short, human-readable link.
+ * The attachment kind carries `id` + `label` only (the workspace's file
+ * reference and a stripped preview): the bytes grounded the one draft and
+ * were then dropped, so the row is a dead-link-plus-honest-label once the
+ * workspace deletes the file — the same treatment the audit trail gives
+ * every other reference to something outside the store
+ * (docs/workspace/attachments.md §3).
+ */
 export interface DraftSource {
-  readonly kind: "rule" | "evidence";
+  readonly kind: "rule" | "evidence" | "attachment";
   readonly id: string;
   readonly label: string;
 }

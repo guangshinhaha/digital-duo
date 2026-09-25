@@ -2,6 +2,7 @@ import {
   ClientEvent,
   createClient,
   EventType,
+  Method,
   MsgType,
   RoomEvent,
   SetPresence,
@@ -13,11 +14,13 @@ import {
   type Room,
 } from "matrix-js-sdk";
 import { localpartOf } from "./directory.js";
-import type { RoomInvite } from "./messages.js";
+import { fileFromContent, type RoomInvite } from "./messages.js";
 import type { WorkspaceSettings } from "./settings.js";
 import type {
   AnswerEventContent,
   WorkspaceCandidateMessage,
+  WorkspaceFileBody,
+  WorkspaceFileReference,
   WorkspaceMember,
   WorkspaceMemberIdentity,
   WorkspaceMemberIdentityListing,
@@ -112,6 +115,56 @@ function revokedTokenErrorOf(error: unknown): WorkspaceTokenRevokedError | undef
     : undefined;
 }
 
+/**
+ * #190: the files a question rode with. Association is positional and
+ * sender-scoped — the asker's own contiguous run of `m.file`/`m.image`
+ * events immediately preceding their text question in the same room's
+ * timeline. Nothing about the protocol links them (Matrix has no
+ * attachment relation); this convention is what any Matrix client's
+ * "attach then ask" flow produces, and it degrades honestly at every
+ * edge: another member's message, the asker's own text, or any other
+ * event between the files and the question ends the run (older files
+ * don't silently ground a later question — they'd have to be re-shared),
+ * and a question not found on the live timeline (a thread reply, whose
+ * files would live in the thread) associates nothing.
+ *
+ * The walk is bounded by the timeline the SDK holds in memory — a run
+ * that begins before the live window starts simply associates fewer
+ * files, which the door treats as the honest count. The door, not this
+ * adapter, enforces the count/type/size policy (attachments.md §7).
+ */
+function attachmentsForQuestion(room: Room, questionEventId: string, senderId: string): WorkspaceFileReference[] {
+  const events = room.getLiveTimeline().getEvents();
+  let index = events.length - 1;
+  while (index >= 0 && events[index]!.getId() !== questionEventId) {
+    index -= 1;
+  }
+  if (index < 0) {
+    return [];
+  }
+  const attachments: WorkspaceFileReference[] = [];
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const candidate = events[i]!;
+    if (candidate.getType() !== EventType.RoomMessage || candidate.getSender() !== senderId) {
+      break;
+    }
+    const content = candidate.getContent() as Record<string, unknown>;
+    const msgtype = content.msgtype;
+    if (msgtype !== MsgType.File && msgtype !== MsgType.Image) {
+      break;
+    }
+    // The same one-parsing-layer rule the contract states (messages.ts):
+    // file facts come from fileFromContent or not at all. A file event
+    // without a content reference contributes nothing but does not end
+    // the run — it renders as its own (broken) file message either way.
+    const file = fileFromContent(msgtype as string, content);
+    if (file !== undefined) {
+      attachments.unshift({ reference: file.reference, name: file.name, mimeType: file.mimeType, size: file.size });
+    }
+  }
+  return attachments;
+}
+
 export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTransport {
   // The access token lives in the client and in the env var it came from,
   // and nowhere else: it is never logged, never persisted by this code.
@@ -170,13 +223,21 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
     if (senderId === undefined || room === undefined) {
       return;
     }
+    const eventId = event.getId() ?? "";
+    // #190: the asker's own files immediately preceding this question, on
+    // the room's timeline (see attachmentsForQuestion). Set only when
+    // non-empty so the no-attachments candidate stays byte-identical to
+    // the pre-#190 shape — the seam-level fakes and the sibling works read
+    // this same object.
+    const attachments = attachmentsForQuestion(room, eventId, senderId);
     const message: WorkspaceCandidateMessage = {
-      eventId: event.getId() ?? "",
+      eventId,
       roomId: event.getRoomId() ?? room.roomId,
       senderId,
       body,
       originServerTs: event.getTs(),
       joinedMemberIds: room.getJoinedMembers().map((member) => member.userId),
+      ...(attachments.length > 0 ? { attachments } : {}),
     };
     for (const handler of messageHandlers) {
       handler(message);
@@ -263,6 +324,52 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
       // (decision record §6): the room's members cannot read this as the
       // owner, whatever a client renders.
       await client.sendMessage(roomId, { msgtype: MsgType.Text, body: content.body });
+    },
+
+    async fetchFile(reference: string, options: { readonly maxBytes: number }): Promise<WorkspaceFileBody> {
+      // #190: the daemon's one dereference of conversation files — as the
+      // duo's own authenticated user, over the held connection, bounded by
+      // the caller's byte cap. See messages.ts's "Files" section for the
+      // platform model (authenticated media, MSC3916; the homeserver
+      // serves bytes to authenticated users, not to rooms) and what our
+      // side adds on top: this body goes to the door and nowhere else.
+      if (stopped) {
+        throw new Error("workspace transport stopped — the file read needs the held connection");
+      }
+      const parsed = /^mxc:\/\/([^/]+)\/([^/]+)$/.exec(reference);
+      if (parsed === null) {
+        throw new Error(`workspace file reference is not an mxc URI: ${reference}`);
+      }
+      // Range is inclusive, so `0..maxBytes` fetches at most maxBytes+1
+      // bytes — one byte past the cap is exactly the evidence that the
+      // body exceeds it (`exceededMaxBytes`), while a body at or under the
+      // cap arrives whole. A server that ignores Range and sends the full
+      // body is caught by the same check; the bytes still never leave this
+      // function's return value.
+      const response = await client.http.authedRequest<unknown>(
+        Method.Get,
+        `/_matrix/client/v1/media/download/${encodeURIComponent(parsed[1]!)}/${encodeURIComponent(parsed[2]!)}`,
+        undefined,
+        undefined,
+        {
+          prefix: "",
+          rawResponseBody: true,
+          headers: { Range: `bytes=0-${options.maxBytes}` },
+          // Required by this SDK version's IRequestOpts (it extends
+          // Pick<RequestInit, "priority">); undefined is the browser/fetch
+          // default — no scheduling hint asked for.
+          priority: undefined,
+        },
+      );
+      if (!(response instanceof Blob)) {
+        // rawResponseBody promised a raw body; anything else is an SDK
+        // contract change, and the door's caller treats a throw as a
+        // retrieval failure — refused with a recoverable reason, never a
+        // guessed grounding.
+        throw new Error("workspace media download returned an unreadable body");
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      return { bytes, exceededMaxBytes: bytes.byteLength > options.maxBytes };
     },
 
     async markAlive() {

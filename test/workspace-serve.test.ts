@@ -3,13 +3,14 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { runServe } from "../src/commands/serve.js";
+import { listDrafts } from "../src/drafting/draft-log.js";
 import { PUBLIC_PASSED_ON_MESSAGE } from "../src/permissions/public-answer.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import { createDeviceToken } from "../src/serve/tokens.js";
 import { createEncryptedStore } from "../src/store/store.js";
 import type { RoomInvite } from "../src/workspace/messages.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
-import { WorkspaceTokenRevokedError, type WorkspaceTransport } from "../src/workspace/transport.js";
+import { WorkspaceTokenRevokedError, type WorkspaceFileReference, type WorkspaceTransport } from "../src/workspace/transport.js";
 import { FakeWorkspaceTransport } from "./helpers/fake-workspace-transport.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 
@@ -538,5 +539,96 @@ describe("runServe + workspace — scope follows the asker, not the room (#192)"
       await close();
     }
     await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+  });
+});
+
+describe("runServe + workspace — the attachment grounding door, end to end (#190)", () => {
+  const FILE: WorkspaceFileReference = { reference: "mxc://workspace/f1", name: "notes.txt", mimeType: "text/plain", size: 24 };
+
+  function attachmentQuestion(eventId: string, body: string, attachments: readonly WorkspaceFileReference[]) {
+    return {
+      eventId,
+      roomId: "!dm:workspace",
+      senderId: "@bob:workspace",
+      body,
+      originServerTs: Date.now(),
+      joinedMemberIds: [SELF, "@bob:workspace"],
+      attachments,
+    };
+  }
+
+  async function served(storePath: string) {
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    return { transport, close };
+  }
+
+  it("refuses an above-ceiling attachment with the marking named — and drafts nothing at all", async () => {
+    const { storePath } = initStore();
+    const { transport, close } = await served(storePath);
+    try {
+      await untilConnected(transport);
+      transport.setFile("mxc://workspace/f1", "secret\nthe launch date is March 3rd");
+      transport.deliver(attachmentQuestion("$secret", "when do we launch?", [FILE]));
+      await until(() => transport.sentAnswers.length >= 1);
+      expect(transport.sentAnswers).toHaveLength(1);
+      const body = transport.sentAnswers[0].content.body;
+      // The door's own refusal — the asker sees which marking and whose
+      // ceiling, never the file's contents.
+      expect(body).toContain("marked secret");
+      expect(body).toContain("official_open");
+      expect(body).not.toContain("March 3rd");
+      // The #34 shape: nothing below the check ran — no draft row, no
+      // public-answer log row, the question handled at the door.
+      expect(listDrafts(storePath, PASSPHRASE)).toEqual([]);
+      expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)).toEqual([]);
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+  });
+
+  it("grounds a within-ceiling attachment — the draft row cites it as its source, the asker sees the public pipeline's own outcome", async () => {
+    const { storePath } = initStore();
+    const { transport, close } = await served(storePath);
+    try {
+      await untilConnected(transport);
+      transport.setFile("mxc://workspace/f1", "the launch date is March 3rd");
+      transport.deliver(attachmentQuestion("$ok", "when do we launch?", [FILE]));
+      await until(() => transport.sentAnswers.length >= 1);
+      // An empty corpus plus one attachment: the gate passed (grounded, not
+      // groundless) but confidence stays corpus-honest at 0.425, so the
+      // public pipeline passes the question on — its own outcome, composed
+      // exactly as for a text question.
+      expect(transport.sentAnswers[0].content.body).toContain(PUBLIC_PASSED_ON_MESSAGE);
+      // The one durable duo-side trace of the attachment (attachments.md
+      // §3): the draft row's source — id + label, nothing else.
+      const drafts = listDrafts(storePath, PASSPHRASE);
+      expect(drafts).toHaveLength(1);
+      expect(drafts[0].escalated).toBe(true);
+      expect(drafts[0].sources).toEqual([
+        { kind: "attachment", id: "mxc://workspace/f1", label: "attachment notes.txt (text/plain): the launch date is March 3rd" },
+      ]);
+      // The asker's question and the passed-on text are logged by the public
+      // pipeline as for any question; the attachment's text appears nowhere.
+      const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].question).toBe("when do we launch?");
+      expect(JSON.stringify(entries[0])).not.toContain("March 3rd");
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+  });
+
+  it("refuses at boot when a workspace-configured daemon carries an unparseable ceiling — no door comes up guessing", async () => {
+    const { storePath } = initStore();
+    const env = workspaceEnv(storePath);
+    env.DUO_CLASSIFICATION_CEILING = "top-secret";
+    const config = loadConfig(env);
+    await expect(runServe({ host: "127.0.0.1", port: 0 }, config, env, () => new FakeWorkspaceTransport() as WorkspaceTransport)).rejects.toThrow(
+      /Invalid classification ceiling "top-secret"/,
+    );
   });
 });

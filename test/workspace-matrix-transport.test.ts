@@ -29,6 +29,11 @@ class StubMatrixClient {
   maxPresenceInFlight = 0;
   private presenceInFlight = 0;
   readonly sentMessages: { roomId: string; content: unknown }[] = [];
+  /** Every authenticated media download, exactly as the adapter issued it (#190). */
+  readonly authedRequests: { method: unknown; path: string; opts: Record<string, unknown> }[] = [];
+  /** What authedRequest serves the next media download — a raw body, as rawResponseBody promises. */
+  mediaBody: Blob = new Blob([]);
+  mediaError: Error | undefined;
   startClientError: Error | undefined;
   /** What searchUserDirectory returns for listMembers — the homeserver's user directory page. */
   directoryResults: { user_id: string; display_name?: string }[] = [];
@@ -108,6 +113,17 @@ class StubMatrixClient {
     return { results: this.directoryResults, limited: this.directoryLimited };
   }
 
+  /** Authenticated media download (MSC3916) — the SDK's httpApi surface the adapter rides (#190). */
+  authedRequest(method: unknown, path: string, _queryParams: unknown, _body: unknown, opts: Record<string, unknown>): Promise<unknown> {
+    this.authedRequests.push({ method, path, opts });
+    if (this.mediaError) {
+      return Promise.reject(this.mediaError);
+    }
+    return Promise.resolve(this.mediaBody);
+  }
+
+  readonly http = { authedRequest: this.authedRequest.bind(this) };
+
   async getPresence(userId: string): Promise<{ presence?: string; last_active_ago?: number }> {
     this.presenceLookups += 1;
     this.presenceInFlight += 1;
@@ -133,7 +149,8 @@ vi.mock("matrix-js-sdk", () => ({
   ClientEvent: { Sync: "sync" },
   RoomEvent: { Timeline: "Room.timeline", MyMembership: "Room.myMembership" },
   EventType: { RoomMessage: "m.room.message", RoomName: "m.room.name" },
-  MsgType: { Text: "m.text" },
+  Method: { Get: "GET" },
+  MsgType: { Text: "m.text", File: "m.file", Image: "m.image" },
   SetPresence: { Online: "online" },
   SyncState: { Error: "Error", Prepared: "Prepared", Stopped: "Stopped" },
   createClient: () => client,
@@ -159,12 +176,14 @@ interface TimelineEventInit {
   msgtype?: unknown;
   body?: unknown;
   ts?: number;
+  /** Extra content keys (url, filename, info, …) — how file messages carry their facts. */
+  content?: Record<string, unknown>;
 }
 
 function timelineEvent(init: TimelineEventInit = {}) {
   return {
     getType: () => init.type ?? "m.room.message",
-    getContent: () => ({ msgtype: init.msgtype ?? "m.text", body: init.body ?? "What did Alice decide?" }),
+    getContent: () => ({ msgtype: init.msgtype ?? "m.text", body: init.body ?? "What did Alice decide?", ...init.content }),
     getSender: () => (init.senderMissing ? undefined : (init.senderId ?? "@bob:workspace")),
     getId: () => init.eventId ?? "$e1",
     getRoomId: () => init.roomId ?? "!room:workspace",
@@ -172,10 +191,26 @@ function timelineEvent(init: TimelineEventInit = {}) {
   };
 }
 
-function room(members: readonly string[] = ["@duo-alice:workspace", "@bob:workspace"]) {
+/** A file message on the wire: msgtype m.file/m.image, url, optional filename and info. */
+function fileTimelineEvent(init: { eventId: string; senderId?: string; url: string; filename?: string; mimetype?: string; size?: number; msgtype?: string }) {
+  return timelineEvent({
+    eventId: init.eventId,
+    senderId: init.senderId,
+    msgtype: init.msgtype ?? "m.file",
+    body: init.filename ?? "file.txt",
+    content: {
+      url: init.url,
+      ...(init.filename !== undefined ? { filename: init.filename } : {}),
+      info: { ...(init.mimetype !== undefined ? { mimetype: init.mimetype } : {}), ...(init.size !== undefined ? { size: init.size } : {}) },
+    },
+  });
+}
+
+function room(members: readonly string[] = ["@duo-alice:workspace", "@bob:workspace"], liveEvents: readonly object[] = []) {
   return {
     roomId: "!room:workspace",
     getJoinedMembers: () => members.map((userId) => ({ userId })),
+    getLiveTimeline: () => ({ getEvents: () => [...liveEvents] }),
   };
 }
 
@@ -568,5 +603,161 @@ describe("Matrix adapter — join and leave are plain membership calls (#192)", 
     const transport = createMatrixTransport(settings());
     await expect(transport.leaveRoom("!room:workspace")).rejects.toThrow(/M_FORBIDDEN/);
     expect(client.leaveCalls).toEqual([]);
+  });
+});
+
+describe("Matrix adapter — the files a question rode with (#190's association walk)", () => {
+  it("associates the asker's contiguous run of file messages immediately preceding their question, in share order", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const question = timelineEvent({ eventId: "$q", senderId: "@bob:workspace", body: "what do these say?" });
+    client.emit(
+      RoomEvent.Timeline,
+      question,
+      room(["@duo-alice:workspace", "@bob:workspace"], [
+        timelineEvent({ eventId: "$old", senderId: "@carol:workspace", body: "unrelated" }),
+        fileTimelineEvent({ eventId: "$f1", url: "mxc://workspace/f1", filename: "a.txt", mimetype: "text/plain", size: 3 }),
+        fileTimelineEvent({ eventId: "$f2", url: "mxc://workspace/f2", filename: "b.md", mimetype: "text/markdown" }),
+        question,
+      ]),
+      false,
+      false,
+      {},
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.attachments).toEqual([
+      { reference: "mxc://workspace/f1", name: "a.txt", mimeType: "text/plain", size: 3 },
+      { reference: "mxc://workspace/f2", name: "b.md", mimeType: "text/markdown", size: null },
+    ]);
+  });
+
+  it("reads an image association too — the adapter carries it; the door is where images are refused", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const question = timelineEvent({ eventId: "$q", body: "look at this" });
+    client.emit(
+      RoomEvent.Timeline,
+      question,
+      room(["@duo-alice:workspace", "@bob:workspace"], [
+        fileTimelineEvent({ eventId: "$img", url: "mxc://workspace/i1", msgtype: "m.image", mimetype: "image/png" }),
+        question,
+      ]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.attachments).toEqual([{ reference: "mxc://workspace/i1", name: "file.txt", mimeType: "image/png", size: null }]);
+  });
+
+  it("ends the run at anyone else's message, the asker's own text, or any other event — older files don't ground a later question", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const question = timelineEvent({ eventId: "$q", body: "what do these say?" });
+    client.emit(
+      RoomEvent.Timeline,
+      question,
+      room(["@duo-alice:workspace", "@bob:workspace", "@carol:workspace"], [
+        fileTimelineEvent({ eventId: "$stale", url: "mxc://workspace/stale", filename: "old.txt" }),
+        timelineEvent({ eventId: "$chatter", senderId: "@carol:workspace", body: "meanwhile" }),
+        question,
+      ]),
+      false,
+      false,
+      {},
+    );
+    // No attachments key at all — the pre-#190 candidate shape.
+    expect(messages[0]!.attachments).toBeUndefined();
+  });
+
+  it("contributes nothing when the file run belongs to a different sender than the question", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const question = timelineEvent({ eventId: "$q", senderId: "@bob:workspace", body: "what do these say?" });
+    client.emit(
+      RoomEvent.Timeline,
+      question,
+      room(["@duo-alice:workspace", "@bob:workspace", "@carol:workspace"], [
+        fileTimelineEvent({ eventId: "$carols", senderId: "@carol:workspace", url: "mxc://workspace/c1", filename: "c.txt" }),
+        question,
+      ]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.attachments).toBeUndefined();
+  });
+
+  it("associates nothing when the question is not on the live timeline (a thread reply) or the run is empty — the honest nothing", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    // A thread reply: the SDK hands the adapter the event, but it lives in
+    // the thread's timeline, not the room's live one.
+    client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$thread" }), room(), false, false, {});
+    // And a plain question with no files before it.
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({ eventId: "$plain" }),
+      room(["@duo-alice:workspace", "@bob:workspace"], [timelineEvent({ eventId: "$older", senderId: "@bob:workspace", body: "older text" }), timelineEvent({ eventId: "$plain" })]),
+      false,
+      false,
+      {},
+    );
+    expect(messages.map((message) => message.eventId)).toEqual(["$thread", "$plain"]);
+    expect(messages[0]!.attachments).toBeUndefined();
+    expect(messages[1]!.attachments).toBeUndefined();
+    // The no-attachments message carries no attachments key at all — the
+    // pre-#190 candidate shape, byte-identical.
+    expect("attachments" in messages[0]!).toBe(false);
+  });
+});
+
+describe("Matrix adapter — fetchFile, the daemon's one file dereference (#190)", () => {
+  it("issues one authenticated media download with a Range cut at the bound, and decodes the raw body", async () => {
+    client.mediaBody = new Blob(["the launch date is March 3rd"], { type: "text/plain" });
+    const transport = createMatrixTransport(settings());
+    const body = await transport.fetchFile("mxc://workspace/abc123", { maxBytes: 32 * 1024 });
+    expect(new TextDecoder().decode(body.bytes)).toBe("the launch date is March 3rd");
+    expect(body.exceededMaxBytes).toBe(false);
+    expect(client.authedRequests).toEqual([
+      {
+        method: "GET",
+        path: "/_matrix/client/v1/media/download/workspace/abc123",
+        opts: {
+          prefix: "",
+          rawResponseBody: true,
+          // Inclusive Range: 0..maxBytes fetches at most maxBytes+1 bytes —
+          // one past the cap is the evidence that the body exceeds it.
+          headers: { Range: "bytes=0-32768" },
+        },
+      },
+    ]);
+  });
+
+  it("flags a body that came back longer than the bound — the Range evidence the door refuses on", async () => {
+    client.mediaBody = new Blob([new Uint8Array(40 * 1024)]);
+    const transport = createMatrixTransport(settings());
+    const body = await transport.fetchFile("mxc://workspace/big", { maxBytes: 32 * 1024 });
+    expect(body.bytes.byteLength).toBeGreaterThan(32 * 1024);
+    expect(body.exceededMaxBytes).toBe(true);
+  });
+
+  it("refuses a reference that is not an mxc URI, before any request is issued", async () => {
+    const transport = createMatrixTransport(settings());
+    await expect(transport.fetchFile("https://evil.example/f1", { maxBytes: 32 * 1024 })).rejects.toThrow(/not an mxc URI/);
+    expect(client.authedRequests).toEqual([]);
+  });
+
+  it("refuses after stop() — the file read rides the held connection or refuses, like every other read", async () => {
+    const transport = createMatrixTransport(settings());
+    await transport.stop();
+    await expect(transport.fetchFile("mxc://workspace/abc123", { maxBytes: 32 * 1024 })).rejects.toThrow(
+      /stopped — the file read needs the held connection/,
+    );
+    expect(client.authedRequests).toEqual([]);
   });
 });

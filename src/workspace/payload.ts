@@ -31,3 +31,16 @@ export function buildAnswerEvent(outcome: PublicAnswerOutcome): AnswerEventConte
 export function buildFailedAnswerEvent(): AnswerEventContent {
   return { msgtype: "m.text", body: PUBLIC_ANSWER_FAILED_MESSAGE };
 }
+
+/**
+ * #190: the event sent when the attachment grounding door refuses — the
+ * door's own message (drafting/attachment-grounding.ts), which is built to
+ * name the limit broken (size in KiB, count, type, or the classification
+ * marking) so an asker knows what to change, never the file's contents.
+ * Still exactly the one shape every other outbound constructor builds — a
+ * refusal differs from an answer in wording only, never in what it could
+ * carry — so the corpus-never-crosses rule above holds for it too.
+ */
+export function buildAttachmentRefusalEvent(message: string): AnswerEventContent {
+  return { msgtype: "m.text", body: message };
+}

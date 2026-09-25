@@ -10,10 +10,12 @@ import {
 } from "./consent.js";
 import { workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
 import type { RoomInvite } from "./messages.js";
+import { buildAnswerEvent, buildAttachmentRefusalEvent, buildFailedAnswerEvent } from "./payload.js";
 import { answerableQuestionFrom, type RoomDecisionLookup } from "./questions.js";
-import { buildAnswerEvent, buildFailedAnswerEvent } from "./payload.js";
 import { AnswerRateWindow, isStaleEvent, type DuoReadState } from "./read-state.js";
 import type {
+  AnswerEventContent,
+  WorkspaceAttachmentDoor,
   WorkspaceCandidateMessage,
   WorkspaceMemberIdentity,
   WorkspaceQuestion,
@@ -92,6 +94,17 @@ export interface WorkspaceServiceOptions {
    * daemon's work.
    */
   readonly consent?: WorkspaceConsentOptions;
+  /**
+   * #190: the attachment grounding door — injected, like `answer` and
+   * `readState`, because the pinned import boundary (test/workspace-
+   * payload.test.ts) keeps this module off the ingest/permissions modules
+   * the door reads markings with. `runServe` wires
+   * `attachmentGroundingDoor(parseClassificationCeiling(...))`; absent
+   * means attachment questions are answered text-only with an owner-side
+   * log, which is what a caller that never opted into grounding wants and
+   * what the seam-level tests run with.
+   */
+  readonly attachmentDoor?: WorkspaceAttachmentDoor;
 }
 
 /** Where the consent record lives — the owner's `duo/` directory (consent.ts states why a file and not the store). */
@@ -788,7 +801,7 @@ export class WorkspaceService {
     }
     let content;
     try {
-      content = buildAnswerEvent(await this.options.answer(question));
+      content = await this.answerOrRefuse(question);
     } catch (error) {
       // The asker must never see internals (the /ask route's own rule) —
       // but they also must not stare at silence: send the same generic
@@ -845,6 +858,46 @@ export class WorkspaceService {
     }
     this.answerRate.record(Date.now());
     this.markRead(question, originServerTs);
+  }
+
+  /**
+   * #190: the door step of one question's fate. A question with no
+   * attachments takes the pre-#190 path untouched — `answer`, composed
+   * into an answer event — so the sibling seams see byte-identical
+   * behavior for every text-only question. A question that rode with
+   * files goes through the injected door first, over the live transport's
+   * own `fetchFile`: refused → the door's message as a refusal event
+   * (send/markRead/accounting continue as for any answer, below); grounded
+   * → the pipeline answers with `grounding` set, and the fetched text
+   * lives exactly that long. No door configured → text-only, with an
+   * owner-side log saying so — never a silent grounding, and never a
+   * dropped question.
+   */
+  private async answerOrRefuse(question: WorkspaceQuestion): Promise<AnswerEventContent> {
+    if (question.attachments.length === 0) {
+      return buildAnswerEvent(await this.options.answer(question));
+    }
+    const door = this.options.attachmentDoor;
+    if (door === undefined) {
+      this.consoleError(
+        `answering workspace question ${question.eventId} text-only`,
+        new Error("no attachment grounding door is configured (DUO_CLASSIFICATION_CEILING wiring) — the question's files were not read"),
+      );
+      return buildAnswerEvent(await this.options.answer({ ...question, grounding: [] }));
+    }
+    // Captured before the door runs (not after): the door fetches file
+    // bodies over this very transport, so it must be live now; a connection
+    // that stopped mid-question throws here and degrades through
+    // handleQuestion's existing failure-event path.
+    const transport = this.transport;
+    if (transport === undefined) {
+      throw new Error("the workspace connection stopped before the attachment door could run");
+    }
+    const result = await door(question.attachments, (reference, options) => transport.fetchFile(reference, options));
+    if (result.kind === "refused") {
+      return buildAttachmentRefusalEvent(result.message);
+    }
+    return buildAnswerEvent(await this.options.answer({ ...question, grounding: result.grounding }));
   }
 
   /**

@@ -13,6 +13,7 @@ import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
+import type { WorkspaceGroundedAttachment } from "../src/workspace/transport.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -430,5 +431,150 @@ describe("draftReply — a refused subject escalates without reasoning about it 
     );
     if (result.kind !== "escalation") throw new Error("expected an escalation");
     expect(result.refused).toBe(false);
+  });
+});
+
+describe("draftReply — attachments ground the one draft without touching the corpus (#190, attachments.md §3)", () => {
+  function attachment(text: string): WorkspaceGroundedAttachment {
+    // What the door hands the pipeline: already decoded, already
+    // marking-stripped at the boundary. The pipeline trusts both.
+    return { reference: "mxc://workspace/f1", name: "notes.txt", mimeType: "text/plain", text };
+  }
+
+  it("counts for the no-evidence gate — a fresh store with an attachment is NOT the groundless escalation", async () => {
+    const storePath = initStore(); // no records, no rules
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "when do we launch?",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+      undefined,
+      [attachment("the launch date is March 3rd")],
+    );
+    if (result.kind !== "escalation") throw new Error("expected a confidence escalation, not a draft");
+    // The gate passed (the reason is a scored confidence escalation, not
+    // noEvidenceEscalationReason's "no standing order or past exchange … at
+    // all"), and the source row the escalation cites is the attachment.
+    expect(result.reason).toContain("below the");
+    expect(result.reason).not.toContain("at all. Answering it yourself");
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.sources).toEqual([
+      { kind: "attachment", id: "mxc://workspace/f1", label: expect.stringContaining("notes.txt (text/plain)") },
+    ]);
+  });
+
+  it("contributes nothing to confidence: the fresh-store attachment scores exactly the empty-corpus 0.425, under the 0.55 threshold", async () => {
+    const storePath = initStore();
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "when do we launch?",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+      undefined,
+      [attachment("the launch date is March 3rd")],
+    );
+    if (result.kind !== "escalation" || result.confidence === undefined) throw new Error("expected a scored escalation");
+    // 0.3 (selfConsistency, single deterministic sample) + 0.1 (recency,
+    // neutral at no evidence) + 0.05×0.5 (selfReport, neutral at no
+    // provider) — retrievalStrength and ruleHit stay corpus-honest at 0,
+    // which is the whole test: provided material is kin to a rule hit for
+    // the gate but contributes nothing to the signals.
+    expect(result.confidence.score).toBeCloseTo(0.425, 10);
+    expect(result.confidence.signals.retrievalStrength).toBe(0);
+    expect(result.confidence.signals.ruleHit).toBe(0);
+  });
+
+  it("drafts when a rule also hit — and the source order is rule, attachment, evidence, with the label carrying name/type/preview only", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+      undefined,
+      [attachment("also, the launch date is March 3rd")],
+    );
+    if (result.kind !== "draft") throw new Error(`expected a draft, got ${result.kind}`);
+    // seedConfirmedRule's fixture retrieves two evidence records (the Q and
+    // the A of the seeded pair) — the order under test is where the
+    // attachment sits: after the rule, ahead of evidence.
+    expect(result.sources.map((source) => source.kind)).toEqual(["rule", "attachment", "evidence", "evidence"]);
+    const attachmentSource = result.sources.find((source) => source.kind === "attachment")!;
+    expect(attachmentSource.id).toBe("mxc://workspace/f1");
+    expect(attachmentSource.label).toContain("attachment notes.txt (text/plain)");
+    // The label's preview is the door-stripped text and nothing more — no
+    // second copy of the body rides the row.
+    expect(attachmentSource.label).toBe(`attachment notes.txt (text/plain): also, the launch date is March 3rd`);
+  });
+
+  it("never persists the attachment on threadContext — the one draft-row field that IS retained stays null", async () => {
+    const storePath = initStore();
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "when do we launch?",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+      undefined,
+      [attachment("the launch date is March 3rd")],
+    );
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.threadContext).toBeNull();
+    // The extractive fallback's sanctioned verbatim quote is the draft text
+    // (§3: "can quote an attachment verbatim"); the row's other fields carry
+    // no copy of the body.
+    expect(stored?.sources).toHaveLength(1);
+    expect(Object.keys(stored?.sources[0] ?? {}).sort()).toEqual(["id", "kind", "label"]);
+  });
+
+  it("the provider path's prompt carries the attachment ahead of the question — and no other call does", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const seenPrompts: string[] = [];
+    const capturingProvider: InferenceProvider = {
+      name: "fake",
+      async complete(prompt: string) {
+        seenPrompts.push(prompt);
+        return "Five days.";
+      },
+    };
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      createFakeEmbeddingProvider(),
+      capturingProvider,
+      CONFIDENCE_CONFIG,
+      undefined,
+      [attachment("the launch date is March 3rd")],
+    );
+    if (result.kind !== "draft") throw new Error(`expected a draft, got ${result.kind}`);
+    expect(
+      seenPrompts.some(
+        (prompt) =>
+          prompt.includes("Material the asker attached to this question") &&
+          prompt.includes("--- notes.txt (text/plain) ---") &&
+          prompt.includes("the launch date is March 3rd") &&
+          prompt.includes("Question: how much vacation leave do I get"),
+      ),
+    ).toBe(true);
   });
 });

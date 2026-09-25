@@ -1,7 +1,7 @@
 /**
  * #186: the outbound workspace connection's seam. Everything above this
  * interface (the service, the serve wiring, every test) is written against
- * these six operations and knows nothing about `matrix-js-sdk`; the one
+ * these operations and knows nothing about `matrix-js-sdk`; the one
  * implementation that does (`matrix-transport.ts`) is a thin adapter wired
  * in composition. The seam is Matrix-shaped on purpose — the platform
  * decision (docs/workspace-platform.md, MERGED) picked the protocol, so the
@@ -94,6 +94,20 @@ export interface WorkspaceTransport {
   onMessage(handler: (message: WorkspaceCandidateMessage) => void): void;
 
   /**
+   * #190: reads one file's bytes over the held connection, as the duo's own
+   * user — Matrix authenticated media (MSC3916): the homeserver serves media
+   * only to requests carrying an access token, never anonymously. The read
+   * is cut at `maxBytes` on purpose: the grounding door's size limit
+   * (docs/workspace/attachments.md §7) is a bound on what may ENTER the
+   * daemon, so a body longer than the bound is reported (`exceededMaxBytes`)
+   * rather than transferred whole and trimmed after the fact. This is the
+   * only seam operation that moves file bytes, and it moves them in one
+   * direction only: workspace → daemon. Nothing here can upload, republish,
+   * or re-serve a member's file.
+   */
+  fetchFile(reference: string, options: { readonly maxBytes: number }): Promise<WorkspaceFileBody>;
+
+  /**
    * The held outbound connection dropped and the SDK's own retries gave up.
    * The service answers this by re-dialing with backoff. Transient network
    * blips the SDK absorbs internally never reach here.
@@ -152,7 +166,50 @@ export interface WorkspaceCandidateMessage {
   readonly originServerTs: number;
   /** User ids of the room's joined members, including the duo itself. */
   readonly joinedMemberIds: readonly string[];
+  /**
+   * #190: the file attachments riding this question — the sender's
+   * contiguous run of file messages (`m.file`/`m.image`) immediately
+   * preceding it in the same room (see the adapter). Absent on the
+   * pre-#190 wire shape and on every text question with no preceding
+   * files; the adapter only sets it when the run is non-empty.
+   */
+  readonly attachments?: readonly WorkspaceFileReference[];
 }
+
+/**
+ * #190: one file as it rode a message — the asker-visible facts (name,
+ * declared type, declared size) plus the one thing the duo's side needs:
+ * the stable content reference (`mxc://…`) the homeserver issued at upload.
+ * The reference is the file's address for as long as the file exists —
+ * deleted files stop dereferencing (the door treats that as a recoverable
+ * failure, it does not guess content), and #183 §8's contract dependency
+ * is satisfied by this shape: the reference is what a draft's attachment
+ * source carries as its `id`, and any member of the conversation can
+ * dereference it themselves through authenticated media.
+ */
+export interface WorkspaceFileReference {
+  /** The Matrix content URI (`mxc://server/mediaId`) — stable, unique per upload. */
+  readonly reference: string;
+  /** The filename as sent (the event's `filename`, falling back to its `body`). */
+  readonly name: string;
+  /**
+   * The declared MIME type (`info.mimetype`). Null when the sending client
+   * didn't declare one — the door refuses undeclared types rather than
+   * guess. An `m.image` with no declared type reads as `"image/*"`.
+   */
+  readonly mimeType: string | null;
+  /** The declared size in bytes (`info.size`), checked before the body is read. Null when undeclared. */
+  readonly size: number | null;
+}
+
+/** The bytes `fetchFile` returned: at most `maxBytes` long, and whether the body exceeded the bound. */
+export interface WorkspaceFileBody {
+  readonly bytes: Uint8Array;
+  readonly exceededMaxBytes: boolean;
+}
+
+/** `fetchFile` as a standalone function — the door takes this so the service can hand it the live transport. */
+export type WorkspaceFileFetcher = (reference: string, options: { readonly maxBytes: number }) => Promise<WorkspaceFileBody>;
 
 /**
  * #187: one workspace user's presence as the homeserver knows it —
@@ -229,7 +286,72 @@ export interface WorkspaceQuestion {
   readonly body: string;
   /** ISO-8601 instant the question reached the daemon (not the homeserver's event timestamp — held questions arrive late by design). */
   readonly receivedAt: string;
+  /**
+   * #190: the file attachments riding the question (from the candidate —
+   * normalized to an empty list when none rode it). Raw references only:
+   * whether any of them may ground a draft is the attachment door's
+   * decision, never the question filter's.
+   */
+  readonly attachments: readonly WorkspaceFileReference[];
+  /**
+   * #190: the attachments that passed the grounding door — stripped,
+   * in-memory text plus the reference it rode in on. Set by the service
+   * (the door's caller) right before the answering pipeline runs, so the
+   * pipeline receives provided grounding without ever touching the seam or
+   * the raw bytes. Never persisted on the question: it exists for the one
+   * draft call and then is gone (#183 §3 — bytes live in daemon memory for
+   * exactly one draft call).
+   */
+  readonly grounding?: readonly WorkspaceGroundedAttachment[];
 }
+
+/**
+ * #190: one attachment that passed the grounding door — the door's output,
+ * consumed by the draft pipeline as provided material. `text` is decoded
+ * and already marking-stripped (the door strips once, at the boundary, so
+ * no downstream echo — source label, extractive quote, provider prompt —
+ * can repeat a marking line it never received). It is kin to a rule hit,
+ * not retrieved evidence (#183 §3): it counts as grounding for the
+ * pipeline's no-evidence gate but contributes nothing to retrieval-honest
+ * confidence.
+ */
+export interface WorkspaceGroundedAttachment {
+  /** The stable file reference — becomes the attachment DraftSource's `id` verbatim (#183 §8). */
+  readonly reference: string;
+  readonly name: string;
+  readonly mimeType: string;
+  /** Decoded, marking-stripped text. In memory for the one draft call only — never written to disk. */
+  readonly text: string;
+}
+
+/**
+ * The door's verdict for one question's attachments: either the question
+ * grounds (and the refusal never happened), or it is refused with a
+ * message that names the limit it broke — the count, the type, the size in
+ * KiB, or the classification marking (#190's limits AC). The refusal is
+ * asker-visible text, sent as the question's answer; nothing is retained
+ * on either branch.
+ */
+export type WorkspaceAttachmentDoorResult =
+  | { readonly kind: "refused"; readonly message: string }
+  | { readonly kind: "grounded"; readonly grounding: readonly WorkspaceGroundedAttachment[] };
+
+/**
+ * #190/#183: the attachment grounding door, injected into the service the
+ * way the answering pipeline is. Lives behind an interface because of the
+ * pinned import boundary (test/workspace-payload.test.ts): src/workspace
+ * cannot import the classification and drafting machinery the door needs,
+ * so the door is built where those imports are legal
+ * (src/drafting/attachment-grounding.ts) and handed in at composition
+ * (commands/serve.ts). Order of checks, per docs/workspace/attachments.md
+ * §6/§7 — count, type, and declared size (all decided before any body is
+ * read), then the read itself cut at the bound, then the classification
+ * ceiling on the decoded text, and only then grounding.
+ */
+export type WorkspaceAttachmentDoor = (
+  attachments: readonly WorkspaceFileReference[],
+  fetchFile: WorkspaceFileFetcher,
+) => Promise<WorkspaceAttachmentDoorResult>;
 
 /**
  * The one outbound payload shape (#186 AC5): the answer event's content is
