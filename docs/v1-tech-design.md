@@ -70,6 +70,13 @@ so there is no public URL to expose or approve.
                  LLM provider (see G1) · Slack
 ```
 
+**Extended 2026-09-20, not repealed (#184/#185):** a second store now exists beside this local
+one — an org-hosted Matrix workspace holding identity, conversations, messages, read state and
+files. The posture above carries over unchanged: the daemon **dials out** to the workspace and
+the owner's Mac still opens no inbound port. Corpus, passphrase, derived rules and draft
+evidence stay exactly where this diagram puts them. The platform decision and its reasoning are
+recorded in [`workspace-platform.md`](workspace-platform.md).
+
 ## 1.2 Stack
 
 | Layer | Choice | Why |
