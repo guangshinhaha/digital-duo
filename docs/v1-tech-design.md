@@ -1,7 +1,7 @@
 # Digital Duo — v1 Technical Design
 
 > Design + adversarial review + the revisions that survived it.
-> Last updated: 2026-09-18 · Scope from `v1-spec.md`, ingest contract in `import-adapters.md`.
+> Last updated: 2026-09-25 · Scope from `v1-spec.md`, ingest contract in `import-adapters.md`.
 
 ---
 
@@ -42,19 +42,51 @@ to check.
 
 # Part 1 — The design
 
-## 1.1 Shape: a local application, not a deployment
+## 1.1 Shape: two stores — the corpus local, messages on the org workspace
 
-v1 runs entirely on the owner's machine. No hosting, no public endpoint, no inbound firewall
-rule, no data at rest on third-party infrastructure.
+The product runs on **two stores, and the line between them never moves** (#184).
 
-This is not laziness — it removes the security review from the critical path for the pilot
-entirely, and for gov data that is worth more than any convenience a cloud stack buys.
+**The corpus store lives on the owner's machine.** Records, imports and embeddings
+(`data/duo.db`, encrypted, gitignored), the passphrase, the derived artifacts
+(`duo/rules/*.md`, voice, refusals, the portrait) and every draft's evidence — all of it
+local. No hosting of it, no public endpoint on the owner's machine, no inbound firewall rule,
+no data at rest on third-party infrastructure. This is not laziness — it removes the security
+review from the critical path for the corpus entirely, and for gov data that is worth more
+than any convenience a cloud stack buys.
 
-Slack integration survives this via **Socket Mode**: Bolt opens an outbound websocket to Slack,
-so there is no public URL to expose or approve.
+**The message store is the org's workspace server.** One org-hosted Matrix homeserver
+([`workspace-platform.md`](workspace-platform.md), #185) holds identity, conversations,
+messages, read state and files — and nothing else. On it, **messages are org-readable records
+on org infrastructure; corpora never leave the owner's machine** (#191): a room's members
+read them, and the org's administrators read them through a logged, stated-basis path. The
+asymmetry a member acts on: everything sent in a message is a record on org infrastructure,
+and nothing about their corpus — not its text, not its names, not the evidence a duo
+consulted — reaches the server, even when a duo answers from it.
+
+The line is absolute: the workspace may **never** hold a corpus, a passphrase, derived rules
+or a draft's evidence. A draft that is sent becomes a message by the owner's explicit act —
+until then, nothing about it transits the workspace. Moving the line is a change to epic
+#184, not a configuration choice.
+
+Mechanically, the boundary is held by connection direction: the daemon **dials out** to the
+workspace server and holds that connection open, and the owner's Mac never opens an inbound
+port — the same reasoning that picked **Socket Mode** for Slack, one layer up. `duo serve`
+still refuses wildcard binds. A duo posts as its own Matrix user beside its owner's
+(`@duo-<owner>:workspace`), so the protocol itself keeps it from rendering as its owner.
+
+One named exception, by owner decision (#161): **org mode** waives "no data at rest on
+third-party infrastructure" per duo. An owner may choose to co-locate their daemon on org
+hardware beside the homeserver — same `duo serve` code, one process, one encrypted store, one
+passphrase per person, no multi-tenant rewrite. The concession is stated plainly: the box's
+operator can read plaintext artifacts (`duo/rules/*.md`) and holds each daemon's passphrase
+material in memory, so no cryptographic barrier stands between the operator and a corpus on
+their machine — the store's encryption defends against everything except the operator.
+Personal hardware stays the pilot default; the choice is per duo, and mixed fleets are the
+expected shape. Full record: [`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md).
 
 ```
 ┌──────────────────── owner's machine ────────────────────┐
+│  the corpus store — never on org infrastructure         │
 │                                                          │
 │  duo/            ← git-versioned human artifacts        │
 │    rules/*.md      standing orders, one file per rule   │
@@ -63,11 +95,20 @@ so there is no public URL to expose or approve.
 │    topics.json     stable topic IDs                     │
 │                                                          │
 │  data/duo.db     ← SQLite, gitignored, encrypted        │
+│                   records · embeddings · draft evidence │
 │                                                          │
 │  surfaces:  CLI  ·  local web (Mirror)  ·  Slack Socket │
-└──────────────────────────────────────────────────────────┘
-                            │ outbound only
-                 LLM provider (see G1) · Slack
+└──────────┬──────────────────────────────┬───────────────┘
+           │ the daemon dials out         │ outbound only
+           ▼                              ▼
+┌─────────────────────────┐   ┌─────────────────────────────┐
+│ org workspace server    │   │ LLM provider (see G1)       │
+│ (Matrix, #185)          │   │ · Slack (Socket Mode)       │
+│ the message store:      │   └─────────────────────────────┘
+│ identity · conversations│
+│ messages · read state   │
+│ files — and nothing else│
+└─────────────────────────┘
 ```
 
 **Extended 2026-09-20, not repealed (#184/#185):** a second store now exists beside this local
@@ -88,8 +129,8 @@ holds each daemon's passphrase material in memory, so no cryptographic barrier s
 the operator and a corpus on their machine — the store's encryption defends against everything
 except the operator. The two-store boundary (`workspace-platform.md` §5) does not move, and
 `duo serve` still refuses wildcard binds. Full record:
-[`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md); #193 carries this into
-the §1.1 rewrite.
+[`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md); #193 carried this into
+the §1.1 main text above.
 
 ## 1.2 Stack
 
@@ -313,18 +354,27 @@ Plain markdown is pleasant at 10 rules and unnavigable at 100, and hand-edits dr
 **→ One file per rule with YAML frontmatter (id, topic, support, evidence, timestamps), markdown
 body. Files win on conflict; a sync step reconciles. Batched weekly review, never auto-write.**
 
-### AR-10 · The duo is asleep when your laptop is — LOW for v1
-Local-only means no drafts overnight. For private drafting this is fine: if you were asleep you
-were not answering either. It becomes real the moment the duo answers others directly.
-**→ Accepted for v1. Flagged as the forcing function for v2's hosting question.**
+### AR-10 · The duo is asleep when its owner's laptop is — MEDIUM for the workspace product
+The duo answers only while the daemon that holds its corpus is running. For private drafting
+this was fine: if you were asleep, you were not answering either. The workspace product
+inverts the reasoning — the point of asking a colleague's duo at 21:00 is that the colleague
+is not available.
+**→ Accepted, and made honest rather than solved: a question to an offline duo is an ordinary
+message — held by the workspace, delivered when the daemon reconnects, answered then on the
+existing pipeline — and the asker is told the duo is offline at send time (availability is a
+directory state, #187). No fabricated answer, no cached answer, no spinner, no predicted
+time. Drafts and duo actions remain disabled-when-offline, never queued (AR-15).
+Org-hosted daemons (#161) remain an owner's deployment option that removes the wait — not a
+default that moves the corpus. Full record: [`workspace/asleep-duo.md`](workspace/asleep-duo.md)
+(#188).**
 
-**Decided 2026-09-25, not repealed (#188):** with the workspace product the risk arrived, and it
-is accepted-and-made-honest rather than solved. A question to an offline duo is an ordinary
-message — held by the workspace, delivered when the daemon reconnects, answered then — and the
-asker is told the duo is offline. Drafts and duo actions remain disabled-when-offline, never
-queued. Org-hosted daemons (#161) remain a deployment option, not a default. The replacement
-wording for this entry and the full reasoning are in
-[`workspace/asleep-duo.md`](workspace/asleep-duo.md); #193 applies the wording.
+Two queueing rules, kept distinct — the AR-15 split, so the wrong rule is never applied to
+the wrong object ([`workspace/asleep-duo.md`](workspace/asleep-duo.md) §7):
+
+| Object | Rule | Reasoning |
+|---|---|---|
+| Ordinary messages, **including questions to a duo** | Queue and deliver on reconnect | The message is asker-authored workspace data; holding it violates nothing in §1.1's line. |
+| Drafts and duo actions (the duo's own outgoing output) | Disabled while the actor is unavailable, never queued to fire later | A Send firing hours later against moved context is worse than no action. |
 
 ### AR-11 · Personal AI chat history may not be about work — MEDIUM
 `concept.md` bets heavily on LLM history as the densest record of reasoning. If the exportable
@@ -370,3 +420,22 @@ Each step ends somewhere useful, so stopping early still leaves something workin
 | 10 | Slack Socket Mode app: relevance gate → DM draft → Send/Edit/Ignore | Admin install |
 
 Steps 1–8 are a complete, measurable, useful duo that needs nobody's permission.
+
+## The workspace layer — epic #184, shipped
+
+Steps 11–20 record what the workspace epic built, in the order it shipped (2026-09-20 →
+2026-09-25). The plan above built the corpus side of §1.1; this layer added the second store —
+the org-hosted message layer — without moving the corpus an inch.
+
+| # | Step | Status |
+|---|---|---|
+| 11 | **Workspace platform decided** — Matrix/Synapse org-hosted, federation off, own client on `matrix-js-sdk`; the two-store line drawn ([`workspace-platform.md`](workspace-platform.md)) | Shipped — #185 (PR #194) |
+| 12 | **Asleep-duo decided** — a question to an offline duo is an ordinary message: held, delivered on reconnect, honestly signposted; the two queueing rules of AR-10 ([`workspace/asleep-duo.md`](workspace/asleep-duo.md)) | Shipped — #188 (PR #216) |
+| 13 | **Org-read decided** — messages are org-readable records under a logged, stated-basis admin path; the messages-vs-corpus asymmetry ([`workspace/org-read.md`](workspace/org-read.md)) | Shipped — #191 (PR #217) |
+| 14 | **Attachments decided** — attach means ephemeral grounding, never silent import ([`workspace/attachments.md`](workspace/attachments.md)) | Shipped — #183 (PR #215) |
+| 15 | **The daemon dials out** — one authenticated outbound Matrix connection, held open; questions answered by the same pipeline `/ask` uses; reconnect with backoff | Shipped — #186 (PR #219) |
+| 16 | **Identity and directory** — people, whose duo is whose (the `@duo-<owner>:` convention), availability as a directory state | Shipped — #187 (PR #220) |
+| 17 | **The message contract** — typed events, structural duo authorship, durable read state; the store itself stays Matrix's, we write no message store | Shipped — #189 (PR #221) |
+| 18 | **Consent** — a duo's presence in a shared conversation is its owner's consent (`duo/room-consent.json`); invitations held, never auto-joined | Shipped — #192 (PR #222) |
+| 19 | **Files** — a member shares a file in a conversation and asks about it; the grounding door keeps sharing distinct from importing | Shipped — #190 (PR #223) |
+| 20 | **Org-mode deployment decided** — per-duo co-location on org hardware beside the homeserver; personal hardware stays the default ([`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md)) | Shipped — #161 (PR #224) |
