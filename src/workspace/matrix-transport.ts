@@ -9,9 +9,11 @@ import {
   type IRoomTimelineData,
   type MatrixClient,
   type MatrixEvent,
+  type Membership,
   type Room,
 } from "matrix-js-sdk";
 import { localpartOf } from "./directory.js";
+import type { RoomInvite } from "./messages.js";
 import type { WorkspaceSettings } from "./settings.js";
 import type {
   AnswerEventContent,
@@ -121,6 +123,7 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
   let stopped = false;
   let pendingConnectReject: ((error: Error) => void) | undefined;
   const messageHandlers: ((message: WorkspaceCandidateMessage) => void)[] = [];
+  const inviteHandlers: ((invite: RoomInvite) => void)[] = [];
   const disconnectHandlers: (() => void)[] = [];
 
   client.on(ClientEvent.Sync, (state: SyncState, _oldState: SyncState | null, _data?: { error?: Error }) => {
@@ -180,6 +183,34 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
     }
   });
 
+  // #192: the invite surface. MyMembership fires for THIS account's
+  // membership changing — including rooms the initial sync catch-up
+  // discovers (an invitation held while the Mac was asleep surfaces on
+  // wake, the same held-not-lost recovery a question gets). Only the
+  // `invite` state is an invitation; the facts delivered are exactly what
+  // the room object knows: the invite membership event's sender (the
+  // inviter — a fact the protocol attributes, not a display-name claim),
+  // the m.room.name state if the stripped state carried one, and the joined
+  // members visible in it (heroes-limited until the room is joined —
+  // stated by the contract, not inflated here). Nothing else happens on an
+  // invite: the adapter never joins; the service holds it for the owner.
+  client.on(RoomEvent.MyMembership, (room: Room, membership: Membership) => {
+    if (stopped || membership !== "invite") {
+      return;
+    }
+    const inviteEvent = room.getMember(settings.userId)?.events.member;
+    const nameContent = room.currentState.getStateEvents(EventType.RoomName, "")?.getContent() as Record<string, unknown> | undefined;
+    const invite: RoomInvite = {
+      roomId: room.roomId,
+      inviterId: inviteEvent?.getSender() ?? null,
+      name: typeof nameContent?.name === "string" ? nameContent.name : null,
+      joinedMemberCount: room.getMembers().filter((member) => member.membership === "join").length,
+    };
+    for (const handler of inviteHandlers) {
+      handler(invite);
+    }
+  });
+
   return {
     connect() {
       return new Promise<void>((resolve, reject) => {
@@ -221,6 +252,7 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
       stopped = true;
       client.removeAllListeners(ClientEvent.Sync);
       client.removeAllListeners(RoomEvent.Timeline);
+      client.removeAllListeners(RoomEvent.MyMembership);
       client.stopClient();
       pendingConnectReject?.(new Error("workspace transport stopped before connect finished"));
       pendingConnectReject = undefined;
@@ -288,6 +320,26 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
 
     onDisconnected(handler: () => void) {
       disconnectHandlers.push(handler);
+    },
+
+    onInvite(handler: (invite: RoomInvite) => void) {
+      inviteHandlers.push(handler);
+    },
+
+    async joinRoom(roomId: string) {
+      // The sole join primitive (the seam's own doc): a homeserver-accepted
+      // membership change and nothing else — the service's allow path is the
+      // only caller, and it joins BEFORE recording the decision (the
+      // crash-safety ordering: a crash between the two leaves the room
+      // joined-but-unrecorded, which the gate answers with silence).
+      await client.joinRoom(roomId);
+    },
+
+    async leaveRoom(roomId: string) {
+      // A leave is also the invite rejection on Matrix — the seam's doc —
+      // which is why the refusal path and the withdrawal path share this
+      // one primitive.
+      await client.leave(roomId);
     },
   };
 }

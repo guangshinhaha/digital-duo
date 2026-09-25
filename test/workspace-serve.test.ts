@@ -1,10 +1,13 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { runServe } from "../src/commands/serve.js";
 import { PUBLIC_PASSED_ON_MESSAGE } from "../src/permissions/public-answer.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
+import { createDeviceToken } from "../src/serve/tokens.js";
 import { createEncryptedStore } from "../src/store/store.js";
+import type { RoomInvite } from "../src/workspace/messages.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
 import { WorkspaceTokenRevokedError, type WorkspaceTransport } from "../src/workspace/transport.js";
 import { FakeWorkspaceTransport } from "./helpers/fake-workspace-transport.js";
@@ -281,5 +284,259 @@ describe("runServe + workspace — the outbound connection alongside the unchang
     } finally {
       await second.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #192: consent for a duo in a shared conversation — the owner surface over
+// HTTP, and the scope-follows-the-asker contract through the real pipeline.
+// ---------------------------------------------------------------------------
+
+const ROOM = "!room:workspace";
+const BOB = "@bob:workspace";
+
+function invite(overrides: Partial<RoomInvite> = {}): RoomInvite {
+  return { roomId: ROOM, inviterId: BOB, name: "Launch planning", joinedMemberCount: 3, ...overrides };
+}
+
+function roomMessage(message: { eventId: string; body: string; senderId?: string; roomId?: string; joinedMemberIds?: string[] }) {
+  return {
+    eventId: message.eventId,
+    roomId: message.roomId ?? ROOM,
+    senderId: message.senderId ?? BOB,
+    body: message.body,
+    originServerTs: Date.now(),
+    joinedMemberIds: message.joinedMemberIds ?? [SELF, BOB, "@carol:workspace"],
+  };
+}
+
+/** Polls the negative half for the same ~1s window the positive halves allow. */
+async function staysSilent(transport: FakeWorkspaceTransport): Promise<void> {
+  for (let i = 0; i < 100 && transport.sentAnswers.length === 0; i += 1) {
+    await new Promise((resolveTick) => setTimeout(resolveTick, 10));
+  }
+  expect(transport.sentAnswers).toEqual([]);
+}
+
+describe("runServe + workspace — the consent surface over HTTP (#192)", () => {
+  it("holds the invitation, lists it, allows it, and the room becomes answerable — owner-token gated throughout", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const paired = createDeviceToken(storePath, PASSPHRASE, "owner-device");
+      const auth = { authorization: `Bearer ${paired.token}` };
+      // The surface is the owner's: no token, no list.
+      expect((await fetch(`${address}/workspace/invites`)).status).toBe(401);
+      transport.deliverInvite(invite());
+      await until(() => transport.inviteDeliveries >= 1);
+      const listed = (await (await fetch(`${address}/workspace/invites`, { headers: auth })).json()) as { invites: { roomId: string; inviterId: string; name: string; joinedMemberCount: number }[] };
+      expect(listed.invites[0]).toMatchObject({ roomId: ROOM, inviterId: BOB, name: "Launch planning", joinedMemberCount: 3 });
+      // The allow is the owner's act, and it is the only thing that joined.
+      expect(transport.joinCalls).toEqual([]);
+      const allowed = await fetch(`${address}/workspace/invites/${ROOM}/allow`, { method: "POST", headers: auth });
+      expect(allowed.status).toBe(200);
+      expect(await allowed.json()).toMatchObject({ roomId: ROOM, status: "allowed", inviterId: BOB, name: "Launch planning", joinedMemberCount: 3 });
+      expect(transport.joinCalls).toEqual([ROOM]);
+      const rooms = (await (await fetch(`${address}/workspace/rooms`, { headers: auth })).json()) as { rooms: { roomId: string }[] };
+      expect(rooms.rooms.map((room) => room.roomId)).toEqual([ROOM]);
+      // The gate opened: a question in the shared room now answers, through
+      // the same pipeline a DM question takes.
+      transport.deliver(roomMessage({ eventId: "$q1", body: "What did Alice decide about the vendor?" }));
+      await until(() => transport.sentAnswers.length >= 1);
+      expect(transport.sentAnswers[0]!.roomId).toBe(ROOM);
+      expect(transport.sentAnswers[0]!.content.body).toContain(PUBLIC_PASSED_ON_MESSAGE);
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+  });
+
+  it("refuses over HTTP — 204 with nothing left held or recorded, and the room stays gated", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}` };
+      transport.deliverInvite(invite());
+      await until(() => transport.inviteDeliveries >= 1);
+      const refused = await fetch(`${address}/workspace/invites/${ROOM}/refuse`, { method: "POST", headers: auth });
+      expect(refused.status).toBe(204);
+      expect(await refused.text()).toBe("");
+      expect((await (await fetch(`${address}/workspace/invites`, { headers: auth })).json()).invites).toEqual([]);
+      expect((await (await fetch(`${address}/workspace/rooms`, { headers: auth })).json()).rooms).toEqual([]);
+      expect(transport.leaveCalls).toEqual([ROOM]);
+      // The refusal was real: the room's questions are not work.
+      transport.deliver(roomMessage({ eventId: "$q-after-refuse", body: "let me in anyway" }));
+      await staysSilent(transport);
+    } finally {
+      await close();
+    }
+  });
+
+  it("withdraws over HTTP — the withdrawn entry comes back, the room empties, and the questions stop", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}` };
+      transport.deliverInvite(invite());
+      await until(() => transport.inviteDeliveries >= 1);
+      await fetch(`${address}/workspace/invites/${ROOM}/allow`, { method: "POST", headers: auth });
+      transport.deliver(roomMessage({ eventId: "$before", body: "answered while consented" }));
+      await until(() => transport.sentAnswers.length >= 1);
+      const withdrawn = await fetch(`${address}/workspace/rooms/${ROOM}/withdraw`, { method: "POST", headers: auth });
+      expect(withdrawn.status).toBe(200);
+      expect(await withdrawn.json()).toMatchObject({ roomId: ROOM, status: "withdrawn" });
+      expect((await (await fetch(`${address}/workspace/rooms`, { headers: auth })).json()).rooms).toEqual([]);
+      expect(transport.leaveCalls).toEqual([ROOM]);
+      // Only the pre-withdrawal answer ever went out — withdrawal killed the
+      // room at once, with no in-flight grace for later questions.
+      transport.deliver(roomMessage({ eventId: "$after", body: "asked after withdrawal" }));
+      for (let i = 0; i < 100 && transport.sentAnswers.length === 1; i += 1) {
+        await new Promise((resolveTick) => setTimeout(resolveTick, 10));
+      }
+      expect(transport.sentAnswers).toHaveLength(1);
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+  });
+
+  it("maps the service's not-found refusals to clean 404s", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}` };
+      const allow = await fetch(`${address}/workspace/invites/${ROOM}/allow`, { method: "POST", headers: auth });
+      expect(allow.status).toBe(404);
+      expect(((await allow.json()) as { error: { code: string } }).error.code).toBe("NoPendingInviteError");
+      const withdraw = await fetch(`${address}/workspace/rooms/${ROOM}/withdraw`, { method: "POST", headers: auth });
+      expect(withdraw.status).toBe(404);
+      expect(((await withdraw.json()) as { error: { code: string } }).error.code).toBe("RoomConsentNotFoundError");
+    } finally {
+      await close();
+    }
+  });
+
+  it("reads empty state and refuses the consented acts when no workspace is configured", async () => {
+    const { storePath, config } = initStore();
+    const { address, close } = await runServe(
+      { host: "127.0.0.1", port: 0 },
+      config,
+      { DUO_STORE_PATH: storePath, DUO_DIR: join(tempDir(), "duo"), DUO_PASSPHRASE: PASSPHRASE } as NodeJS.ProcessEnv,
+      () => new FakeWorkspaceTransport() as WorkspaceTransport,
+    );
+    try {
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}` };
+      expect(await (await fetch(`${address}/workspace/invites`, { headers: auth })).json()).toEqual({ invites: [] });
+      expect(await (await fetch(`${address}/workspace/rooms`, { headers: auth })).json()).toEqual({ rooms: [] });
+      for (const [path, act] of [
+        [`/workspace/invites/${ROOM}/allow`, "Allowing"],
+        [`/workspace/invites/${ROOM}/refuse`, "Refusing"],
+        [`/workspace/rooms/${ROOM}/withdraw`, "Withdrawing"],
+      ] as const) {
+        const response = await fetch(`${address}${path}`, { method: "POST", headers: auth });
+        expect(response.status).toBe(503);
+        const error = ((await response.json()) as { error: { code: string; message: string } }).error;
+        expect(error.code).toBe("workspace_not_configured");
+        expect(error.message).toContain(act);
+      }
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe("runServe + workspace — scope follows the asker, not the room (#192)", () => {
+  it("the same asker gets the identical decline in a consented shared room that their DM gets — same text, same logged ref", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}` };
+      transport.deliverInvite(invite());
+      await until(() => transport.inviteDeliveries >= 1);
+      await fetch(`${address}/workspace/invites/${ROOM}/allow`, { method: "POST", headers: auth });
+      // Same person, same question: once in their DM with the duo, once in
+      // the consented shared room.
+      transport.deliver({
+        eventId: "$dm-ask",
+        roomId: "!dm:workspace",
+        senderId: BOB,
+        body: "What did Alice decide about the vendor?",
+        originServerTs: Date.now(),
+        joinedMemberIds: [SELF, BOB],
+      });
+      transport.deliver(roomMessage({ eventId: "$room-ask", body: "What did Alice decide about the vendor?" }));
+      await until(() => transport.sentAnswers.length >= 2);
+      const [dmAnswer, roomAnswer] = transport.sentAnswers;
+      // Zero lenience from room membership: the shared room's members see
+      // exactly what the DM would have shown — the uniform public ceiling,
+      // not the room's population, decided.
+      expect(roomAnswer!.roomId).toBe(ROOM);
+      expect(roomAnswer!.content.body).toBe(dmAnswer!.content.body);
+      // And the log attributes both asks to the asker, identically — the
+      // resolution is sender-scoped (room-blind) by construction.
+      const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+      expect(entries).toHaveLength(2);
+      expect(entries.every((entry) => entry.askerRef === BOB)).toBe(true);
+      expect(entries.every((entry) => entry.askerResolved === false)).toBe(true);
+      expect(entries.every((entry) => entry.askLinkId === null)).toBe(true);
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+  });
+
+  it("an unresolved asker stays conservative from any room — and a directory entry, however high, buys no lenience", async () => {
+    const { storePath } = initStore();
+    const duoDir = join(tempDir(), "duo");
+    mkdirSync(duoDir, { recursive: true });
+    // The owner's own roster names Bob at the highest clearance there is.
+    writeFileSync(join(duoDir, "directory.json"), JSON.stringify([{ id: "bob", name: "Bob", clearance: "secret" }]), "utf8");
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}` };
+      transport.deliverInvite(invite());
+      await until(() => transport.inviteDeliveries >= 1);
+      await fetch(`${address}/workspace/invites/${ROOM}/allow`, { method: "POST", headers: auth });
+      // The resolved, top-clearance asker in the consented room…
+      transport.deliver(roomMessage({ eventId: "$bob", body: "What did Alice decide about the vendor?" }));
+      // …and a complete stranger in the same room.
+      transport.deliver(roomMessage({ eventId: "$stranger", body: "What did Alice decide about the vendor?", senderId: "@stranger:workspace", joinedMemberIds: [SELF, "@stranger:workspace", "@carol:workspace"] }));
+      await until(() => transport.sentAnswers.length >= 2);
+      const [bobAnswer, strangerAnswer] = transport.sentAnswers;
+      // Identical declines both ways: the public answering path applies one
+      // uniform ceiling regardless of who resolved — a directory entry,
+      // however senior, changes the log line, never the answer.
+      expect(bobAnswer!.content.body).toBe(strangerAnswer!.content.body);
+      expect(bobAnswer!.content.body).toContain(PUBLIC_PASSED_ON_MESSAGE);
+      const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+      expect(entries).toHaveLength(2);
+      const byRef = new Map(entries.map((entry) => [entry.askerRef, entry]));
+      // Resolution is audit fidelity only: Bob logs as the directory's id
+      // (resolved), the stranger as their full Matrix id (unresolved) — and
+      // both got the same conservative answer above.
+      expect(byRef.get("bob")?.askerResolved).toBe(true);
+      expect(byRef.get("@stranger:workspace")?.askerResolved).toBe(false);
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
   });
 });

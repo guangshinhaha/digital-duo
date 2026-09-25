@@ -1,7 +1,17 @@
 import type { PublicAnswerOutcome } from "../permissions/public-answer.js";
+import {
+  forgetRoomDecision,
+  readRoomConsent,
+  recordRoomDecision,
+  roomDecisionFor,
+  RoomConsentNotFoundError,
+  type RoomConsentEntry,
+  type RoomConsentStatus,
+} from "./consent.js";
 import { workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
+import type { RoomInvite } from "./messages.js";
+import { answerableQuestionFrom, type RoomDecisionLookup } from "./questions.js";
 import { buildAnswerEvent, buildFailedAnswerEvent } from "./payload.js";
-import { directQuestionFrom } from "./questions.js";
 import { AnswerRateWindow, isStaleEvent, type DuoReadState } from "./read-state.js";
 import type {
   WorkspaceCandidateMessage,
@@ -73,6 +83,40 @@ export interface WorkspaceServiceOptions {
    * semantics runs with.
    */
   readonly readState?: DuoReadState;
+  /**
+   * #192: the room-consent surface. Present means this service holds
+   * invitations for the owner's decision, gates shared-room questions on
+   * `duo/room-consent.json`, and carries allow/refuse/withdrawal out over
+   * the seam. Absent is the pre-#192 behavior exactly: direct rooms only,
+   * and invitations (if an adapter delivers them at all) are not this
+   * daemon's work.
+   */
+  readonly consent?: WorkspaceConsentOptions;
+}
+
+/** Where the consent record lives — the owner's `duo/` directory (consent.ts states why a file and not the store). */
+export interface WorkspaceConsentOptions {
+  readonly duoDir: string;
+}
+
+/**
+ * #192: a held invitation — the seam's invite facts plus when this process
+ * received them. Held in memory only, deliberately: the invitation itself
+ * is server-side state the homeserver holds and re-delivers on every sync
+ * until it is joined or left, so a restart re-populates this exactly the
+ * way held questions repopulate (the platform's held-not-lost stance — no
+ * daemon-side queue to lose or corrupt).
+ */
+export interface HeldRoomInvite extends RoomInvite {
+  readonly receivedAt: string;
+}
+
+/** An allow or refuse decided on an invitation this daemon is not holding — there is nothing to decide on. Maps to 404 on the owner surface. */
+export class NoPendingInviteError extends Error {
+  constructor(roomId: string) {
+    super(`No held invitation for room ${JSON.stringify(roomId)} — an allow or a refuse is a decision on an invitation the daemon is holding`);
+    this.name = "NoPendingInviteError";
+  }
 }
 
 /**
@@ -165,10 +209,29 @@ export class WorkspaceService {
   private membersById = new Map<string, WorkspaceMemberIdentity>();
   private readonly answerRate: AnswerRateWindow;
   private answerChain: Promise<void> = Promise.resolve();
+  /** #192: held invitations, keyed by room id — a still-live invite replays on every sync, so the room id is the dedupe. Cleared on terminate like every other live-connection fact. */
+  private pendingInvitesById = new Map<string, HeldRoomInvite>();
+  /**
+   * #192: rooms withdrawn in THIS process — the in-flight half of
+   * withdrawal's immediacy. The record flips to `withdrawn` and then, once
+   * the leave lands, deletes itself (the executed-exit rule), so a record
+   * read alone cannot tell "never consented" from "consent withdrawn a
+   * moment ago"; this memory can, and the send-time re-check reads it so a
+   * draft that was underway when the owner withdrew goes nowhere — no
+   * in-flight grace. Cleared only by a fresh allow on a new invitation for
+   * the room (allowInvite) — the owner's newer word — and deliberately NOT
+   * on terminate: a stop/start cycle inside one process must not re-open
+   * the window. Growth is bounded by the owner's own acts, not by inbound
+   * data.
+   */
+  private readonly withdrawnRoomIds = new Set<string>();
+  /** The consent gate's lookup, bound iff the consent surface is configured — undefined means the pre-#192 filter exactly. */
+  private readonly roomDecisionLookup: RoomDecisionLookup | undefined;
 
   constructor(options: WorkspaceServiceOptions) {
     this.options = options;
     this.answerRate = new AnswerRateWindow(options.settings.backlog.maxAnswersPerMinute);
+    this.roomDecisionLookup = options.consent ? (roomId) => this.decisionFor(roomId) : undefined;
     this.stateValue = { phase: "stopped", since: new Date().toISOString(), lastAliveAt: null, attempts: 0 };
   }
 
@@ -216,6 +279,211 @@ export class WorkspaceService {
   }
 
   /**
+   * #192: the invitations currently held for the owner's decision — the
+   * surfaced half of "a duo is never conscripted". Sorted by room id for a
+   * deterministic read; in-memory only (see HeldRoomInvite for why that is
+   * not a durability gap). Empty when no consent surface is configured.
+   */
+  pendingInvites(): readonly HeldRoomInvite[] {
+    return [...this.pendingInvitesById.values()].sort((a, b) => (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0));
+  }
+
+  /** The consent record's live half: the rooms whose standing decision is `allowed`, provenance included. Empty when no consent surface is configured. */
+  consentedRooms(): readonly RoomConsentEntry[] {
+    const duoDir = this.options.consent?.duoDir;
+    if (duoDir === undefined) {
+      return [];
+    }
+    return readRoomConsent(duoDir).filter((entry) => entry.status === "allowed");
+  }
+
+  /**
+   * The owner's explicit allow on a held invitation — the consented act.
+   * Join first, record second (a crash between them leaves a joined-but-
+   * unrecorded room, which the gate answers with silence — the safe
+   * direction; the reverse would consent a room the daemon can never put
+   * the duo in, because nothing auto-joins). A join failure records
+   * nothing and leaves the invitation held and still live server-side, so
+   * the owner's retry is a real retry. The record write failing after a
+   * successful join propagates loudly (disk trouble should be loud): the
+   * invite stays held and a retry re-joins — Matrix joins are idempotent.
+   */
+  async allowInvite(roomId: string): Promise<RoomConsentEntry> {
+    const invite = this.requireHeldInvite(roomId);
+    const duoDir = this.requireConsentDir("allow the invitation");
+    const transport = this.requireLiveTransport("allowing the invitation");
+    await transport.joinRoom(roomId);
+    const entry: RoomConsentEntry = {
+      roomId,
+      status: "allowed",
+      name: invite.name,
+      inviterId: invite.inviterId,
+      joinedMemberCount: invite.joinedMemberCount,
+      decidedAt: new Date().toISOString(),
+    };
+    recordRoomDecision(duoDir, entry);
+    this.pendingInvitesById.delete(roomId);
+    // A fresh allow is a fresh consent act — the owner's newer word. It
+    // retires the in-flight memory of any earlier withdrawal for this room
+    // (see withdrawnRoomIds): without this, a withdrawn-then-reallowed room
+    // would stay silent for the rest of the process's life, which would make
+    // withdrawal a one-way door the record's own re-allow says it is not.
+    this.withdrawnRoomIds.delete(roomId);
+    return entry;
+  }
+
+  /**
+   * The owner's explicit refusal on a held invitation. The decision is
+   * recorded first (that IS the refusal), then the invitation is rejected
+   * over the seam — on Matrix a leave rejects an invite, and until that
+   * lands the homeserver keeps replaying the invite in sync. Once the leave
+   * lands the entry is deleted (consent.ts's executed-exit rule): a
+   * re-invite must arrive as a fresh decision, not be answered by a
+   * standing refusal. A failed or unreachable leave leaves the entry as the
+   * memory of an unfinished exit — settleRoomExits retries it on the next
+   * connect.
+   */
+  async refuseInvite(roomId: string): Promise<void> {
+    const invite = this.requireHeldInvite(roomId);
+    recordRoomDecision(this.requireConsentDir("refuse the invitation"), {
+      roomId,
+      status: "refused",
+      name: invite.name,
+      inviterId: invite.inviterId,
+      joinedMemberCount: invite.joinedMemberCount,
+      decidedAt: new Date().toISOString(),
+    });
+    this.pendingInvitesById.delete(roomId);
+    await this.exitRoom(roomId);
+  }
+
+  /**
+   * #192 AC4: withdrawal. The record flips to `withdrawn` first — from that
+   * write the gate refuses the room (vetoing even the direct-room posture),
+   * so answering stops at the next question and any answer already being
+   * drafted is dropped at its send-time re-check: no in-flight grace, the
+   * "instantly killable" stance. The leave then follows over the seam; if
+   * it cannot land now (connection down, server refusal) the `withdrawn`
+   * entry is exactly what remembers the unfinished exit, and
+   * settleRoomExits retries it on every successful connect. Withdrawing a
+   * room with no record is an error, not a no-op: there is no consent to
+   * withdraw (leaving a room the duo was never put in by consent is an
+   * ordinary client-side leave, not a consent act).
+   */
+  async withdrawRoom(roomId: string): Promise<RoomConsentEntry> {
+    const duoDir = this.requireConsentDir("withdraw");
+    const existing = readRoomConsent(duoDir).find((entry) => entry.roomId === roomId);
+    if (existing === undefined) {
+      throw new RoomConsentNotFoundError(roomId);
+    }
+    const withdrawn: RoomConsentEntry = { ...existing, status: "withdrawn", decidedAt: new Date().toISOString() };
+    recordRoomDecision(duoDir, withdrawn);
+    // The in-flight half of "instantly killable", effective from this line —
+    // ahead of the leave, which may not land until a later connect.
+    this.withdrawnRoomIds.add(roomId);
+    await this.exitRoom(roomId);
+    return withdrawn;
+  }
+
+  /** The leave/reject half every exit shares — fail-soft on purpose (the decision is already recorded; the exit retries on connect). */
+  private async exitRoom(roomId: string): Promise<void> {
+    const transport = this.transport;
+    if (transport === undefined || this.stateValue.phase !== "connected") {
+      return;
+    }
+    try {
+      await transport.leaveRoom(roomId);
+    } catch (error) {
+      this.consoleError(
+        `leaving workspace room ${roomId} failed (the decision is recorded; the leave retries on the next successful connect)`,
+        error,
+      );
+      return;
+    }
+    // Executed: delete the entry so a later invitation is a fresh decision,
+    // never answered by this standing one (consent.ts's executed-exit rule).
+    try {
+      forgetRoomDecision(this.requireConsentDir("forget the executed decision"), roomId);
+    } catch (error) {
+      this.consoleError(`forgetting the executed room decision for ${roomId} failed`, error);
+    }
+  }
+
+  /**
+   * Every successful connect settles unfinished exits: any recorded
+   * `refused`/`withdrawn` room is left again — the only reconciliation the
+   * consent surface does, and deliberately the only automatic room
+   * operation in the service: it enforces an owner decision, it never
+   * makes one. Failures log and wait for the next connect.
+   */
+  private async settleRoomExits(): Promise<void> {
+    const duoDir = this.options.consent?.duoDir;
+    if (duoDir === undefined || this.transport === undefined) {
+      return;
+    }
+    let exits: RoomConsentEntry[];
+    try {
+      exits = readRoomConsent(duoDir).filter((entry) => entry.status !== "allowed");
+    } catch (error) {
+      this.consoleError("reading the room consent record to settle room exits failed", error);
+      return;
+    }
+    for (const entry of exits) {
+      await this.exitRoom(entry.roomId);
+    }
+  }
+
+  /**
+   * The gate's one read of the record: fresh per decision, degrading to "no
+   * record" (logged) rather than erroring the question — a malformed record
+   * never turns an answerable question into an exception, and never invents
+   * authority either. The non-null assertion is pinned by construction: this
+   * is only ever reachable through `roomDecisionLookup`, which the
+   * constructor binds iff consent is configured.
+   */
+  private decisionFor(roomId: string): RoomConsentStatus | null {
+    try {
+      return roomDecisionFor(readRoomConsent(this.options.consent!.duoDir), roomId);
+    } catch (error) {
+      this.consoleError(`reading the room consent record for room ${roomId} failed`, error);
+      return null;
+    }
+  }
+
+  /** The send-time half of withdrawal's immediacy: permitted means recorded-`allowed`, or no record at all (the direct-room posture — a room the owner has never spoken about is not forbidden by that silence). */
+  private roomStillPermitted(roomId: string): boolean {
+    const decision = this.decisionFor(roomId);
+    return decision === null || decision === "allowed";
+  }
+
+  /** Both decision methods' shared refusal: nothing is decidable without a held invitation. */
+  private requireHeldInvite(roomId: string): HeldRoomInvite {
+    const invite = this.pendingInvitesById.get(roomId);
+    if (invite === undefined) {
+      throw new NoPendingInviteError(roomId);
+    }
+    return invite;
+  }
+
+  /** The consent surface's own directory — every record-writing path states its precondition by calling this. */
+  private requireConsentDir(what: string): string {
+    const duoDir = this.options.consent?.duoDir;
+    if (duoDir === undefined) {
+      throw new Error(`cannot ${what}: no consent surface is configured for this workspace service`);
+    }
+    return duoDir;
+  }
+
+  /** The live-connection requirement a join needs — same refusal shape directory() uses. */
+  private requireLiveTransport(what: string): WorkspaceTransport {
+    const transport = this.transport;
+    if (transport === undefined || this.stateValue.phase !== "connected") {
+      throw new Error(`cannot ${what}: the outbound workspace connection is not live`);
+    }
+    return transport;
+  }
+
+  /**
    * Begins dialing out. Returns immediately — `duo serve` must start its
    * HTTP listener on time even when the workspace is unreachable; the
    * connect/reconnect loop owns recovery from that point on, reporting
@@ -251,6 +519,10 @@ export class WorkspaceService {
     this.stopPresenceRefresh();
     this.consecutiveFailures = 0;
     this.membersById = new Map();
+    // Held invitations live only with the connection that carries them; the
+    // homeserver re-delivers any still-live invite on the next connect, so
+    // nothing is lost by dropping them here (the held-not-lost stance).
+    this.pendingInvitesById = new Map();
     this.setState({ phase, lastAliveAt: this.stateValue.lastAliveAt, attempts: 0 });
     const transport = this.transport;
     this.transport = undefined;
@@ -277,6 +549,7 @@ export class WorkspaceService {
         const previous = this.transport;
         this.transport = transport;
         transport.onMessage((message) => this.receive(message));
+        transport.onInvite((invite) => this.receiveInvite(invite));
         transport.onDisconnected(() => this.scheduleReconnect());
         await previous?.stop();
       }
@@ -328,6 +601,7 @@ export class WorkspaceService {
     }
     this.startPresenceRefresh();
     void this.refreshMembers();
+    void this.settleRoomExits();
   }
 
   /**
@@ -407,7 +681,13 @@ export class WorkspaceService {
   }
 
   private receive(message: WorkspaceCandidateMessage): void {
-    const question = directQuestionFrom(message, this.options.settings.userId);
+    // #192: the consent-aware filter — direct rooms (the v1 posture) pass as
+    // before, shared rooms only on the owner's recorded allow, everything
+    // else not-a-question at all. This is the reachability gate, and it runs
+    // here, ahead of the dedupe mark and the serialized chain, so a room the
+    // owner has not consented to costs nothing — no pipeline call, no store
+    // open, no draft (the refusal gate's short-circuit shape).
+    const question = answerableQuestionFrom(message, this.options.settings.userId, this.roomDecisionLookup);
     if (!question || this.seenEventIds.has(question.eventId)) {
       return;
     }
@@ -424,6 +704,36 @@ export class WorkspaceService {
       // exists so the chain itself can never reject and poison the next
       // question.
     });
+  }
+
+  /**
+   * #192: an invitation arrived. It is HELD, never acted on — the duo joins
+   * by invitation the same as a person (platform record §6), and only its
+   * owner's explicit allow (allowInvite) ever turns one into a join.
+   * Surfaced owner-side with the facts the sync slice carried (name,
+   * inviter, joined count) so the decision is made on what the inviter
+   * actually did, and held in memory only: the invitation is server-side
+   * state, re-delivered by sync until joined or left, so a restart or
+   * reconnect repopulates this for free.
+   */
+  private receiveInvite(invite: RoomInvite): void {
+    if (this.options.consent === undefined) {
+      // No consent surface configured: the pre-#192 daemon. Nothing holds
+      // or joins anything, and the invite stays server-side, inert.
+      return;
+    }
+    this.pendingInvitesById.set(invite.roomId, { ...invite, receivedAt: new Date().toISOString() });
+    const facts = [
+      invite.name === null ? null : `named ${JSON.stringify(invite.name)}`,
+      invite.inviterId === null ? null : `invited by ${invite.inviterId}`,
+      `${invite.joinedMemberCount} joined member(s) visible`,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(", ");
+    this.consoleError(
+      `workspace invitation held for the owner's decision — room ${invite.roomId}`,
+      new Error(`${facts}; the duo joins only on an explicit allow (see the workspace consent surface)`),
+    );
   }
 
   /**
@@ -486,6 +796,23 @@ export class WorkspaceService {
       // daemon alive for the next question.
       this.consoleError(`answering workspace question ${question.eventId} failed`, error);
       content = buildFailedAnswerEvent();
+    }
+    if (this.roomDecisionLookup !== undefined && (this.withdrawnRoomIds.has(question.roomId) || !this.roomStillPermitted(question.roomId))) {
+      // #192: withdrawal is immediate, with no in-flight grace — the draft
+      // ran while the room was consented, and consent was withdrawn before
+      // the send. The withdrawn-rooms memory catches the case where the
+      // leave already landed and deleted the record (the executed-exit
+      // rule), where a fresh read alone would read as "never consented".
+      // Nothing goes out (not even the failure event above: that is an
+      // asker-visible send too). The event id is forgotten, the send-failure
+      // stance, so a replay re-decides under whatever consent holds then;
+      // the backlog age window bounds how long that door stays open.
+      this.seenEventIds.forget(question.eventId);
+      this.consoleError(
+        `not sending the answer to workspace question ${question.eventId}`,
+        new Error(`consent for room ${question.roomId} was withdrawn while the answer was being drafted — the duo stops answering there at once`),
+      );
+      return;
     }
     // Captured after the draft, not before: a reconnect mid-draft should
     // still deliver over the fresh transport, while a stop() mid-draft

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { directQuestionFrom } from "../src/workspace/questions.js";
+import { answerableQuestionFrom, directQuestionFrom, type RoomDecisionLookup } from "../src/workspace/questions.js";
 import type { WorkspaceCandidateMessage } from "../src/workspace/transport.js";
 
 const SELF = "@duo-alice:workspace";
@@ -62,5 +62,68 @@ describe("directQuestionFrom — v1: a direct question is a text message from th
     // The convention is @duo-<owner>: a bare @duo localpart is not the
     // convention and stays a person's message.
     expect(directQuestionFrom(candidate({ senderId: "@duo:workspace", joinedMemberIds: [SELF, "@duo:workspace"] }), SELF)).not.toBeNull();
+  });
+});
+
+describe("answerableQuestionFrom — #192: reachable means a direct room, or a room the owner allowed", () => {
+  const GROUP = { roomId: "!room:workspace", joinedMemberIds: [SELF, "@bob:workspace", "@carol:workspace"] };
+
+  it("keeps the direct-room posture exactly: a DM question answers with no lookup at all", () => {
+    const question = answerableQuestionFrom(candidate(), SELF);
+    expect(question).toMatchObject({ eventId: "$1", roomId: "!dm:workspace", senderId: "@bob:workspace", body: "What did Alice decide about the vendor?" });
+    expect(question?.receivedAt).toBeTruthy();
+  });
+
+  it("answers in an owner-allowed room of any size", () => {
+    const allowed: RoomDecisionLookup = (roomId) => (roomId === "!room:workspace" ? "allowed" : null);
+    const question = answerableQuestionFrom(candidate(GROUP), SELF, allowed);
+    expect(question).toMatchObject({ eventId: "$1", roomId: "!room:workspace", body: "What did Alice decide about the vendor?" });
+  });
+
+  it("treats a shared room with no record as not-a-question — the pre-#192 default refusal, structurally ahead of any retrieval", () => {
+    expect(answerableQuestionFrom(candidate(GROUP), SELF)).toBeNull();
+    expect(answerableQuestionFrom(candidate(GROUP), SELF, () => null)).toBeNull();
+  });
+
+  it("an explicit refused or withdrawn decision is the same silence with the owner's name on it — and it vetoes the direct posture too", () => {
+    for (const status of ["refused", "withdrawn"] as const) {
+      const decision: RoomDecisionLookup = () => status;
+      expect(answerableQuestionFrom(candidate(GROUP), SELF, decision)).toBeNull();
+      // The veto outranks the two-member default: a withdrawn direct room
+      // stays unanswered until a fresh consent act reopens it.
+      expect(answerableQuestionFrom(candidate(), SELF, decision)).toBeNull();
+    }
+  });
+
+  it("still requires the duo and the sender to be joined members, allowed or not", () => {
+    const allowed: RoomDecisionLookup = () => "allowed";
+    // The duo was kicked or left: consent cannot make an un-joined room reachable.
+    expect(answerableQuestionFrom(candidate({ ...GROUP, joinedMemberIds: ["@bob:workspace", "@carol:workspace"] }), SELF, allowed)).toBeNull();
+    // The sender left: a departed member's replayed line is not a live question.
+    expect(answerableQuestionFrom(candidate({ ...GROUP, joinedMemberIds: [SELF, "@carol:workspace"] }), SELF, allowed)).toBeNull();
+  });
+
+  it("keeps every other structural guard: blank bodies, the duo's own messages, and other duos — the loop guard holds wherever consent reaches", () => {
+    const allowed: RoomDecisionLookup = () => "allowed";
+    expect(answerableQuestionFrom(candidate({ ...GROUP, body: "  \n " }), SELF, allowed)).toBeNull();
+    expect(answerableQuestionFrom(candidate({ ...GROUP, senderId: SELF }), SELF, allowed)).toBeNull();
+    expect(answerableQuestionFrom(candidate({ ...GROUP, senderId: "@duo-bob:workspace", joinedMemberIds: [SELF, "@duo-bob:workspace", "@bob:workspace"] }), SELF, allowed)).toBeNull();
+  });
+
+  it("scopes the lookup to the message's own room — one allowed room does not open its neighbors", () => {
+    const seenBy: string[] = [];
+    const lookup: RoomDecisionLookup = (roomId) => {
+      seenBy.push(roomId);
+      return roomId === "!room:workspace" ? "allowed" : null;
+    };
+    expect(answerableQuestionFrom(candidate(GROUP), SELF, lookup)).not.toBeNull();
+    expect(answerableQuestionFrom(candidate({ ...GROUP, roomId: "!other:workspace" }), SELF, lookup)).toBeNull();
+    expect(seenBy).toEqual(["!room:workspace", "!other:workspace"]);
+  });
+
+  it("with no lookup is the pre-#192 filter byte for byte: direct rooms only, everything else silence", () => {
+    expect(answerableQuestionFrom(candidate(), SELF)).not.toBeNull();
+    expect(answerableQuestionFrom(candidate(GROUP), SELF)).toBeNull();
+    expect(answerableQuestionFrom(candidate({ roomId: "!dm:workspace", joinedMemberIds: [SELF] }), SELF)).toBeNull();
   });
 });
