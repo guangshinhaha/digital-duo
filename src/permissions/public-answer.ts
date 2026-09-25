@@ -34,6 +34,14 @@ export const PUBLIC_ANSWER_CLEARANCE_CEILING = CLASSIFICATION_LEVELS[0];
 export const PUBLIC_PASSED_ON_MESSAGE = "I can't answer that one for you directly — I've passed it on to the owner, and they'll follow up.";
 export const PUBLIC_REFUSAL_MESSAGE =
   "That's not something I speak for the owner on. I've passed it on to them, without saying anything more about it here.";
+/**
+ * The generic failure text an asker sees when answering itself breaks — the
+ * 500 body `POST /ask` sends (src/serve/server.ts) and the workspace failure
+ * event (src/workspace/payload.ts) both come from this one constant: one
+ * asker-visible vocabulary, so a colleague can never tell which transport
+ * answered, and internals never reach either surface.
+ */
+export const PUBLIC_ANSWER_FAILED_MESSAGE = "Something went wrong answering that.";
 
 export interface PublicAnswered {
   readonly kind: "answered";

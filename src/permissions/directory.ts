@@ -89,6 +89,29 @@ export function resolveAsker(askerRef: string, directory: readonly AskerIdentity
 }
 
 /**
+ * Resolves an asker through `duo/directory.json` for the ask log: the matched
+ * identity's canonical id on a hit, `fallbackRef` otherwise — including when
+ * the directory cannot be read at all (a malformed roster degrades the log's
+ * fidelity, never the ask: identity resolution never turns an answerable
+ * question into an error). The lookup *ran* and failed in that case, so
+ * `resolved: false`, not a null that would claim no lookup ever happened.
+ * The two asker surfaces — #159's ask-link names and #186's workspace
+ * senders — resolve through this one path so they log identically.
+ */
+export function resolveAskerRef(
+  lookupName: string,
+  fallbackRef: string,
+  duoDir: string,
+): { readonly ref: string; readonly resolved: boolean } {
+  try {
+    const resolution = resolveAsker(lookupName, loadDirectory(duoDir));
+    return { ref: resolution.resolved ? resolution.identity.id : fallbackRef, resolved: resolution.resolved };
+  } catch {
+    return { ref: fallbackRef, resolved: false };
+  }
+}
+
+/**
  * The clearance a resolution grants for retrieval filtering: the matched
  * identity's own clearance, or — for an unresolvable asker — the lowest
  * defined level (#49 AC2: "only material requiring no clearance is

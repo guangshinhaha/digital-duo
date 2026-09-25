@@ -1,4 +1,5 @@
 import type { DuoConfig } from "../config.js";
+import { answerPublicly } from "../permissions/public-answer.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
 import { assertServableHost } from "../serve/bind.js";
@@ -19,6 +20,10 @@ import {
 import { DecryptionError } from "../store/crypto.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists, withDatabase } from "../store/store.js";
+import { askerContextForSender } from "../workspace/asker.js";
+import { workspaceSettingsFrom, type WorkspaceSettings } from "../workspace/settings.js";
+import { WorkspaceService } from "../workspace/service.js";
+import type { WorkspaceTransport, WorkspaceTransportFactory } from "../workspace/transport.js";
 
 /** Thrown by `runServe` when the resolved passphrase doesn't decrypt the store — checked once at boot, before binding, so a typo'd `DUO_PASSPHRASE` fails loudly here instead of the daemon reporting "listening" and then 500ing every request forever (every route's first real store access would otherwise be the first place this surfaces). */
 export class ServePassphraseMismatchError extends Error {
@@ -34,19 +39,41 @@ export interface ServeOptions {
 }
 
 /**
+ * The default workspace transport factory: lazily imports the matrix-js-sdk
+ * adapter so a daemon with no workspace configured (and every test of the
+ * non-workspace surface) never loads the SDK at all. Dynamic on purpose —
+ * `matrix-js-sdk` is the repo's largest dependency and nothing else in the
+ * serve path needs it.
+ */
+async function defaultWorkspaceTransportFactory(settings: WorkspaceSettings): Promise<WorkspaceTransport> {
+  const { createMatrixTransport } = await import("../workspace/matrix-transport.js");
+  return createMatrixTransport(settings);
+}
+
+/**
  * Implements `duo serve` (`client-tech-design.md` §1.3): resolves the
  * passphrase and providers once, refuses an unsafe bind host, and starts
  * listening. Returns the bound address and a `close` function rather than
  * blocking forever itself, so a test (or a wrapping process) controls the
  * daemon's lifetime rather than this function owning `process` directly.
+ *
+ * #186: alongside the inbound listener, a configured workspace starts the
+ * OUTBOUND Matrix connection (docs/workspace-platform.md §5 — the boundary
+ * held by connection direction). No workspace config means none of this
+ * runs: serve is byte-for-byte its pre-#186 self.
  */
 export async function runServe(
   options: ServeOptions,
   config: DuoConfig,
   env: NodeJS.ProcessEnv = process.env,
+  workspaceTransportFactory: WorkspaceTransportFactory = defaultWorkspaceTransportFactory,
 ): Promise<{ address: string; close: () => Promise<void> }> {
   requireStoreExists(config.storePath);
   assertServableHost(options.host);
+  // Boot refusals in the assertServableHost family: a half-configured
+  // workspace (or a plaintext homeserver URL) must fail loudly before any
+  // socket opens, not surface later as a duo that silently isn't there.
+  const workspaceSettings = workspaceSettingsFrom(config);
 
   const passphrase = await resolvePassphraseForServing(env);
   try {
@@ -74,9 +101,51 @@ export async function runServe(
     env,
   };
 
+  const workspace = workspaceSettings
+    ? new WorkspaceService({
+        settings: workspaceSettings,
+        transportFactory: workspaceTransportFactory,
+        // THE answering pipeline, not a workspace twin: the identical
+        // answerPublicly call POST /ask makes, argument for argument, with
+        // the asking Matrix user resolved through the same directory
+        // lookup. A question over the workspace connection and a question
+        // over an ask link cannot diverge, because this is one call.
+        answer: (question) =>
+          answerPublicly(
+            config.storePath,
+            passphrase,
+            config.duoDir,
+            // POST /ask hands answerPublicly a trimmed question; a chat
+            // client's body can carry trailing whitespace. The trim keeps
+            // "argument for argument" true (the body itself is non-blank —
+            // directQuestionFrom already rejected whitespace-only).
+            question.body.trim(),
+            askerContextForSender(question.senderId, config.duoDir),
+            embeddingProvider,
+            inferenceProvider,
+            config.confidence,
+            config.ownerName,
+          ),
+      })
+    : undefined;
+
   const app = createServer(deps);
   const address = await app.listen({ host: options.host, port: options.port });
-  return { address, close: () => app.close() };
+  // start() returns without waiting on the workspace: an unreachable
+  // homeserver must not delay the HTTP listener — the connection retries
+  // in the background and its state is observable on the service.
+  workspace?.start();
+  return {
+    address,
+    close: async () => {
+      // In parallel, not in series: the two shutdowns are independent, and
+      // app.close() drains in-flight /ask requests (LLM drafting) while
+      // workspace.stop() tears down its own connection — neither should
+      // wait on the other, and a workspace.stop() rejection must not skip
+      // closing the listener.
+      await Promise.all([workspace ? workspace.stop() : Promise.resolve(), app.close()]);
+    },
+  };
 }
 
 // `duo pair`/`duo pair list`/`duo pair revoke` are management commands run
