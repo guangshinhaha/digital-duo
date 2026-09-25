@@ -1,7 +1,7 @@
 # Digital Duo — v1 Spec
 
 > Internal dogfood. Pilot = the author and their immediate team.
-> Last updated: 2026-09-18 · See `concept.md` for the thesis, `import-adapters.md` for ingest.
+> Last updated: 2026-09-25 · See `concept.md` for the thesis, `import-adapters.md` for ingest.
 
 ## 1. The risk v1 is designed around
 
@@ -44,6 +44,17 @@ the edit becomes a standing order
 T0 (answering others directly) is v2, and the trigger is behavioural not calendar-based: switch
 it on when the duo is beating you to the answer often enough that it is annoying not to let it
 speak.
+
+**Amended 2026-09-25 (#184, #193):** the answering side has since shipped, and this section's
+"T0 is v2" no longer describes the product. The workspace epic added an org-hosted message
+layer — Matrix, per [`workspace-platform.md`](workspace-platform.md) — in which colleagues
+address duos directly in consented shared conversations, with every corpus still local
+([`v1-tech-design.md`](v1-tech-design.md) §1.1). Nothing here is repealed: private drafting is
+still what v1 built, still the on-ramp, and still the corpus pipeline a workspace duo answers
+from. The §3 out-scope row "Public answering (T0 to others)" is superseded by that layer;
+"Multi-tenant anything" still holds — a daemon is one duo, one owner, one encrypted store, and
+org mode ([`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md)) adds a place
+a daemon may run, not a multi-tenant rewrite.
 
 ## 3. Scope
 
