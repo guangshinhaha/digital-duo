@@ -254,7 +254,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
   // looks in device_tokens, so an ask token is refused byte-identically to an
   // unknown device token on every owner route, whatever its own state.
   // Issue #159 pins the FULL owner-route inventory (every method), not just
-  // the GETs: the eleven POSTs are owner-only surfaces too, and a seam bug
+  // the GETs: the twelve POSTs are owner-only surfaces too, and a seam bug
   // that only leaked on POSTs would otherwise pass unnoticed. #177's two
   // device routes, #172's three channel-policy routes, #178's three
   // escalation routes, #182's refusals route, #180's three actions
