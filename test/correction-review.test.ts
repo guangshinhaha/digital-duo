@@ -9,6 +9,7 @@ import {
   approveCandidate,
   CandidateConflictError,
   listPendingReview,
+  listReviewCandidates,
   rejectCandidate,
   ReviewCandidateNotFoundError,
 } from "../src/corrections/review.js";
@@ -66,6 +67,71 @@ describe("listPendingReview — merges #37's and #34's queues (#38 AC1)", () => 
     expect(review.candidates.map((c) => c.question)).toEqual(["q1", "q2"]);
     expect(review.candidates[0]).toMatchObject({ kind: "style", source: "draft_edit", draftText: "draft a", proposedText: "sent a" });
     expect(review.candidates[1]).toMatchObject({ kind: "substance", source: "escalation", draftText: null, proposedText: "the answer" });
+  });
+});
+
+describe("listReviewCandidates — the status-aware merge GET /review serves (#166)", () => {
+  it("returns every candidate from both tables when no status narrows it", () => {
+    const storePath = initStore();
+    const draftA = seedDraft(storePath, "q1", "draft a");
+    queueCorrectionCandidate(storePath, PASSPHRASE, { kind: "style", draftId: draftA, question: "q1", draftText: "draft a", sentText: "sent a" });
+
+    const escalatedDraft = appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "thin",
+      confidenceScore: 0,
+      sources: [],
+    });
+    const standingId = queueStandingOrderCandidate(storePath, PASSPHRASE, escalatedDraft, "the answer");
+
+    const candidates = listReviewCandidates(storePath, PASSPHRASE);
+    expect(candidates.map((c) => c.question)).toEqual(["q1", "q2"]);
+    // A review candidate carries its state wherever it is read — the same
+    // fields getReviewCandidate returns after a review action (#173).
+    expect(candidates[1]).toMatchObject({ id: standingId, source: "escalation", status: "pending", reviewedAt: null });
+  });
+
+  it("narrows to one status across both tables — an approved escalation leaves pending and joins an approved draft edit", () => {
+    const storePath = initStore();
+    const draftA = seedDraft(storePath, "q1", "draft a");
+    const styleId = queueCorrectionCandidate(storePath, PASSPHRASE, {
+      kind: "style",
+      draftId: draftA,
+      question: "q1",
+      draftText: "draft a",
+      sentText: "sent a",
+    }).id;
+    approveCandidate(storePath, PASSPHRASE, duoDir(), styleId);
+
+    const escalatedDraft = appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "thin",
+      confidenceScore: 0,
+      sources: [],
+    });
+    const standingId = queueStandingOrderCandidate(storePath, PASSPHRASE, escalatedDraft, "the answer");
+    approveCandidate(storePath, PASSPHRASE, duoDir(), standingId);
+
+    const rejectedDraft = seedDraft(storePath, "q3", "draft c");
+    const rejectedId = queueCorrectionCandidate(storePath, PASSPHRASE, {
+      kind: "substance",
+      draftId: rejectedDraft,
+      question: "q3",
+      draftText: "draft c",
+      sentText: "sent c",
+    }).id;
+    rejectCandidate(storePath, PASSPHRASE, rejectedId);
+
+    expect(listReviewCandidates(storePath, PASSPHRASE, "pending").map((c) => c.id)).toEqual([]);
+    expect(listReviewCandidates(storePath, PASSPHRASE, "approved").map((c) => c.id)).toEqual([styleId, standingId]);
+    expect(listReviewCandidates(storePath, PASSPHRASE, "rejected").map((c) => c.id)).toEqual([rejectedId]);
+    expect(listReviewCandidates(storePath, PASSPHRASE).map((c) => c.id)).toEqual([styleId, standingId, rejectedId]);
   });
 });
 

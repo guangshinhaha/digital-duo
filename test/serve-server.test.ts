@@ -1526,6 +1526,191 @@ describe("POST /review/:id/approve and /review/:id/reject — acting on the corr
   });
 });
 
+describe("GET /review — the whole review queue, escalation answers included (#166)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  function queueDraftEditCandidate(question: string, draftText: string, sentText: string): string {
+    return queueCorrectionCandidate(storePath, PASSPHRASE, {
+      kind: "substance",
+      draftId: "draft-1",
+      question,
+      draftText,
+      sentText,
+    }).id;
+  }
+
+  // The live smoke test from the issue, end to end over HTTP: a question
+  // with nothing behind it escalates, the owner answers it, and the
+  // candidate the answer queues is what GET /review lists — the drawer
+  // this route is the only surface that opens.
+  it("the smoke-test sequence: answer an escalation over HTTP and the candidate IS listed", async () => {
+    const drafted = await app.inject({
+      method: "POST",
+      url: "/drafts",
+      headers: authHeader,
+      payload: { question: "What is the meaning of life?" },
+    });
+    expect(drafted.statusCode).toBe(201);
+    expect(drafted.json().kind).toBe("escalation");
+    expect(drafted.json().refused).toBe(false);
+    const draftId: string = drafted.json().draftId;
+
+    const answered = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/answer`,
+      headers: authHeader,
+      payload: { answer: "20 days paid leave, carried over at the owner's discretion" },
+    });
+    expect(answered.statusCode).toBe(200);
+    const candidateId: string = answered.json().candidateId;
+
+    const review = await app.inject({ method: "GET", url: "/review", headers: authHeader });
+    expect(review.statusCode).toBe(200);
+    expect(review.json()).toHaveLength(1);
+    expect(review.json()[0]).toMatchObject({
+      id: candidateId,
+      kind: "substance",
+      source: "escalation",
+      draftId,
+      question: "What is the meaning of life?",
+      // An escalation had no confident draft to edit — empty string on
+      // the wire (never null: the client diffs draftText against
+      // sentText with non-null string types), and the owner's answer is
+      // the proposed text under this route's own historical name for it.
+      draftText: "",
+      sentText: "20 days paid leave, carried over at the owner's discretion",
+      status: "pending",
+      reviewedAt: null,
+    });
+
+    // A retried answer (client remounting before the outcome lands) is
+    // idempotent at the queue — the listing must not double either.
+    const retried = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/answer`,
+      headers: authHeader,
+      payload: { answer: "20 days paid leave, carried over at the owner's discretion" },
+    });
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json().candidateId).toBe(candidateId);
+
+    const stillOne = await app.inject({ method: "GET", url: "/review", headers: authHeader });
+    expect(stillOne.json()).toHaveLength(1);
+  });
+
+  it("?status=pending lists the escalation candidate, and after an approve it moves to ?status=approved", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I expense conference travel?",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+    const candidateId = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "submit the pre-approval form two weeks ahead");
+
+    const pending = await app.inject({ method: "GET", url: "/review?status=pending", headers: authHeader });
+    expect(pending.json().map((candidate: { id: string }) => candidate.id)).toEqual([candidateId]);
+
+    const approved = await app.inject({ method: "POST", url: `/review/${candidateId}/approve`, headers: authHeader });
+    expect(approved.statusCode).toBe(200);
+
+    const stillPending = await app.inject({ method: "GET", url: "/review?status=pending", headers: authHeader });
+    expect(stillPending.json()).toEqual([]);
+
+    const nowApproved = await app.inject({ method: "GET", url: "/review?status=approved", headers: authHeader });
+    expect(nowApproved.json().map((candidate: { id: string }) => candidate.id)).toEqual([candidateId]);
+
+    // The bare route is history, not a queue (#44): every status, both sources.
+    const bare = await app.inject({ method: "GET", url: "/review", headers: authHeader });
+    expect(bare.json().map((candidate: { id: string }) => candidate.id)).toEqual([candidateId]);
+  });
+
+  it("a draft-edit candidate keeps its exact wire shape, plus the additive source", async () => {
+    const candidateId = queueDraftEditCandidate("what are the office hours?", "office hours are flexible", "office hours are nine to five");
+
+    const review = await app.inject({ method: "GET", url: "/review?status=pending", headers: authHeader });
+    expect(review.json()).toHaveLength(1);
+    expect(review.json()[0]).toEqual({
+      id: candidateId,
+      kind: "substance",
+      source: "draft_edit",
+      draftId: "draft-1",
+      question: "what are the office hours?",
+      draftText: "office hours are flexible",
+      sentText: "office hours are nine to five",
+      status: "pending",
+      createdAt: expect.any(String),
+      reviewedAt: null,
+    });
+  });
+
+  it("lists both sources in one queue, oldest first", async () => {
+    queueDraftEditCandidate("q1", "draft one", "sent one");
+
+    const escalatedDraft = appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+    queueStandingOrderCandidate(storePath, PASSPHRASE, escalatedDraft, "the answer");
+
+    const review = await app.inject({ method: "GET", url: "/review?status=pending", headers: authHeader });
+    expect(review.json().map((candidate: { question: string }) => candidate.question)).toEqual(["q1", "q2"]);
+    expect(review.json().map((candidate: { source: string }) => candidate.source)).toEqual(["draft_edit", "escalation"]);
+  });
+
+  // The route's old status semantics, pinned across BOTH halves of the
+  // merge: an unknown value filters to an empty list, an empty value is no
+  // filter at all (the reading the corrections-only route always gave it —
+  // the two halves must not disagree), and a candidate rejected through
+  // the route's own action stays listed under ?status=rejected.
+  it("keeps the old ?status semantics across both halves, and lists a route-rejected candidate under ?status=rejected", async () => {
+    const draftEditId = queueDraftEditCandidate("q1", "draft one", "sent one");
+    const escalatedDraft = appendDraft(storePath, PASSPHRASE, {
+      question: "q2",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no evidence",
+      confidenceScore: 0,
+      sources: [],
+    });
+    queueStandingOrderCandidate(storePath, PASSPHRASE, escalatedDraft, "the answer");
+
+    const bogus = await app.inject({ method: "GET", url: "/review?status=bogus", headers: authHeader });
+    expect(bogus.statusCode).toBe(200);
+    expect(bogus.json()).toEqual([]);
+
+    const empty = await app.inject({ method: "GET", url: "/review?status=", headers: authHeader });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json()).toHaveLength(2);
+
+    const rejected = await app.inject({ method: "POST", url: `/review/${draftEditId}/reject`, headers: authHeader });
+    expect(rejected.statusCode).toBe(200);
+
+    const rejectedList = await app.inject({ method: "GET", url: "/review?status=rejected", headers: authHeader });
+    expect(rejectedList.json().map((candidate: { id: string }) => candidate.id)).toEqual([draftEditId]);
+
+    const pending = await app.inject({ method: "GET", url: "/review?status=pending", headers: authHeader });
+    expect(pending.json().map((candidate: { id: string }) => candidate.id)).not.toContain(draftEditId);
+  });
+});
+
 describe("GET /search — the corpus, from a client (#174)", () => {
   let app: FastifyInstance;
   let storePath: string;

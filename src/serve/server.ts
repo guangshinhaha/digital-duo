@@ -6,8 +6,8 @@ import { endDuoAndRecord, readLifecycle } from "../continuity/lifecycle.js";
 import { listTransfers } from "../continuity/transfer.js";
 import type { DuoConfig } from "../config.js";
 import { createLlmEditClassifier } from "../corrections/classify.js";
-import { listCorrectionCandidates, type CorrectionCandidateStatus } from "../corrections/queue.js";
-import { approveCandidate, getReviewCandidate, rejectCandidate } from "../corrections/review.js";
+import type { CorrectionCandidateStatus } from "../corrections/queue.js";
+import { approveCandidate, getReviewCandidate, listReviewCandidates, rejectCandidate } from "../corrections/review.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
@@ -536,8 +536,34 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     }
   });
 
+  // #166: /review lists the whole review queue, not just #37's draft-edit
+  // half — an answered escalation's standing-order candidate (#34) is a
+  // correction candidate too, and this route is the one surface the client
+  // reads, so it must be where the owner finds it. Rows keep the wire shape
+  // this route has always served — sentText, and a string draftText (empty
+  // for an escalation, which had no confident draft to edit) — plus the
+  // additive `source` saying which of the two queues a row came from; the
+  // client's Review screen diffs draftText against sentText, so a null
+  // draft would break it. listReviewCandidates is the same read `duo
+  // corrections review` serves the CLI from — one code path, two surfaces.
   app.get<{ Querystring: { status?: string } }>("/review", async (request) => {
-    return listCorrectionCandidates(deps.storePath, deps.passphrase, request.query.status as CorrectionCandidateStatus | undefined);
+    // `?status=` (empty) normalizes to "no filter" — the reading the
+    // corrections-only route always gave it, now applied to both halves of
+    // the merge rather than only the corrections half. Any other unknown
+    // value filters to an empty list from both halves, as before.
+    const status = (request.query.status || undefined) as CorrectionCandidateStatus | undefined;
+    return listReviewCandidates(deps.storePath, deps.passphrase, status).map((candidate) => ({
+      id: candidate.id,
+      kind: candidate.kind,
+      source: candidate.source,
+      draftId: candidate.draftId,
+      question: candidate.question,
+      draftText: candidate.draftText ?? "",
+      sentText: candidate.proposedText,
+      status: candidate.status,
+      createdAt: candidate.createdAt,
+      reviewedAt: candidate.reviewedAt,
+    }));
   });
 
   // #173: thin wrappers over the same module functions `duo corrections
