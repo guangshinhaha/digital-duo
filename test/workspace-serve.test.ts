@@ -1,12 +1,12 @@
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { runServe } from "../src/commands/serve.js";
 import { PUBLIC_PASSED_ON_MESSAGE } from "../src/permissions/public-answer.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import { createEncryptedStore } from "../src/store/store.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
-import type { WorkspaceTransport } from "../src/workspace/transport.js";
+import { WorkspaceTokenRevokedError, type WorkspaceTransport } from "../src/workspace/transport.js";
 import { FakeWorkspaceTransport } from "./helpers/fake-workspace-transport.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 
@@ -34,10 +34,16 @@ const SELF = "@duo-alice:workspace";
 
 /** runServe resolves before the async workspace dial finishes — wait for the outbound connection to be live (messages only flow once connected). */
 async function untilConnected(transport: FakeWorkspaceTransport): Promise<void> {
-  for (let i = 0; i < 100 && transport.connectCalls === 0; i += 1) {
+  await until(() => transport.connectCalls >= 1);
+  expect(transport.connectCalls).toBeGreaterThanOrEqual(1);
+}
+
+/** Polls a short-bounded condition instead of sleeping a fixed interval — the answering pipeline is async (draftReply inside answerPublicly). */
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 100 && !condition(); i += 1) {
     await new Promise((resolveTick) => setTimeout(resolveTick, 10));
   }
-  expect(transport.connectCalls).toBeGreaterThanOrEqual(1);
+  expect(condition()).toBe(true);
 }
 
 describe("runServe + workspace — the outbound connection alongside the unchanged listener (#186 AC1/AC2)", () => {
@@ -88,11 +94,7 @@ describe("runServe + workspace — the outbound connection alongside the unchang
         body: "What did Alice decide about the vendor?",
         joinedMemberIds: [SELF, "@bob:workspace"],
       });
-      // The answering pipeline is async (draftReply inside answerPublicly);
-      // poll briefly rather than sleeping a fixed interval.
-      for (let i = 0; i < 100 && transport.sentAnswers.length === 0; i += 1) {
-        await new Promise((resolveTick) => setTimeout(resolveTick, 10));
-      }
+      await until(() => transport.sentAnswers.length >= 1);
       // An empty store answers passed_on through the public pipeline — the
       // identical outcome POST /ask produces for the same corpus state,
       // attribution line included (withPublicAttribution composes it into
@@ -141,5 +143,89 @@ describe("runServe + workspace — the outbound connection alongside the unchang
     await expect(runServe({ host: "127.0.0.1", port: 0 }, config, partial, () => new FakeWorkspaceTransport() as WorkspaceTransport)).rejects.toThrow(
       /workspace configuration is incomplete/,
     );
+  });
+
+  it("runs the connect-time identity read and logs the asker exactly as the unfed path does — the directory serves the existing path, never replaces it (#187 AC3)", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    transport.setMembers({
+      members: [
+        { userId: "@bob:workspace", displayName: "Bob", presence: { online: true, lastActiveAgoMs: 1000 } },
+        { userId: "@mallory:workspace", displayName: "Bob", presence: { online: false, lastActiveAgoMs: null } },
+      ],
+      truncated: false,
+    });
+    const { close } = await runServe(
+      { host: "127.0.0.1", port: 0 },
+      config,
+      workspaceEnv(storePath),
+      () => transport as WorkspaceTransport,
+    );
+    try {
+      await untilConnected(transport);
+      // The connect-time identity read ran — the workspace directory is
+      // what the feed reads — and it is the identity-only read: no
+      // presence fan-out on the connect path.
+      await until(() => transport.listMemberIdentitiesCalls >= 1);
+      expect(transport.listMembersCalls).toBe(0);
+      transport.deliver({
+        eventId: "$q1",
+        roomId: "!dm:workspace",
+        senderId: "@bob:workspace",
+        body: "What did Alice decide about the vendor?",
+        joinedMemberIds: [SELF, "@bob:workspace"],
+      });
+      await until(() => transport.sentAnswers.length >= 1);
+      // The member-fed resolution logged the same ref the existing path
+      // produces for this sender (no directory.json exists, so the full
+      // Matrix user id): the feed is outcome-neutral by design — the AC's
+      // "the existing permissions path is unchanged" — so this asserts the
+      // byte-identical outcome, not a new one.
+      const entries = listPublicAnswerLogEntries(storePath, PASSPHRASE);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.askerRef).toBe("@bob:workspace");
+      expect(entries[0]!.askerResolved).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  it("survives a revoked token at boot — the listener serves, the error says re-pair, and nothing hot-loops (#187 R7)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { storePath } = initStore();
+      // A short initial delay makes the post-rejection window below long
+      // enough to catch a wrongly-scheduled STANDARD reconnect too, not
+      // just a hot loop (the service-level test pins the full 300s no-dial
+      // contract against fake timers).
+      const fastBackoff = workspaceEnv(storePath);
+      fastBackoff.DUO_WORKSPACE_RECONNECT_INITIAL_MS = "50";
+      const config = loadConfig(fastBackoff);
+      const transport = new FakeWorkspaceTransport();
+      transport.rejectNextConnectWith(new WorkspaceTokenRevokedError("Unrecognised access token"));
+      const { address, close } = await runServe(
+        { host: "127.0.0.1", port: 0 },
+        config,
+        fastBackoff,
+        () => transport as WorkspaceTransport,
+      );
+      try {
+        // The revoked dial is async; wait for it to land, then give a
+        // would-be reconnect (initial delay 50ms) a window to fire in.
+        await until(() => transport.connectCalls >= 1);
+        await new Promise((resolveTick) => setTimeout(resolveTick, 200));
+        // Terminal: no re-dials, the HTTP listener is unaffected, and the
+        // owner-side error names the fix.
+        expect(transport.connectCalls).toBe(1);
+        expect(await (await fetch(`${address}/health`)).json()).toEqual({ ok: true });
+        const logged = consoleError.mock.calls.map((call) => String(call[0]));
+        expect(logged.some((line) => line.includes("re-pair the duo"))).toBe(true);
+      } finally {
+        await close();
+      }
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

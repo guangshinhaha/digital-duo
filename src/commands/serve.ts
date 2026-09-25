@@ -101,7 +101,10 @@ export async function runServe(
     env,
   };
 
-  const workspace = workspaceSettings
+  // Annotated, not inferred: the answer closure below reaches back into
+  // `workspace` for the member cache (the #187 feed), and a self-referencing
+  // initializer is exactly the shape TS refuses to infer through.
+  const workspace: WorkspaceService | undefined = workspaceSettings
     ? new WorkspaceService({
         settings: workspaceSettings,
         transportFactory: workspaceTransportFactory,
@@ -120,7 +123,11 @@ export async function runServe(
             // "argument for argument" true (the body itself is non-blank —
             // directQuestionFrom already rejected whitespace-only).
             question.body.trim(),
-            askerContextForSender(question.senderId, config.duoDir),
+            // #187's feed: the sender's workspace member record when the
+            // daemon's connect-time listing has one, through the same
+            // resolver either way (asker.ts — the member is the mapping's
+            // input, never a second resolution path).
+            askerContextForSender(question.senderId, config.duoDir, workspace?.memberFor(question.senderId)),
             embeddingProvider,
             inferenceProvider,
             config.confidence,

@@ -229,4 +229,22 @@ describe("workspace egress surface — structural pin on what src/workspace may 
     const offenders = workspaceFiles().filter((path) => /\blisten\s*\(|createServer\s*\(/.test(readFileSync(path, "utf8")));
     expect(offenders).toEqual([]);
   });
+
+  // #187 AC4: nobody gets a duo they did not create. The enforcement is
+  // structural, not disciplinary: the module that talks to the homeserver
+  // has no provisioning primitive at all, so a member joining the workspace
+  // cannot be handed a duo by this code — or by an administrator through
+  // it. The only duo-credential creation that exists is local pairing
+  // (#186's env-token shape), on the owner's machine, per the platform
+  // decision §6.
+  it("contains no account-provisioning primitive — the module cannot create, register, or administer workspace users (#187 AC4)", () => {
+    // Every form of user creation the SDK (and Synapse's admin surface)
+    // names: the client-side register calls, admin-API paths, and the raw
+    // registration endpoint. The adapter is the only SDK importer, and the
+    // seam above pins that — this scan pins the calls themselves, wherever
+    // they would appear.
+    const provisioning = /\bregister(User|Request|Guest)?\s*\(|\bcreateAccount\b|\/_synapse\/admin|\/register\b|\bdeactivateAccount\b/;
+    const offenders = workspaceFiles().filter((path) => provisioning.test(readFileSync(path, "utf8")));
+    expect(offenders).toEqual([]);
+  });
 });
