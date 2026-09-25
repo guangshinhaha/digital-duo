@@ -19,6 +19,7 @@ import {
   setCandidateStatus,
   type CorrectionCandidate,
   type CorrectionCandidateKind,
+  type CorrectionCandidateStatus,
 } from "./queue.js";
 import { contentWordOverlap } from "./text-similarity.js";
 
@@ -42,7 +43,7 @@ export interface PendingReviewCandidate {
   readonly createdAt: string;
 }
 
-function fromCorrectionCandidate(candidate: CorrectionCandidate): PendingReviewCandidate {
+function fromCorrectionCandidate(candidate: CorrectionCandidate): ReviewCandidate {
   return {
     id: candidate.id,
     kind: candidate.kind,
@@ -52,10 +53,12 @@ function fromCorrectionCandidate(candidate: CorrectionCandidate): PendingReviewC
     draftText: candidate.draftText,
     proposedText: candidate.sentText,
     createdAt: candidate.createdAt,
+    status: candidate.status,
+    reviewedAt: candidate.reviewedAt,
   };
 }
 
-function fromStandingOrderCandidate(candidate: StandingOrderCandidate): PendingReviewCandidate {
+function fromStandingOrderCandidate(candidate: StandingOrderCandidate): ReviewCandidate {
   return {
     id: candidate.id,
     kind: "substance",
@@ -65,6 +68,8 @@ function fromStandingOrderCandidate(candidate: StandingOrderCandidate): PendingR
     draftText: null,
     proposedText: candidate.answerText,
     createdAt: candidate.createdAt,
+    status: candidate.status,
+    reviewedAt: candidate.reviewedAt,
   };
 }
 
@@ -123,11 +128,11 @@ export interface ReviewCandidate extends PendingReviewCandidate {
 export function getReviewCandidate(storePath: string, passphrase: string, id: string): ReviewCandidate | undefined {
   const correction = getCorrectionCandidate(storePath, passphrase, id);
   if (correction) {
-    return { ...fromCorrectionCandidate(correction), status: correction.status, reviewedAt: correction.reviewedAt };
+    return fromCorrectionCandidate(correction);
   }
   const standing = getStandingOrderCandidate(storePath, passphrase, id);
   if (standing) {
-    return { ...fromStandingOrderCandidate(standing), status: standing.status, reviewedAt: standing.reviewedAt };
+    return fromStandingOrderCandidate(standing);
   }
   return undefined;
 }
@@ -138,17 +143,34 @@ export interface PendingReview {
 }
 
 /**
+ * Every review candidate across both source tables (#166: the read behind
+ * GET /review) — #37's draft-edit candidates and #34's escalation-answer
+ * candidates alike, oldest first, optionally narrowed to one status the
+ * way queue.ts's own lister narrows its single table. The same merge
+ * listPendingReview serves the CLI from, so the CLI's `duo corrections
+ * review` and the serve route cannot disagree about what the review queue
+ * contains; there is exactly one code path that decides.
+ */
+export function listReviewCandidates(
+  storePath: string,
+  passphrase: string,
+  status?: CorrectionCandidateStatus,
+): ReviewCandidate[] {
+  return [
+    ...listCorrectionCandidates(storePath, passphrase, status).map(fromCorrectionCandidate),
+    ...listStandingOrderCandidates(storePath, passphrase)
+      .filter((candidate) => status === undefined || candidate.status === status)
+      .map(fromStandingOrderCandidate),
+  ].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+}
+
+/**
  * #38 AC3: "an empty queue says nothing" — an empty `candidates` array is
  * exactly that signal; the CLI prints nothing further when it sees one,
  * rather than a recurring "nothing to review" notification.
  */
 export function listPendingReview(storePath: string, passphrase: string, duoDir: string): PendingReview {
-  const candidates: PendingReviewCandidate[] = [
-    ...listCorrectionCandidates(storePath, passphrase, "pending").map(fromCorrectionCandidate),
-    ...listStandingOrderCandidates(storePath, passphrase)
-      .filter((candidate) => candidate.status === "pending")
-      .map(fromStandingOrderCandidate),
-  ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const candidates = listReviewCandidates(storePath, passphrase, "pending");
 
   const activeRules = listActiveRules(storePath, passphrase, duoDir);
   const conflicts: SubstanceConflict[] = [];
