@@ -69,6 +69,22 @@ const DEFAULT_EVAL_GATE_PRECISION_FLOOR = 0.95;
 // learned the hard way for the shared duo's usage log.
 const DEFAULT_LIFECYCLE_LOG_PATH = "duo-lifecycle-runtime/events.json";
 
+// Jev typed-decision spike (docs/plans/2026-09-20-1759-spike-jev-typed-decisions-plan.md).
+// Hosted egress accepted for the spike only, synthetic content only (R9);
+// production inference paths stay local-only (G1) and Jev never enters
+// defaultRegistry. The API key has no default on purpose — it must be set
+// explicitly (DUO_JEV_API_KEY) for a run that is allowed to leave the machine.
+const DEFAULT_JEV_GATEWAY_URL = "https://api.typesafe.ai";
+// Vendor-stated input-only price ($0.042/MTok) as the accounting default —
+// measured usage is multiplied by it, never trusted as a performance claim (R6).
+const DEFAULT_JEV_INPUT_PRICE_PER_MTOK = 0.042;
+// Spike runtime artifacts (recorded HTTP exchanges, reports) land here —
+// gitignored (U4), separate from data/ and duo/ for the same reason
+// lifecycleLogPath is: it must survive purges of the things it records.
+const DEFAULT_JEV_SPIKE_RUNTIME_DIR = "jev-spike-runtime";
+const DEFAULT_EVAL_JEV_MULTIWAY_TASKS_PATH = "eval/jev-multiway-tasks.json";
+const DEFAULT_EVAL_JEV_TRACES_PATH = "eval/jev-traces.json";
+
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
     return fallback;
@@ -120,9 +136,24 @@ export interface DuoConfig {
     gateLabelsPath: string;
     /** #36: the stated precision floor a gate-eval run fails against. Defaults to 0.95, matching RELEVANCE_GATE_TARGET_PRECISION. */
     gatePrecisionFloor: number;
+    /** Jev spike: path to the authored multi-way task set. Defaults to "eval/jev-multiway-tasks.json". */
+    jevMultiwayTasksPath: string;
+    /** Jev spike: path to the recorded navigation traces. Defaults to "eval/jev-traces.json". */
+    jevTracesPath: string;
   };
   /** #63: where the durable archival/transfer/deletion log lives. Defaults to "duo-lifecycle-runtime/events.json" — its own directory, outside anything `endDuo` or `duo purge` ever deletes. */
   lifecycleLogPath: string;
+  /** Jev spike: the hosted typed-decision gateway's configuration. Undefined apiKey means "not configured" — the adapter refuses rather than guessing (KTD2). */
+  jev: {
+    /** Gateway base URL. Defaults to "https://api.typesafe.ai"; the adapter rejects non-https values rather than sending the key or payloads in plaintext. */
+    gatewayUrl: string;
+    /** DUO_JEV_API_KEY, or undefined when unset — there is deliberately no default. */
+    apiKey: string | undefined;
+    /** Input-token price per million tokens, for cost accounting only. Defaults to 0.042 (vendor-stated, input-only). */
+    inputPricePerMTok: number;
+    /** Where spike runtime artifacts (recorded exchanges, reports) are written. Defaults to "jev-spike-runtime" (gitignored). */
+    runtimeDir: string;
+  };
 }
 
 /**
@@ -160,7 +191,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       holdoutDays: parseNumberEnv(env.DUO_EVAL_HOLDOUT_DAYS, DEFAULT_EVAL_HOLDOUT_DAYS),
       gateLabelsPath: env.DUO_EVAL_GATE_LABELS_PATH || DEFAULT_EVAL_GATE_LABELS_PATH,
       gatePrecisionFloor: parseNumberEnv(env.DUO_EVAL_GATE_PRECISION_FLOOR, DEFAULT_EVAL_GATE_PRECISION_FLOOR),
+      jevMultiwayTasksPath: env.DUO_EVAL_JEV_MULTIWAY_TASKS_PATH || DEFAULT_EVAL_JEV_MULTIWAY_TASKS_PATH,
+      jevTracesPath: env.DUO_EVAL_JEV_TRACES_PATH || DEFAULT_EVAL_JEV_TRACES_PATH,
     },
     lifecycleLogPath: env.DUO_LIFECYCLE_LOG_PATH || DEFAULT_LIFECYCLE_LOG_PATH,
+    jev: {
+      gatewayUrl: env.DUO_JEV_GATEWAY_URL || DEFAULT_JEV_GATEWAY_URL,
+      apiKey: env.DUO_JEV_API_KEY || undefined,
+      inputPricePerMTok: parseNumberEnv(env.DUO_JEV_INPUT_PRICE_PER_MTOK, DEFAULT_JEV_INPUT_PRICE_PER_MTOK),
+      runtimeDir: env.DUO_JEV_SPIKE_RUNTIME_DIR || DEFAULT_JEV_SPIKE_RUNTIME_DIR,
+    },
   };
 }

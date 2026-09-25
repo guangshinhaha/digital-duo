@@ -7,3 +7,4 @@ duo-lifecycle-runtime/
 .DS_Store
 .claude/
 *.tsbuildinfo
+jev-spike-runtime/

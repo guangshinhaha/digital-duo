@@ -5,5 +5,6 @@ export default defineConfig({
     root: ".",
     include: ["test/**/*.test.ts"],
     environment: "node",
+    setupFiles: ["test/setup/network-denial.ts"],
   },
 });

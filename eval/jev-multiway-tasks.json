@@ -1,0 +1,257 @@
+{
+  "provenance": {
+    "synthetic": true,
+    "note": "Hand-authored synthetic multi-way decision tasks for the Jev typed-decision spike. Every scenario, name, company, and date below is invented. This file is egress-eligible (R9) precisely because it contains no owner or user content — never add real material here. Real recorded navigation traces belong in a different path, never this egress-audited file (KTD10, R8).",
+    "authored": "2026-09-20",
+    "plan": "docs/plans/2026-09-20-1759-spike-jev-typed-decisions-plan.md"
+  },
+  "items": [
+    {
+      "id": "mw01",
+      "scenario": "Search results for \"Q3 budget\" on the team wiki. Five results are shown.",
+      "goal": "Open the document the team actually uses as the Q3 budget.",
+      "candidates": [
+        { "id": "q3-budget-2026-final", "description": "Q3 2026 Budget — FINAL (finance/team-budgets)" },
+        { "id": "q3-budget-2026-draft", "description": "Q3 2026 Budget — DRAFT v3 (personal sandbox)" },
+        { "id": "q2-budget-2026", "description": "Q2 2026 Budget — archived (finance/team-budgets)" },
+        { "id": "budget-template", "description": "Blank budget template (finance/templates)" },
+        { "id": "q3-budget-2025", "description": "Q3 2025 Budget — last year's numbers (finance/archive)" }
+      ],
+      "correct": "q3-budget-2026-final"
+    },
+    {
+      "id": "mw02",
+      "scenario": "A vendor portal's contract page lists four downloadable agreements for Northwind Traders.",
+      "goal": "Find the currently active master services agreement.",
+      "candidates": [
+        { "id": "msa-2026-signed", "description": "MSA 2026 — signed by both parties, effective Jan 2026" },
+        { "id": "msa-2024-expired", "description": "MSA 2024 — expired Dec 2025" },
+        { "id": "msa-draft-redline", "description": "MSA 2026 renewal — redline draft, unsigned" },
+        { "id": "dpa-2024", "description": "Data processing addendum, 2024 version" }
+      ],
+      "correct": "msa-2026-signed"
+    },
+    {
+      "id": "mw03",
+      "scenario": "The expense tool's category picker for a $34 airport taxi charge during a client visit.",
+      "goal": "File the charge under the correct expense category.",
+      "candidates": [
+        { "id": "ground-transport", "description": "Ground transportation — taxis, rideshares, trains to/from client sites" },
+        { "id": "air-travel", "description": "Air travel — flights only" },
+        { "id": "client-meals", "description": "Meals with clients — requires attendee names" },
+        { "id": "parking", "description": "Parking and tolls" },
+        { "id": "office-supplies", "description": "Office supplies and equipment under $100" }
+      ],
+      "correct": "ground-transport"
+    },
+    {
+      "id": "mw04",
+      "scenario": "Calendar's room-booking screen for a 30-minute standup with 4 remote attendees.",
+      "goal": "Pick a room that supports the meeting.",
+      "candidates": [
+        { "id": "focus-2p", "description": "Focus room — seats 2, no video equipment" },
+        { "id": "huddle-6p-vc", "description": "Huddle room — seats 6, full video conferencing" },
+        { "id": "board-20p-vc", "description": "Board room — seats 20, full video conferencing" },
+        { "id": "phone-booth-1p", "description": "Phone booth — seats 1" }
+      ],
+      "correct": "huddle-6p-vc"
+    },
+    {
+      "id": "mw05",
+      "scenario": "GitHub pull request #4821 has four failing checks; the list shows their names.",
+      "goal": "Open the check that most likely broke because of the code change itself.",
+      "candidates": [
+        { "id": "unit-tests", "description": "Unit tests — 12 newly failing assertions in changed modules" },
+        { "id": "nightly-e2e", "description": "Nightly E2E — known flaky on all PRs this week" },
+        { "id": "infra-provision", "description": "Infra provisioning — staging allocation timed out" },
+        { "id": "docs-build", "description": "Docs build — warning-as-error on an unrelated page" }
+      ],
+      "correct": "unit-tests"
+    },
+    {
+      "id": "mw06",
+      "scenario": "The password manager shows five logins all named \"Confluence\".",
+      "goal": "Use the login for the company's active Confluence workspace.",
+      "candidates": [
+        { "id": "confluence-acme-prod", "description": "confluence.acme-example.com — SSO, last used today" },
+        { "id": "confluence-old-domain", "description": "confluence.old-acme-example.com — pre-migration domain" },
+        { "id": "confluence-free-trial", "description": "atlassian.net free trial workspace from 2023" },
+        { "id": "confluence-sandbox", "description": "confluence-sandbox.acme-example.com — test workspace" },
+        { "id": "confluence-client-x", "description": "Client X's Confluence guest login" }
+      ],
+      "correct": "confluence-acme-prod"
+    },
+    {
+      "id": "mw07",
+      "scenario": "A pharmacy's online refill page asks how to continue with a repeat prescription.",
+      "goal": "Choose the standard repeat-refill path.",
+      "candidates": [
+        { "id": "refill-existing", "description": "Refill my existing prescription — same medication and pharmacy" },
+        { "id": "new-prescription", "description": "Start a new prescription — requires a provider visit" },
+        { "id": "transfer-pharmacy", "description": "Transfer prescription to a different pharmacy" },
+        { "id": "cancel-order", "description": "Cancel all pending orders" }
+      ],
+      "correct": "refill-existing"
+    },
+    {
+      "id": "mw08",
+      "scenario": "The HR portal's leave-request form for attending a wedding on a weekday.",
+      "goal": "Select the right leave type.",
+      "candidates": [
+        { "id": "annual-leave", "description": "Annual leave — discretionary paid time off" },
+        { "id": "sick-leave", "description": "Sick leave — requires a health note beyond 3 days" },
+        { "id": "parental-leave", "description": "Parental leave — birth or adoption related" },
+        { "id": "unpaid-leave", "description": "Unpaid leave — when balances are exhausted" },
+        { "id": "public-holiday", "description": "Public holiday — company-wide, not requestable" }
+      ],
+      "correct": "annual-leave"
+    },
+    {
+      "id": "mw09",
+      "scenario": "A bank app's transfer screen after typing an amount, showing four continuation buttons.",
+      "goal": "Send the money as a one-time transfer.",
+      "candidates": [
+        { "id": "review-transfer", "description": "Review and send — one-time transfer to the entered recipient" },
+        { "id": "set-recurring", "description": "Make recurring — repeat monthly until cancelled" },
+        { "id": "save-draft", "description": "Save as draft — nothing is sent" },
+        { "id": "split-bill", "description": "Split the amount across several recipients" }
+      ],
+      "correct": "review-transfer"
+    },
+    {
+      "id": "mw10",
+      "scenario": "Search results for \"runbook migration\" on the internal docs site, four hits.",
+      "goal": "Open the runbook for this weekend's database migration.",
+      "candidates": [
+        { "id": "db-migration-runbook-oct", "description": "DB migration runbook — October 2026 window (current)" },
+        { "id": "db-migration-runbook-2024", "description": "DB migration runbook — 2024 window (historical)" },
+        { "id": "cloud-migration-runbook", "description": "Cloud provider migration runbook — different project" },
+        { "id": "migration-rollback-notes", "description": "Rollback notes from the April migration incident" }
+      ],
+      "correct": "db-migration-runbook-oct"
+    },
+    {
+      "id": "mw11",
+      "scenario": "An airline booking site offers four fare bundles for the same flight.",
+      "goal": "Pick the cheapest option that still includes a cabin bag.",
+      "candidates": [
+        { "id": "basic-no-bag", "description": "Basic — cheapest, cabin bag costs extra" },
+        { "id": "standard-cabin-bag", "description": "Standard — cabin bag included, no seat choice" },
+        { "id": "flex-two-bags", "description": "Flex — cabin + checked bag, free changes" },
+        { "id": "premium-all", "description": "Premium — lounge, priority, two checked bags" }
+      ],
+      "correct": "standard-cabin-bag"
+    },
+    {
+      "id": "mw12",
+      "scenario": "Slack's channel directory shows five channels matching \"deploy\".",
+      "goal": "Post a question about today's failed production deploy.",
+      "candidates": [
+        { "id": "deploys-prod", "description": "#deploys-prod — production deploy coordination, on-call engineers" },
+        { "id": "deploys-social", "description": "#deploys-social — social committee event planning" },
+        { "id": "devops-articles", "description": "#devops-articles — link sharing, no on-call" },
+        { "id": "deploys-staging", "description": "#deploys-staging — staging environment only" },
+        { "id": "help-it", "description": "#help-it — laptop and account help" }
+      ],
+      "correct": "deploys-prod"
+    },
+    {
+      "id": "mw13",
+      "scenario": "The phone settings page shows four entries under \"Battery\".",
+      "goal": "Find out which apps drained the battery overnight.",
+      "candidates": [
+        { "id": "battery-usage", "description": "Battery usage — per-app battery consumption breakdown" },
+        { "id": "battery-saver", "description": "Battery saver — toggle low-power mode" },
+        { "id": "charging-sound", "description": "Charging sound — play a sound when plugged in" },
+        { "id": "battery-health", "description": "Battery health — maximum capacity versus new" }
+      ],
+      "correct": "battery-usage"
+    },
+    {
+      "id": "mw14",
+      "scenario": "A code review tool flags one method for a security scan finding with four suggested resolutions.",
+      "goal": "Choose the fix that removes the vulnerability rather than hiding it.",
+      "candidates": [
+        { "id": "parameterize-query", "description": "Replace string concatenation with a parameterized query" },
+        { "id": "suppress-finding", "description": "Add an inline suppression comment for the scanner" },
+        { "id": "rename-method", "description": "Rename the method so the scanner no longer matches it" },
+        { "id": "wrap-try-catch", "description": "Wrap the call in try/catch and log failures" }
+      ],
+      "correct": "parameterize-query"
+    },
+    {
+      "id": "mw15",
+      "scenario": "The company travel tool asks how to book a train for a same-day return trip to a client office.",
+      "goal": "Book the standard same-day return rail option.",
+      "candidates": [
+        { "id": "day-return-ticket", "description": "Day return ticket — outbound and return on the same day" },
+        { "id": "open-return", "description": "Open return — return valid for one month, higher price" },
+        { "id": "season-ticket", "description": "Monthly season ticket — for repeated travel" },
+        { "id": "advance-single-x2", "description": "Two advance singles — cheapest but fixed trains, no flexibility" }
+      ],
+      "correct": "day-return-ticket"
+    },
+    {
+      "id": "mw16",
+      "scenario": "A file-sharing link fails with five possible error explanations offered by the help page.",
+      "goal": "Open the explanation matching \"link expired\".",
+      "candidates": [
+        { "id": "link-expired", "description": "The link expired — the sender set an expiry date that has passed" },
+        { "id": "no-permission", "description": "You lack permission — ask the sender to grant access" },
+        { "id": "file-deleted", "description": "The file was deleted by its owner" },
+        { "id": "signed-in-wrong", "description": "You are signed in with a different account than intended" },
+        { "id": "region-block", "description": "The file is not available in your region" }
+      ],
+      "correct": "link-expired"
+    },
+    {
+      "id": "mw17",
+      "scenario": "The team's dashboard lists four services with their alert states.",
+      "goal": "Open the service currently paging the on-call engineer.",
+      "candidates": [
+        { "id": "checkout-api-critical", "description": "checkout-api — CRITICAL: error rate 12%, paging on-call" },
+        { "id": "search-svc-warn", "description": "search-svc — WARNING: latency above target, not paging" },
+        { "id": "metrics-ingest-ok", "description": "metrics-ingest — healthy" },
+        { "id": "docs-site-stale", "description": "docs-site — last deploy 9 days ago, informational" }
+      ],
+      "correct": "checkout-api-critical"
+    },
+    {
+      "id": "mw18",
+      "scenario": "An online course page shows four buttons after finishing lesson 3 of 10.",
+      "goal": "Continue with the next lesson.",
+      "candidates": [
+        { "id": "next-lesson", "description": "Continue to lesson 4" },
+        { "id": "restart-lesson", "description": "Restart lesson 3 from the beginning" },
+        { "id": "course-home", "description": "Back to the course outline" },
+        { "id": "download-certificate", "description": "Download certificate — available after course completion" }
+      ],
+      "correct": "next-lesson"
+    },
+    {
+      "id": "mw19",
+      "scenario": "The office visitor system asks how to register a guest who arrives next Tuesday.",
+      "goal": "Pre-register the guest for the future date.",
+      "candidates": [
+        { "id": "schedule-visit", "description": "Schedule a future visit — visitor badge ready on arrival" },
+        { "id": "check-in-now", "description": "Check in a visitor who is at the desk now" },
+        { "id": "recurring-visitor", "description": "Add a recurring visitor — weekly standing access" },
+        { "id": "view-log", "description": "View today's visitor log" }
+      ],
+      "correct": "schedule-visit"
+    },
+    {
+      "id": "mw20",
+      "scenario": "A smart-home app shows five scenes to run while leaving for a week-long trip.",
+      "goal": "Activate the setting that saves the most energy while away.",
+      "candidates": [
+        { "id": "away-week", "description": "Away (week) — heating off, lights off, cameras on" },
+        { "id": "away-day", "description": "Away (day) — heating setback for one evening" },
+        { "id": "good-night", "description": "Good night — locks doors, lights dimmed, heating stays on" },
+        { "id": "movie", "description": "Movie — blinds down, TV on, ambient lights" },
+        { "id": "focus", "description": "Focus — do-not-disturb lighting for work" }
+      ],
+      "correct": "away-week"
+    }
+  ]
+}

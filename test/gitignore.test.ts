@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -7,5 +8,51 @@ describe(".gitignore", () => {
     const path = fileURLToPath(new URL("../.gitignore", import.meta.url));
     const contents = readFileSync(path, "utf8");
     expect(contents.split("\n").map((line) => line.trim())).toContain("data/");
+  });
+
+  it("ignores jev-spike-runtime/, where the spike's recorded exchanges and reports land", () => {
+    const path = fileURLToPath(new URL("../.gitignore", import.meta.url));
+    const contents = readFileSync(path, "utf8");
+    expect(contents.split("\n").map((line) => line.trim())).toContain("jev-spike-runtime/");
+  });
+});
+
+describe("structural egress scan (R2/KTD10)", () => {
+  // Imports of network-capable modules, `fetch(` call sites, and WebSocket
+  // constructions — a comment *mentioning* a primitive (src/serve/server.ts
+  // cites the client design's proposed WebSocket shape) matches nothing and
+  // stays legal; only code that can actually issue network I/O is flagged.
+  const IMPORT_RE = /\b(?:import|export)\b[^;\n]*from\s+["'](node:)?(http|https|http2|net|tls|dgram|undici|ws)["']/;
+  const BARE_IMPORT_RE = /^\s*import\s+["'](node:)?(http|https|undici|ws)["']/m;
+  const FETCH_CALL_RE = /\bfetch\s*\(/;
+  const WEBSOCKET_USE_RE = /\bnew\s+WebSocket\b|\bWebSocket\s*\(/;
+
+  it("has no network primitive outside src/provider/ and src/serve/ — the adapter-only Jev footprint", () => {
+    const srcRoot = fileURLToPath(new URL("../src", import.meta.url));
+    const offenders: string[] = [];
+    // src/provider/ is the sanctioned adapter boundary; src/serve/ is the
+    // daemon, a network surface by design (HTTP + WebSocket serving is its
+    // documented function, client-tech-design.md Part 2). Everything else —
+    // drafting, derivation, store, permissions, eval, corrections — must stay
+    // free of network primitives so corpus paths have no unplanned egress.
+    const sanctioned = new Set(["provider", "serve"]);
+    const walk = (dir: string, isSrcRoot: boolean): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (isSrcRoot && sanctioned.has(entry.name)) {
+            continue;
+          }
+          walk(path, false);
+        } else if (entry.name.endsWith(".ts")) {
+          const text = readFileSync(path, "utf8");
+          if (IMPORT_RE.test(text) || BARE_IMPORT_RE.test(text) || FETCH_CALL_RE.test(text) || WEBSOCKET_USE_RE.test(text)) {
+            offenders.push(path);
+          }
+        }
+      }
+    };
+    walk(srcRoot, true);
+    expect(offenders).toEqual([]);
   });
 });
