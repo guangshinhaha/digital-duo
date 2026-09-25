@@ -77,6 +77,20 @@ the owner's Mac still opens no inbound port. Corpus, passphrase, derived rules a
 evidence stay exactly where this diagram puts them. The platform decision and its reasoning are
 recorded in [`workspace-platform.md`](workspace-platform.md).
 
+**Amended 2026-09-25, by owner decision (#161):** one sentence of the posture above now has a
+named, per-duo exception — "no data at rest on third-party infrastructure" is waived when a
+duo's owner chooses **org mode**: the org may co-locate per-person daemons on org hardware
+beside the homeserver, same `duo serve` code, one process, one encrypted store, one passphrase
+per person, no multi-tenant rewrite. Personal hardware stays the pilot default
+([`workspace/asleep-duo.md`](workspace/asleep-duo.md) §8). The threat-model change is stated
+plainly in the record: the box's operator can read plaintext artifacts (`duo/rules/*.md`) and
+holds each daemon's passphrase material in memory, so no cryptographic barrier stands between
+the operator and a corpus on their machine — the store's encryption defends against everything
+except the operator. The two-store boundary (`workspace-platform.md` §5) does not move, and
+`duo serve` still refuses wildcard binds. Full record:
+[`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md); #193 carries this into
+the §1.1 rewrite.
+
 ## 1.2 Stack
 
 | Layer | Choice | Why |
