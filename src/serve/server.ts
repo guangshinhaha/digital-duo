@@ -23,8 +23,8 @@ import { importPastedTranscript } from "../ingest/paste-import.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { hasRefusalsDecision, readRefusalsFile } from "../trust/refusals.js";
-import { loadDirectory, resolveAsker } from "../permissions/directory.js";
-import { answerPublicly, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { resolveAskerRef } from "../permissions/directory.js";
+import { answerPublicly, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
@@ -98,23 +98,12 @@ function askerContextFor(principal: Principal, duoDir: string): AskerContext {
   if (principal.kind === "device") {
     return { ref: "owner", resolved: null, askLinkId: null };
   }
-  try {
-    const resolution = resolveAsker(principal.name, loadDirectory(duoDir));
-    return {
-      ref: resolution.resolved ? resolution.identity.id : principal.name,
-      resolved: resolution.resolved,
-      askLinkId: principal.tokenId,
-    };
-  } catch {
-    // A directory that cannot be read at all — malformed JSON throws a
-    // raw SyntaxError from loadDirectory, a wrong shape an
-    // InvalidDirectoryError — logs every ask under the raw name rather
-    // than failing the ask. The directory is owner-maintained; an
-    // unresolvable roster degrades the logs' fidelity, never the answers.
-    // The lookup *ran* and failed, so `resolved: false` — not the null
-    // that would claim no lookup ever happened.
-    return { ref: principal.name, resolved: false, askLinkId: principal.tokenId };
-  }
+  // The resolve-or-degrade core is directory.ts's resolveAskerRef — the
+  // same one the workspace's sender mapping uses (#186), so link asks and
+  // workspace asks log identically. The verified ask link's id rides along
+  // either way; only the ref/resolved pair comes from the directory.
+  const { ref, resolved } = resolveAskerRef(principal.name, principal.name, duoDir);
+  return { ref, resolved, askLinkId: principal.tokenId };
 }
 
 /** Thrown to signal a 400 from inside a route body without duplicating the reply.code(400).send(...) dance at every call site — `registerRoutes` never lets this reach the client uncaught; every parse call site catches it explicitly (below). */
@@ -488,7 +477,7 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       // server-side via console.error, matching the CLI's reportError
       // stderr convention).
       console.error("POST /ask: answering failed:", error);
-      reply.code(500).send(errorBody("internal_error", "Something went wrong answering that."));
+      reply.code(500).send(errorBody("internal_error", PUBLIC_ANSWER_FAILED_MESSAGE));
       return;
     }
   });

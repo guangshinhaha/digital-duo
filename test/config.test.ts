@@ -33,6 +33,13 @@ describe("loadConfig", () => {
       inputPricePerMTok: 0.042,
       runtimeDir: "jev-spike-runtime",
     });
+    expect(config.workspace).toEqual({
+      homeserverUrl: undefined,
+      accessToken: undefined,
+      userId: undefined,
+      reconnect: { initialDelayMs: 1000, maxDelayMs: 60000 },
+      presenceIntervalMs: 240000,
+    });
   });
 
   it("uses exactly the given values with no defaults applied over them", () => {
@@ -63,6 +70,12 @@ describe("loadConfig", () => {
       DUO_JEV_API_KEY: "sk-live",
       DUO_JEV_INPUT_PRICE_PER_MTOK: "0.05",
       DUO_JEV_SPIKE_RUNTIME_DIR: "/tmp/jev-runtime",
+      DUO_WORKSPACE_HOMESERVER: "https://matrix.workspace.example",
+      DUO_WORKSPACE_ACCESS_TOKEN: "syt_secret",
+      DUO_WORKSPACE_USER_ID: "@duo-priya:workspace",
+      DUO_WORKSPACE_RECONNECT_INITIAL_MS: "250",
+      DUO_WORKSPACE_RECONNECT_MAX_MS: "30000",
+      DUO_WORKSPACE_PRESENCE_INTERVAL_MS: "5000",
     });
     expect(config).toEqual({
       providerName: "ollama",
@@ -90,6 +103,13 @@ describe("loadConfig", () => {
         apiKey: "sk-live",
         inputPricePerMTok: 0.05,
         runtimeDir: "/tmp/jev-runtime",
+      },
+      workspace: {
+        homeserverUrl: "https://matrix.workspace.example",
+        accessToken: "syt_secret",
+        userId: "@duo-priya:workspace",
+        reconnect: { initialDelayMs: 250, maxDelayMs: 30000 },
+        presenceIntervalMs: 5000,
       },
     });
   });

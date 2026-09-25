@@ -85,6 +85,20 @@ const DEFAULT_JEV_SPIKE_RUNTIME_DIR = "jev-spike-runtime";
 const DEFAULT_EVAL_JEV_MULTIWAY_TASKS_PATH = "eval/jev-multiway-tasks.json";
 const DEFAULT_EVAL_JEV_TRACES_PATH = "eval/jev-traces.json";
 
+// #186: the outbound workspace connection's timing knobs. The asleep-duo
+// decision record (#188) was still unwritten when these landed, so they are
+// configuration rather than code — #188 can retune hold/asker-messaging
+// behavior without a code change. 1s growing to a 60s ceiling is the
+// conservative reading of "reconnect with backoff": fast enough to feel
+// instant on a blip, quiet enough not to hammer the homeserver overnight.
+const DEFAULT_WORKSPACE_RECONNECT_INITIAL_MS = 1_000;
+const DEFAULT_WORKSPACE_RECONNECT_MAX_MS = 60_000;
+// Presence is server-side state the daemon feeds (docs/workspace-platform.md
+// §5): Synapse forgets "online" after its presence timeout unless refreshed,
+// so a connected daemon re-reports every 4 minutes — under the typical
+// 5-minute default, without being chatty.
+const DEFAULT_WORKSPACE_PRESENCE_INTERVAL_MS = 240_000;
+
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
     return fallback;
@@ -154,6 +168,29 @@ export interface DuoConfig {
     /** Where spike runtime artifacts (recorded exchanges, reports) are written. Defaults to "jev-spike-runtime" (gitignored). */
     runtimeDir: string;
   };
+  /**
+   * #186: the org workspace Matrix connection. All three strings undefined
+   * (the default) means "no workspace" — `duo serve` behaves exactly as it
+   * always has. They are read raw here and validated all-or-nothing by
+   * `workspaceSettingsFrom` (src/workspace/settings.ts) at the point of use,
+   * the same raw-read-then-validate split providerName uses.
+   */
+  workspace: {
+    /** DUO_WORKSPACE_HOMESERVER — the org homeserver's base URL. Undefined when unset; there is deliberately no default. */
+    homeserverUrl: string | undefined;
+    /** DUO_WORKSPACE_ACCESS_TOKEN — the duo's own Matrix account token (docs/workspace-platform.md §6). Undefined when unset. Handled exactly like DUO_PASSPHRASE/DUO_JEV_API_KEY: env-only, never written anywhere by this code. */
+    accessToken: string | undefined;
+    /** DUO_WORKSPACE_USER_ID — the duo's own Matrix user id (`@duo-<owner>:workspace`). Undefined when unset. */
+    userId: string | undefined;
+    reconnect: {
+      /** First reconnect delay after a dropped/failed connection, in ms. Defaults to 1000. */
+      initialDelayMs: number;
+      /** Backoff ceiling, in ms. Defaults to 60000. */
+      maxDelayMs: number;
+    };
+    /** How often a connected daemon re-reports presence, in ms. Defaults to 240000. */
+    presenceIntervalMs: number;
+  };
 }
 
 /**
@@ -200,6 +237,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       apiKey: env.DUO_JEV_API_KEY || undefined,
       inputPricePerMTok: parseNumberEnv(env.DUO_JEV_INPUT_PRICE_PER_MTOK, DEFAULT_JEV_INPUT_PRICE_PER_MTOK),
       runtimeDir: env.DUO_JEV_SPIKE_RUNTIME_DIR || DEFAULT_JEV_SPIKE_RUNTIME_DIR,
+    },
+    workspace: {
+      homeserverUrl: env.DUO_WORKSPACE_HOMESERVER || undefined,
+      accessToken: env.DUO_WORKSPACE_ACCESS_TOKEN || undefined,
+      userId: env.DUO_WORKSPACE_USER_ID || undefined,
+      reconnect: {
+        initialDelayMs: parseNumberEnv(env.DUO_WORKSPACE_RECONNECT_INITIAL_MS, DEFAULT_WORKSPACE_RECONNECT_INITIAL_MS),
+        maxDelayMs: parseNumberEnv(env.DUO_WORKSPACE_RECONNECT_MAX_MS, DEFAULT_WORKSPACE_RECONNECT_MAX_MS),
+      },
+      presenceIntervalMs: parseNumberEnv(env.DUO_WORKSPACE_PRESENCE_INTERVAL_MS, DEFAULT_WORKSPACE_PRESENCE_INTERVAL_MS),
     },
   };
 }
