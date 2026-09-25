@@ -20,6 +20,7 @@ import {
 import { DecryptionError } from "../store/crypto.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists, withDatabase } from "../store/store.js";
+import { durableDuoReadState } from "../serve/workspace-read-state.js";
 import { askerContextForSender } from "../workspace/asker.js";
 import { workspaceSettingsFrom, type WorkspaceSettings } from "../workspace/settings.js";
 import { WorkspaceService } from "../workspace/service.js";
@@ -108,6 +109,12 @@ export async function runServe(
     ? new WorkspaceService({
         settings: workspaceSettings,
         transportFactory: workspaceTransportFactory,
+        // #189: durable read state in the same encrypted store the answers
+        // themselves log to — which events previous processes handled, so a
+        // restart no longer re-answers the sync window. The impl lives in
+        // src/serve/ (the workspace boundary scan forbids the store import
+        // there); its retention is the backlog age window, one concept.
+        readState: durableDuoReadState(config.storePath, passphrase, workspaceSettings.backlog.maxAgeMs),
         // THE answering pipeline, not a workspace twin: the identical
         // answerPublicly call POST /ask makes, argument for argument, with
         // the asking Matrix user resolved through the same directory

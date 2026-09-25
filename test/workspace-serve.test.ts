@@ -92,6 +92,7 @@ describe("runServe + workspace — the outbound connection alongside the unchang
         roomId: "!dm:workspace",
         senderId: "@bob:workspace",
         body: "What did Alice decide about the vendor?",
+        originServerTs: Date.now(),
         joinedMemberIds: [SELF, "@bob:workspace"],
       });
       await until(() => transport.sentAnswers.length >= 1);
@@ -113,6 +114,10 @@ describe("runServe + workspace — the outbound connection alongside the unchang
     } finally {
       await close();
     }
+    // The durable read state coalesces its writes onto the next event-loop
+    // turn; let that turn happen while this test's store still exists, so
+    // the record lands (and no orphaned flush fires after teardown).
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
   });
 
   it("never starts the workspace when unconfigured — zero behavior change for non-workspace users (#186 AC2)", async () => {
@@ -174,6 +179,7 @@ describe("runServe + workspace — the outbound connection alongside the unchang
         roomId: "!dm:workspace",
         senderId: "@bob:workspace",
         body: "What did Alice decide about the vendor?",
+        originServerTs: Date.now(),
         joinedMemberIds: [SELF, "@bob:workspace"],
       });
       await until(() => transport.sentAnswers.length >= 1);
@@ -226,6 +232,54 @@ describe("runServe + workspace — the outbound connection alongside the unchang
       }
     } finally {
       vi.restoreAllMocks();
+    }
+  });
+
+  it("does not re-answer an already-handled question after a restart — durable read state in the encrypted store (#189)", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const question = {
+      eventId: "$once",
+      roomId: "!dm:workspace",
+      senderId: "@bob:workspace",
+      body: "What did Alice decide about the vendor?",
+      originServerTs: Date.now(),
+      joinedMemberIds: [SELF, "@bob:workspace"],
+    };
+    // First process: answers, and records the handled event durably.
+    const firstTransport = new FakeWorkspaceTransport();
+    const first = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => firstTransport as WorkspaceTransport);
+    try {
+      await untilConnected(firstTransport);
+      firstTransport.deliver(question);
+      for (let i = 0; i < 100 && firstTransport.sentAnswers.length === 0; i += 1) {
+        await new Promise((resolveTick) => setTimeout(resolveTick, 10));
+      }
+      expect(firstTransport.sentAnswers).toHaveLength(1);
+    } finally {
+      await first.close();
+    }
+    // The handled-event record coalesces onto the next event-loop turn —
+    // let it land before the test's teardown removes the store, or the
+    // restart below would rightly see nothing handled.
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
+    // Restart: fresh service, same encrypted store — the sync replay of the
+    // same event stays silent where the pre-#189 in-process dedupe would
+    // have re-answered it.
+    const secondTransport = new FakeWorkspaceTransport();
+    const second = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => secondTransport as WorkspaceTransport);
+    try {
+      await untilConnected(secondTransport);
+      secondTransport.deliver(question);
+      // The negative half polls for the same ~1s window the positive halves
+      // allow, so a late answer (the failure this test pins) cannot hide
+      // behind a too-short fixed wait.
+      for (let i = 0; i < 100 && secondTransport.sentAnswers.length === 0; i += 1) {
+        await new Promise((resolveTick) => setTimeout(resolveTick, 10));
+      }
+      expect(secondTransport.sentAnswers).toEqual([]);
+    } finally {
+      await second.close();
     }
   });
 });

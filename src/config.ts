@@ -98,6 +98,20 @@ const DEFAULT_WORKSPACE_RECONNECT_MAX_MS = 60_000;
 // so a connected daemon re-reports every 4 minutes — under the typical
 // 5-minute default, without being chatty.
 const DEFAULT_WORKSPACE_PRESENCE_INTERVAL_MS = 240_000;
+// #189's backlog policy (docs in src/workspace/read-state.ts): an event
+// older than this is marked read, never answered — a duo waking after a
+// night asleep must not reply to yesterday's messages. 1h answers a
+// genuinely-away colleague while killing the overnight zombie, with
+// headroom for modest daemon/homeserver clock skew. The same window is the
+// durable read-state table's retention, so they retune together — #188's
+// territory, as with every knob here.
+const DEFAULT_WORKSPACE_BACKLOG_MAX_AGE_MS = 3_600_000;
+// The answering pipeline's flood bound: at most this many answers per
+// rolling minute, counted at send time. 30 sits above the pipeline's
+// natural serialized throughput (an LLM draft per question), so steady
+// conversation never meets it — only a sync-replay burst or a live flood
+// does, and its excess is marked read and logged rather than queued.
+const DEFAULT_WORKSPACE_MAX_ANSWERS_PER_MINUTE = 30;
 
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
@@ -190,6 +204,12 @@ export interface DuoConfig {
     };
     /** How often a connected daemon re-reports presence, in ms. Defaults to 240000. */
     presenceIntervalMs: number;
+    backlog: {
+      /** Events older than this are marked read, never answered (restart/sync replay). Defaults to 3600000 (1h). */
+      maxAgeMs: number;
+      /** Max answers per rolling 60s — the flood bound protecting the pipeline. Defaults to 30. */
+      maxAnswersPerMinute: number;
+    };
   };
 }
 
@@ -247,6 +267,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
         maxDelayMs: parseNumberEnv(env.DUO_WORKSPACE_RECONNECT_MAX_MS, DEFAULT_WORKSPACE_RECONNECT_MAX_MS),
       },
       presenceIntervalMs: parseNumberEnv(env.DUO_WORKSPACE_PRESENCE_INTERVAL_MS, DEFAULT_WORKSPACE_PRESENCE_INTERVAL_MS),
+      backlog: {
+        maxAgeMs: parseNumberEnv(env.DUO_WORKSPACE_BACKLOG_MAX_AGE_MS, DEFAULT_WORKSPACE_BACKLOG_MAX_AGE_MS),
+        maxAnswersPerMinute: parseNumberEnv(env.DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE, DEFAULT_WORKSPACE_MAX_ANSWERS_PER_MINUTE),
+      },
     },
   };
 }

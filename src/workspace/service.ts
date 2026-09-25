@@ -2,6 +2,7 @@ import type { PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
 import { buildAnswerEvent, buildFailedAnswerEvent } from "./payload.js";
 import { directQuestionFrom } from "./questions.js";
+import { AnswerRateWindow, isStaleEvent, type DuoReadState } from "./read-state.js";
 import type {
   WorkspaceCandidateMessage,
   WorkspaceMemberIdentity,
@@ -63,6 +64,15 @@ export interface WorkspaceServiceOptions {
   readonly settings: WorkspaceSettings;
   readonly transportFactory: WorkspaceTransportFactory;
   readonly answer: WorkspaceAnswerPipeline;
+  /**
+   * #189: the duo's durable read state — which events previous processes
+   * already handled. Injected (`runServe` wires the encrypted-store
+   * implementation; this module cannot import the store, by the pinned
+   * boundary scan). Absent means no durable dedupe: in-process only, the
+   * pre-#189 behavior, which is what every test of the seam-level
+   * semantics runs with.
+   */
+  readonly readState?: DuoReadState;
 }
 
 /**
@@ -76,11 +86,12 @@ export function reconnectDelayMs(attempt: number, reconnect: WorkspaceSettings["
 }
 
 /**
- * Event ids this daemon has already answered, FIFO-capped: the set only
- * needs to cover a sync-replay window after a reconnect (how far back the
- * homeserver's sync replays), so the oldest ids are evicted once the cap is
- * hit rather than growing for a daemon's whole lifetime. Durable dedupe
- * across restarts is #189's read state, not this.
+ * Event ids this daemon has already answered, FIFO-capped: the set covers
+ * in-session duplicates and the in-flight window (a replay arriving while
+ * an answer is still being drafted). Durable dedupe across restarts is the
+ * injected `readState` (#189); this set alone survives only the process,
+ * so the oldest ids are evicted once the cap is hit rather than growing
+ * for a daemon's whole lifetime.
  */
 export class RecentlySeenEventIds {
   private readonly max: number;
@@ -135,9 +146,11 @@ export class RecentlySeenEventIds {
  * sync has caught up; the held events then arrive through `onMessage` and
  * are answered like any other question. The service's own obligations are
  * only to come back (backoff), stay observable (state), and not answer the
- * same event twice (in-process dedupe by event id — #189's read-state work
- * owns durable dedupe across restarts; the one exception is an answer whose
- * send failed, which is forgotten so the replay re-answers it).
+ * same event twice — in-process by event id, across restarts through the
+ * injected durable read state (#189), with the one deliberate exception of
+ * an answer whose send failed, which is forgotten so the replay re-answers
+ * it. The backlog policies (age window, answer rate bound — read-state.ts)
+ * bound what a wake-up replay may ask of the pipeline at all.
  */
 export class WorkspaceService {
   private readonly options: WorkspaceServiceOptions;
@@ -150,10 +163,12 @@ export class WorkspaceService {
   private readonly stateHandlers = new Set<(state: WorkspaceServiceState) => void>();
   private readonly seenEventIds = new RecentlySeenEventIds(10_000);
   private membersById = new Map<string, WorkspaceMemberIdentity>();
+  private readonly answerRate: AnswerRateWindow;
   private answerChain: Promise<void> = Promise.resolve();
 
   constructor(options: WorkspaceServiceOptions) {
     this.options = options;
+    this.answerRate = new AnswerRateWindow(options.settings.backlog.maxAnswersPerMinute);
     this.stateValue = { phase: "stopped", since: new Date().toISOString(), lastAliveAt: null, attempts: 0 };
   }
 
@@ -398,15 +413,69 @@ export class WorkspaceService {
     }
     this.seenEventIds.add(question.eventId);
     // Serialized on purpose: the answering pipeline opens the store per
-    // call, and a burst of held questions replaying after a reconnect must
-    // not interleave drafts inside it.
-    this.answerChain = this.answerChain.then(() => this.answerOne(question)).catch(() => {
-      // answerOne already handles its own failures; this catch only exists
-      // so the chain itself can never reject and poison the next question.
+    // call, the durable read state does the same, and the encrypted store's
+    // decrypt-to-temp-file dance is not re-entrant — a burst of held
+    // questions replaying after a reconnect must not interleave any of it.
+    // (That is also why every store-touching decision below lives in this
+    // chain, never in receive(): a timeline event arriving mid-draft must
+    // not open the store beside the pipeline's own open.)
+    this.answerChain = this.answerChain.then(() => this.handleQuestion(question, message.originServerTs)).catch(() => {
+      // handleQuestion already handles its own failures; this catch only
+      // exists so the chain itself can never reject and poison the next
+      // question.
     });
   }
 
-  private async answerOne(question: WorkspaceQuestion): Promise<void> {
+  /**
+   * One question's full decided fate, on the serialized chain: dedupe
+   * (durable first, then the policies), draft, send, record. The durable
+   * row is written only after a successful send — a crash mid-draft leaves
+   * the event unrecorded so the post-restart replay re-answers it, the same
+   * at-least-once recovery a send failure gets (read-state.ts's stated
+   * semantics).
+   */
+  private async handleQuestion(question: WorkspaceQuestion, originServerTs: number): Promise<void> {
+    if (this.queryReadState(question)) {
+      // A previous process already handled this event — the durable half of
+      // the restart dedupe #219 deferred here. The in-process mark stays:
+      // this process never re-enqueues it either.
+      return;
+    }
+    const backlog = this.options.settings.backlog;
+    const now = Date.now();
+    if (isStaleEvent(originServerTs, now, backlog.maxAgeMs)) {
+      // The backlog age policy: too old to answer, marked read instead, so
+      // the asker is not answered-for yesterday. (A stale event's durable
+      // mark is a no-op by the store's own retention design — the age
+      // window doubles as it — because re-deciding an older-than-window
+      // event always lands on this same skip; in-process, the seen set
+      // already holds it.)
+      this.markRead(question, originServerTs);
+      this.consoleError(
+        `not answering workspace question ${question.eventId}`,
+        new Error(
+          `the event is older than the backlog window (DUO_WORKSPACE_BACKLOG_MAX_AGE_MS=${backlog.maxAgeMs}) — marked read instead of answered`,
+        ),
+      );
+      return;
+    }
+    if (!this.answerRate.allows(now)) {
+      // The rate bound: a flood (sync replay or live) may not pin the
+      // pipeline, and the excess is suppressed in-process and logged
+      // owner-side. It is deliberately NOT durably marked: the bound is a
+      // statement about this process's pipeline capacity, not a verdict on
+      // the event — a flooding sender must not permanently silence fresh
+      // questions that merely arrived behind the flood. A restart replays
+      // them against a fresh window and answers them then; before that,
+      // the in-process seen set holds them.
+      this.consoleError(
+        `not answering workspace question ${question.eventId}`,
+        new Error(
+          `the answer rate bound was reached (DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE=${backlog.maxAnswersPerMinute}) — suppressed for this process, not durably marked, so a restart re-decides it`,
+        ),
+      );
+      return;
+    }
     let content;
     try {
       content = buildAnswerEvent(await this.options.answer(question));
@@ -441,9 +510,50 @@ export class WorkspaceService {
       // homeserver's hold IS the queue, the same recovery a restart gets).
       // The re-answer re-runs the draft, and a send that landed server-side
       // but whose response was lost can double-answer — at-least-once
-      // delivery, deliberately, until #189's durable read state tightens it.
+      // delivery, deliberately, and now consistently so: the durable row
+      // is only ever written after a send that succeeded.
       this.seenEventIds.forget(question.eventId);
       this.consoleError(`sending workspace answer for ${question.eventId} failed`, error);
+      return;
+    }
+    this.answerRate.record(Date.now());
+    this.markRead(question, originServerTs);
+  }
+
+  /**
+   * A durable read-state lookup that degrades, never fails the question: a
+   * store error (disk, passphrase, corruption) is logged and reads as
+   * "not handled" — the worst outcome is the at-least-once re-answer the
+   * pre-#189 daemon always had, never a silently dropped question.
+   */
+  private queryReadState(question: WorkspaceQuestion): boolean {
+    const readState = this.options.readState;
+    if (readState === undefined) {
+      return false;
+    }
+    try {
+      return readState.hasRead(question.eventId);
+    } catch (error) {
+      this.consoleError(`checking durable read state for ${question.eventId} failed`, error);
+      return false;
+    }
+  }
+
+  /**
+   * A durable read-state write that likewise degrades: if recording fails
+   * the answer still went out; the event simply stays unrecorded, so a
+   * replay may answer it again — the same at-least-once stance a crash
+   * between send and record already has.
+   */
+  private markRead(question: WorkspaceQuestion, originServerTs: number): void {
+    const readState = this.options.readState;
+    if (readState === undefined) {
+      return;
+    }
+    try {
+      readState.markRead(question.roomId, question.eventId, originServerTs);
+    } catch (error) {
+      this.consoleError(`recording durable read state for ${question.eventId} failed`, error);
     }
   }
 

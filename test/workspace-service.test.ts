@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../src/permissions/public-answer.js";
+import type { DuoReadState } from "../src/workspace/read-state.js";
 import { availabilityOfState, reconnectDelayMs, RecentlySeenEventIds, WorkspaceService, type WorkspaceServiceState } from "../src/workspace/service.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
 import { WorkspaceTokenRevokedError, type WorkspaceQuestion, type WorkspaceTransport, type WorkspaceMemberIdentityListing } from "../src/workspace/transport.js";
@@ -15,6 +16,7 @@ function settings(overrides: Partial<WorkspaceSettings> = {}): WorkspaceSettings
     userId: SELF,
     reconnect: { initialDelayMs: 1000, maxDelayMs: 8000 },
     presenceIntervalMs: 5000,
+    backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
     ...overrides,
   };
 }
@@ -43,7 +45,7 @@ interface Harness {
   states: WorkspaceServiceState[];
 }
 
-function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>): Harness {
+function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>, readState?: DuoReadState): Harness {
   const transport = new FakeWorkspaceTransport();
   const answers: WorkspaceQuestion[] = [];
   const service = new WorkspaceService({
@@ -53,18 +55,20 @@ function harness(harnessSettings: WorkspaceSettings = settings(), answerImpl?: (
       answers.push(question);
       return answered(`answer to ${question.body}`);
     }),
+    readState,
   });
   const states: WorkspaceServiceState[] = [];
   service.onState((state) => states.push(state));
   return { transport, service, answers, states };
 }
 
-function dm(message: { eventId: string; body: string; senderId?: string }) {
+function dm(message: { eventId: string; body: string; senderId?: string; originServerTs?: number }) {
   return {
     eventId: message.eventId,
     roomId: "!dm:workspace",
     senderId: message.senderId ?? "@bob:workspace",
     body: message.body,
+    originServerTs: message.originServerTs ?? Date.now(),
     joinedMemberIds: [SELF, "@bob:workspace"],
   };
 }
@@ -879,6 +883,203 @@ describe("WorkspaceService — a revoked token fails fast, not forever (#187, fr
     await flush();
     expect(transport.connectCalls).toBe(2);
     expect(service.state().phase).toBe("revoked");
+    await service.stop();
+  });
+});
+
+describe("WorkspaceService — durable read state and the backlog policies (#189)", () => {
+  /** A DuoReadState that records what was marked, for asserting the durable half. */
+  class RecordingReadState implements DuoReadState {
+    readonly marked: { roomId: string; eventId: string; originServerTs: number }[] = [];
+    private readonly ids = new Set<string>();
+
+    hasRead(eventId: string): boolean {
+      return this.ids.has(eventId);
+    }
+
+    markRead(roomId: string, eventId: string, originServerTs: number): void {
+      this.ids.add(eventId);
+      this.marked.push({ roomId, eventId, originServerTs });
+    }
+  }
+
+  it("does not re-answer an event a previous process already handled — the restart dedupe #219 deferred here", async () => {
+    const readState = new RecordingReadState();
+    readState.markRead("!dm:workspace", "$q1", Date.now());
+    const { transport, service, answers } = harness(settings(), undefined, readState);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$q1", body: "asked before the restart" }));
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    // Suppressed by the durable set, not re-marked: the one recorded mark
+    // is the test's own setup, nothing new.
+    expect(readState.marked).toHaveLength(1);
+    await service.stop();
+  });
+
+  it("records an answered event durably — after the send, so a fresh process will not answer it again", async () => {
+    const readState = new RecordingReadState();
+    const { transport, service } = harness(settings(), undefined, readState);
+    service.start();
+    await flush();
+    const at = Date.now();
+    transport.deliver(dm({ eventId: "$q1", body: "once, durably", originServerTs: at }));
+    await flush();
+    expect(readState.marked).toEqual([{ roomId: "!dm:workspace", eventId: "$q1", originServerTs: at }]);
+    // The restart: a fresh service sharing the read state replays the same
+    // event and stays silent.
+    const secondTransport = new FakeWorkspaceTransport();
+    const second = new WorkspaceService({
+      settings: settings(),
+      transportFactory: () => (secondTransport as WorkspaceTransport),
+      answer: async (question) => answered(question.body),
+      readState,
+    });
+    second.start();
+    await flush();
+    secondTransport.deliver(dm({ eventId: "$q1", body: "once, durably", originServerTs: at }));
+    await flush();
+    expect(secondTransport.sentAnswers).toEqual([]);
+    await second.stop();
+    await service.stop();
+  });
+
+  it("records nothing durable when the send fails — the replay re-answers, at-least-once preserved (#219's stance, now consistent)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const readState = new RecordingReadState();
+    const { transport, service, answers } = harness(settings(), undefined, readState);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$q", body: "asked before the drop" }));
+    transport.dropConnection();
+    await flush();
+    expect(answers).toHaveLength(1);
+    expect(readState.marked).toEqual([]);
+    transport.hold(dm({ eventId: "$q", body: "asked before the drop" }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await flush();
+    expect(answers).toHaveLength(2);
+    // Only the successful re-answer is durable.
+    expect(readState.marked).toHaveLength(1);
+    await service.stop();
+  });
+
+  it("skips an event older than the backlog window — marked read, logged owner-side, never answered", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const readState = new RecordingReadState();
+    const { transport, service, answers } = harness(
+      settings({ backlog: { maxAgeMs: 1000, maxAnswersPerMinute: 30 } }),
+      undefined,
+      readState,
+    );
+    service.start();
+    await flush();
+    const ancient = Date.now() - 5000;
+    transport.deliver(dm({ eventId: "$old", body: "asked last night", originServerTs: ancient }));
+    await flush();
+    expect(answers).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    expect(readState.marked).toEqual([{ roomId: "!dm:workspace", eventId: "$old", originServerTs: ancient }]);
+    const logged = consoleError.mock.calls.map((call) => String(call[0]));
+    expect(logged.some((line) => line.includes("not answering workspace question $old"))).toBe(true);
+    await service.stop();
+  });
+
+  it("rate-bounds a flood — at most the configured answers per rolling minute, the excess suppressed, logged, and never durably marked", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const readState = new RecordingReadState();
+    const { transport, service, answers } = harness(
+      settings({ backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 1 } }),
+      undefined,
+      readState,
+    );
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$first", body: "first" }));
+    transport.deliver(dm({ eventId: "$second", body: "second" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["first"]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to first"]);
+    // Only the answered event is durable. The excess was suppressed for
+    // this process alone: the bound is a statement about pipeline capacity,
+    // not a verdict on the event — durably marking it would let a flooder
+    // permanently silence fresh questions that merely arrived behind the
+    // flood (the in-process seen set holds them until the restart).
+    expect(readState.marked.map((marked) => marked.eventId)).toEqual(["$first"]);
+    const logged = consoleError.mock.calls.map((call) => String(call[0]));
+    expect(logged.some((line) => line.includes("not answering workspace question $second"))).toBe(true);
+    await service.stop();
+  });
+
+  it("re-answers rate-bound excess after a restart — a fresh window re-decides what this process merely lacked capacity for", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const readState = new RecordingReadState();
+    const bounded = settings({ backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 1 } });
+    const { transport, service, answers } = harness(bounded, undefined, readState);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$first", body: "first" }));
+    transport.deliver(dm({ eventId: "$second", body: "second" }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["first"]);
+    await service.stop();
+    // Restart: the same durable read state (only "$first" is in it), a
+    // fresh rate window — the suppressed event is decided again, and this
+    // time answered.
+    const secondTransport = new FakeWorkspaceTransport();
+    const secondAnswers: WorkspaceQuestion[] = [];
+    const second = new WorkspaceService({
+      settings: bounded,
+      transportFactory: () => (secondTransport as WorkspaceTransport),
+      answer: async (question) => {
+        secondAnswers.push(question);
+        return answered(`answer to ${question.body}`);
+      },
+      readState,
+    });
+    second.start();
+    await flush();
+    secondTransport.deliver(dm({ eventId: "$second", body: "second" }));
+    await flush();
+    expect(secondAnswers.map((question) => question.body)).toEqual(["second"]);
+    expect(secondTransport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to second"]);
+    await second.stop();
+  });
+
+  it("degrades, never fails, when the durable read state errors — a store failure reads as 'not handled' and the answer still goes out", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const broken: DuoReadState = {
+      hasRead: () => {
+        throw new Error("store is unhappy");
+      },
+      markRead: () => {
+        throw new Error("store is unhappy");
+      },
+    };
+    const { transport, service, answers } = harness(settings(), undefined, broken);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$q1", body: "answer me anyway" }));
+    await flush();
+    expect(answers).toHaveLength(1);
+    expect(transport.sentAnswers).toHaveLength(1);
+    // Both the failed lookup and the failed record are visible owner-side
+    // as read-state failures — a store problem never masquerades as a
+    // question-handling one.
+    const logged = consoleError.mock.calls.map((call) => String(call[0]));
+    expect(logged.some((line) => line.includes("durable read state"))).toBe(true);
+    await service.stop();
+  });
+
+  it("keeps the pre-#189 behavior with no read state injected — answers replayed duplicates exactly once, in-process", async () => {
+    const { transport, service, answers } = harness();
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$q1", body: "once" }));
+    await flush();
+    expect(answers).toHaveLength(1);
     await service.stop();
   });
 });

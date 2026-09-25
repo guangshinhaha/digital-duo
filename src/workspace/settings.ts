@@ -1,4 +1,5 @@
 import type { DuoConfig } from "../config.js";
+import type { WorkspaceBacklogPolicy } from "./read-state.js";
 
 /**
  * #186: whether `duo serve` dials out to the org workspace at all. The three
@@ -36,6 +37,15 @@ export interface WorkspaceSettings {
     readonly maxDelayMs: number;
   };
   readonly presenceIntervalMs: number;
+  /**
+   * #189's backlog policy knobs (read-state.ts documents the semantics):
+   * how old an event may be and still be answered on a restart/sync
+   * catch-up, and how many answers per rolling minute the pipeline will
+   * give a flood. Defaults come from config.ts (1h / 30 per minute); #188
+   * retunes them without a code change, the same stance the timing knobs
+   * above take.
+   */
+  readonly backlog: WorkspaceBacklogPolicy;
 }
 
 /**
@@ -104,6 +114,23 @@ export function workspaceSettingsFrom(config: DuoConfig): WorkspaceSettings | nu
     }
   }
 
+  // #189's backlog knobs are validated with the same all-or-nothing stance:
+  // a zero/negative age window or rate bound is not a "skip the policy"
+  // setting but a broken one — the age window is also the durable
+  // read-state table's retention, and a rate bound of zero would refuse
+  // every question. The count must additionally be a whole number: half an
+  // answer per minute has no meaning the sliding window could apply.
+  if (!Number.isFinite(config.workspace.backlog.maxAgeMs) || config.workspace.backlog.maxAgeMs <= 0) {
+    throw new WorkspaceConfigError(
+      `DUO_WORKSPACE_BACKLOG_MAX_AGE_MS must be a positive number of milliseconds (got ${JSON.stringify(config.workspace.backlog.maxAgeMs)}) — the backlog window doubles as the durable read state's retention, and a zero or negative value would prune or refuse everything`,
+    );
+  }
+  if (!Number.isInteger(config.workspace.backlog.maxAnswersPerMinute) || config.workspace.backlog.maxAnswersPerMinute < 1) {
+    throw new WorkspaceConfigError(
+      `DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE must be a whole number of at least 1 (got ${JSON.stringify(config.workspace.backlog.maxAnswersPerMinute)}) — zero would refuse every question`,
+    );
+  }
+
   return {
     // All three are set — `missing` is empty here — but the filter above
     // doesn't narrow the destructured bindings, hence the assertions.
@@ -112,5 +139,6 @@ export function workspaceSettingsFrom(config: DuoConfig): WorkspaceSettings | nu
     userId: userId!,
     reconnect: config.workspace.reconnect,
     presenceIntervalMs: config.workspace.presenceIntervalMs,
+    backlog: config.workspace.backlog,
   };
 }

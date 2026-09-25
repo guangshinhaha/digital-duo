@@ -10,6 +10,7 @@ function candidate(overrides: Partial<WorkspaceCandidateMessage> = {}): Workspac
     roomId: "!dm:workspace",
     senderId: "@bob:workspace",
     body: "What did Alice decide about the vendor?",
+    originServerTs: Date.now(),
     joinedMemberIds: [SELF, "@bob:workspace"],
     ...overrides,
   };
@@ -49,5 +50,17 @@ describe("directQuestionFrom — v1: a direct question is a text message from th
 
   it("treats duplicate member listings as the one member they are", () => {
     expect(directQuestionFrom(candidate({ joinedMemberIds: [SELF, "@bob:workspace", "@bob:workspace"] }), SELF)).not.toBeNull();
+  });
+
+  it("never treats another duo's message as a question — the duo-to-duo loop #219 flagged, closed structurally (#189)", () => {
+    // A direct room whose other member is a DIFFERENT duo: the self-filter
+    // alone would pass it (the sender is not our exact user id), and the
+    // two daemons would answer each other forever. The sender's kind —
+    // derived from the @duo- convention, the same authorFromUserId the
+    // message contract uses — refuses it.
+    expect(directQuestionFrom(candidate({ senderId: "@duo-bob:workspace", joinedMemberIds: [SELF, "@duo-bob:workspace"] }), SELF)).toBeNull();
+    // The convention is @duo-<owner>: a bare @duo localpart is not the
+    // convention and stays a person's message.
+    expect(directQuestionFrom(candidate({ senderId: "@duo:workspace", joinedMemberIds: [SELF, "@duo:workspace"] }), SELF)).not.toBeNull();
   });
 });

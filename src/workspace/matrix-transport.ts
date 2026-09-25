@@ -145,9 +145,23 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
     if (event.getType() !== EventType.RoomMessage) {
       return;
     }
-    const content = event.getContent() as { msgtype?: unknown; body?: unknown };
+    const content = event.getContent() as Record<string, unknown>;
     if (content.msgtype !== MsgType.Text || typeof content.body !== "string") {
       return;
+    }
+    // An edited message arrives as an m.replace replacement whose top-level
+    // body is the "* " fallback marker — the same marker the message
+    // contract refuses to treat as text. The edited text lives in
+    // m.new_content.body (a top-level key beside m.relates_to): prefer it,
+    // so a person editing their question re-asks the question as written,
+    // and the marker never reaches a draft.
+    const relatesTo = content["m.relates_to"];
+    let body = content.body;
+    if (relatesTo !== null && typeof relatesTo === "object" && (relatesTo as Record<string, unknown>).rel_type === "m.replace") {
+      const newContent = content["m.new_content"];
+      if (newContent !== null && typeof newContent === "object" && typeof (newContent as Record<string, unknown>).body === "string") {
+        body = (newContent as Record<string, unknown>).body as string;
+      }
     }
     const senderId = event.getSender();
     if (senderId === undefined || room === undefined) {
@@ -157,7 +171,8 @@ export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTra
       eventId: event.getId() ?? "",
       roomId: event.getRoomId() ?? room.roomId,
       senderId,
-      body: content.body,
+      body,
+      originServerTs: event.getTs(),
       joinedMemberIds: room.getJoinedMembers().map((member) => member.userId),
     };
     for (const handler of messageHandlers) {
