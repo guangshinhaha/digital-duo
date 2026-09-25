@@ -1,3 +1,4 @@
+import { authorFromUserId, isDuoAuthor } from "./messages.js";
 import type { WorkspaceCandidateMessage, WorkspaceQuestion } from "./transport.js";
 
 /**
@@ -8,11 +9,24 @@ import type { WorkspaceCandidateMessage, WorkspaceQuestion } from "./transport.j
  * consent questions around them are #189/#192 and are deliberately not
  * guessed at here: a three-plus-member room produces no question at all
  * rather than a wrong one.
+ *
+ * #189 adds the structural guard #219's successor notes flagged: the sender
+ * must be a PERSON, not merely "not this duo". A message from another duo
+ * (`@duo-*`, the record §6 convention, read through the same
+ * `authorFromUserId` the message contract uses) is not a question — v1's
+ * answering is person-to-duo, and without this guard a duo-to-duo direct
+ * room would answer each other's messages in a loop (the self-filter only
+ * ever excluded our own exact user id). Duo-to-duo conversation, if it ever
+ * becomes product, is #192's consent surface, not a filter loosened here.
  */
 export function directQuestionFrom(message: WorkspaceCandidateMessage, selfUserId: string): WorkspaceQuestion | null {
   if (message.senderId === selfUserId) {
     // The duo's own messages (an earlier answer replayed by sync, a local
     // echo) are never questions to itself.
+    return null;
+  }
+  if (isDuoAuthor(authorFromUserId(message.senderId))) {
+    // Another duo's message is never a question to this duo.
     return null;
   }
   if (message.body.trim().length === 0) {

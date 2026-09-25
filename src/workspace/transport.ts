@@ -102,6 +102,14 @@ export interface WorkspaceCandidateMessage {
   readonly roomId: string;
   readonly senderId: string;
   readonly body: string;
+  /**
+   * The homeserver's epoch-millisecond timestamp for the event
+   * (`origin_server_ts`) — server time, when it was actually sent, not when
+   * the daemon happened to receive it (held questions arrive late by
+   * design). #189's backlog age policy reads this: an event older than the
+   * configured window is marked read, never answered.
+   */
+  readonly originServerTs: number;
   /** User ids of the room's joined members, including the duo itself. */
   readonly joinedMemberIds: readonly string[];
 }

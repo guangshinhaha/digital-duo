@@ -25,6 +25,7 @@ describe("workspaceSettingsFrom — no workspace is a supported state, half a wo
       userId: "@duo-alice:workspace",
       reconnect: { initialDelayMs: 1000, maxDelayMs: 60000 },
       presenceIntervalMs: 240000,
+      backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
     });
   });
 
@@ -94,5 +95,24 @@ describe("workspaceSettingsFrom — no workspace is a supported state, half a wo
     );
     expect(settings?.reconnect).toEqual({ initialDelayMs: 250, maxDelayMs: 30000 });
     expect(settings?.presenceIntervalMs).toBe(5000);
+  });
+
+  it("refuses a broken backlog knob — the age window is also the read-state retention, and a zero rate bound would refuse every question (#189)", () => {
+    expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_BACKLOG_MAX_AGE_MS: "0" }))).toThrow(
+      /DUO_WORKSPACE_BACKLOG_MAX_AGE_MS must be a positive number of milliseconds/,
+    );
+    expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE: "0" }))).toThrow(
+      /DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE must be a whole number of at least 1/,
+    );
+    expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE: "2.5" }))).toThrow(
+      /DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE must be a whole number of at least 1/,
+    );
+  });
+
+  it("honors the backlog knobs from env — #188 retunes the wake-up replay policy without a code change", () => {
+    const settings = workspaceSettingsFrom(
+      configWithWorkspace({ ...FULL, DUO_WORKSPACE_BACKLOG_MAX_AGE_MS: "900000", DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE: "5" }),
+    );
+    expect(settings?.backlog).toEqual({ maxAgeMs: 900000, maxAnswersPerMinute: 5 });
   });
 });

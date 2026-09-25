@@ -124,6 +124,7 @@ function settings(): WorkspaceSettings {
     userId: "@duo-alice:workspace",
     reconnect: { initialDelayMs: 1000, maxDelayMs: 8000 },
     presenceIntervalMs: 5000,
+    backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
   };
 }
 
@@ -135,6 +136,7 @@ interface TimelineEventInit {
   type?: string;
   msgtype?: unknown;
   body?: unknown;
+  ts?: number;
 }
 
 function timelineEvent(init: TimelineEventInit = {}) {
@@ -144,6 +146,7 @@ function timelineEvent(init: TimelineEventInit = {}) {
     getSender: () => (init.senderMissing ? undefined : (init.senderId ?? "@bob:workspace")),
     getId: () => init.eventId ?? "$e1",
     getRoomId: () => init.roomId ?? "!room:workspace",
+    getTs: () => init.ts ?? 1_758_000_000_000,
   };
 }
 
@@ -237,19 +240,20 @@ describe("Matrix adapter — onDisconnected fires only on the states the SDK can
 });
 
 describe("Matrix adapter — timeline normalization at the seam", () => {
-  it("forwards a text room message normalized to the seam's shape, live and backlog-replayed alike", () => {
+  it("forwards a text room message normalized to the seam's shape, live and backlog-replayed alike — carrying the homeserver's timestamp for #189's backlog policy", () => {
     const transport = createMatrixTransport(settings());
     const messages: WorkspaceCandidateMessage[] = [];
     transport.onMessage((message) => messages.push(message));
     // Backlog (replayed by the initial sync — the held-not-lost path), then live.
-    client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$held" }), room(), true, false, {});
-    client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$live" }), room(), false, false, {});
+    client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$held", ts: 1_758_000_000_000 }), room(), true, false, {});
+    client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$live", ts: 1_758_000_004_000 }), room(), false, false, {});
     expect(messages).toEqual([
       {
         eventId: "$held",
         roomId: "!room:workspace",
         senderId: "@bob:workspace",
         body: "What did Alice decide?",
+        originServerTs: 1_758_000_000_000,
         joinedMemberIds: ["@duo-alice:workspace", "@bob:workspace"],
       },
       {
@@ -257,6 +261,41 @@ describe("Matrix adapter — timeline normalization at the seam", () => {
         roomId: "!room:workspace",
         senderId: "@bob:workspace",
         body: "What did Alice decide?",
+        originServerTs: 1_758_000_004_000,
+        joinedMemberIds: ["@duo-alice:workspace", "@bob:workspace"],
+      },
+    ]);
+  });
+
+  it("unwraps an edited message's m.new_content.body — the '* ' fallback marker never reaches a draft", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    // A person edits their question: the SDK hands the adapter the
+    // replacement event, whose top-level body is the "* " fallback marker.
+    client.emit(
+      RoomEvent.Timeline,
+      {
+        ...timelineEvent({ eventId: "$edit" }),
+        getContent: () => ({
+          msgtype: "m.text",
+          body: "* What did Alice decide about the renewal?",
+          "m.new_content": { msgtype: "m.text", body: "What did Alice decide about the renewal?" },
+          "m.relates_to": { rel_type: "m.replace", event_id: "$q1" },
+        }),
+      },
+      room(),
+      false,
+      false,
+      {},
+    );
+    expect(messages).toEqual([
+      {
+        eventId: "$edit",
+        roomId: "!room:workspace",
+        senderId: "@bob:workspace",
+        body: "What did Alice decide about the renewal?",
+        originServerTs: 1_758_000_000_000,
         joinedMemberIds: ["@duo-alice:workspace", "@bob:workspace"],
       },
     ]);
