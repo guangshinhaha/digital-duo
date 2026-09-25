@@ -180,6 +180,20 @@ Slack mention
   → DM owner: draft + source links + [Send] [Edit] [Ignore]
 ```
 
+**Extended 2026-09-25, proposed (#183, pending ratification):** a question may carry
+*attachments* — and "attach" means ephemeral grounding, never silent import. An attachment
+grounds the one draft it rode with, appears in that draft's sources as a new `attachment`
+kind (`id` + stripped label only), and is retained nowhere: the file stays in the workspace
+where the sharer put it, and the daemon holds the text in memory for the one draft call,
+dropping it on return. Corpus import — keep, index, let it move the rules — remains the
+separate, explicitly labelled, owner-only act of the existing two-phase ingest path. A
+marked attachment above the owner's configured ceiling is refused with an escalation naming
+the marking (the ceiling refuses rather than quarantines everywhere else, and #164's strip
+was for content the ceiling had already admitted); within the ceiling, every echo of its
+text strips, including prompt assembly. v1 grounding types are `text/plain` and
+`text/markdown`, size-bounded at the door; images are blocked on #14 (no provider
+decision). Full record: [`workspace/attachments.md`](workspace/attachments.md).
+
 ## 1.8 Confidence
 
 Self-reported LLM confidence is poorly calibrated and is weighted lowest. Composite of:
