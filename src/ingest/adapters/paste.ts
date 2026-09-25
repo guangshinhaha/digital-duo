@@ -2,8 +2,18 @@ import { createHash } from "node:crypto";
 import { createRecord, type IngestRecord, type RecordAuthor } from "../record.js";
 import { isWorkRelevant } from "../work-relevance.js";
 
-/** Thrown when pasted text has no line recognisable as a turn (see TURN_MARKER). Names the expected format. */
-export class MalformedTranscriptError extends Error {}
+/**
+ * Thrown when pasted text has no line recognisable as a turn (see
+ * TURN_MARKER). Names the expected format. Sets `name` so the serve
+ * layer's error-to-status mapping (#176) can tell it apart from a generic
+ * Error — the same idiom every named error that reaches HTTP follows.
+ */
+export class MalformedTranscriptError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MalformedTranscriptError";
+  }
+}
 
 /** "Human:"/"Me:" for the owner's turns, "Assistant:"/"Claude:" for the model's — case-insensitive, one turn per matching line. */
 const TURN_MARKER = /^(human|me|assistant|claude)\s*:\s?(.*)$/i;

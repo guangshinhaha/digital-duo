@@ -45,11 +45,19 @@ export interface EmbedRecordsResult {
  * moment it returns), so the async network round-trips to Ollama happen
  * outside it, between a read pass (what needs embedding) and a write pass
  * (persisting what got computed).
+ *
+ * `opts.limit` (#176) embeds at most that many pending records per call —
+ * the serve layer's embed job calls in batches so a client can watch the
+ * count climb rather than waiting on one opaque whole-corpus call. The
+ * result shape is unchanged (a partial batch still reports only what this
+ * call embedded); the CLI passes no limit and embeds everything, exactly
+ * as before.
  */
 export async function embedRecords(
   storePath: string,
   passphrase: string,
   provider: EmbeddingProvider,
+  opts: { limit?: number } = {},
 ): Promise<EmbedRecordsResult> {
   const { pending, total } = withDatabase(storePath, passphrase, false, (db) => {
     ensureRecordsSchema(db);
@@ -69,12 +77,13 @@ export async function embedRecords(
     return { pending: pendingRows, total: totalRow.count };
   });
 
-  if (pending.length === 0) {
+  const batch = opts.limit === undefined ? pending : pending.slice(0, opts.limit);
+  if (batch.length === 0) {
     return { embedded: 0, total };
   }
 
   const computed: { id: string; vector: readonly number[] }[] = [];
-  for (const record of pending) {
+  for (const record of batch) {
     computed.push({ id: record.id, vector: await provider.embed(record.text) });
   }
 

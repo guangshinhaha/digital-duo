@@ -69,6 +69,7 @@ export async function runServe(
     embeddingProvider,
     inferenceProvider,
     confidenceConfig: config.confidence,
+    classificationCeiling: config.classificationCeiling,
     ownerName: config.ownerName,
     env,
   };
