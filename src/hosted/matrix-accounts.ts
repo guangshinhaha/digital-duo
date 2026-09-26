@@ -73,14 +73,21 @@ export type ProvisionStatus =
   /** Already provisioned earlier; nothing was called. */
   | "already"
   /** Synapse could not do it right now; the duo is marked pending and will be retried. */
-  | "pending";
+  | "pending"
+  /**
+   * Something the daemon cannot fix by asking Synapse again: recorded accounts that do not fit the
+   * duo's org or the configured server (nothing is written, nothing is retried), or an unexpected
+   * error (logged by name; the duo is still retried, with backoff, if it has no accounts).
+   * Needs an operator.
+   */
+  | "failed";
 
 export interface ProvisionOutcome {
   readonly duoId: string;
   readonly status: ProvisionStatus;
   /** Present for `provisioned` and `already`. Never a token. */
   readonly accounts?: HostedMatrixAccountsView;
-  /** Present for `pending`: the scrubbed reason. */
+  /** Present for `pending` and `failed`: the scrubbed reason. */
   readonly error?: string;
 }
 
@@ -88,6 +95,7 @@ export interface ProvisionSummary {
   readonly provisioned: number;
   readonly already: number;
   readonly pending: number;
+  readonly failed: number;
   readonly outcomes: readonly ProvisionOutcome[];
 }
 
@@ -98,7 +106,14 @@ export interface MatrixProvisionerOptions {
   readonly serverName?: string;
   /** One line per event. Carries duo ids and scrubbed reasons only; defaults to stderr. */
   readonly log?: (line: string) => void;
+  /** `retryPending` waits this long after a duo's first failed attempt, doubling per further failure. Default one minute. */
+  readonly retryBaseMs?: number;
+  /** ... and never longer than this between attempts. Default thirty minutes. */
+  readonly retryMaxMs?: number;
 }
+
+const DEFAULT_RETRY_BASE_MS = 60_000;
+const DEFAULT_RETRY_MAX_MS = 30 * 60_000;
 
 /** The duo's display name on Matrix; the human name is the person's. */
 function duoDisplayName(ownerName: string): string {
@@ -115,7 +130,8 @@ function duoDisplayName(ownerName: string): string {
  *   a refused request leaves the duo marked pending (visible, counted,
  *   retried) and returns `pending`, so it cannot block a sign-up. Only a
  *   bug (an id the naming rules reject, a duo the registry does not know)
- *   throws.
+ *   throws from `provision`; the sweeps (`provisionAll`, `retryPending`)
+ *   catch it per duo and report it as `failed`, so one bad duo costs one outcome.
  * - **One run per duo at a time.** A sign-up, the startup backfill and an
  *   admin's `provision` can overlap; they share one attempt, so a duo is
  *   never given two tokens.
@@ -126,6 +142,7 @@ export class MatrixProvisioner {
   private readonly inflight = new Map<string, Promise<ProvisionOutcome>>();
   private serverNameCache: string | undefined;
   private readonly log: (line: string) => void;
+  private stopped = false;
 
   constructor(private readonly options: MatrixProvisionerOptions) {
     this.serverNameCache = options.serverName === undefined ? undefined : assertServerName(options.serverName);
@@ -152,18 +169,68 @@ export class MatrixProvisioner {
     return attempt;
   }
 
-  /** Provisions every duo that lacks accounts; the backfill, and the retry. Duos that already have them cost nothing. */
-  async provisionAll(): Promise<ProvisionSummary> {
+  /** Provisions every duo that lacks accounts; the backfill. Duos that already have them cost nothing. */
+  provisionAll(): Promise<ProvisionSummary> {
+    return this.sweep(this.duoIds());
+  }
+
+  /**
+   * The timer's sweep: only duos still owed accounts whose backoff has passed. A duo that failed
+   * n times waits base x 2^(n-1) after its last attempt (capped), so a Synapse that is down or
+   * hanging costs a duo one attempt, one registry write and one log line per backoff, not per tick.
+   * The backoff is read from the registry's own pending record, so it survives a restart.
+   */
+  retryPending(now: number = Date.now()): Promise<ProvisionSummary> {
+    return this.sweep(this.dueDuoIds(now));
+  }
+
+  /** Whether any duo is owed accounts and due a retry now; lets a timer skip a tick without starting a sweep. */
+  hasRetryDue(now: number = Date.now()): boolean {
+    return this.dueDuoIds(now).length > 0;
+  }
+
+  private dueDuoIds(now: number): string[] {
+    const base = this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
+    const max = this.options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS;
+    return this.pendingDuoIds().filter((duoId) => {
+      const pending = this.options.registry.matrixPending(duoId);
+      return !pending || Date.parse(pending.lastAttemptAt) + Math.min(base * 2 ** Math.min(pending.attempts - 1, 30), max) <= now;
+    });
+  }
+
+  /** After this, a running sweep finishes the duo it is on and starts no other. For shutdown; `provision` is unaffected. */
+  stop(): void {
+    this.stopped = true;
+  }
+
+  /** One duo at a time. One duo's unexpected error is that duo's outcome, never the sweep's. */
+  private async sweep(duoIds: readonly string[]): Promise<ProvisionSummary> {
     const outcomes: ProvisionOutcome[] = [];
-    for (const duoId of this.duoIds()) {
-      outcomes.push(await this.provision(duoId));
+    for (const duoId of duoIds) {
+      if (this.stopped) {
+        break;
+      }
+      try {
+        outcomes.push(await this.provision(duoId));
+      } catch (error) {
+        outcomes.push(this.unexpected(duoId, error));
+      }
     }
-    return {
-      provisioned: outcomes.filter((outcome) => outcome.status === "provisioned").length,
-      already: outcomes.filter((outcome) => outcome.status === "already").length,
-      pending: outcomes.filter((outcome) => outcome.status === "pending").length,
-      outcomes,
-    };
+    const count = (status: ProvisionStatus) => outcomes.filter((outcome) => outcome.status === status).length;
+    return { provisioned: count("provisioned"), already: count("already"), pending: count("pending"), failed: count("failed"), outcomes };
+  }
+
+  /** Logs the error's name only (a message could quote something it should not), and best-effort marks the duo so it backs off. */
+  private unexpected(duoId: string, error: unknown): ProvisionOutcome {
+    const name = error instanceof Error ? error.name : "error";
+    this.log(`hosted: Matrix provisioning failed unexpectedly for duo ${duoId} (${name})`);
+    const reason = `unexpected error (${name}); see the daemon log`;
+    try {
+      this.options.registry.recordMatrixFailure(duoId, reason);
+    } catch {
+      // The registry may be what failed, or the duo may not exist; the outcome and the log still say so.
+    }
+    return { duoId, status: "failed", error: reason };
   }
 
   /** Resolves when nothing is running; for tests and orderly shutdown. */
@@ -198,7 +265,10 @@ export class MatrixProvisioner {
       // Recorded accounts must still be this org's and this server's; a mismatch is reported, never silently re-provisioned.
       const problem = accountProblem(duoId, org.id, existing, this.serverNameCache);
       if (problem) {
-        return this.fail(duoId, problem);
+        // Not `fail`: a pending mark on a duo that has accounts is never cleared and never retried
+        // (`pendingDuoIds` skips it), so it would only add a registry write per sweep and a false "will be retried".
+        this.log(`hosted: ${problem}; it needs an operator, nothing was changed`);
+        return { duoId, status: "failed", error: problem };
       }
       return { duoId, status: "already", accounts: matrixAccountsView(existing) };
     }
@@ -211,13 +281,34 @@ export class MatrixProvisioner {
       await admin.putUser(duoUserId, { displayName: duoDisplayName(member.name) });
       // The duo's token never expires (§5): the daemon holds it for good and the registry keeps it encrypted.
       const token = await admin.mintToken(duoUserId, { neverExpires: true });
-      const accounts = registry.setMatrixAccounts(duoId, { personUserId, duoUserId }, token);
+      const accounts = this.storeToken(duoId, personUserId, duoUserId, token);
       this.log(`hosted: provisioned Matrix accounts for duo ${duoId}`);
       return { duoId, status: "provisioned", accounts };
     } catch (error) {
       if (error instanceof SynapseAdminError) {
         return this.fail(duoId, error.message);
       }
+      throw error;
+    }
+  }
+
+  /**
+   * The mint and this write are two steps, and Synapse cannot be asked for the token again: a
+   * process that dies between them, or a write that keeps failing, leaves a token that never
+   * expires on the duo's account and that nothing recorded (docs/deploy/hosted-mode.md). One
+   * immediate retry covers a transient write error and cannot double-mint (the token is already
+   * in hand); a second failure is logged, without the token, and rethrown.
+   */
+  private storeToken(duoId: string, personUserId: string, duoUserId: string, token: string): HostedMatrixAccountsView {
+    const { registry } = this.options;
+    try {
+      try {
+        return registry.setMatrixAccounts(duoId, { personUserId, duoUserId }, token);
+      } catch {
+        return registry.setMatrixAccounts(duoId, { personUserId, duoUserId }, token);
+      }
+    } catch (error) {
+      this.log(`hosted: minted a Matrix token for duo ${duoId} but could not store it (${error instanceof Error ? error.name : "error"}); an unrecorded token now exists on ${duoUserId}`);
       throw error;
     }
   }

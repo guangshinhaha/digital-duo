@@ -324,21 +324,34 @@ export async function createHostedServer(
         admin: new SynapseAdmin({ baseUrl: settings.synapse.adminUrl, adminToken: settings.synapse.adminToken, fetch: extras.synapseFetch, timeoutMs: extras.synapseTimeoutMs }),
         serverName: settings.synapse.serverName,
         log: extras.log,
+        retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
       })
     : undefined;
   // An unexpected failure is logged by name only (a message could quote something it should not), and never stops the server.
   const logUnexpected = (error: unknown): void => {
     (extras.log ?? ((line) => console.error(line)))(`hosted: Matrix provisioning failed unexpectedly (${error instanceof Error ? error.name : "error"})`);
   };
-  const runProvisioning = (): void => {
-    matrix?.provisionAll().catch(logUnexpected);
+  // One sweep at a time: a tick that finds the last sweep still running (a slow Synapse) skips itself
+  // instead of piling a second sweep onto it. The provisioner's own backoff spaces out each failed duo.
+  let sweeping = false;
+  const runSweep = (sweep: () => Promise<unknown>): void => {
+    if (!matrix || sweeping) {
+      return;
+    }
+    sweeping = true;
+    sweep()
+      .catch(logUnexpected)
+      .finally(() => {
+        sweeping = false;
+      });
   };
+  const runProvisioning = (): void => runSweep(() => matrix!.provisionAll());
   let retryTimer: NodeJS.Timeout | undefined;
   if (matrix) {
     runProvisioning();
     retryTimer = setInterval(() => {
-      if (matrix.pendingDuoIds().length > 0) {
-        runProvisioning();
+      if (matrix.hasRetryDue()) {
+        runSweep(() => matrix.retryPending());
       }
     }, extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS);
     retryTimer.unref();
@@ -694,6 +707,8 @@ export async function createHostedServer(
       if (retryTimer) {
         clearInterval(retryTimer);
       }
+      // Stop the sweep from starting its next duo, then wait for the one in flight.
+      matrix?.stop();
       await matrix?.whenIdle();
       await new Promise<void>((resolve) => front.close(() => resolve()));
       await Promise.all([control.close(), rootDuo?.app.close(), ...Array.from(duos.values(), (duo) => duo.app.close())]);

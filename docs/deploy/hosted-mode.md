@@ -140,11 +140,20 @@ homeserver, and neither account has a password.
 - **When.** After an invite is redeemed, before the sign-up answers, but bounded: sign-up waits a
   few seconds for Synapse and then answers regardless. A Synapse that is down, slow or refusing
   never blocks an invite. The duo is marked pending in the registry (`matrixPending`, with the
-  attempt count and a scrubbed reason) and retried every minute.
+  attempt count and a scrubbed reason) and retried by a timer that checks every minute. Retries back
+  off per duo: a duo that has failed n times waits one minute x 2^(n-1) after its last attempt,
+  capped at 30 minutes, so a Synapse that is down or hanging costs each duo one attempt, one
+  registry write and one log line per backoff, not per tick. A sweep never overlaps the previous
+  one, and shutdown (`close()`) lets the duo in flight finish and starts no other.
 - **Backfill.** At startup the daemon provisions every duo, and the root duo, that lacks accounts.
   `duo hosted provision` (`POST /hosted/matrix/provision`, super admin) does the same on demand
-  and prints counts. Both are safe to repeat: a provisioned duo costs no call, and the account
-  calls are idempotent `PUT`s.
+  and prints counts: provisioned, already done, pending (Synapse's fault, retried) and needs
+  attention (`failed`). Both are safe to repeat: a provisioned duo costs no call, and the account
+  calls are idempotent `PUT`s. One duo's unexpected error is that duo's `failed` outcome and
+  a log line naming the error type; it does not stop the sweep or turn the route into a 500.
+- **Needs attention.** Recorded accounts that do not fit the duo's org or the configured server
+  are reported as `failed` and logged, and nothing is written or retried: the daemon never
+  re-provisions over them. Fix the registry or the variable, then run `duo hosted provision`.
 - **The duo's access token** is minted through the admin login API without an expiry (the
   daemon holds it for good), and stored in the registry encrypted under `DUO_HOSTED_MASTER_KEY`
   like the duo's passphrase. It is read only by `registry.duoMatrixToken(duoId)`. No route
@@ -157,6 +166,14 @@ homeserver, and neither account has a password.
 - **Not to do.** Never call `/logout/all` as `@workspace-admin`: it would expire every token the
   daemon minted. Provisioning cannot recreate a token it has lost; it mints a new one only for a
   duo that has none recorded.
+- **One window it cannot close.** The token is minted by Synapse, then written to the registry:
+  two steps. If the process dies between them, or the write keeps failing (a full disk), the
+  token exists on the duo's account, never expires and is recorded nowhere, and the next run mints
+  another. The daemon retries the write once at once (the token is already in hand, so that cannot
+  double-mint) and, if it still fails, logs `minted a Matrix token for duo <id> but could not store
+  it` with no token in it. When you see that line or a crash right after provisioning, revoke the
+  duo account's stray tokens as an operator (Synapse admin API, that one user only, never
+  `/logout/all` as `@workspace-admin`) and run `duo hosted provision` again.
 
 Read side, for the work that builds on this (`src/hosted/registry.ts`, `src/hosted/matrix-accounts.ts`):
 
@@ -164,7 +181,7 @@ Read side, for the work that builds on this (`src/hosted/registry.ts`, `src/host
 registry.matrixAccounts(duoId): HostedMatrixAccounts | undefined  // { personUserId, duoUserId, duoTokenCipher, provisionedAt }
 registry.duoMatrixToken(duoId): string | undefined                // decrypted; daemon-internal only
 registry.matrixPending(duoId): MatrixPending | undefined
-hosted.matrix?.provision(duoId) / .provisionAll() / .pendingDuoIds()
+hosted.matrix?.provision(duoId) / .provisionAll() / .retryPending() / .pendingDuoIds() / .stop()
 ```
 
 ## Variables (in addition to `railway.md`'s)

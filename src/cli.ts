@@ -171,9 +171,12 @@ hostedCommand
   .action(async () => {
     try {
       const summary = await runHostedProvision();
-      console.log(`Provisioned ${summary.provisioned}, already done ${summary.already}, pending ${summary.pending}.`);
+      console.log(`Provisioned ${summary.provisioned}, already done ${summary.already}, pending ${summary.pending}, needs attention ${summary.failed}.`);
       for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "pending")) {
         console.log(`  ${outcome.duoId}: pending (${outcome.error ?? "unknown"}) — it will be retried`);
+      }
+      for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "failed")) {
+        console.log(`  ${outcome.duoId}: needs attention (${outcome.error ?? "unknown"}) — see the daemon log`);
       }
     } catch (error) {
       reportError(error);

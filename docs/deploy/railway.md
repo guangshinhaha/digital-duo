@@ -38,6 +38,19 @@ Railway's edge terminates TLS and is the only inbound path, so the daemon binds 
 | `DUO_CORS_ORIGINS` | `https://${{duo-web.RAILWAY_PUBLIC_DOMAIN}}` |
 | `DUO_OWNER_NAME` | Your name, as public answers attribute it |
 
+### Hosted mode and Matrix (optional)
+
+Only when the daemon serves a multi-org hosted workspace with a Synapse next to it
+(`hosted-mode.md`, `hosted-workspace.md`). Set the first two together; one without the other
+refuses to start.
+
+| Variable | What it does |
+|---|---|
+| `DUO_WORKSPACE_PRIVATE_URL` | Where the daemon reaches Synapse, on the private network: `http://synapse.railway.internal:8008` (https, or http on a `*.railway.internal` host). Used for the admin API only. |
+| `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin` service account's access token. It acts as any user, so keep it in the daemon's variables only and never share it with a duo. |
+| `DUO_WORKSPACE_SERVER_NAME` | Optional. Synapse's `server_name` (`duo`). Unset, the daemon reads it from the admin token's own user id. It is permanent once accounts exist. |
+| `DUO_WORKSPACE_PUBLIC_URL` | The https address clients are given for Synapse. It is not used to call Synapse. |
+
 Volume: mount at `/data`. The store (`data/duo.db`), the derived `duo/` files and the runtime logs
 all live there. The container `cd`s into the volume, and `duo` on its PATH does the same.
 

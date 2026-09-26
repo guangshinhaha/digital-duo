@@ -1,6 +1,6 @@
-import type { AddressInfo } from "node:net";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { createFakeSynapse, FAKE_ADMIN_TOKEN, FAKE_SYNAPSE_URL, type FakeSynapse } from "./helpers/fake-synapse.js";
 import { useTempDir } from "./helpers/temp-dir.js";
@@ -262,6 +262,119 @@ describe("the backfill", () => {
     expect(done.outcomes[0]).toMatchObject({ duoId: id, status: "provisioned" });
     expect(await runHostedProvision(env)).toMatchObject({ provisioned: 0, already: 1, pending: 0 });
     expect(JSON.stringify(done)).not.toContain("syt_");
+  });
+});
+
+/** Existing duos with no accounts; the caller then starts the server with Synapse configured. */
+async function duosOwedAccounts(count: number): Promise<string[]> {
+  const before = await start({ synapse: undefined });
+  const ids: string[] = [];
+  for (let n = 0; n < count; n += 1) {
+    ids.push(((await (await signup(before.base, await invite(before.base), `Duo ${n}`)).json()) as { tenantId: string }).tenantId);
+  }
+  await running.pop()!.close();
+  return ids;
+}
+
+describe("the retry sweep", () => {
+  it("does not start a second sweep while one is still running, and backs off each failed duo", async () => {
+    const ids = await duosOwedAccounts(2);
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const fake = createFakeSynapse();
+      let hangingCalls = 0;
+      let failingCalls = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      // The first duo's requests fail at once; the second duo's hang. A second sweep would retry the first while the second is stuck.
+      const mixed: typeof fetch = async (input, init) => {
+        if (String(input).includes(ids[0]!)) {
+          failingCalls += 1;
+          return new Response(JSON.stringify({ errcode: "M_UNKNOWN" }), { status: 500 });
+        }
+        hangingCalls += 1;
+        await gate;
+        return fake.fetch(input, init);
+      };
+      const { hosted } = await start({ hostedRoot: join(tempDir(), "hosted") }, { extras: { synapseFetch: mixed, provisionRetryMs: 1_000, synapseTimeoutMs: 600_000 } });
+      // The startup sweep is stuck on the second duo. Ten ticks pass; none starts another sweep.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(failingCalls).toBe(1);
+      expect(hangingCalls).toBe(1);
+      expect(hosted.registry.matrixPending(ids[0]!)?.attempts).toBe(1);
+
+      // Synapse goes down (rather than hanging): the sweep ends with both duos pending, then backoff spaces the retries.
+      fake.down = true;
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      await hosted.matrix!.whenIdle();
+      expect(ids.map((id) => hosted.registry.matrixPending(id)?.attempts ?? 0)).toEqual([1, 1]);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      // Ten ticks of 1s: one attempt per tick would be 11; doubling waits give about 4.
+      const attempts = ids.map((id) => hosted.registry.matrixPending(id)!.attempts);
+      expect(attempts[0]).toBeGreaterThanOrEqual(3);
+      expect(attempts[0]).toBeLessThanOrEqual(5);
+      expect(attempts[1]).toBe(attempts[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("shutdown", () => {
+  it("close() stops the sweep from starting the next duo instead of waiting out the whole list", async () => {
+    const ids = await duosOwedAccounts(5);
+    const fake = createFakeSynapse();
+    const slow: typeof fetch = async (input, init) => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return fake.fetch(input, init);
+    };
+    const { hosted } = await start({ hostedRoot: join(tempDir(), "hosted") }, { extras: { synapseFetch: slow } });
+    const started = Date.now();
+    await running.pop()!.close();
+    // One duo is three calls (person, duo, mint) at 60ms; five duos would be about 900ms.
+    expect(Date.now() - started).toBeLessThan(600);
+    expect(ids.filter((id) => hosted.registry.matrixAccounts(id)).length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("the provision route and CLI survive an unexpected error", () => {
+  it("answers with counts including failed (not a 500), and the CLI call times out instead of hanging", async () => {
+    await duosOwedAccounts(2);
+    const fake = createFakeSynapse();
+    // whoami answers a server part the naming rules reject: a bug-shaped failure, not a Synapse one.
+    const poisoned: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/whoami")) {
+        return new Response(JSON.stringify({ user_id: "@workspace-admin:duo/evil" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return fake.fetch(input, init);
+    };
+    const { base, logs } = await start(
+      { synapse: { adminUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, serverName: undefined, publicUrl: undefined }, hostedRoot: join(tempDir(), "hosted") },
+      { extras: { synapseFetch: poisoned } },
+    );
+    const response = await fetch(`${base}/hosted/matrix/provision`, { method: "POST", headers: admin });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ provisioned: 0, pending: 0, failed: 2 });
+    expect(logs.some((line) => line.includes("failed unexpectedly"))).toBe(true);
+    expect(logs.join("\n")).not.toContain(FAKE_ADMIN_TOKEN);
+
+    // A daemon that accepts the connection and never answers.
+    const sockets = new Set<Socket>();
+    const silent = createServer((socket) => {
+      sockets.add(socket);
+    });
+    await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", () => resolve()));
+    try {
+      const env = { PORT: String((silent.address() as AddressInfo).port), DUO_HOSTED_MASTER_KEY: MASTER, DUO_HOSTED_ADMIN_TOKEN: ADMIN };
+      await expect(runHostedProvision(env, 150)).rejects.toThrow(/did not answer within 0\.15s/);
+    } finally {
+      sockets.forEach((socket) => socket.destroy());
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
   });
 });
 

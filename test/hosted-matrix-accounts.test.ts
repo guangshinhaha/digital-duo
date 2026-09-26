@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -283,7 +283,162 @@ describe("reconcileMatrixAccounts", () => {
       log: () => {},
     });
     const outcome = await moved.provision(id);
-    expect(outcome.status).toBe("pending");
+    expect(outcome.status).toBe("failed");
     expect(outcome.error).toMatch(/different server/);
+  });
+
+  it("a mismatch needs an operator: it is reported and logged, but writes no pending mark and is never retried", async () => {
+    const { registry, provisioner, path, logs } = setup();
+    const id = addDuo(registry, "Sam");
+    await provisioner.provision(id);
+    const tampered = JSON.parse(readFileSync(path, "utf8"));
+    tampered.tenants[0].matrix.personUserId = `@wrongorg.${id}:duo.test`;
+    writeFileSync(path, JSON.stringify(tampered));
+    const reopened = new HostedRegistry(path, MASTER);
+    const sweeper = new MatrixProvisioner({ registry: reopened, admin: new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: createFakeSynapse().fetch }), serverName: FAKE_SERVER_NAME, log: (line) => logs.push(line) });
+
+    const summary = await sweeper.provisionAll();
+    expect(summary).toMatchObject({ provisioned: 0, already: 0, pending: 0, failed: 1 });
+    expect(summary.outcomes[0]).toMatchObject({ duoId: id, status: "failed", error: expect.stringContaining("do not match its org") });
+    expect(reopened.matrixPending(id)).toBeUndefined();
+    expect(logs.some((line) => line.includes("needs an operator"))).toBe(true);
+    // Running again does not add attempts, and the retry sweep has nothing to do for it.
+    await sweeper.provisionAll();
+    expect(reopened.matrixPending(id)).toBeUndefined();
+    expect(sweeper.pendingDuoIds()).toEqual([]);
+    expect((await sweeper.retryPending()).outcomes).toEqual([]);
+  });
+});
+
+describe("MatrixProvisioner — one duo's bug does not stop the sweep", () => {
+  it("an unexpected error is that duo's outcome; later duos are still provisioned, and only the error's name is logged", async () => {
+    const { registry, fake, logs } = setup();
+    const first = addDuo(registry, "A");
+    const second = addDuo(registry, "B");
+    const real = fake.fetch;
+    // whoami answers a server part the naming rules reject (a slash), once: a bug-shaped failure, not a Synapse one.
+    let poisoned = true;
+    const provisioner = new MatrixProvisioner({
+      registry,
+      admin: new SynapseAdmin({
+        baseUrl: FAKE_SYNAPSE_URL,
+        adminToken: FAKE_ADMIN_TOKEN,
+        fetch: async (input, init) => {
+          const url = String(input);
+          if (poisoned && url.endsWith("/whoami")) {
+            poisoned = false;
+            return new Response(JSON.stringify({ user_id: "@workspace-admin:duo/evil" }), { status: 200, headers: { "content-type": "application/json" } });
+          }
+          return real(input, init);
+        },
+      }),
+      log: (line) => logs.push(line),
+    });
+    const summary = await provisioner.provisionAll();
+    expect(summary).toMatchObject({ provisioned: 1, failed: 1, pending: 0 });
+    const outcomes = new Map(summary.outcomes.map((outcome) => [outcome.duoId, outcome]));
+    expect(outcomes.get(first)).toMatchObject({ status: "failed", error: expect.stringContaining("Error") });
+    expect(outcomes.get(second)!.status).toBe("provisioned");
+    expect(logs.some((line) => line.includes(`failed unexpectedly for duo ${first} (Error)`))).toBe(true);
+    expect(logs.join("\n")).not.toContain("duo/evil");
+    // It is still owed accounts, marked so it backs off, and the next run finishes it.
+    expect(registry.matrixPending(first)).toMatchObject({ attempts: 1 });
+    expect((await provisioner.provisionAll()).provisioned).toBe(1);
+  });
+
+  it("a registry write that fails while storing the token is retried once, and a token that cannot be stored is logged without the token", async () => {
+    const { registry, fake, logs, provisioner } = setup();
+    const ok = addDuo(registry, "A");
+    const lost = addDuo(registry, "B");
+    const real = registry.setMatrixAccounts.bind(registry);
+    let calls = 0;
+    registry.setMatrixAccounts = (duoId, ids, token) => {
+      calls += 1;
+      if (duoId === ok && calls === 1) {
+        throw new Error("disk hiccup");
+      }
+      if (duoId === lost) {
+        throw new Error(`disk full ${token}`);
+      }
+      return real(duoId, ids, token);
+    };
+    const summary = await provisioner.provisionAll();
+    // The transient failure was retried in place: one token, one duo done.
+    expect(registry.matrixAccounts(ok)).toBeDefined();
+    expect(fake.minted.filter((entry) => entry.userId.includes(ok))).toHaveLength(1);
+    // The persistent one is reported, named in the log, and leaks no token.
+    expect(summary).toMatchObject({ provisioned: 1, failed: 1 });
+    expect(logs.some((line) => line.includes(`minted a Matrix token for duo ${lost} but could not store it`))).toBe(true);
+    for (const entry of fake.minted) {
+      expect(JSON.stringify([logs, summary])).not.toContain(entry.token);
+    }
+  });
+});
+
+describe("MatrixProvisioner — retryPending backs off per duo", () => {
+  it("skips a duo until base x 2^(attempts-1) has passed since its last attempt, then tries again", async () => {
+    const { registry, fake, provisioner } = setup();
+    const id = addDuo(registry, "Sam");
+    fake.down = true;
+    await provisioner.provision(id); // attempt 1
+    const attempts = () => registry.matrixPending(id)!.attempts;
+    const last = () => Date.parse(registry.matrixPending(id)!.lastAttemptAt);
+
+    // Default base is 60s: nothing is due 30s later, and no request is made.
+    const calls = fake.requests.length;
+    expect(provisioner.hasRetryDue(last() + 30_000)).toBe(false);
+    expect((await provisioner.retryPending(last() + 30_000)).outcomes).toEqual([]);
+    expect(fake.requests).toHaveLength(calls);
+
+    expect((await provisioner.retryPending(last() + 60_000)).pending).toBe(1); // attempt 2
+    expect(attempts()).toBe(2);
+    // The second failure waits twice as long.
+    expect(provisioner.hasRetryDue(last() + 119_000)).toBe(false);
+    expect(provisioner.hasRetryDue(last() + 120_000)).toBe(true);
+    // And the wait is capped.
+    for (let n = 0; n < 12; n += 1) {
+      await provisioner.provision(id);
+    }
+    expect(provisioner.hasRetryDue(last() + 30 * 60_000 - 1)).toBe(false);
+    expect(provisioner.hasRetryDue(last() + 30 * 60_000)).toBe(true);
+  });
+});
+
+describe("MatrixProvisioner — stop()", () => {
+  it("lets the duo in flight finish and starts no other", async () => {
+    const { registry, fake } = setup();
+    const ids = [addDuo(registry, "A"), addDuo(registry, "B"), addDuo(registry, "C")];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const provisioner = new MatrixProvisioner({
+      registry,
+      admin: new SynapseAdmin({
+        baseUrl: FAKE_SYNAPSE_URL,
+        adminToken: FAKE_ADMIN_TOKEN,
+        fetch: async (input, init) => {
+          entered();
+          await gate;
+          return fake.fetch(input, init);
+        },
+      }),
+      serverName: FAKE_SERVER_NAME,
+      log: () => {},
+    });
+    const sweep = provisioner.provisionAll();
+    await started;
+    provisioner.stop();
+    release();
+    const summary = await sweep;
+    expect(summary.outcomes.map((outcome) => outcome.duoId)).toEqual([ids[0]]);
+    expect(registry.matrixAccounts(ids[0]!)).toBeDefined();
+    expect(registry.matrixAccounts(ids[1]!)).toBeUndefined();
+    expect((await provisioner.retryPending()).outcomes).toEqual([]);
+    await provisioner.whenIdle();
   });
 });
