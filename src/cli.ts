@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedServe } from "./commands/hosted.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runConnectorNew, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -148,17 +148,70 @@ program
     }
   });
 
-const hostedCommand = program.command("hosted").description("Hosted mode administration: invite people to create their own duo on this server");
+const hostedCommand = program.command("hosted").description("Hosted mode administration: orgs, and inviting people to create their own duo on this server");
 
 hostedCommand
   .command("invite <name>")
   .description("Mint a single-use invite link for <name> (run on the server; talks to the running hosted daemon)")
   .option("--expires-in-hours <n>", "hours before the invite expires", parseIntegerOption("--expires-in-hours"), 168)
-  .action(async (name: string, options: { expiresInHours: number }) => {
+  .option("--org <id>", "the org the invitee joins (see `duo hosted org list`); default is the default org")
+  .action(async (name: string, options: { expiresInHours: number; org?: string }) => {
     try {
-      const invite = await runHostedInvite(name, options.expiresInHours);
-      console.log(`Invite for "${invite.name}" (expires ${invite.expiresAt}, single use):`);
+      const invite = await runHostedInvite(name, options.expiresInHours, process.env, options.org);
+      console.log(`Invite for "${invite.name}" into org ${invite.orgId} (expires ${invite.expiresAt}, single use):`);
       console.log(invite.link ?? `code: ${invite.code} (set DUO_HOSTED_PUBLIC_URL and DUO_HOSTED_WEB_URL to get a full link)`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const hostedOrgCommand = hostedCommand.command("org").description("Orgs on this hosted server (talks to the running hosted daemon)");
+
+hostedOrgCommand
+  .command("create <name>")
+  .description("Create an org")
+  .action(async (name: string) => {
+    try {
+      const org = await runHostedOrgCreate(name);
+      console.log(`Created org "${org.name}" (id ${org.id}). Invite people into it: duo hosted invite "<name>" --org ${org.id}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgCommand
+  .command("list")
+  .description("List orgs and how many duos are in each")
+  .action(async () => {
+    try {
+      for (const org of await runHostedOrgList()) {
+        console.log(`${org.id}\t${org.name}\t${org.memberCount} member${org.memberCount === 1 ? "" : "s"}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgCommand
+  .command("rename <id> <name>")
+  .description("Rename an org")
+  .action(async (id: string, name: string) => {
+    try {
+      const org = await runHostedOrgRename(id, name);
+      console.log(`Renamed org ${org.id} to "${org.name}".`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgCommand
+  .command("members <id>")
+  .description("List the duos in an org")
+  .action(async (id: string) => {
+    try {
+      for (const member of await runHostedOrgMembers(id)) {
+        console.log(`${member.duoId}\t${member.name}\t${member.email ?? "-"}${member.isAdmin ? "\tadmin" : ""}`);
+      }
     } catch (error) {
       reportError(error);
     }
