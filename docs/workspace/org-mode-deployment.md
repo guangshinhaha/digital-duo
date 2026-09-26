@@ -18,7 +18,9 @@
 1. **Org mode is the org running the workspace homeserver — already decided, #185 — and
    optionally co-locating per-person duo daemons on org hardware beside it.** Same `duo serve`
    code, one process, one encrypted store, one passphrase per person. No multi-tenant rewrite,
-   now or later (§2).
+   now or later (§2). *Amended 2026-09-26 for the hosted POC: `docs/deploy/hosted-mode.md` serves
+   many such duos from one process — still one unchanged app and one store per person, not a
+   multi-tenant rewrite.*
 2. **The pilot default stays daemons-on-own-hardware** (#188 §8: "a deployment mode an owner or
    org may choose … availability is then a deployment property, not a platform guarantee").
    Co-location is the always-on option; personal hardware is not deprecated by this record and

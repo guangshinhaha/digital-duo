@@ -168,6 +168,7 @@ export async function runServe(
     // #192: the consent routes' service — present exactly when the workspace
     // is (the consent surface is wired with it, one configuration).
     workspace,
+    trustProxy: options.behindProxy ?? false,
   };
 
   const app = createServer(deps);

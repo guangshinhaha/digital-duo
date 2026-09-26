@@ -29,6 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
+import { runHostedInvite, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -135,11 +136,29 @@ program
     "--behind-proxy",
     "allow a wildcard --host — only for a container whose sole inbound path is a TLS-terminating front (e.g. Railway)",
   )
-  .action(async (options: { host?: string; port: number; behindProxy?: boolean }) => {
+  .option("--hosted", "serve many duos from one process, invite-only (docs/deploy/hosted-mode.md)")
+  .action(async (options: { host?: string; port: number; behindProxy?: boolean; hosted?: boolean }) => {
     const config = loadConfig();
     try {
-      const { address } = await runServe({ host: options.host, port: options.port, behindProxy: options.behindProxy }, config);
+      const serveOptions = { host: options.host, port: options.port, behindProxy: options.behindProxy };
+      const { address } = options.hosted ? await runHostedServe(serveOptions, config) : await runServe(serveOptions, config);
       console.error(`duo serve listening on ${address}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const hostedCommand = program.command("hosted").description("Hosted mode administration: invite people to create their own duo on this server");
+
+hostedCommand
+  .command("invite <name>")
+  .description("Mint a single-use invite link for <name> (run on the server; talks to the running hosted daemon)")
+  .option("--expires-in-hours <n>", "hours before the invite expires", parseIntegerOption("--expires-in-hours"), 168)
+  .action(async (name: string, options: { expiresInHours: number }) => {
+    try {
+      const invite = await runHostedInvite(name, options.expiresInHours);
+      console.log(`Invite for "${invite.name}" (expires ${invite.expiresAt}, single use):`);
+      console.log(invite.link ?? `code: ${invite.code} (set DUO_HOSTED_PUBLIC_URL and DUO_HOSTED_WEB_URL to get a full link)`);
     } catch (error) {
       reportError(error);
     }
