@@ -79,6 +79,10 @@ Then in claude.ai: Settings, Connectors, Add custom connector, paste the URL. In
 "save this to my duo". Claude calls `save_to_duo`; the text is ingested under the duo's classification
 ceiling and embedded before Claude answers.
 
+- To feed past chats: after adding the connector, paste the prompt from `GET /connector` (`historyPrompt`) into
+  a claude.ai chat. Claude searches your past chats (paid plans) and saves notes with `save_notes_to_duo`, up
+  to 50 per call. The notes are Claude's summaries, not exact copies, and only identical text is recognised as
+  already saved, so continue from the date range Claude reports rather than re-running the same range.
 - The URL is a password. Anyone holding it can write to that duo. Treat a leak by running `duo connector new`.
 - Hosted duos use `/t/<duo-id>/mcp/<secret>`, and a secret only ever works for the duo that minted it.
 - The app can mint the same URL: `POST /connector` returns `{ path }` once; join it to the duo's base URL.

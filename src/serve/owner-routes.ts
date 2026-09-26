@@ -8,6 +8,7 @@ import { grantAutonomy } from "../trust/grants.js";
 import { isTrustTier } from "../trust/grid.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers } from "../trust/promotion.js";
 import { DeriveJob } from "./derive-job.js";
+import { buildHistoryPrompt } from "./mcp.js";
 import type { ServeDeps } from "./server.js";
 import {
   AskTokenNotFoundError,
@@ -146,14 +147,18 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
   // #227: the claude.ai connector. POST mints this duo's connector secret
   // (revoking any earlier one) and returns its path once; the client joins
   // it to the daemon base it already talks to, which under hosted mode
-  // carries the duo's /t/<id> prefix. GET reports whether one is live.
+  // carries the duo's /t/<id> prefix. GET reports whether one is live, plus
+  // the prompt the owner pastes into claude.ai to feed their past chats.
   app.post("/connector", async (_request, reply) => {
     const minted = createConnectorToken(deps.storePath, deps.passphrase);
     reply.code(201);
     return { id: minted.id, createdAt: minted.createdAt, path: `/mcp/${minted.token}` };
   });
 
-  app.get("/connector", async () => ({ connector: getConnectorToken(deps.storePath, deps.passphrase) ?? null }));
+  app.get("/connector", async () => ({
+    connector: getConnectorToken(deps.storePath, deps.passphrase) ?? null,
+    historyPrompt: buildHistoryPrompt(deps.classificationCeiling),
+  }));
 
   app.get("/trust/promotions", async () => getPendingPromotionOffers(deps.storePath, deps.passphrase, deps.duoDir));
 

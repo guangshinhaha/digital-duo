@@ -57,6 +57,18 @@ async function saveThroughConnector(url: string, text: string): Promise<string> 
   }
 }
 
+/** Calls save_notes_to_duo the same way: one MCP call carrying several notes. */
+async function saveNotesThroughConnector(url: string, notes: string[]): Promise<string> {
+  const client = new Client({ name: "test-claude", version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+  try {
+    const result = await client.callTool({ name: "save_notes_to_duo", arguments: { notes } });
+    return (result.content as { type: string; text: string }[])[0].text;
+  } finally {
+    await client.close();
+  }
+}
+
 function connectorRecords(storePath: string) {
   return listRecords(storePath, PASSPHRASE).filter((record) => record.source === CONNECTOR_SOURCE);
 }
@@ -158,12 +170,81 @@ describe("MCP connector (#227)", () => {
     expect(connectorRecords(storePath)).toHaveLength(1);
   });
 
+  it("saves several notes in one call, all embedded, and reports the counts", async () => {
+    const { base, storePath } = await startDuo("owner");
+    const { token } = createConnectorToken(storePath, PASSPHRASE);
+
+    const reply = await saveNotesThroughConnector(`${base}/mcp/${token}`, ["The budget deadline moved.", "The printer on the floor is broken.", "Leave approvals go to Sam."]);
+
+    expect(reply).toBe("Done: 3 saved, 0 already in your duo, 0 refused as above your classification ceiling.");
+    const saved = connectorRecords(storePath);
+    expect(saved).toHaveLength(3);
+    for (const record of saved) {
+      expect(embeddedIds(storePath)).toContain(record.id);
+    }
+  });
+
+  it("sorts a mixed batch: new notes saved, repeats and above-ceiling notes reported, none double-counted", async () => {
+    const { base, storePath } = await startDuo("owner");
+    const { token } = createConnectorToken(storePath, PASSPHRASE);
+    await saveThroughConnector(`${base}/mcp/${token}`, "Saved before.");
+
+    const reply = await saveNotesThroughConnector(`${base}/mcp/${token}`, [
+      "Saved before.",
+      "A brand new note.",
+      "A brand new note.",
+      "SECRET: launch codes",
+    ]);
+
+    expect(reply).toBe("Done: 1 saved, 2 already in your duo, 1 refused as above your classification ceiling.");
+    expect(connectorRecords(storePath).map((record) => record.text).sort()).toEqual(["A brand new note.", "Saved before."]);
+  });
+
+  it("refuses more notes than one call allows and writes nothing", async () => {
+    const { base, storePath } = await startDuo("owner");
+    const { token } = createConnectorToken(storePath, PASSPHRASE);
+
+    const tooMany = Array.from({ length: 51 }, (_, index) => `note ${index}`);
+    const reply = await saveNotesThroughConnector(`${base}/mcp/${token}`, tooMany);
+    expect(reply).toMatch(/expected array to have <=50 items/);
+    expect(connectorRecords(storePath)).toEqual([]);
+  });
+
+  it("keeps a saved batch when embedding fails, and says so", async () => {
+    const down: EmbeddingProvider = {
+      name: "down",
+      model: "down",
+      async embed() {
+        throw new Error("Ollama unreachable");
+      },
+    };
+    const { base, storePath } = await startDuo("owner", down);
+    const { token } = createConnectorToken(storePath, PASSPHRASE);
+
+    const reply = await saveNotesThroughConnector(`${base}/mcp/${token}`, ["One.", "Two."]);
+
+    expect(reply).toMatch(/^Done: 2 saved/);
+    expect(reply).toMatch(/not searchable by meaning yet/);
+    expect(connectorRecords(storePath)).toHaveLength(2);
+  });
+
+  it("refuses a batch sent to a wrong connector URL and writes nothing", async () => {
+    const { base, storePath } = await startDuo("owner");
+    createConnectorToken(storePath, PASSPHRASE);
+
+    await expect(saveNotesThroughConnector(`${base}/mcp/not-the-secret`, ["anything"])).rejects.toThrow();
+    expect(connectorRecords(storePath)).toEqual([]);
+  });
+
   it("mints the connector from the app: POST /connector returns the path once, GET reports it live", async () => {
     const { app, storePath } = await startDuo("owner");
     const device = createDeviceToken(storePath, PASSPHRASE, "laptop");
     const auth = { authorization: `Bearer ${device.token}` };
 
-    expect((await app.inject({ method: "GET", url: "/connector", headers: auth })).json()).toEqual({ connector: null });
+    const before = (await app.inject({ method: "GET", url: "/connector", headers: auth })).json();
+    expect(before.connector).toBeNull();
+    expect(before.historyPrompt).toContain("save_notes_to_duo");
+    expect(before.historyPrompt).toContain('above "official open"');
     const minted = await app.inject({ method: "POST", url: "/connector", headers: auth });
     expect(minted.statusCode).toBe(201);
     expect(minted.json().path).toMatch(/^\/mcp\/[A-Za-z0-9_-]{43}$/);
