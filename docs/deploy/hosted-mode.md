@@ -41,6 +41,11 @@
    its own decision) and per-duo inference billing (every duo shares the server's OpenRouter
    key; org mode §7's gateway is still the answer for real metering).
 
+   > **Amended 2026-09-26 (#229):** the Matrix workspace connection is now in scope for hosted
+   > mode, as a multi-org workspace on one shared Synapse, with each duo holding its own
+   > provisioned account. Orgs, account naming, the org wall and its limits are decided in
+   > `docs/deploy/hosted-workspace.md`. Per-duo inference billing stays out, as above.
+
 ## Sign-in (added 2026-09-26)
 
 - **Google sign-in, bound once.** With `DUO_HOSTED_GOOGLE_CLIENT_ID` set, redeeming an invite
