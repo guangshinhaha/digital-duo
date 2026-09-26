@@ -167,7 +167,7 @@ hostedCommand
 
 hostedCommand
   .command("provision")
-  .description("Create the Matrix accounts every hosted duo still lacks (safe to re-run; talks to the running hosted daemon, which needs DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN)")
+  .description("Create the Matrix accounts every hosted duo still lacks, then each org's Space and #general and put members in them (safe to re-run; talks to the running hosted daemon, which needs DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN)")
   .action(async () => {
     try {
       const summary = await runHostedProvision();
@@ -177,6 +177,17 @@ hostedCommand
       }
       for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "failed")) {
         console.log(`  ${outcome.duoId}: needs attention (${outcome.error ?? "unknown"}) — see the daemon log`);
+      }
+      const { orgs, members } = summary.spaces;
+      console.log(
+        `Org spaces: ${orgs.provisioned} made, ${orgs.already} already done, ${orgs.pending} pending, ${orgs.failed} need attention. ` +
+          `Members joined: ${members.provisioned} now, ${members.already} already, ${members.pending} pending, ${members.failed} need attention, ${members.waiting} waiting for their accounts.`,
+      );
+      for (const outcome of summary.spaces.orgOutcomes.filter((candidate) => candidate.status === "pending" || candidate.status === "failed")) {
+        console.log(`  org ${outcome.orgId}: ${outcome.status} (${outcome.error ?? "unknown"})`);
+      }
+      for (const outcome of summary.spaces.memberOutcomes.filter((candidate) => candidate.status === "pending" || candidate.status === "failed")) {
+        console.log(`  ${outcome.duoId}: space join ${outcome.status} (${outcome.error ?? "unknown"})`);
       }
     } catch (error) {
       reportError(error);

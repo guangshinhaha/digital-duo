@@ -13,6 +13,7 @@ import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
 import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
+import { OrgSpaceProvisioner, type SpaceSummary } from "./org-spaces.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
 import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedTenant } from "./registry.js";
 import { assertSynapseBaseUrl, SynapseAdmin, SynapseConfigError } from "./synapse-admin.js";
@@ -235,6 +236,16 @@ function publicOutcome(outcome: ProvisionOutcome) {
   return { duoId: outcome.duoId, status: outcome.status, ...(outcome.accounts ? { accounts: outcome.accounts } : {}), ...(outcome.error ? { error: outcome.error } : {}) };
 }
 
+/** The org-space sweep as an admin may see it: counts and per-item status, no secret exists in it to leave out. */
+function publicSpaces(summary: SpaceSummary) {
+  return {
+    orgs: summary.orgs,
+    members: summary.members,
+    orgOutcomes: summary.orgOutcomes,
+    memberOutcomes: summary.memberOutcomes,
+  };
+}
+
 function sendError(reply: FastifyReply, status: number, code: string, message: string): void {
   reply.code(status).send({ error: { code, message } });
 }
@@ -292,6 +303,8 @@ export interface HostedServer {
   readonly registry: HostedRegistry;
   /** Set when the Synapse admin variables are configured. */
   readonly matrix: MatrixProvisioner | undefined;
+  /** Each org's Space and `#general`, and members' joins into them (#234). Set with `matrix`. */
+  readonly spaces: OrgSpaceProvisioner | undefined;
   close(): Promise<void>;
 }
 
@@ -350,15 +363,32 @@ export async function createHostedServer(
   // Matrix accounts (#232). Only when the Synapse admin variables are set. A Synapse that is down
   // never stops a duo from being served or a person from joining: the duo is marked pending and
   // the timer below retries it.
-  const matrix = settings.synapse
+  const synapseAdmin = settings.synapse
+    ? new SynapseAdmin({ baseUrl: settings.synapse.adminUrl, adminToken: settings.synapse.adminToken, fetch: extras.synapseFetch, timeoutMs: extras.synapseTimeoutMs })
+    : undefined;
+  const matrix = synapseAdmin
     ? new MatrixProvisioner({
         registry,
-        admin: new SynapseAdmin({ baseUrl: settings.synapse.adminUrl, adminToken: settings.synapse.adminToken, fetch: extras.synapseFetch, timeoutMs: extras.synapseTimeoutMs }),
-        serverName: settings.synapse.serverName,
+        admin: synapseAdmin,
+        serverName: settings.synapse?.serverName,
         log: extras.log,
         retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
       })
     : undefined;
+  // Each org's Space and `#general` (#234), and members' joins into them. Same rules as the accounts:
+  // a Synapse that is down marks the org or member pending and never blocks creating an org or redeeming an invite.
+  const spaces = synapseAdmin
+    ? new OrgSpaceProvisioner({
+        registry,
+        admin: synapseAdmin,
+        serverName: settings.synapse?.serverName,
+        log: extras.log,
+        retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
+      })
+    : undefined;
+  const settleWithin = async (attempt: Promise<unknown>): Promise<void> => {
+    await Promise.race([attempt, new Promise<void>((resolve) => setTimeout(resolve, extras.signupProvisionWaitMs ?? DEFAULT_SIGNUP_PROVISION_WAIT_MS).unref())]);
+  };
   // An unexpected failure is logged by name only (a message could quote something it should not), and never stops the server.
   const logUnexpected = (error: unknown): void => {
     (extras.log ?? ((line) => console.error(line)))(`hosted: Matrix provisioning failed unexpectedly (${error instanceof Error ? error.name : "error"})`);
@@ -377,13 +407,21 @@ export async function createHostedServer(
         sweeping = false;
       });
   };
-  const runProvisioning = (): void => runSweep(() => matrix!.provisionAll());
+  // Accounts first: a member can be joined to their org's Space only once their accounts exist.
+  const runProvisioning = (): void =>
+    runSweep(async () => {
+      await matrix!.provisionAll();
+      await spaces!.syncAll();
+    });
   let retryTimer: NodeJS.Timeout | undefined;
   if (matrix) {
     runProvisioning();
     retryTimer = setInterval(() => {
-      if (matrix.hasRetryDue()) {
-        runSweep(() => matrix.retryPending());
+      if (matrix.hasRetryDue() || spaces!.hasRetryDue()) {
+        runSweep(async () => {
+          await matrix.retryPending();
+          await spaces!.retryPending();
+        });
       }
     }, extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS);
     retryTimer.unref();
@@ -577,8 +615,12 @@ export async function createHostedServer(
     if (matrix) {
       // Redeeming an invite must not depend on Synapse: wait a moment so the app can usually connect
       // straight away, then answer regardless. A failed or slow run leaves the duo pending for the retry.
-      const attempt = matrix.provision(tenant.id).catch(logUnexpected);
-      await Promise.race([attempt, new Promise<void>((resolve) => setTimeout(resolve, extras.signupProvisionWaitMs ?? DEFAULT_SIGNUP_PROVISION_WAIT_MS).unref())]);
+      // The accounts come first, then the person and their duo are put into the org's Space (#234).
+      const attempt = matrix
+        .provision(tenant.id)
+        .then(() => spaces!.syncMember(tenant.id))
+        .catch(logUnexpected);
+      await settleWithin(attempt);
     }
     reply.code(201);
     return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
@@ -636,9 +678,13 @@ export async function createHostedServer(
 
   control.post<{ Body: { name?: unknown } }>("/hosted/orgs", { preHandler: requireAdmin }, async (request, reply) => {
     try {
-      const org = registry.createOrg(request.body?.name as string);
+      const created = registry.createOrg(request.body?.name as string);
+      // The org exists whatever Synapse does; its Space is made now if Synapse answers in time, else by the retry.
+      if (spaces) {
+        await settleWithin(spaces.ensureOrg(created.id).catch(logUnexpected));
+      }
       reply.code(201);
-      return { ...org, memberCount: 0 };
+      return { ...(registry.org(created.id) ?? created), memberCount: 0 };
     } catch (error) {
       if (sendOrgError(reply, error)) {
         return;
@@ -649,8 +695,11 @@ export async function createHostedServer(
 
   control.post<{ Params: { orgId: string }; Body: { name?: unknown } }>("/hosted/orgs/:orgId/rename", { preHandler: requireAdmin }, async (request, reply) => {
     try {
-      const org = registry.renameOrg(request.params.orgId, request.body?.name as string);
-      return { ...org, memberCount: registry.listOrgMembers(org.id).length };
+      const renamed = registry.renameOrg(request.params.orgId, request.body?.name as string);
+      if (spaces) {
+        await settleWithin(spaces.ensureOrg(renamed.id).catch(logUnexpected));
+      }
+      return { ...(registry.org(renamed.id) ?? renamed), memberCount: registry.listOrgMembers(renamed.id).length };
     } catch (error) {
       if (sendOrgError(reply, error)) {
         return;
@@ -686,7 +735,8 @@ export async function createHostedServer(
       return;
     }
     const summary = await matrix.provisionAll();
-    return { ...summary, outcomes: summary.outcomes.map(publicOutcome) };
+    const spaceSummary = await spaces!.syncAll();
+    return { ...summary, outcomes: summary.outcomes.map(publicOutcome), spaces: publicSpaces(spaceSummary) };
   });
 
   await control.ready();
@@ -746,13 +796,16 @@ export async function createHostedServer(
     server: front,
     registry,
     matrix,
+    spaces,
     close: async () => {
       if (retryTimer) {
         clearInterval(retryTimer);
       }
       // Stop the sweep from starting its next duo, then wait for the one in flight.
       matrix?.stop();
+      spaces?.stop();
       await matrix?.whenIdle();
+      await spaces?.whenIdle();
       await new Promise<void>((resolve) => front.close(() => resolve()));
       await Promise.all([control.close(), rootDuo?.app.close(), ...Array.from(duos.values(), (duo) => duo.app.close())]);
     },

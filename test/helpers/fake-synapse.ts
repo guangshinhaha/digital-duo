@@ -9,7 +9,13 @@ import { randomBytes } from "node:crypto";
  * - `PUT /_synapse/admin/v2/users/<id>`: 201 when it creates, 200 when it modifies;
  * - `POST /_synapse/admin/v1/users/<id>/login`: `{access_token}` for an existing user, 404 otherwise;
  * - `GET /_matrix/client/v3/account/whoami`: the admin token's own user id;
- * - every call needs the admin token as a bearer, else 401 `M_UNKNOWN_TOKEN`.
+ * - every call needs the admin token as a bearer, else 401 `M_UNKNOWN_TOKEN`;
+ * - rooms (#234), as Synapse v1.161.0 does them: `PUT /createRoom/<txnId>` returns the first room again for a
+ *   repeated id (until `expireTransactions()`, standing in for its 30 minute cache); the `private_chat` preset
+ *   starts `invite` at 0 and the caller's `power_level_content_override` replaces keys whole (shallow update);
+ *   the admin join API on an invite-only room first invites, so a user already joined gets 403 `M_FORBIDDEN`;
+ *   `GET /_synapse/admin/v1/rooms/<room>/members` lists joined users only (no pagination, 404 for an unknown room);
+ *   state events need the sender's level to reach `state_default`.
  */
 export const FAKE_SYNAPSE_URL = "http://synapse.railway.internal:8008";
 export const FAKE_SERVER_NAME = "duo.test";
@@ -43,9 +49,46 @@ export interface FakeSynapse {
   hangNext(): void;
   /** #233: the clock `whoami` judges a minted token's `valid_until_ms` by (default: real time). */
   now?: () => number;
+
+  // --- rooms (#234): createRoom, m.space.child, m.room.name and the admin join API ---
+  /** Every room the fake has created, by room id. */
+  readonly rooms: Map<string, FakeRoom>;
+  /** Forget the createRoom transaction ids, as Synapse does after 30 minutes or a restart. */
+  expireTransactions(): void;
+  /** Whether `userId` may invite in the room: their power level (default 0) reaches the room's `invite` level. */
+  mayInvite(roomId: string, userId: string): boolean;
 }
 
-export function createFakeSynapse(options: { adminToken?: string; serverName?: string } = {}): FakeSynapse {
+/** A room as the fake keeps it (#234). `joinRule` is "public" only for a `public_chat` preset, so tests can prove no room is ever public. */
+export interface FakeRoom {
+  roomId: string;
+  name: string | undefined;
+  /** `creation_content.type`, e.g. "m.space". */
+  type: string | undefined;
+  visibility: string | undefined;
+  preset: string | undefined;
+  joinRule: "invite" | "public";
+  members: Set<string>;
+  /** m.space.child state: child room id -> content (`via`, `suggested`). */
+  children: Map<string, { via?: string[]; suggested?: boolean }>;
+  powerLevelOverride: unknown;
+  /** The room's effective power levels: Synapse's defaults, the preset's, then the caller's override on top (shallow). */
+  powerLevels: { invite: number; events_default: number; state_default: number; users_default: number; users: Record<string, number> };
+}
+
+export interface FakeSynapseOptions {
+  adminToken?: string;
+  serverName?: string;
+  /**
+   * #234: stand in for the org module (#235) on joins: an admin-API join runs as the target user, so refuse
+   * (403 M_FORBIDDEN) a join of an account whose org (read from its id) differs from that of any non-service member of the room.
+   * This models the module until #235 ships and has an end-to-end test of its own; a test that uses it is proving the
+   * provisioner copes with a refusal, not that the real module refuses.
+   */
+  orgWall?: boolean;
+}
+
+export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse {
   const adminToken = options.adminToken ?? FAKE_ADMIN_TOKEN;
   const serverName = options.serverName ?? FAKE_SERVER_NAME;
   const users = new Map<string, FakeUser>();
@@ -54,12 +97,22 @@ export function createFakeSynapse(options: { adminToken?: string; serverName?: s
   let failures: { count: number; status: number; errcode: string } | null = null;
   let hang = false;
   const loggedOut = new Set<string>(); // #233
+  const rooms = new Map<string, FakeRoom>();
+  const transactions = new Map<string, string>();
 
   const json = (status: number, body: unknown) =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
   const fake: FakeSynapse = {
     users,
+    rooms,
+    expireTransactions() {
+      transactions.clear();
+    },
+    mayInvite(roomId, userId) {
+      const room = rooms.get(roomId);
+      return !!room && (room.powerLevels.users[userId] ?? room.powerLevels.users_default) >= room.powerLevels.invite;
+    },
     minted,
     requests,
     down: false,
@@ -148,6 +201,115 @@ export function createFakeSynapse(options: { adminToken?: string; serverName?: s
         const token = `syt_minted_${randomBytes(12).toString("hex")}`;
         minted.push({ userId, token, validUntilMs: body.valid_until_ms ?? null });
         return json(200, { access_token: token });
+      }
+      // --- rooms (#234) ---
+      const adminUserId = `@workspace-admin:${serverName}`;
+      const roomOrg = (userId: string): string | null => {
+        const local = /^@([^:]+):/.exec(userId)?.[1] ?? "";
+        const stripped = local.startsWith("duo-") ? local.slice(4) : local;
+        return stripped.includes(".") ? stripped.slice(0, stripped.indexOf(".")) : null;
+      };
+      const create = /^\/_matrix\/client\/v3\/createRoom(?:\/([^/]+))?$/.exec(url.pathname);
+      if ((method === "POST" && create && create[1] === undefined) || (method === "PUT" && create && create[1] !== undefined)) {
+        const txnId = create[1] === undefined ? null : decodeURIComponent(create[1]);
+        const seen = txnId === null ? undefined : transactions.get(txnId);
+        if (seen !== undefined) {
+          return json(200, { room_id: seen });
+        }
+        const body = JSON.parse(rawBody ?? "{}") as {
+          name?: string;
+          visibility?: string;
+          preset?: string;
+          creation_content?: { type?: string };
+          power_level_content_override?: Record<string, unknown>;
+        };
+        const roomId = `!${randomBytes(9).toString("hex")}:${serverName}`;
+        rooms.set(roomId, {
+          roomId,
+          name: body.name,
+          type: body.creation_content?.type,
+          visibility: body.visibility,
+          preset: body.preset,
+          joinRule: body.preset === "public_chat" || body.visibility === "public" ? "public" : "invite",
+          members: new Set([adminUserId]),
+          children: new Map(),
+          powerLevelOverride: body.power_level_content_override,
+          // The creator holds 100; private_chat sets invite 0; the caller's override replaces whole keys.
+          powerLevels: {
+            invite: 0,
+            events_default: 0,
+            state_default: 50,
+            users_default: 0,
+            users: { [adminUserId]: 100 },
+            ...(body.power_level_content_override as object | undefined),
+          },
+        });
+        if (txnId !== null) {
+          transactions.set(txnId, roomId);
+        }
+        return json(200, { room_id: roomId });
+      }
+      const listed = method === "GET" ? /^\/_synapse\/admin\/v1\/rooms\/([^/]+)\/members$/.exec(url.pathname) : null;
+      if (listed) {
+        const room = rooms.get(decodeURIComponent(listed[1]!));
+        if (!room) {
+          return json(404, { errcode: "M_NOT_FOUND", error: "Room not found" });
+        }
+        const members = [...room.members];
+        return json(200, { members, total: members.length });
+      }
+      const state = method === "PUT" ? /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/(m\.space\.child|m\.room\.name)(?:\/([^/]+))?$/.exec(url.pathname) : null;
+      if (state) {
+        const room = rooms.get(decodeURIComponent(state[1]!));
+        if (!room) {
+          return json(404, { errcode: "M_NOT_FOUND", error: "Unknown room" });
+        }
+        if (!room.members.has(adminUserId)) {
+          return json(403, { errcode: "M_FORBIDDEN", error: "not in the room" });
+        }
+        if ((room.powerLevels.users[adminUserId] ?? room.powerLevels.users_default) < room.powerLevels.state_default) {
+          return json(403, { errcode: "M_FORBIDDEN", error: "not enough power to send this state event" });
+        }
+        const body = JSON.parse(rawBody ?? "{}") as { name?: string; via?: string[]; suggested?: boolean };
+        if (state[2] === "m.room.name") {
+          room.name = body.name;
+        } else {
+          room.children.set(decodeURIComponent(state[3] ?? ""), { via: body.via, suggested: body.suggested });
+        }
+        return json(200, { event_id: `$${randomBytes(6).toString("hex")}` });
+      }
+      const join = method === "POST" ? /^\/_synapse\/admin\/v1\/join\/([^/]+)$/.exec(url.pathname) : null;
+      if (join) {
+        const roomId = decodeURIComponent(join[1]!);
+        const userId = (JSON.parse(rawBody ?? "{}") as { user_id?: string }).user_id ?? "";
+        const room = rooms.get(roomId);
+        if (!room) {
+          return json(404, { errcode: "M_NOT_FOUND", error: "Unknown room" });
+        }
+        if (!users.has(userId)) {
+          return json(404, { errcode: "M_NOT_FOUND", error: "User not found" });
+        }
+        if (!room.members.has(adminUserId)) {
+          return json(403, { errcode: "M_FORBIDDEN", error: "the server admin must be in the room" });
+        }
+        if (room.joinRule === "invite") {
+          // The admin API invites first, as the admin; Synapse refuses to invite someone who is already in.
+          if (!fake.mayInvite(roomId, adminUserId)) {
+            return json(403, { errcode: "M_FORBIDDEN", error: "not enough power to invite" });
+          }
+          if (room.members.has(userId)) {
+            return json(403, { errcode: "M_FORBIDDEN", error: `${userId} is already in the room.` });
+          }
+        }
+        if (options.orgWall) {
+          const joinerOrg = roomOrg(userId);
+          const clash = [...room.members].some((member) => member !== adminUserId && roomOrg(member) !== joinerOrg);
+          if (joinerOrg === null || clash) {
+            return json(403, { errcode: "M_FORBIDDEN", error: "org wall" });
+          }
+        }
+        room.members.add(userId);
+        return json(200, { room_id: roomId });
       }
       return json(404, { errcode: "M_UNRECOGNIZED", error: "Unrecognized request" });
     },
