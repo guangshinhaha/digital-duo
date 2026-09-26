@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedServe } from "./commands/hosted.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedProvision, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -160,6 +160,24 @@ hostedCommand
       const invite = await runHostedInvite(name, options.expiresInHours, process.env, options.org);
       console.log(`Invite for "${invite.name}" into org ${invite.orgId} (expires ${invite.expiresAt}, single use):`);
       console.log(invite.link ?? `code: ${invite.code} (set DUO_HOSTED_PUBLIC_URL and DUO_HOSTED_WEB_URL to get a full link)`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedCommand
+  .command("provision")
+  .description("Create the Matrix accounts every hosted duo still lacks (safe to re-run; talks to the running hosted daemon, which needs DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN)")
+  .action(async () => {
+    try {
+      const summary = await runHostedProvision();
+      console.log(`Provisioned ${summary.provisioned}, already done ${summary.already}, pending ${summary.pending}, needs attention ${summary.failed}.`);
+      for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "pending")) {
+        console.log(`  ${outcome.duoId}: pending (${outcome.error ?? "unknown"}) — it will be retried`);
+      }
+      for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "failed")) {
+        console.log(`  ${outcome.duoId}: needs attention (${outcome.error ?? "unknown"}) — see the daemon log`);
+      }
     } catch (error) {
       reportError(error);
     }

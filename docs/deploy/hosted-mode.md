@@ -127,6 +127,63 @@ registry.createInvite(name, expiresAt, email?, orgId?)        // orgId defaults 
 (provisioned accounts, spaces, the org boundary) should read org membership through these and not
 re-derive it.
 
+## Matrix accounts (added 2026-09-26, #232)
+
+Decision record: `hosted-workspace.md`. When the Synapse admin variables (below) are set, the
+daemon creates every duo's two accounts through Synapse's admin API. Nobody registers on the
+homeserver, and neither account has a password.
+
+- **Names** carry the org: the person is `@<orgId>.<handle>:<server>`, their duo
+  `@duo-<orgId>.<handle>:<server>`. `<handle>` is the tenant id, or `root` for the pre-hosted root
+  duo (which gets accounts too). Display names are the person's name (from the Google profile
+  when there is one) and `<name>'s duo`.
+- **When.** After an invite is redeemed, before the sign-up answers, but bounded: sign-up waits a
+  few seconds for Synapse and then answers regardless. A Synapse that is down, slow or refusing
+  never blocks an invite. The duo is marked pending in the registry (`matrixPending`, with the
+  attempt count and a scrubbed reason) and retried by a timer that checks every minute. Retries back
+  off per duo: a duo that has failed n times waits one minute x 2^(n-1) after its last attempt,
+  capped at 30 minutes, so a Synapse that is down or hanging costs each duo one attempt, one
+  registry write and one log line per backoff, not per tick. A sweep never overlaps the previous
+  one, and shutdown (`close()`) lets the duo in flight finish and starts no other.
+- **Backfill.** At startup the daemon provisions every duo, and the root duo, that lacks accounts.
+  `duo hosted provision` (`POST /hosted/matrix/provision`, super admin) does the same on demand
+  and prints counts: provisioned, already done, pending (Synapse's fault, retried) and needs
+  attention (`failed`). Both are safe to repeat: a provisioned duo costs no call, and the account
+  calls are idempotent `PUT`s. One duo's unexpected error is that duo's `failed` outcome and
+  a log line naming the error type; it does not stop the sweep or turn the route into a 500.
+- **Needs attention.** Recorded accounts that do not fit the duo's org or the configured server
+  are reported as `failed` and logged, and nothing is written or retried: the daemon never
+  re-provisions over them. Fix the registry or the variable, then run `duo hosted provision`.
+- **The duo's access token** is minted through the admin login API without an expiry (the
+  daemon holds it for good), and stored in the registry encrypted under `DUO_HOSTED_MASTER_KEY`
+  like the duo's passphrase. It is read only by `registry.duoMatrixToken(duoId)`. No route
+  returns it or its ciphertext (`GET /hosted/duos` shows only the account ids and a date), it is
+  not logged, and it is not in a duo's env.
+- **A duo's env is an allowlist** (`TENANT_ENV_ALLOWLIST` in `src/hosted/server.ts`), no longer
+  the whole process env, so `DUO_WORKSPACE_ADMIN_TOKEN` (which acts as any user),
+  `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN` cannot reach a duo. The root duo keeps its
+  env minus those three.
+- **Not to do.** Never call `/logout/all` as `@workspace-admin`: it would expire every token the
+  daemon minted. Provisioning cannot recreate a token it has lost; it mints a new one only for a
+  duo that has none recorded.
+- **One window it cannot close.** The token is minted by Synapse, then written to the registry:
+  two steps. If the process dies between them, or the write keeps failing (a full disk), the
+  token exists on the duo's account, never expires and is recorded nowhere, and the next run mints
+  another. The daemon retries the write once at once (the token is already in hand, so that cannot
+  double-mint) and, if it still fails, logs `minted a Matrix token for duo <id> but could not store
+  it` with no token in it. When you see that line or a crash right after provisioning, revoke the
+  duo account's stray tokens as an operator (Synapse admin API, that one user only, never
+  `/logout/all` as `@workspace-admin`) and run `duo hosted provision` again.
+
+Read side, for the work that builds on this (`src/hosted/registry.ts`, `src/hosted/matrix-accounts.ts`):
+
+```ts
+registry.matrixAccounts(duoId): HostedMatrixAccounts | undefined  // { personUserId, duoUserId, duoTokenCipher, provisionedAt }
+registry.duoMatrixToken(duoId): string | undefined                // decrypted; daemon-internal only
+registry.matrixPending(duoId): MatrixPending | undefined
+hosted.matrix?.provision(duoId) / .provisionAll() / .retryPending() / .pendingDuoIds() / .stop()
+```
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -138,6 +195,10 @@ re-derive it.
 | `DUO_HOSTED_ROOT` | Optional. Defaults to `hosted` (under the volume). |
 | `DUO_HOSTED_GOOGLE_CLIENT_ID` | The Google OAuth web client id. Public, not a secret. |
 | `DUO_HOSTED_ADMIN_EMAILS` | Comma-separated admin Google emails. |
+| `DUO_WORKSPACE_PRIVATE_URL` | Synapse as the daemon reaches it, e.g. `http://synapse.railway.internal:8008` (https, or http on a `*.railway.internal` host). With `DUO_WORKSPACE_ADMIN_TOKEN` it turns provisioning on; one without the other refuses to start. |
+| `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin` service account's token. Acts as any user: never in a duo's env, a route or a log. |
+| `DUO_WORKSPACE_SERVER_NAME` | Optional. Synapse's `server_name` (`duo`). When unset it is read from the admin token's own user id. |
+| `DUO_WORKSPACE_PUBLIC_URL` | The https address clients are given for Synapse (used by the session work, #233). |
 
 ## Inviting someone
 
@@ -156,6 +217,10 @@ duo hosted org list                            # id, name, member count
 duo hosted org rename <id> "Platform"
 duo hosted org members <id>
 duo hosted invite "Kim" --org <id>             # without --org: the default org
+```
+
+```sh
+duo hosted provision                           # create any Matrix accounts still missing; safe to repeat
 ```
 
 Like `invite`, these talk to the running daemon with `DUO_HOSTED_ADMIN_TOKEN`.

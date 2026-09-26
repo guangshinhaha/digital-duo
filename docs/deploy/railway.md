@@ -132,16 +132,17 @@ connected): `cd deploy/synapse && railway up --service synapse --detach`.
 
 | Variable | Value | Used for |
 |---|---|---|
-| `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin:duo` access token | The admin API (below). The only Synapse admin. |
-| `DUO_WORKSPACE_PRIVATE_URL` | `http://${{synapse.RAILWAY_PRIVATE_DOMAIN}}:8008` | The daemon's calls to the admin API |
-| `DUO_WORKSPACE_PUBLIC_URL` | `https://${{synapse.RAILWAY_PUBLIC_DOMAIN}}` | The homeserver URL handed to clients |
+| `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin:duo` access token | The admin API (below). The only Synapse admin; it acts as any user, so it lives in the daemon's variables only and never reaches a duo. |
+| `DUO_WORKSPACE_PRIVATE_URL` | `http://${{synapse.RAILWAY_PRIVATE_DOMAIN}}:8008` | The daemon's calls to the admin API (https, or http on a `*.railway.internal` host). With the admin token it turns Matrix provisioning on (#232); one without the other refuses to start. |
+| `DUO_WORKSPACE_SERVER_NAME` | `duo` (optional) | Synapse's `server_name`. Unset, the daemon reads it from the admin token's own user id. Permanent once accounts exist. |
+| `DUO_WORKSPACE_PUBLIC_URL` | `https://${{synapse.RAILWAY_PUBLIC_DOMAIN}}` | The homeserver URL handed to clients (#233). Not used to call Synapse. |
 
 These were set with `--skip-deploys`, so they take effect at the daemon's next deploy.
-**`DUO_WORKSPACE_HOMESERVER` is deliberately not set yet.** `duo serve` reads it with
+**`DUO_WORKSPACE_HOMESERVER` stays unset.** `duo serve` reads it with
 `DUO_WORKSPACE_ACCESS_TOKEN` and `DUO_WORKSPACE_USER_ID` as an all-or-nothing trio and refuses to
-boot on a partial set, and it requires `https`, which the private URL is not. Hosted mode
-switches to `DUO_WORKSPACE_HOMESERVER` (the private URL) in #232; until then the daemon must
-not have it set.
+boot on a partial set, and it requires `https`, which the private URL is not. Hosted mode reads
+`DUO_WORKSPACE_PRIVATE_URL` instead (#232), so the daemon must not have `DUO_WORKSPACE_HOMESERVER`
+set.
 
 ### The admin API and its credential
 

@@ -62,6 +62,17 @@ describe("workspaceSettingsFrom — no workspace is a supported state, half a wo
     ).toThrow(/must be https/);
   });
 
+  it("accepts plain http only on Railway's private network (*.railway.internal)", () => {
+    const settings = workspaceSettingsFrom(
+      configWithWorkspace({ ...FULL, DUO_WORKSPACE_HOMESERVER: "http://synapse.railway.internal:8008" }),
+    );
+    expect(settings?.homeserverUrl).toBe("http://synapse.railway.internal:8008");
+    // Lookalikes are not the private network.
+    for (const host of ["http://railway.internal", "http://synapse.railway.internal.evil.example", "http://evilrailway.internal"]) {
+      expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_HOMESERVER: host }))).toThrow(/must be https/);
+    }
+  });
+
   it("refuses an unparseable homeserver URL", () => {
     expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_HOMESERVER: "not a url" }))).toThrow(
       /not a parseable URL/,

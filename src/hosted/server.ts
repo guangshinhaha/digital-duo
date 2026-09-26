@@ -12,8 +12,10 @@ import { createServer, type ServeDeps } from "../serve/server.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
+import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
-import { HostedRegistry, InviteInvalidError, type HostedTenant } from "./registry.js";
+import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedTenant } from "./registry.js";
+import { assertSynapseBaseUrl, SynapseAdmin, SynapseConfigError } from "./synapse-admin.js";
 
 /** Where a hosted duo lives: everything under one directory per duo, nothing shared between them. */
 export function tenantPaths(hostedRoot: string, tenantId: string) {
@@ -26,6 +28,21 @@ export function tenantPaths(hostedRoot: string, tenantId: string) {
     sharedPersonaPath: join(root, "shared-duo", "persona.json"),
     sharedUsageLogPath: join(root, "shared-duo-runtime", "usage.json"),
   };
+}
+
+/**
+ * How the daemon reaches Synapse to create accounts (docs/deploy/hosted-workspace.md §5). Absent
+ * means no workspace provisioning: hosted mode behaves as it did before #232.
+ */
+export interface SynapseSettings {
+  /** `DUO_WORKSPACE_PRIVATE_URL`: the private-network URL the daemon calls, e.g. `http://synapse.railway.internal:8008`. https, or http on `*.railway.internal`. Not `DUO_WORKSPACE_HOMESERVER`, which stays the personal-hardware trio's variable. */
+  readonly adminUrl: string;
+  /** `DUO_WORKSPACE_ADMIN_TOKEN`: the service account's token. Never given to a duo, a route or a log. */
+  readonly adminToken: string;
+  /** `DUO_WORKSPACE_SERVER_NAME`: Synapse's `server_name` (`duo`). When unset it is read from the admin token's own user id. */
+  readonly serverName: string | undefined;
+  /** `DUO_WORKSPACE_PUBLIC_URL`: the https address clients are given (#233); not used to call Synapse. */
+  readonly publicUrl: string | undefined;
 }
 
 export interface HostedSettings {
@@ -42,6 +59,8 @@ export interface HostedSettings {
    * From `hostedSettingsFrom` this is read from the env on every access, so editing `DUO_HOSTED_ADMIN_EMAILS` takes effect on the next request.
    */
   readonly adminEmails: readonly string[];
+  /** Set when the Synapse admin variables are; without it no Matrix accounts are provisioned. */
+  readonly synapse?: SynapseSettings;
 }
 
 export class HostedConfigError extends Error {
@@ -61,6 +80,7 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
     throw new HostedConfigError("DUO_HOSTED_ADMIN_TOKEN");
   }
   return {
+    synapse: synapseSettingsFrom(env),
     hostedRoot: env.DUO_HOSTED_ROOT || "hosted",
     masterKey,
     adminToken,
@@ -75,6 +95,36 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
     get adminEmails() {
       return parseAdminEmails(env.DUO_HOSTED_ADMIN_EMAILS);
     },
+  };
+}
+
+/**
+ * The Synapse admin variables are all-or-nothing, like the workspace ones: a URL with no token (or
+ * the reverse) is a half-finished setup, and provisioning would quietly not happen. Neither set
+ * means no provisioning.
+ */
+export function synapseSettingsFrom(env: NodeJS.ProcessEnv): SynapseSettings | undefined {
+  const adminUrl = env.DUO_WORKSPACE_PRIVATE_URL || undefined;
+  const adminToken = env.DUO_WORKSPACE_ADMIN_TOKEN || undefined;
+  if (adminUrl === undefined && adminToken === undefined) {
+    return undefined;
+  }
+  if (adminUrl === undefined || adminToken === undefined) {
+    throw new HostedConfigError(adminUrl === undefined ? "DUO_WORKSPACE_PRIVATE_URL (it is needed with DUO_WORKSPACE_ADMIN_TOKEN)" : "DUO_WORKSPACE_ADMIN_TOKEN (it is needed with DUO_WORKSPACE_PRIVATE_URL)");
+  }
+  try {
+    assertSynapseBaseUrl(adminUrl);
+  } catch (error) {
+    if (error instanceof SynapseConfigError) {
+      throw new HostedConfigError(`DUO_WORKSPACE_PRIVATE_URL (${error.message})`);
+    }
+    throw error;
+  }
+  return {
+    adminUrl,
+    adminToken,
+    serverName: env.DUO_WORKSPACE_SERVER_NAME || undefined,
+    publicUrl: env.DUO_WORKSPACE_PUBLIC_URL?.replace(/\/+$/, "") || undefined,
   };
 }
 
@@ -115,7 +165,42 @@ async function mountDuo(deps: ServeDeps): Promise<MountedDuo> {
   return { app, server };
 }
 
-function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string): ServeDeps {
+/**
+ * The only process-env variables a hosted tenant's duo may see. The process env holds the
+ * master key, the admin tokens and (with #232) the Synapse admin token, which acts as any
+ * user; a duo's `deps.env` is reachable from per-duo routes, so it is built from this list
+ * and not spread from the whole env. What a duo's routes actually read is CORS and the
+ * websocket re-verify interval; the per-duo paths and identity are set explicitly below.
+ */
+export const TENANT_ENV_ALLOWLIST = ["DUO_CORS_ORIGINS", "DUO_WS_REVERIFY_MS", "TZ"] as const;
+
+/** The variables that must never reach any duo, tenant or root. */
+export const HOSTED_SECRET_ENV = ["DUO_HOSTED_MASTER_KEY", "DUO_HOSTED_ADMIN_TOKEN", "DUO_WORKSPACE_ADMIN_TOKEN"] as const;
+
+/** A tenant duo's base env: the allowlisted variables of `env`, and nothing else. */
+export function tenantEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const picked: NodeJS.ProcessEnv = {};
+  for (const key of TENANT_ENV_ALLOWLIST) {
+    if (env[key] !== undefined) {
+      picked[key] = env[key];
+    }
+  }
+  return picked;
+}
+
+/**
+ * The pre-hosted root duo keeps the whole process env (its shared-duo paths and provider settings
+ * come from it, as they did before hosted mode), minus the hosted secrets.
+ */
+export function rootEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...env };
+  for (const key of HOSTED_SECRET_ENV) {
+    delete copy[key];
+  }
+  return copy;
+}
+
+export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
   return {
     storePath: paths.storePath,
@@ -130,7 +215,7 @@ function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: 
     // Every env-derived path a route reads points inside this duo's own
     // directory, so no route can reach another duo's files through env.
     env: {
-      ...shared.env,
+      ...tenantEnvFrom(shared.env),
       DUO_STORE_PATH: paths.storePath,
       DUO_DIR: paths.duoDir,
       DUO_PASSPHRASE: passphrase,
@@ -141,6 +226,11 @@ function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: 
     },
     trustProxy: shared.trustProxy,
   };
+}
+
+/** A provisioning outcome as an admin may see it: ids and status, never a token. */
+function publicOutcome(outcome: ProvisionOutcome) {
+  return { duoId: outcome.duoId, status: outcome.status, ...(outcome.accounts ? { accounts: outcome.accounts } : {}), ...(outcome.error ? { error: outcome.error } : {}) };
 }
 
 function sendError(reply: FastifyReply, status: number, code: string, message: string): void {
@@ -172,10 +262,29 @@ const SIGNUP_MAX_FAILURES = 10;
 const DEFAULT_INVITE_HOURS = 7 * 24;
 const MAX_NAME_LENGTH = 80;
 
+/** Test seams for `createHostedServer`; production passes none. */
+export interface HostedServerExtras {
+  /** The `fetch` used for Synapse admin calls. */
+  readonly synapseFetch?: typeof fetch;
+  /** One line per provisioning event (default: stderr). Carries duo ids and scrubbed reasons only. */
+  readonly log?: (line: string) => void;
+  /** How long a sign-up waits for provisioning before answering anyway (default 5s). */
+  readonly signupProvisionWaitMs?: number;
+  /** Per-call timeout for Synapse admin requests (default 10s). */
+  readonly synapseTimeoutMs?: number;
+  /** How often owed provisioning is retried (default 60s). */
+  readonly provisionRetryMs?: number;
+}
+
+const DEFAULT_SIGNUP_PROVISION_WAIT_MS = 5_000;
+const DEFAULT_PROVISION_RETRY_MS = 60_000;
+
 export interface HostedServer {
   /** The front: dispatches `/hosted/*` to the control app, `/t/<id>/*` to that duo, anything else to the root duo when there is one. */
   readonly server: Server;
   readonly registry: HostedRegistry;
+  /** Set when the Synapse admin variables are configured. */
+  readonly matrix: MatrixProvisioner | undefined;
   close(): Promise<void>;
 }
 
@@ -194,6 +303,7 @@ export async function createHostedServer(
   settings: HostedSettings,
   root: ServeDeps | undefined,
   identityVerifier: IdentityVerifier | undefined = settings.googleClientId ? googleIdentityVerifier(settings.googleClientId) : undefined,
+  extras: HostedServerExtras = {},
 ): Promise<HostedServer> {
   const registry = new HostedRegistry(join(settings.hostedRoot, "registry.json"), settings.masterKey);
   const duos = new Map<string, MountedDuo>();
@@ -203,6 +313,48 @@ export async function createHostedServer(
   const rootDuo = root ? await mountDuo(root) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
+  }
+
+  // Matrix accounts (#232). Only when the Synapse admin variables are set. A Synapse that is down
+  // never stops a duo from being served or a person from joining: the duo is marked pending and
+  // the timer below retries it.
+  const matrix = settings.synapse
+    ? new MatrixProvisioner({
+        registry,
+        admin: new SynapseAdmin({ baseUrl: settings.synapse.adminUrl, adminToken: settings.synapse.adminToken, fetch: extras.synapseFetch, timeoutMs: extras.synapseTimeoutMs }),
+        serverName: settings.synapse.serverName,
+        log: extras.log,
+        retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
+      })
+    : undefined;
+  // An unexpected failure is logged by name only (a message could quote something it should not), and never stops the server.
+  const logUnexpected = (error: unknown): void => {
+    (extras.log ?? ((line) => console.error(line)))(`hosted: Matrix provisioning failed unexpectedly (${error instanceof Error ? error.name : "error"})`);
+  };
+  // One sweep at a time: a tick that finds the last sweep still running (a slow Synapse) skips itself
+  // instead of piling a second sweep onto it. The provisioner's own backoff spaces out each failed duo.
+  let sweeping = false;
+  const runSweep = (sweep: () => Promise<unknown>): void => {
+    if (!matrix || sweeping) {
+      return;
+    }
+    sweeping = true;
+    sweep()
+      .catch(logUnexpected)
+      .finally(() => {
+        sweeping = false;
+      });
+  };
+  const runProvisioning = (): void => runSweep(() => matrix!.provisionAll());
+  let retryTimer: NodeJS.Timeout | undefined;
+  if (matrix) {
+    runProvisioning();
+    retryTimer = setInterval(() => {
+      if (matrix.hasRetryDue()) {
+        runSweep(() => matrix.retryPending());
+      }
+    }, extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS);
+    retryTimer.unref();
   }
 
   let controlServer: Server | undefined;
@@ -390,6 +542,12 @@ export async function createHostedServer(
       identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
     );
     duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
+    if (matrix) {
+      // Redeeming an invite must not depend on Synapse: wait a moment so the app can usually connect
+      // straight away, then answer regardless. A failed or slow run leaves the duo pending for the retry.
+      const attempt = matrix.provision(tenant.id).catch(logUnexpected);
+      await Promise.race([attempt, new Promise<void>((resolve) => setTimeout(resolve, extras.signupProvisionWaitMs ?? DEFAULT_SIGNUP_PROVISION_WAIT_MS).unref())]);
+    }
     reply.code(201);
     return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
   });
@@ -480,9 +638,24 @@ export async function createHostedServer(
     }
   });
 
+  // Never the passphrase cipher and never the Matrix token cipher: a duo's accounts are shown as ids and a date.
   control.get("/hosted/duos", { preHandler: requireAdmin }, async () =>
-    registry.tenants().map(({ passphraseCipher: _cipher, ...rest }) => rest),
+    registry.tenants().map(({ passphraseCipher: _cipher, matrix: accounts, ...rest }) => ({
+      ...rest,
+      ...(accounts ? { matrix: matrixAccountsView(accounts) } : {}),
+    })),
   );
+
+  // Backfill on demand (`duo hosted provision`): creates the accounts every duo still lacks and answers
+  // with counts and per-duo status, never a token. Startup already does this when Synapse is configured.
+  control.post("/hosted/matrix/provision", { preHandler: requireAdmin }, async (_request, reply) => {
+    if (!matrix) {
+      sendError(reply, 400, "matrix_not_configured", "Set DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN to provision Matrix accounts.");
+      return;
+    }
+    const summary = await matrix.provisionAll();
+    return { ...summary, outcomes: summary.outcomes.map(publicOutcome) };
+  });
 
   await control.ready();
   if (!controlServer) {
@@ -529,7 +702,14 @@ export async function createHostedServer(
   return {
     server: front,
     registry,
+    matrix,
     close: async () => {
+      if (retryTimer) {
+        clearInterval(retryTimer);
+      }
+      // Stop the sweep from starting its next duo, then wait for the one in flight.
+      matrix?.stop();
+      await matrix?.whenIdle();
       await new Promise<void>((resolve) => front.close(() => resolve()));
       await Promise.all([control.close(), rootDuo?.app.close(), ...Array.from(duos.values(), (duo) => duo.app.close())]);
     },
