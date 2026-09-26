@@ -1,8 +1,9 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { decrypt, encrypt } from "../store/crypto.js";
 import {
+  assertOrgId,
   DEFAULT_ORG_ID,
   DEFAULT_ORG_NAME,
   normalizeOrgName,
@@ -82,6 +83,8 @@ interface RegistryFile {
   root?: RootClaim | null;
   /** The org the pre-hosted root duo (not a tenant) belongs to. */
   rootOrgId: string;
+  /** Present once a server has served the pre-hosted root duo: makes it a member of `rootOrgId` without depending on any server having started since. */
+  rootDuo?: { name: string } | null;
 }
 
 /**
@@ -92,23 +95,28 @@ interface RegistryFile {
  *
  * v1 (no `version`, no orgs): a default org is created and every tenant,
  * invite and the root duo go into it, so no id, URL or pairing changes.
+ *
+ * The per-record defaulting runs on every load, not only for v1: a
+ * pre-orgs build that is started again on a v2 file (a rollback) writes
+ * tenants and invites with no `orgId`, and nothing else would repair them.
+ * Existing orgs are kept, and every org id must be valid (`assertOrgId`),
+ * so a hand-edited id fails loudly here rather than after accounts exist.
  */
 export function migrateRegistryFile(raw: unknown, now = new Date().toISOString()): { data: RegistryFile; migrated: boolean } {
   const file = (raw ?? {}) as Partial<RegistryFile>;
   if (file.version !== undefined && file.version > REGISTRY_VERSION) {
     throw new RegistryVersionError(file.version);
   }
-  if (file.version === REGISTRY_VERSION) {
-    return { data: file as RegistryFile, migrated: false };
-  }
   const tenants = file.tenants ?? [];
   const oldest = tenants.map((tenant) => tenant.createdAt).sort()[0] ?? now;
+  const orgs = file.orgs?.length ? file.orgs : [{ id: DEFAULT_ORG_ID, name: DEFAULT_ORG_NAME, createdAt: oldest }];
+  orgs.forEach((org) => assertOrgId(org.id));
   return {
-    migrated: true,
+    migrated: (file.version ?? 1) < REGISTRY_VERSION,
     data: {
       ...file,
       version: REGISTRY_VERSION,
-      orgs: [{ id: DEFAULT_ORG_ID, name: DEFAULT_ORG_NAME, createdAt: oldest }],
+      orgs,
       tenants: tenants.map((tenant) => ({ ...tenant, orgId: tenant.orgId ?? DEFAULT_ORG_ID })),
       invites: (file.invites ?? []).map((invite) => ({ ...invite, orgId: invite.orgId ?? DEFAULT_ORG_ID })),
       rootOrgId: file.rootOrgId ?? DEFAULT_ORG_ID,
@@ -136,19 +144,29 @@ function newShortId(length: number): string {
 
 export class HostedRegistry {
   private data: RegistryFile;
+  /** True while the file on disk is still a pre-orgs (v1) one, so the first write keeps a copy of it. */
+  private backupBeforeWrite: boolean;
 
   constructor(
     private readonly path: string,
     private readonly masterKey: string,
   ) {
-    this.data = migrateRegistryFile(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {}).data;
+    const loaded = migrateRegistryFile(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {});
+    this.data = loaded.data;
+    this.backupBeforeWrite = loaded.migrated;
   }
 
-  /** Set by the server when a pre-hosted root duo is being served, so it shows up as an org member. Not persisted. */
-  private rootDuoName: string | null = null;
-
+  /**
+   * Records that a pre-hosted root duo is being served, so it is a member of
+   * its org. Persisted (only when it changes), so `listOrgMembers` does not
+   * depend on a server having called this since the registry was loaded.
+   */
   declareRootDuo(name: string): void {
-    this.rootDuoName = name;
+    if (this.data.rootDuo?.name !== name) {
+      this.commit((draft) => {
+        draft.rootDuo = { name };
+      });
+    }
   }
 
   tenants(): readonly HostedTenant[] {
@@ -165,9 +183,33 @@ export class HostedRegistry {
 
   claimRoot(identitySubject: string, email: string): RootClaim {
     const claim: RootClaim = { identitySubject, email, claimedAt: new Date().toISOString() };
-    this.data.root = claim;
-    this.persist();
-    return claim;
+    return this.commit((draft) => {
+      draft.root = claim;
+      return claim;
+    });
+  }
+
+  /** Keeps the claim's email in step with the verified sign-in of the account that holds it; writes only on change. */
+  refreshRootEmail(identitySubject: string, email: string): void {
+    const claim = this.data.root;
+    if (claim && claim.identitySubject === identitySubject && claim.email !== email) {
+      this.commit((draft) => {
+        draft.root = { ...claim, email };
+      });
+    }
+  }
+
+  /** Keeps a duo's stored email in step with its owner's verified sign-in; writes only on change. Returns the current record. */
+  refreshTenantEmail(tenantId: string, email: string): HostedTenant | undefined {
+    const tenant = this.data.tenants.find((candidate) => candidate.id === tenantId);
+    if (!tenant || tenant.email === email) {
+      return tenant;
+    }
+    const updated: HostedTenant = { ...tenant, email };
+    this.commit((draft) => {
+      draft.tenants = draft.tenants.map((candidate) => (candidate.id === tenantId ? updated : candidate));
+    });
+    return updated;
   }
 
   orgs(): readonly HostedOrg[] {
@@ -191,10 +233,12 @@ export class HostedRegistry {
     while (this.org(id)) {
       id = newShortId(8);
     }
+    assertOrgId(id);
     const org: HostedOrg = { id, name: clean, createdAt: new Date().toISOString() };
-    this.data.orgs.push(org);
-    this.persist();
-    return org;
+    return this.commit((draft) => {
+      draft.orgs.push(org);
+      return org;
+    });
   }
 
   renameOrg(orgId: string, name: string): HostedOrg {
@@ -205,9 +249,10 @@ export class HostedRegistry {
     const clean = normalizeOrgName(name);
     this.assertOrgNameFree(clean, orgId);
     const renamed: HostedOrg = { ...existing, name: clean };
-    this.data.orgs = this.data.orgs.map((org) => (org.id === orgId ? renamed : org));
-    this.persist();
-    return renamed;
+    return this.commit((draft) => {
+      draft.orgs = draft.orgs.map((org) => (org.id === orgId ? renamed : org));
+      return renamed;
+    });
   }
 
   /**
@@ -225,8 +270,8 @@ export class HostedRegistry {
       throw new OrgNotFoundError(orgId);
     }
     const members: OrgMember[] = [];
-    if (this.rootDuoName !== null && this.data.rootOrgId === orgId) {
-      members.push({ duoId: ROOT_DUO_ID, name: this.rootDuoName, email: this.data.root?.email ?? null, isRoot: true, joinedAt: null });
+    if (this.data.rootDuo && this.data.rootOrgId === orgId) {
+      members.push({ duoId: ROOT_DUO_ID, name: this.data.rootDuo.name, email: this.data.root?.email ?? null, isRoot: true, joinedAt: null });
     }
     for (const tenant of this.data.tenants) {
       if (tenant.orgId === orgId) {
@@ -273,8 +318,9 @@ export class HostedRegistry {
       email,
       orgId,
     };
-    this.data.invites.push(invite);
-    this.persist();
+    this.commit((draft) => {
+      draft.invites.push(invite);
+    });
     return { invite, code };
   }
 
@@ -309,12 +355,11 @@ export class HostedRegistry {
       passphraseCipher: encrypt(Buffer.from(passphrase, "utf8"), this.masterKey).toString("base64"),
       ...identity,
     };
-    this.data.tenants.push(tenant);
-    this.data.invites = this.data.invites.map((invite) =>
-      invite.id === inviteId ? { ...invite, usedAt: tenant.createdAt, tenantId: tenant.id } : invite,
-    );
-    this.persist();
-    return tenant;
+    return this.commit((draft) => {
+      draft.tenants.push(tenant);
+      draft.invites = draft.invites.map((invite) => (invite.id === inviteId ? { ...invite, usedAt: tenant.createdAt, tenantId: tenant.id } : invite));
+      return tenant;
+    });
   }
 
   newTenantId(): string {
@@ -325,11 +370,35 @@ export class HostedRegistry {
     return id;
   }
 
-  /** Write-then-rename, so a crash mid-write never leaves a truncated registry. */
-  private persist(): void {
+  /**
+   * Applies a change to a copy of the registry and writes it; the copy
+   * becomes the live data only once the write has succeeded. A write that
+   * throws (disk full, a read-only volume) therefore leaves memory as it was,
+   * matching the file, instead of showing an org or duo that a restart drops.
+   */
+  private commit<T>(change: (draft: RegistryFile) => T): T {
+    const draft = structuredClone(this.data);
+    const result = change(draft);
+    this.persist(draft);
+    this.data = draft;
+    return result;
+  }
+
+  /**
+   * Write-then-rename, so a crash mid-write never leaves a truncated
+   * registry. The first write after converting a v1 file keeps the original
+   * beside it as `registry.json.v1.bak` (never overwriting an existing one),
+   * so a bad migration has a way back.
+   */
+  private persist(data: RegistryFile): void {
     mkdirSync(dirname(this.path), { recursive: true });
+    const backup = `${this.path}.v1.bak`;
+    if (this.backupBeforeWrite && existsSync(this.path) && !existsSync(backup)) {
+      copyFileSync(this.path, backup);
+    }
     const tmp = join(dirname(this.path), `.registry-${process.pid}.tmp`);
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
     renameSync(tmp, this.path);
+    this.backupBeforeWrite = false;
   }
 }

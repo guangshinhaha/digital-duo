@@ -73,14 +73,32 @@
   invite goes to the default org, so an invite made the old way still works. Redeeming it puts the
   new duo in that org, and `POST /hosted/login` and `/hosted/signup` return the duo's `orgId`.
 - **The super admin** is anyone in `DUO_HOSTED_ADMIN_EMAILS` (or the server-side
-  `DUO_HOSTED_ADMIN_TOKEN`). It is read live from the env on each request, not from a flag stored
-  at sign-up. Org-admin routes answer 401 with no credential and 403 for any other caller. Org
-  admins who are not the super admin, and deleting an org, are out of scope (follow-ups).
+  `DUO_HOSTED_ADMIN_TOKEN`). The list is re-read from the process environment on every request,
+  not from a flag stored at sign-up, so removing an email from a running process's env withdraws
+  admin on the next request. A platform that only changes env vars by redeploying
+  applies the change on that redeploy. Admin-ness is judged on the email stored with the
+  duo, and every `POST /hosted/login` refreshes that email from the verified Google identity.
+  The privilege still follows an address, not a person: if an admin address is reassigned to
+  someone else, revoke the old account's devices (its duo's device list) as well as editing the
+  list. Org-admin routes answer 401 with no credential and 403 for any other caller (a garbage
+  or revoked token is a 403 too). Org admins who are not the super admin, and deleting an org,
+  are out of scope (follow-ups).
+- **Org ids are lowercase letters and digits only.** They are embedded in Matrix account names
+  (`@<orgId>.<handle>:<server>`, split on the first dot), which are permanent. The registry
+  refuses to load a file with any other org id, and never generates one. Org names are
+  NFKC-normalized, trimmed, must not contain control or invisible (zero-width, bidi) characters,
+  and stay unique ignoring case.
+- **The root duo is a member of its org in the registry itself.** The server records it once
+  (`rootDuo` in `registry.json`) when it serves a pre-hosted root duo, so `listOrgMembers` and
+  the member counts do not depend on call order.
 - **Migration is versioned and lazy.** A registry file with no `version` (v1) is read as
   version 2 in memory: a default org (`id: "default"`, name "Default") is created and every
   tenant, invite and the root duo go in it. Ids, URLs and device tokens do not change. Nothing
-  is rewritten until the registry next writes, and migrating twice gives the same result. A file
-  from a newer version is refused.
+  is rewritten until the registry next writes (which keeps the original as
+  `registry.json.v1.bak`, never overwriting an existing one), and migrating twice gives the
+  same result. On every load a tenant or invite with no `orgId` (written by a rolled-back
+  pre-orgs build) is put in the default org. A file from a newer version is refused. A write
+  that fails leaves the in-memory registry as it was.
 
 Routes (all super admin only; POST for rename because CORS allows only GET and POST):
 

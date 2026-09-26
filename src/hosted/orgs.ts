@@ -13,6 +13,22 @@ export const DEFAULT_ORG_ID = "default";
 export const DEFAULT_ORG_NAME = "Default";
 
 /**
+ * The shape of an org id. It is embedded in Matrix account names
+ * (`@<orgId>.<handle>:<server>`) that are split on the first dot and are
+ * permanent once created, so an id is lowercase letters and digits only: no
+ * `.`, no `-`. `newShortId` in registry.ts only ever generates such ids; this
+ * is the registry-level rule, checked wherever an id enters it.
+ */
+export const ORG_ID_PATTERN = /^[a-z0-9]+$/;
+
+/** Throws unless `id` is a valid org id (see `ORG_ID_PATTERN`). */
+export function assertOrgId(id: unknown): asserts id is string {
+  if (typeof id !== "string" || !ORG_ID_PATTERN.test(id)) {
+    throw new Error(`Org id ${JSON.stringify(id)} must be lowercase letters and digits only.`);
+  }
+}
+
+/**
  * The stable duo id of the pre-hosted root duo, for the org functions that
  * take a duo id. Tenant ids are ten lowercase-alphanumeric characters, so
  * this cannot collide with one.
@@ -72,11 +88,22 @@ export class RegistryVersionError extends Error {
   }
 }
 
-/** Trims and bounds an org name; throws OrgNameError when it is unusable. */
+/** Control characters, and format characters (zero-width space/joiner, bidi marks, BOM), plus line and paragraph separators: they render as nothing or reorder text, so two "different" names can look identical. */
+const UNSAFE_NAME_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+/**
+ * NFKC-normalizes, trims and bounds an org name; throws OrgNameError when it
+ * is unusable. Normalizing first means look-alike forms (full-width letters,
+ * ligatures, an ideographic space) cannot make two names that read the same
+ * count as different when the registry compares them.
+ */
 export function normalizeOrgName(name: unknown): string {
-  const trimmed = typeof name === "string" ? name.trim() : "";
-  if (trimmed.length === 0 || trimmed.length > MAX_ORG_NAME_LENGTH) {
+  const normalized = typeof name === "string" ? name.normalize("NFKC").trim() : "";
+  if (normalized.length === 0 || normalized.length > MAX_ORG_NAME_LENGTH) {
     throw new OrgNameError(`An org name is required (at most ${MAX_ORG_NAME_LENGTH} characters).`);
   }
-  return trimmed;
+  if (UNSAFE_NAME_CHARACTERS.test(normalized)) {
+    throw new OrgNameError("An org name cannot contain control or invisible characters.");
+  }
+  return normalized;
 }

@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,9 +7,9 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { IdentityError, type IdentityVerifier } from "../src/hosted/google.js";
 import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename } from "../src/hosted/invite.js";
-import { DEFAULT_ORG_ID, OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "../src/hosted/orgs.js";
+import { assertOrgId, DEFAULT_ORG_ID, normalizeOrgName, ORG_ID_PATTERN, OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "../src/hosted/orgs.js";
 import { HostedRegistry } from "../src/hosted/registry.js";
-import { createHostedServer, type HostedServer, type HostedSettings } from "../src/hosted/server.js";
+import { createHostedServer, hostedSettingsFrom, type HostedServer, type HostedSettings } from "../src/hosted/server.js";
 import type { ServeDeps } from "../src/serve/server.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
@@ -147,6 +147,70 @@ describe("registry migration — a pre-orgs registry file loads into a default o
     expect(new HostedRegistry(path, MASTER).orgs()).toHaveLength(2);
   });
 
+  it("keeps a copy of the v1 file before the first migrated write, and never overwrites it", () => {
+    const path = copyOfFixture();
+    const original = readFileSync(path, "utf8");
+    const registry = new HostedRegistry(path, MASTER);
+    expect(existsSync(`${path}.v1.bak`)).toBe(false);
+    registry.createOrg("Team B");
+    expect(readFileSync(`${path}.v1.bak`, "utf8")).toBe(original);
+    registry.createOrg("Team C");
+    expect(readFileSync(`${path}.v1.bak`, "utf8")).toBe(original);
+    // A later process loads a v2 file: no copy is made or replaced.
+    writeFileSync(`${path}.v1.bak`, "sentinel");
+    new HostedRegistry(path, MASTER).createOrg("Team D");
+    expect(readFileSync(`${path}.v1.bak`, "utf8")).toBe("sentinel");
+  });
+
+  it("does not replace an existing .bak, and makes none for a v2 file or a brand-new registry", () => {
+    const path = copyOfFixture();
+    writeFileSync(`${path}.v1.bak`, "older backup");
+    new HostedRegistry(path, MASTER).createOrg("Team B");
+    expect(readFileSync(`${path}.v1.bak`, "utf8")).toBe("older backup");
+
+    const fresh = join(tempDir(), "fresh2", "registry.json");
+    new HostedRegistry(fresh, MASTER).createOrg("Team B");
+    expect(existsSync(`${fresh}.v1.bak`)).toBe(false);
+  });
+
+  it("repairs a v2 file written by a rolled-back pre-orgs build: a tenant or invite with no org goes to the default org", () => {
+    const path = join(tempDir(), "hosted", "registry.json");
+    mkdirSync(dirname(path), { recursive: true });
+    const v1 = JSON.parse(readFileSync(fixture(), "utf8")) as { tenants: Array<Record<string, unknown>>; invites: Array<Record<string, unknown>> };
+    const org = { id: "acme2", name: "Acme", createdAt: "2026-09-26T02:00:00.000Z" };
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 2,
+        orgs: [{ id: DEFAULT_ORG_ID, name: "Default", createdAt: "2026-09-26T01:00:00.000Z" }, org],
+        rootOrgId: "acme2",
+        tenants: [{ ...v1.tenants[0], orgId: "acme2" }, v1.tenants[1]],
+        invites: v1.invites,
+        root: null,
+      }),
+    );
+    const registry = new HostedRegistry(path, MASTER);
+    // Existing orgs and explicit assignments are kept; the record with no org is repaired.
+    expect(registry.orgs().map((entry) => entry.id)).toEqual([DEFAULT_ORG_ID, "acme2"]);
+    expect(registry.orgOf("e2etest001")?.id).toBe("acme2");
+    expect(registry.orgOf("samsamsam2")?.id).toBe(DEFAULT_ORG_ID);
+    expect(registry.invites().every((invite) => invite.orgId === DEFAULT_ORG_ID)).toBe(true);
+    expect(registry.orgOf(ROOT_DUO_ID)?.id).toBe("acme2");
+    expect(registry.listOrgMembers(DEFAULT_ORG_ID).map((member) => member.duoId)).toEqual(["samsamsam2"]);
+    // A v2 file needs no .bak.
+    registry.createOrg("Team B");
+    expect(existsSync(`${path}.v1.bak`)).toBe(false);
+  });
+
+  it("refuses to load a v2 file with an invalid org id, naming it", () => {
+    const path = join(tempDir(), "hosted", "registry.json");
+    mkdirSync(dirname(path), { recursive: true });
+    for (const id of ["acme.eu", "Acme", "a-b"]) {
+      writeFileSync(path, JSON.stringify({ version: 2, orgs: [{ id: DEFAULT_ORG_ID, name: "Default", createdAt: "x" }, { id, name: "Acme", createdAt: "x" }], tenants: [], invites: [], rootOrgId: DEFAULT_ORG_ID }));
+      expect(() => new HostedRegistry(path, MASTER), id).toThrow(new RegExp(`"${id}" must be lowercase letters and digits only`));
+    }
+  });
+
   it("starts a brand-new registry with the default org, and refuses a file from a newer server", () => {
     expect(new HostedRegistry(join(tempDir(), "fresh", "registry.json"), MASTER).orgs().map((org) => org.id)).toEqual([DEFAULT_ORG_ID]);
     const path = join(tempDir(), "future", "registry.json");
@@ -216,6 +280,74 @@ describe("registry — orgs", () => {
     const registry = fresh();
     registry.declareRootDuo("Shin");
     expect(registry.listOrgMembers(DEFAULT_ORG_ID)).toEqual([expect.objectContaining({ duoId: ROOT_DUO_ID, name: "Shin", isRoot: true })]);
+  });
+
+  it("the root duo's membership is in the registry file: a fresh load lists it without any server call", () => {
+    const path = join(tempDir(), "hosted", "registry.json");
+    new HostedRegistry(path, MASTER).declareRootDuo("Shin");
+    const reloaded = new HostedRegistry(path, MASTER);
+    expect(reloaded.listOrgMembers(DEFAULT_ORG_ID)).toEqual([expect.objectContaining({ duoId: ROOT_DUO_ID, name: "Shin", isRoot: true })]);
+    expect(reloaded.listOrgs()).toEqual([expect.objectContaining({ id: DEFAULT_ORG_ID, memberCount: 1 })]);
+    // Declaring the same name again is not a write.
+    const before = readFileSync(path, "utf8");
+    reloaded.declareRootDuo("Shin");
+    expect(readFileSync(path, "utf8")).toBe(before);
+    // A registry that never served a root duo has no root member.
+    expect(new HostedRegistry(join(tempDir(), "other", "registry.json"), MASTER).listOrgMembers(DEFAULT_ORG_ID)).toEqual([]);
+  });
+
+  it("a write that fails leaves memory as it was, for orgs, invites and duos", () => {
+    // A regular file where the registry's directory must be, so every write throws for real.
+    const blocker = join(tempDir(), "blocked");
+    const registry = new HostedRegistry(join(blocker, "registry.json"), MASTER);
+    writeFileSync(blocker, "not a directory");
+    const expires = new Date(Date.now() + 60_000).toISOString();
+
+    expect(() => registry.createOrg("Team B")).toThrow();
+    expect(registry.orgs().map((org) => org.name)).toEqual(["Default"]);
+    expect(() => registry.renameOrg(DEFAULT_ORG_ID, "Renamed")).toThrow();
+    expect(registry.org(DEFAULT_ORG_ID)?.name).toBe("Default");
+    expect(() => registry.createInvite("Kim", expires)).toThrow();
+    expect(registry.invites()).toEqual([]);
+    expect(() => registry.addTenant("no-invite", "Kim", "pw")).toThrow();
+    expect(registry.tenants()).toEqual([]);
+    expect(() => registry.declareRootDuo("Shin")).toThrow();
+    expect(registry.listOrgMembers(DEFAULT_ORG_ID)).toEqual([]);
+
+    // Once the disk is fine again, the same calls work: nothing half-applied is in the way.
+    rmSync(blocker);
+    expect(registry.createOrg("Team B").name).toBe("Team B");
+    expect(registry.orgs().map((org) => org.name)).toEqual(["Default", "Team B"]);
+  });
+
+  it("org ids are lowercase letters and digits only, and created ids conform", () => {
+    for (const bad of ["a.b", "a-b", "Acme", "", "acme eu", "a:b"]) {
+      expect(() => assertOrgId(bad), bad).toThrow(/lowercase letters and digits/);
+    }
+    expect(() => assertOrgId(undefined)).toThrow();
+    for (const good of ["default", "a2b3c4d5"]) {
+      expect(() => assertOrgId(good)).not.toThrow();
+    }
+    const registry = fresh();
+    for (let i = 0; i < 20; i += 1) {
+      expect(registry.createOrg(`Org ${i}`).id).toMatch(ORG_ID_PATTERN);
+    }
+  });
+
+  it("an org name is NFKC-normalized, refuses control and invisible characters, and stays unique ignoring case", () => {
+    const registry = fresh();
+    expect(normalizeOrgName("\uFF34eam\u3000\uFF22")).toBe("Team B");
+    expect(normalizeOrgName("\uFB01nance")).toBe("finance");
+    for (const bad of ["Te\u200Bam", "Team\u200D", "Te\uFEFFam", "Te\u202Eam", "Te\nam", "Te\tam", "Team\u0000", "Te\u2028am", "\u200B"]) {
+      expect(() => normalizeOrgName(bad), JSON.stringify(bad)).toThrow(OrgNameError);
+    }
+    expect(() => normalizeOrgName("x".repeat(81))).toThrow(OrgNameError);
+    expect(() => normalizeOrgName(42)).toThrow(OrgNameError);
+
+    expect(registry.createOrg("\uFF34eam B").name).toBe("Team B");
+    expect(() => registry.createOrg("TEAM b")).toThrow(OrgNameTakenError);
+    expect(() => registry.createOrg("\uFF54\uFF45\uFF41\uFF4D B")).toThrow(OrgNameTakenError);
+    expect(() => registry.createOrg("Te\u200Bam C")).toThrow(OrgNameError);
   });
 });
 
@@ -294,7 +426,29 @@ describe("hosted org routes", () => {
       expect((await call(base, "POST", "/hosted/invites", admin.token, { name: "Kim", orgId: org.id })).status).toBe(201);
     });
 
-    it("admin is read live from the env: a member whose email is later removed loses it", async () => {
+    it("admin is read live from the env: removing an email revokes admin on the next request, with no restart", async () => {
+      const env: NodeJS.ProcessEnv = {
+        DUO_HOSTED_MASTER_KEY: MASTER,
+        DUO_HOSTED_ADMIN_TOKEN: ADMIN,
+        DUO_HOSTED_ADMIN_EMAILS: "shin@x.com, Ann@X.com",
+        DUO_HOSTED_ROOT: join(tempDir(), "hosted"),
+        DUO_HOSTED_GOOGLE_CLIENT_ID: "cid",
+      };
+      const { base } = await start(hostedSettingsFrom(env));
+      const { code } = await json<{ code: string }>(await call(base, "POST", "/hosted/invites", ADMIN, { name: "Ann" }), 201);
+      const ann = await json<Session>(await call(base, "POST", "/hosted/signup", undefined, { invite: code, credential: "sub-ann|ann@x.com|Ann" }), 201);
+      expect(ann.isAdmin).toBe(true);
+      expect((await call(base, "GET", "/hosted/orgs", ann.token)).status).toBe(200);
+
+      env.DUO_HOSTED_ADMIN_EMAILS = "shin@x.com";
+      expect((await call(base, "GET", "/hosted/orgs", ann.token)).status).toBe(403);
+      expect((await call(base, "GET", "/hosted/orgs", ADMIN)).status).toBe(200);
+
+      env.DUO_HOSTED_ADMIN_EMAILS = "shin@x.com,ann@x.com";
+      expect((await call(base, "GET", "/hosted/orgs", ann.token)).status).toBe(200);
+    });
+
+    it("a member whose email is added to the list gains admin on a restart with the new settings", async () => {
       const hostedSettings = settings();
       const first = await start(hostedSettings);
       const { code } = await json<{ code: string }>(await call(first.base, "POST", "/hosted/invites", ADMIN, { name: "Ann" }), 201);
@@ -305,6 +459,32 @@ describe("hosted org routes", () => {
 
       const second = await start({ ...hostedSettings, adminEmails: ["shin@x.com", "ann@x.com"] });
       expect((await call(second.base, "GET", "/hosted/orgs", ann.token)).status).toBe(200);
+    });
+
+    it("a login refreshes the stored email from the verified identity, so a reissued address stops carrying admin", async () => {
+      const hostedSettings = settings({ adminEmails: ["shin@x.com", "ann@x.com"] });
+      const { base } = await start(hostedSettings);
+      const { code } = await json<{ code: string }>(await call(base, "POST", "/hosted/invites", ADMIN, { name: "Ann" }), 201);
+      const ann = await json<Session>(await call(base, "POST", "/hosted/signup", undefined, { invite: code, credential: "sub-ann|ann@x.com|Ann" }), 201);
+      expect(ann.isAdmin).toBe(true);
+      expect((await call(base, "GET", "/hosted/orgs", ann.token)).status).toBe(200);
+
+      // The same Google account (subject) now signs in under a different address, which is not an admin address.
+      const relogin = await json<Session>(await call(base, "POST", "/hosted/login", undefined, { credential: "sub-ann|ann@elsewhere.com|Ann" }), 200);
+      expect(relogin.isAdmin).toBe(false);
+      const stored = JSON.parse(readFileSync(join(hostedSettings.hostedRoot, "registry.json"), "utf8")) as { tenants: Array<{ email: string }> };
+      expect(stored.tenants.map((tenant) => tenant.email)).toEqual(["ann@elsewhere.com"]);
+      // The email is what admin is judged on, so the earlier device loses it as well.
+      expect((await call(base, "GET", "/hosted/orgs", ann.token)).status).toBe(403);
+      expect((await call(base, "GET", "/hosted/orgs", relogin.token)).status).toBe(403);
+    });
+
+    it("a login refreshes the root claim's email too", async () => {
+      const { base } = await start(settings(), rootDeps());
+      const admin = await json<Session>(await call(base, "POST", "/hosted/login", undefined, { credential: "sub-shin|shin@x.com|Shin" }), 200);
+      expect((await call(base, "GET", "/hosted/orgs", admin.token)).status).toBe(200);
+      expect((await call(base, "POST", "/hosted/login", undefined, { credential: "sub-shin|shin@moved.com|Shin" })).status).toBe(404);
+      expect((await call(base, "GET", "/hosted/orgs", admin.token)).status).toBe(403);
     });
   });
 });

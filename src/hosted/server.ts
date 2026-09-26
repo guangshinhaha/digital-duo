@@ -37,7 +37,10 @@ export interface HostedSettings {
   readonly webUrl: string | undefined;
   /** Google OAuth web client id. When set, sign-up and login require a Google sign-in; when unset, sign-up takes a typed name (local/dev). */
   readonly googleClientId: string | undefined;
-  /** Lowercased emails of the super admins: they create and rename orgs, invite people into any org, and the first of them to sign in claims the root duo. */
+  /**
+   * Lowercased emails of the super admins: they create and rename orgs, invite people into any org, and the first of them to sign in claims the root duo.
+   * From `hostedSettingsFrom` this is read from the env on every access, so editing `DUO_HOSTED_ADMIN_EMAILS` takes effect on the next request.
+   */
   readonly adminEmails: readonly string[];
 }
 
@@ -64,11 +67,22 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
     publicUrl: env.DUO_HOSTED_PUBLIC_URL?.replace(/\/+$/, "") || undefined,
     webUrl: env.DUO_HOSTED_WEB_URL?.replace(/\/+$/, "") || undefined,
     googleClientId: env.DUO_HOSTED_GOOGLE_CLIENT_ID || undefined,
-    adminEmails: (env.DUO_HOSTED_ADMIN_EMAILS ?? "")
-      .split(",")
-      .map((email) => email.trim().toLowerCase())
-      .filter((email) => email.length > 0),
+    // A getter, not a snapshot: the list is re-read from `env` (process.env in
+    // the daemon) whenever it is used, so removing an email withdraws admin
+    // without a restart. Only where the running process's env can be edited
+    // (a shell, an orchestrator that sets it live); a platform that changes
+    // env vars by redeploying still needs the redeploy.
+    get adminEmails() {
+      return parseAdminEmails(env.DUO_HOSTED_ADMIN_EMAILS);
+    },
   };
+}
+
+function parseAdminEmails(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter((email) => email.length > 0);
 }
 
 /** What every hosted duo shares: the providers and the confidence knobs. Everything owner-specific comes from the tenant. */
@@ -208,7 +222,10 @@ export async function createHostedServer(
 
   const isAdminEmail = (email: string | undefined) => email !== undefined && settings.adminEmails.includes(email.toLowerCase());
 
-  /** Super admin is live from DUO_HOSTED_ADMIN_EMAILS, so removing an email withdraws the privilege on the next request. */
+  /**
+   * Super admin is decided per request from `settings.adminEmails` (live from DUO_HOSTED_ADMIN_EMAILS when the settings come from
+   * `hostedSettingsFrom`) against the duo's stored email, which every login refreshes from the verified identity.
+   */
   const isSuperAdminTenant = (tenant: HostedTenant) => isAdminEmail(tenant.email);
 
   /** A device token paired to a super admin's duo — the root duo once an admin has claimed it, or any admin tenant. */
@@ -290,7 +307,11 @@ export async function createHostedServer(
     if (!identity) {
       return;
     }
-    const tenant = registry.tenantBySubject(identity.subject);
+    // The stored email is what admin-ness is judged on, so it follows the
+    // verified identity rather than staying as it was at sign-up.
+    registry.refreshRootEmail(identity.subject, identity.email);
+    const found = registry.tenantBySubject(identity.subject);
+    const tenant = found && registry.refreshTenantEmail(found.id, identity.email);
     if (tenant) {
       const device = mintDevice(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant));
       return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
