@@ -154,6 +154,51 @@ export class SynapseAdmin {
     }
   }
 
+  /**
+   * Creates a room as the service account (`POST /_matrix/client/v3/createRoom`, docs/deploy/hosted-workspace.md
+   * §6, §12). **Always private**: `visibility: "private"` and the `private_chat` preset (invite-only) are
+   * fixed here and not options, so no caller can make a public room, which would put everyone in it in
+   * every org's directory. A Space is the same room with `creation_content.type = "m.space"`, and only
+   * the service account may post in it (`events_default: 100`, the spec's recommendation).
+   * Not idempotent by itself (Matrix has no idempotency key for createRoom); callers record the id at once.
+   */
+  async createPrivateRoom(options: { name: string; space?: boolean }): Promise<string> {
+    const { json } = await this.call("POST", "/_matrix/client/v3/createRoom", {
+      name: options.name,
+      visibility: "private",
+      preset: "private_chat",
+      ...(options.space ? { creation_content: { type: "m.space" }, power_level_content_override: { events_default: 100 } } : {}),
+    });
+    const roomId = (json as { room_id?: unknown } | null)?.room_id;
+    if (typeof roomId !== "string" || !roomId.startsWith("!")) {
+      throw new SynapseAdminError("Synapse createRoom returned no room id", 200, null, false);
+    }
+    return roomId;
+  }
+
+  /** Makes `childRoomId` a child of the Space (`PUT .../state/m.space.child/<child>` with `via`). Safe to repeat: it rewrites the same state. */
+  async addSpaceChild(spaceRoomId: string, childRoomId: string, via: readonly string[]): Promise<void> {
+    await this.call("PUT", `/_matrix/client/v3/rooms/${encodeURIComponent(spaceRoomId)}/state/m.space.child/${encodeURIComponent(childRoomId)}`, {
+      via,
+      suggested: true,
+    });
+  }
+
+  /** Sets a room's name (`PUT .../state/m.room.name`), as the service account, which is in the room and its creator. */
+  async setRoomName(roomId: string, name: string): Promise<void> {
+    await this.call("PUT", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`, { name });
+  }
+
+  /**
+   * Puts a local account into a room with no invite to accept (`POST /_synapse/admin/v1/join/<room>`,
+   * body `{user_id}`). The service account must be in the room with the right to invite; for a private
+   * room Synapse invites the user as the admin and then joins them as themselves, so the join runs
+   * through Synapse's org module as that user (§6.2). Joining a user who is already in is a no-op.
+   */
+  async joinUser(roomId: string, userId: string): Promise<void> {
+    await this.call("POST", `/_synapse/admin/v1/join/${encodeURIComponent(roomId)}`, { user_id: userId });
+  }
+
   private async call(method: "GET" | "PUT" | "POST", path: string, body?: unknown, bearer: string = this.adminToken): Promise<{ status: number; json: unknown }> {
     const label = `${method} ${path.replace(/\/users\/[^/]+/, "/users/<id>")}`;
     let response: Response;

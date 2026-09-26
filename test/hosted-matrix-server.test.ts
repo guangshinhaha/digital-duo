@@ -172,8 +172,10 @@ describe("joining through an invite provisions Matrix accounts", () => {
 
   it("a Synapse that hangs does not hold the sign-up past the wait", async () => {
     const fake = createFakeSynapse();
-    fake.hangNext();
     const { hosted, base } = await start({}, { fake, extras: { signupProvisionWaitMs: 40, synapseTimeoutMs: 400 } });
+    // Startup already makes the default org's Space (#234); let that finish so the hang lands on the sign-up's own call.
+    await hosted.spaces!.whenIdle();
+    fake.hangNext();
     const started = Date.now();
     const response = await signup(base, await invite(base));
     expect(response.status).toBe(201);

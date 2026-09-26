@@ -64,6 +64,17 @@ export interface MatrixPending {
   readonly lastError: string;
 }
 
+/**
+ * Which org rooms a duo's two accounts have been put into (#234). Written when both the person and
+ * the duo are in the Space and `#general`; the ids say which rooms, so a member recorded against a
+ * room that is no longer their org's is seen as not joined.
+ */
+export interface HostedMatrixSpaces {
+  readonly spaceRoomId: string;
+  readonly generalRoomId: string;
+  readonly joinedAt: string;
+}
+
 export function matrixAccountsView(accounts: HostedMatrixAccounts): HostedMatrixAccountsView {
   const { duoTokenCipher: _cipher, ...view } = accounts;
   return view;
@@ -86,6 +97,10 @@ export interface HostedTenant {
   readonly matrix?: HostedMatrixAccounts;
   /** Set while provisioning is owed and failing, so an outage is visible and retried. */
   readonly matrixPending?: MatrixPending;
+  /** Set once the person and the duo are in their org's Space and `#general` (#234). */
+  readonly matrixSpaces?: HostedMatrixSpaces;
+  /** Set while joining the org's rooms is owed and failing. */
+  readonly spacePending?: MatrixPending;
 }
 
 /** Who has claimed the pre-hosted root duo by signing in (an admin email's first sign-in). */
@@ -125,6 +140,9 @@ interface RegistryFile {
   /** The root duo's Matrix accounts (handle `root`). Top level, not on `RootClaim`: the root duo needs accounts before any admin has claimed it. */
   rootMatrix?: HostedMatrixAccounts;
   rootMatrixPending?: MatrixPending;
+  /** The root duo's accounts' membership of its org's rooms (#234), and why it is owed. */
+  rootMatrixSpaces?: HostedMatrixSpaces;
+  rootSpacePending?: MatrixPending;
 }
 
 /**
@@ -392,6 +410,103 @@ export class HostedRegistry {
       draft.tenants = draft.tenants.map((candidate) => (candidate.id === duoId ? { ...candidate, matrixPending: pending } : candidate));
     });
     return pending;
+  }
+
+  /** The org rooms a duo's accounts are in (#234), or undefined when they are still owed. */
+  matrixSpaces(duoId: string): HostedMatrixSpaces | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootMatrixSpaces : this.data.tenants.find((tenant) => tenant.id === duoId)?.matrixSpaces;
+  }
+
+  /** Why a duo's room joins are still owed, or undefined when done or not yet tried. */
+  spacePending(duoId: string): MatrixPending | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootSpacePending : this.data.tenants.find((tenant) => tenant.id === duoId)?.spacePending;
+  }
+
+  /** Records that a duo's person and duo accounts are in these rooms; clears any pending mark. */
+  setMatrixSpaces(duoId: string, rooms: { spaceRoomId: string; generalRoomId: string }): HostedMatrixSpaces {
+    const spaces: HostedMatrixSpaces = { ...rooms, joinedAt: new Date().toISOString() };
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrixSpaces = spaces;
+        delete draft.rootSpacePending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record org rooms for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => {
+        const { spacePending: _cleared, ...rest } = candidate;
+        return candidate.id === duoId ? { ...rest, matrixSpaces: spaces } : candidate;
+      });
+    });
+    return spaces;
+  }
+
+  /** Marks a duo's room joins as owed and failing, keeping when it started and counting attempts. */
+  recordSpaceFailure(duoId: string, reason: string): MatrixPending {
+    const pending = this.nextPending(this.spacePending(duoId), reason);
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootSpacePending = pending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record a room-join failure for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => (candidate.id === duoId ? { ...candidate, spacePending: pending } : candidate));
+    });
+    return pending;
+  }
+
+  /**
+   * Records progress on an org's Space, `#general` and their link, merging into the org in one write.
+   * Progress is recorded step by step so a run that dies half way is finished, not redone: a room
+   * that exists is never created twice.
+   */
+  updateOrgSpace(
+    orgId: string,
+    patch: { spaceRoomId?: string; generalRoomId?: string; spaceSyncedName?: string; generalLinked?: boolean },
+  ): HostedOrg {
+    return this.commit((draft) => {
+      const org = draft.orgs.find((candidate) => candidate.id === orgId);
+      if (!org) {
+        throw new OrgNotFoundError(orgId);
+      }
+      const updated: HostedOrg = { ...org, ...patch };
+      draft.orgs = draft.orgs.map((candidate) => (candidate.id === orgId ? updated : candidate));
+      return updated;
+    });
+  }
+
+  /** Clears an org's pending mark: its rooms exist, are linked and carry its current name. */
+  clearOrgSpacePending(orgId: string): void {
+    if (this.org(orgId)?.spacePending === undefined) {
+      return;
+    }
+    this.commit((draft) => {
+      draft.orgs = draft.orgs.map((org) => {
+        const { spacePending: _cleared, ...rest } = org;
+        return org.id === orgId ? rest : org;
+      });
+    });
+  }
+
+  /** Marks an org's rooms as owed and failing. */
+  recordOrgSpaceFailure(orgId: string, reason: string): MatrixPending {
+    const existing = this.org(orgId);
+    if (!existing) {
+      throw new OrgNotFoundError(orgId);
+    }
+    const pending = this.nextPending(existing.spacePending, reason);
+    this.commit((draft) => {
+      draft.orgs = draft.orgs.map((org) => (org.id === orgId ? { ...org, spacePending: pending } : org));
+    });
+    return pending;
+  }
+
+  private nextPending(previous: MatrixPending | undefined, reason: string): MatrixPending {
+    const now = new Date().toISOString();
+    return { since: previous?.since ?? now, attempts: (previous?.attempts ?? 0) + 1, lastAttemptAt: now, lastError: reason };
   }
 
   passphraseFor(tenant: HostedTenant): string {

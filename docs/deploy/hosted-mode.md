@@ -259,6 +259,50 @@ few seconds.
   probe every few seconds would have made the daemon the person's "last seen" client. So a client
   that signed out and asks again is given the same, dead, token until it calls `DELETE`.
 
+## Org spaces (added 2026-09-26, #234)
+
+Decision record: `hosted-workspace.md` §6.1, §12. When Synapse is configured, every org gets a
+Matrix **Space** named after it and a **`#general`** room inside it, and each member's person
+account and duo account are put into both. With `search_all_users: false`, sharing a room is what
+makes people findable, so the org's Space is what makes an org's members findable to each other and
+to nobody else. It is a place and a directory scope; the wall itself is the Synapse module (#235).
+
+- **Both rooms are private.** They are created as `@workspace-admin` with `visibility: private`
+  and the `private_chat` preset (invite-only); the client method cannot make a public room. A public
+  room would put everyone in it into every org's directory search. `@workspace-admin` stays in both,
+  because the admin join API needs an admin in the room.
+- **Members are force-joined**, no invite to accept: `POST /_synapse/admin/v1/join/<room>` as the
+  service account, once per account per room (four calls per member). That call runs as the target
+  user, so it passes through the org module like the user's own join. A member is joined only to
+  their own org's rooms, and only when both account ids carry that org; a mismatch is reported as
+  `failed` and nothing is joined.
+- **When.** Creating an org (`POST /hosted/orgs`) makes its rooms; redeeming an invite provisions
+  the accounts and then joins them; renaming an org (`POST /hosted/orgs/:id/rename`) renames the
+  Space (`#general` keeps its name). Each waits a few seconds for Synapse and then answers
+  regardless: an outage never blocks an org or an invite. The org or member is marked pending
+  (`spacePending`, attempts and a scrubbed reason) and the same timer as the accounts retries it
+  with the same backoff.
+- **Idempotent.** Progress is recorded step by step (Space id, `#general` id, the link, the name
+  written), so a run that dies half way resumes and a room that exists is never created twice. A
+  member who is recorded in (`matrixSpaces`) costs no call. The one window it cannot close: a
+  room is created and the registry write fails twice; the daemon logs the id and an operator can
+  delete the stray room.
+- **Backfill.** Startup and `duo hosted provision` (`POST /hosted/matrix/provision`) run the
+  accounts first and then the spaces, for every org (the default org included, even when empty),
+  every member, and the root duo. The answer keeps its old fields and gains `spaces`: org counts,
+  member counts (`waiting` is a member whose accounts are still owed) and per-item status.
+
+Registry fields (all optional, on a v2 file, so older builds and older files are unaffected):
+`orgs[].spaceRoomId`, `generalRoomId`, `spaceSyncedName`, `generalLinked`, `spacePending`;
+`tenants[].matrixSpaces` (`{ spaceRoomId, generalRoomId, joinedAt }`), `spacePending`;
+top level `rootMatrixSpaces`, `rootSpacePending`.
+
+```ts
+registry.org(orgId)?.spaceRoomId / .generalRoomId              // an org's Space and #general
+registry.matrixSpaces(duoId) / registry.spacePending(duoId)
+hosted.spaces?.ensureOrg(orgId) / .syncMember(duoId) / .syncAll() / .retryPending() / .hasRetryDue()
+```
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -295,7 +339,7 @@ duo hosted invite "Kim" --org <id>             # without --org: the default org
 ```
 
 ```sh
-duo hosted provision                           # create any Matrix accounts still missing; safe to repeat
+duo hosted provision                           # create any Matrix accounts, org Spaces and member joins still missing; safe to repeat
 ```
 
 Like `invite`, these talk to the running daemon with `DUO_HOSTED_ADMIN_TOKEN`.

@@ -50,11 +50,23 @@ export async function runHostedInvite(
   return callDaemon(env, "POST", "/hosted/invites", { name, expiresInHours, ...(orgId ? { orgId } : {}) });
 }
 
-/** Implements `duo hosted provision`: creates the Matrix accounts every hosted duo still lacks (idempotent). */
+/** Implements `duo hosted provision`: creates the Matrix accounts every hosted duo still lacks, then each org's Space and `#general` and the members' places in them (idempotent). */
 export function runHostedProvision(
   env: NodeJS.ProcessEnv = process.env,
   timeoutMs: number = PROVISION_CALL_TIMEOUT_MS,
-): Promise<{ provisioned: number; already: number; pending: number; failed: number; outcomes: Array<{ duoId: string; status: string; error?: string }> }> {
+): Promise<{
+  provisioned: number;
+  already: number;
+  pending: number;
+  failed: number;
+  outcomes: Array<{ duoId: string; status: string; error?: string }>;
+  spaces: {
+    orgs: { provisioned: number; already: number; pending: number; failed: number };
+    members: { provisioned: number; already: number; pending: number; failed: number; waiting: number };
+    orgOutcomes: Array<{ orgId: string; status: string; error?: string }>;
+    memberOutcomes: Array<{ duoId: string; status: string; error?: string }>;
+  };
+}> {
   return callDaemon(env, "POST", "/hosted/matrix/provision", {}, timeoutMs);
 }
 
