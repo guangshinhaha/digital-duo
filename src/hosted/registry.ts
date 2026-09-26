@@ -24,6 +24,18 @@ export interface HostedTenant {
   readonly createdAt: string;
   /** base64 of encrypt(passphrase, masterKey). */
   readonly passphraseCipher: string;
+  /** The identity provider's subject this duo is bound to; absent for a duo made before sign-in existed. */
+  readonly identitySubject?: string;
+  readonly email?: string;
+  /** May mint invites from the app. */
+  readonly isAdmin?: boolean;
+}
+
+/** Who has claimed the pre-hosted root duo by signing in (an admin email's first sign-in). */
+export interface RootClaim {
+  readonly identitySubject: string;
+  readonly email: string;
+  readonly claimedAt: string;
 }
 
 export interface HostedInvite {
@@ -36,11 +48,14 @@ export interface HostedInvite {
   readonly expiresAt: string;
   readonly usedAt: string | null;
   readonly tenantId: string | null;
+  /** When set, only a sign-in with this (lowercased) email may redeem the invite. */
+  readonly email?: string | null;
 }
 
 interface RegistryFile {
   tenants: HostedTenant[];
   invites: HostedInvite[];
+  root?: RootClaim | null;
 }
 
 export class InviteInvalidError extends Error {
@@ -79,12 +94,27 @@ export class HostedRegistry {
     return this.data.invites;
   }
 
+  root(): RootClaim | null {
+    return this.data.root ?? null;
+  }
+
+  claimRoot(identitySubject: string, email: string): RootClaim {
+    const claim: RootClaim = { identitySubject, email, claimedAt: new Date().toISOString() };
+    this.data.root = claim;
+    this.persist();
+    return claim;
+  }
+
+  tenantBySubject(identitySubject: string): HostedTenant | undefined {
+    return this.data.tenants.find((tenant) => tenant.identitySubject === identitySubject);
+  }
+
   passphraseFor(tenant: HostedTenant): string {
     return decrypt(Buffer.from(tenant.passphraseCipher, "base64"), this.masterKey).toString("utf8");
   }
 
   /** Mints an invite; the returned code is the only copy that will ever exist. */
-  createInvite(name: string, expiresAt: string): { invite: HostedInvite; code: string } {
+  createInvite(name: string, expiresAt: string, email: string | null = null): { invite: HostedInvite; code: string } {
     const code = randomBytes(24).toString("base64url");
     const invite: HostedInvite = {
       id: randomUUID(),
@@ -94,6 +124,7 @@ export class HostedRegistry {
       expiresAt,
       usedAt: null,
       tenantId: null,
+      email,
     };
     this.data.invites.push(invite);
     this.persist();
@@ -114,12 +145,19 @@ export class HostedRegistry {
    * Records a new duo and marks its invite spent, in one write. The caller
    * has already created the duo's store under `passphrase`.
    */
-  addTenant(inviteId: string, name: string, passphrase: string, id = newTenantId()): HostedTenant {
+  addTenant(
+    inviteId: string,
+    name: string,
+    passphrase: string,
+    id = newTenantId(),
+    identity: { identitySubject?: string; email?: string; isAdmin?: boolean } = {},
+  ): HostedTenant {
     const tenant: HostedTenant = {
       id,
       name,
       createdAt: new Date().toISOString(),
       passphraseCipher: encrypt(Buffer.from(passphrase, "utf8"), this.masterKey).toString("base64"),
+      ...identity,
     };
     this.data.tenants.push(tenant);
     this.data.invites = this.data.invites.map((invite) =>

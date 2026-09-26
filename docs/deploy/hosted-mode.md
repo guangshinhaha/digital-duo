@@ -41,6 +41,24 @@
    its own decision) and per-duo inference billing (every duo shares the server's OpenRouter
    key; org mode §7's gateway is still the answer for real metering).
 
+## Sign-in (added 2026-09-26)
+
+- **Google sign-in, bound once.** With `DUO_HOSTED_GOOGLE_CLIENT_ID` set, redeeming an invite
+  requires a Google sign-in. The duo is bound to that account's stable subject id, one duo per
+  account. `POST /hosted/login` with a Google ID token then mints a fresh device token on any
+  browser. That device shows up in the duo's device list and can be revoked like any other.
+- **Verified without an SDK.** The server checks the token's RS256 signature against Google's
+  published keys, plus audience, issuer, expiry and verified email (`src/hosted/google.ts`). No
+  client secret is involved. Google is one `IdentityVerifier`, so an agency IdP (TechPass,
+  Entra ID) is another implementation of it, not a redesign.
+- **Admins are emails.** Anyone listed in `DUO_HOSTED_ADMIN_EMAILS` gets an admin account and can
+  mint invites with their own device token (the app's Invite people page). The first admin to
+  sign in claims the pre-hosted root duo, and after that only that Google account opens it.
+- **Invites can be locked to an email.** Only that Google account can redeem such an invite.
+- **The Google project is in Testing mode.** Only its listed test users can sign in, up to 100.
+  Add each invitee's Gmail under Google Auth Platform → Audience → Test users, or complete
+  Branding and publish.
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -50,6 +68,8 @@
 | `DUO_HOSTED_PUBLIC_URL` | The daemon's public origin, used to build invite links. |
 | `DUO_HOSTED_WEB_URL` | The web app's origin, used to build invite links. |
 | `DUO_HOSTED_ROOT` | Optional. Defaults to `hosted` (under the volume). |
+| `DUO_HOSTED_GOOGLE_CLIENT_ID` | The Google OAuth web client id. Public, not a secret. |
+| `DUO_HOSTED_ADMIN_EMAILS` | Comma-separated admin Google emails. |
 
 ## Inviting someone
 

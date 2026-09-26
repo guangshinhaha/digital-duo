@@ -9,8 +9,9 @@ import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
 import { createServer, type ServeDeps } from "../serve/server.js";
-import { createDeviceToken } from "../serve/tokens.js";
+import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
+import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
 import { HostedRegistry, InviteInvalidError, type HostedTenant } from "./registry.js";
 
 /** Where a hosted duo lives: everything under one directory per duo, nothing shared between them. */
@@ -33,6 +34,10 @@ export interface HostedSettings {
   /** The daemon's public origin and the web app's, for building invite links. Both optional: without them an invite returns its code only. */
   readonly publicUrl: string | undefined;
   readonly webUrl: string | undefined;
+  /** Google OAuth web client id. When set, sign-up and login require a Google sign-in; when unset, sign-up takes a typed name (local/dev). */
+  readonly googleClientId: string | undefined;
+  /** Lowercased emails that are admins: they may mint invites from the app, and the first of them to sign in claims the root duo. */
+  readonly adminEmails: readonly string[];
 }
 
 export class HostedConfigError extends Error {
@@ -57,6 +62,11 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
     adminToken,
     publicUrl: env.DUO_HOSTED_PUBLIC_URL?.replace(/\/+$/, "") || undefined,
     webUrl: env.DUO_HOSTED_WEB_URL?.replace(/\/+$/, "") || undefined,
+    googleClientId: env.DUO_HOSTED_GOOGLE_CLIENT_ID || undefined,
+    adminEmails: (env.DUO_HOSTED_ADMIN_EMAILS ?? "")
+      .split(",")
+      .map((email) => email.trim().toLowerCase())
+      .filter((email) => email.length > 0),
   };
 }
 
@@ -154,6 +164,7 @@ export async function createHostedServer(
   shared: SharedDuoRuntime,
   settings: HostedSettings,
   root: ServeDeps | undefined,
+  identityVerifier: IdentityVerifier | undefined = settings.googleClientId ? googleIdentityVerifier(settings.googleClientId) : undefined,
 ): Promise<HostedServer> {
   const registry = new HostedRegistry(join(settings.hostedRoot, "registry.json"), settings.masterKey);
   const duos = new Map<string, MountedDuo>();
@@ -177,13 +188,53 @@ export async function createHostedServer(
     methods: ["GET", "POST", "OPTIONS"],
   });
 
+  const isAdminEmail = (email: string | undefined) => email !== undefined && settings.adminEmails.includes(email.toLowerCase());
+
+  /** A device token paired to an admin's duo — the root duo once an admin has claimed it, or any admin tenant. */
+  const isAdminDevice = (token: string): boolean => {
+    if (root && registry.root() && verifyDeviceToken(root.storePath, root.passphrase, token)) {
+      return true;
+    }
+    return registry
+      .tenants()
+      .filter((tenant) => tenant.isAdmin)
+      .some((tenant) => verifyDeviceToken(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant), token) !== undefined);
+  };
+
+  // The server-side admin token (for `duo hosted invite` on the box) or an
+  // admin's own signed-in device (for the app's Invite people page).
   const requireAdmin = async (request: FastifyRequest, reply: FastifyReply) => {
     const header = request.headers.authorization;
     const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-    if (!token || !constantTimeEquals(token, settings.adminToken)) {
-      sendError(reply, 401, "unauthorized", "Admin token required.");
+    if (!token || !(constantTimeEquals(token, settings.adminToken) || isAdminDevice(token))) {
+      sendError(reply, 401, "unauthorized", "Only an admin can do this.");
     }
   };
+
+  /** Verifies a sign-in credential, answering the failure itself; undefined means the reply is already sent. */
+  const identify = async (credential: unknown, request: FastifyRequest, reply: FastifyReply): Promise<VerifiedIdentity | undefined> => {
+    if (!identityVerifier) {
+      sendError(reply, 400, "sign_in_not_configured", "Sign-in isn't set up on this server.");
+      return undefined;
+    }
+    if (typeof credential !== "string" || credential.length === 0) {
+      sendError(reply, 400, "bad_request", "credential (the Google sign-in token) is required");
+      return undefined;
+    }
+    try {
+      return await identityVerifier.verify(credential);
+    } catch (error) {
+      if (error instanceof IdentityError) {
+        recordSignupFailure(request.ip);
+        sendError(reply, 401, "sign_in_failed", error.message);
+        return undefined;
+      }
+      throw error;
+    }
+  };
+
+  const mintDevice = (storePath: string, passphrase: string) =>
+    createDeviceToken(storePath, passphrase, `Signed in with Google, ${new Date().toISOString().slice(0, 10)}`);
 
   const signupFailures = new Map<string, { windowStart: number; count: number }>();
   const signupBlocked = (ip: string) => {
@@ -201,16 +252,65 @@ export async function createHostedServer(
 
   control.get("/hosted/health", async () => ({ ok: true, duos: duos.size }));
 
-  control.post<{ Body: { invite?: unknown; name?: unknown } }>("/hosted/signup", async (request, reply) => {
+  // Public: what the web app needs to render its sign-in page.
+  control.get("/hosted/config", async () => ({ googleClientId: settings.googleClientId ?? null }));
+
+  control.post<{ Body: { credential?: unknown } }>("/hosted/login", async (request, reply) => {
+    if (signupBlocked(request.ip)) {
+      sendError(reply, 429, "rate_limited", "Too many failed sign-ins from this address; try again later.");
+      return;
+    }
+    const identity = await identify(request.body?.credential, request, reply);
+    if (!identity) {
+      return;
+    }
+    const tenant = registry.tenantBySubject(identity.subject);
+    if (tenant) {
+      const device = mintDevice(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant));
+      return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: tenant.isAdmin === true };
+    }
+    // The root duo belongs to whichever admin signs in first; after that,
+    // only that same Google account opens it.
+    const claim = registry.root();
+    if (root && isAdminEmail(identity.email) && (!claim || claim.identitySubject === identity.subject)) {
+      if (!claim) {
+        registry.claimRoot(identity.subject, identity.email);
+      }
+      const device = mintDevice(root.storePath, root.passphrase);
+      return { tenantId: null, basePath: "", token: device.token, ownerName: root.ownerName, isAdmin: true };
+    }
+    sendError(reply, 404, "no_duo", "There's no duo for this Google account yet. Ask for an invite link.");
+  });
+
+  control.post<{ Body: { invite?: unknown; name?: unknown; credential?: unknown } }>("/hosted/signup", async (request, reply) => {
     if (signupBlocked(request.ip)) {
       sendError(reply, 429, "rate_limited", "Too many failed sign-ups from this address; try again later.");
       return;
     }
     const invite = request.body?.invite;
+    if (typeof invite !== "string" || invite.length === 0) {
+      sendError(reply, 400, "bad_request", "invite is required");
+      return;
+    }
+    // With sign-in configured, a duo is always bound to a Google account —
+    // that is what lets its owner log back in anywhere. Without it (local
+    // development), sign-up takes a typed name as before.
+    let identity: VerifiedIdentity | undefined;
+    if (identityVerifier) {
+      identity = await identify(request.body?.credential, request, reply);
+      if (!identity) {
+        return;
+      }
+      if (registry.tenantBySubject(identity.subject) || registry.root()?.identitySubject === identity.subject) {
+        sendError(reply, 409, "already_has_duo", "This Google account already has a duo. Sign in instead.");
+        return;
+      }
+    }
     const rawName = request.body?.name;
-    const name = typeof rawName === "string" ? rawName.trim() : "";
-    if (typeof invite !== "string" || invite.length === 0 || name.length === 0 || name.length > MAX_NAME_LENGTH) {
-      sendError(reply, 400, "bad_request", `invite and name are required; name is at most ${MAX_NAME_LENGTH} characters`);
+    const typedName = typeof rawName === "string" ? rawName.trim() : "";
+    const name = (typedName || identity?.name || identity?.email || "").slice(0, MAX_NAME_LENGTH);
+    if (name.length === 0) {
+      sendError(reply, 400, "bad_request", `name is required (at most ${MAX_NAME_LENGTH} characters)`);
       return;
     }
     let redeemable;
@@ -224,19 +324,30 @@ export async function createHostedServer(
       }
       throw error;
     }
+    if (redeemable.email && redeemable.email !== identity?.email) {
+      recordSignupFailure(request.ip);
+      sendError(reply, 403, "invite_wrong_account", `This invite is for ${redeemable.email}. Sign in with that Google account.`);
+      return;
+    }
     const tenantId = registry.newTenantId();
     const paths = tenantPaths(settings.hostedRoot, tenantId);
     const passphrase = randomBytes(32).toString("base64url");
     createEncryptedStore(paths.storePath, passphrase);
     mkdirSync(paths.duoDir, { recursive: true });
     const device = createDeviceToken(paths.storePath, passphrase, `${name}'s first device`);
-    const tenant = registry.addTenant(redeemable.id, name, passphrase, tenantId);
+    const tenant = registry.addTenant(
+      redeemable.id,
+      name,
+      passphrase,
+      tenantId,
+      identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
+    );
     duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
     reply.code(201);
-    return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name };
+    return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: tenant.isAdmin === true };
   });
 
-  control.post<{ Body: { name?: unknown; expiresInHours?: unknown } }>(
+  control.post<{ Body: { name?: unknown; email?: unknown; expiresInHours?: unknown } }>(
     "/hosted/invites",
     { preHandler: requireAdmin },
     async (request, reply) => {
@@ -246,13 +357,19 @@ export async function createHostedServer(
         sendError(reply, 400, "bad_request", "name is required; expiresInHours must be a whole number from 1 to 8760");
         return;
       }
-      const { invite, code } = registry.createInvite(name, new Date(Date.now() + hours * 3_600_000).toISOString());
+      const rawEmail = request.body?.email;
+      if (rawEmail !== undefined && rawEmail !== null && (typeof rawEmail !== "string" || !rawEmail.includes("@"))) {
+        sendError(reply, 400, "bad_request", "email, when given, must be an email address");
+        return;
+      }
+      const email = typeof rawEmail === "string" && rawEmail.trim() ? rawEmail.trim().toLowerCase() : null;
+      const { invite, code } = registry.createInvite(name, new Date(Date.now() + hours * 3_600_000).toISOString(), email);
       const link =
         settings.webUrl && settings.publicUrl
           ? `${settings.webUrl}/#join?host=${encodeURIComponent(settings.publicUrl)}&invite=${encodeURIComponent(code)}`
           : null;
       reply.code(201);
-      return { id: invite.id, name: invite.name, expiresAt: invite.expiresAt, code, link };
+      return { id: invite.id, name: invite.name, email: invite.email ?? null, expiresAt: invite.expiresAt, code, link };
     },
   );
 
