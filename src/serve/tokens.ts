@@ -272,3 +272,71 @@ export function verifyAskToken(storePath: string, passphrase: string, rawToken: 
     return row ? rowToAskToken(row) : undefined;
   });
 }
+
+/**
+ * Issue #227 — the connector secret: the credential inside the MCP URL an
+ * owner pastes into claude.ai as a custom connector. A third token kind in
+ * its own table, for the same structural reason ask links have theirs: its
+ * hash is in neither `device_tokens` nor `ask_tokens`, so the bearer auth
+ * hook refuses it everywhere, and the MCP route (serve/mcp.ts) is the only
+ * place that accepts one. A duo has at most one live connector secret:
+ * minting a new one revokes every earlier one, so "replace a leaked URL" is
+ * one action rather than mint-then-revoke.
+ */
+export interface ConnectorToken {
+  readonly id: string;
+  readonly createdAt: string;
+}
+
+export function ensureConnectorTokenSchema(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS connector_tokens (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      revoked_at TEXT
+    ) STRICT
+  `);
+}
+
+/** Result of minting a connector secret: the raw token is returned exactly once and never persisted in this form. */
+export interface MintedConnectorToken {
+  readonly id: string;
+  readonly token: string;
+  readonly createdAt: string;
+}
+
+/** Mints this duo's connector secret, revoking any earlier one in the same write. */
+export function createConnectorToken(storePath: string, passphrase: string): MintedConnectorToken {
+  const id = randomUUID();
+  const token = randomBytes(32).toString("base64url");
+  const createdAt = new Date().toISOString();
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureConnectorTokenSchema(db);
+    db.prepare(`UPDATE connector_tokens SET revoked_at = ? WHERE revoked_at IS NULL`).run(createdAt);
+    db.prepare(`INSERT INTO connector_tokens (id, token_hash, created_at, revoked_at) VALUES (?, ?, ?, NULL)`).run(id, hashToken(token), createdAt);
+  });
+  return { id, token, createdAt };
+}
+
+/** The live connector secret's metadata, or undefined when the duo has none — the raw token is not recoverable. */
+export function getConnectorToken(storePath: string, passphrase: string): ConnectorToken | undefined {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureConnectorTokenSchema(db);
+    const row = db.prepare(`SELECT id, created_at FROM connector_tokens WHERE revoked_at IS NULL`).get() as
+      | { id: string; created_at: string }
+      | undefined;
+    return row ? { id: row.id, createdAt: row.created_at } : undefined;
+  });
+}
+
+/** Verifies a raw connector secret by its SHA-256 hash, read-only like `verifyDeviceToken`. */
+export function verifyConnectorToken(storePath: string, passphrase: string, rawToken: string): ConnectorToken | undefined {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureConnectorTokenSchema(db);
+    const row = db.prepare(`SELECT id, created_at FROM connector_tokens WHERE token_hash = ? AND revoked_at IS NULL`).get(hashToken(rawToken)) as
+      | { id: string; created_at: string }
+      | undefined;
+    return row ? { id: row.id, createdAt: row.created_at } : undefined;
+  });
+}

@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
@@ -110,6 +112,29 @@ describe("hosted mode — many duos, one process, invite-only", () => {
     const reused = await signup(base, code, "Eve");
     expect(reused.status).toBe(403);
     expect(((await reused.json()) as { error: { code: string } }).error.code).toBe("invite_invalid");
+  });
+
+  it("a duo's claude.ai connector saves to that duo through /t/<id>/mcp, and its secret opens no other duo (#227)", async () => {
+    const { base } = await start();
+    const sam = (await (await signup(base, (await invite(base, "Sam")).code, "Sam")).json()) as { basePath: string; token: string };
+    const kim = (await (await signup(base, (await invite(base, "Kim")).code, "Kim")).json()) as { basePath: string; token: string };
+    const minted = await fetch(`${base}${sam.basePath}/connector`, { method: "POST", headers: { authorization: `Bearer ${sam.token}` } });
+    expect(minted.status).toBe(201);
+    const { path } = (await minted.json()) as { path: string };
+
+    const save = async (url: string) => {
+      const client = new Client({ name: "test-claude", version: "1.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        const result = await client.callTool({ name: "save_to_duo", arguments: { text: "The printer on the second floor is broken." } });
+        return (result.content as { text: string }[])[0].text;
+      } finally {
+        await client.close();
+      }
+    };
+
+    expect(await save(`${base}${sam.basePath}${path}`)).toMatch(/^Saved to your duo/);
+    await expect(save(`${base}${kim.basePath}${path}`)).rejects.toThrow();
   });
 
   it("one duo's token never opens another duo, or the root duo", async () => {

@@ -65,6 +65,25 @@ duo derive pairs && duo derive topics && duo derive rules && duo derive voice
 **One writer at a time** (README "Known limitations"): the CLI and the running daemon each write
 the whole store file. Don't use the app while a `duo import`, `duo embed` or `duo derive` runs.
 
+## Connect to claude.ai (save from any chat)
+
+The daemon serves an MCP endpoint at `/mcp/<secret>`; the secret is the credential. Mint the URL from a
+shell on the daemon:
+
+```sh
+railway ssh --service duo-daemon -i ~/.ssh/railway_ed25519
+duo connector new       # prints the URL once; a new one replaces the old
+```
+
+Then in claude.ai: Settings, Connectors, Add custom connector, paste the URL. In any chat, ask Claude to
+"save this to my duo". Claude calls `save_to_duo`; the text is ingested under the duo's classification
+ceiling and embedded before Claude answers.
+
+- The URL is a password. Anyone holding it can write to that duo. Treat a leak by running `duo connector new`.
+- Hosted duos use `/t/<duo-id>/mcp/<secret>`, and a secret only ever works for the duo that minted it.
+- The app can mint the same URL: `POST /connector` returns `{ path }` once; join it to the duo's base URL.
+- This is the POC credential. Replace it with OAuth before anyone other than the owner connects.
+
 ## Backups and cost
 
 - Back up the `/data` volume (Railway volume backups). The backup is ciphertext and is useless

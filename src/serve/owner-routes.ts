@@ -9,7 +9,15 @@ import { isTrustTier } from "../trust/grid.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers } from "../trust/promotion.js";
 import { DeriveJob } from "./derive-job.js";
 import type { ServeDeps } from "./server.js";
-import { AskTokenNotFoundError, createAskToken, createDeviceToken, listAskTokens, revokeAskToken } from "./tokens.js";
+import {
+  AskTokenNotFoundError,
+  createAskToken,
+  createConnectorToken,
+  createDeviceToken,
+  getConnectorToken,
+  listAskTokens,
+  revokeAskToken,
+} from "./tokens.js";
 
 /** A Claude export's conversations.json is routinely tens of MB — far past Fastify's 1 MiB default. */
 const CLAUDE_EXPORT_BODY_LIMIT = 200 * 1024 * 1024;
@@ -134,6 +142,18 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
     reply.code(201);
     return createDeviceToken(deps.storePath, deps.passphrase, name);
   });
+
+  // #227: the claude.ai connector. POST mints this duo's connector secret
+  // (revoking any earlier one) and returns its path once; the client joins
+  // it to the daemon base it already talks to, which under hosted mode
+  // carries the duo's /t/<id> prefix. GET reports whether one is live.
+  app.post("/connector", async (_request, reply) => {
+    const minted = createConnectorToken(deps.storePath, deps.passphrase);
+    reply.code(201);
+    return { id: minted.id, createdAt: minted.createdAt, path: `/mcp/${minted.token}` };
+  });
+
+  app.get("/connector", async () => ({ connector: getConnectorToken(deps.storePath, deps.passphrase) ?? null }));
 
   app.get("/trust/promotions", async () => getPendingPromotionOffers(deps.storePath, deps.passphrase, deps.duoDir));
 

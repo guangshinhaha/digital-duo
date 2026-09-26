@@ -30,7 +30,7 @@ import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeri
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
 import { runHostedInvite, runHostedServe } from "./commands/hosted.js";
-import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
+import { runAskLink, runAskLinkList, runAskLinkRevoke, runConnectorNew, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
 import { runEmbed } from "./commands/embed.js";
@@ -220,6 +220,22 @@ pairCommand
 // never a PairedDevice and never appears in `duo pair list`; the token
 // layer's own refusal of it on every existing route is structural (see
 // src/serve/tokens.ts's AskToken doc comment).
+const connectorCommand = program.command("connector").description("Connect this duo to claude.ai as a custom MCP connector (issue #227)");
+
+connectorCommand
+  .command("new")
+  .description("Mint the connector URL and print it once; any earlier connector URL stops working")
+  .action(() => {
+    const config = loadConfig();
+    try {
+      const minted = runConnectorNew(config);
+      console.log("Connector URL (paste it into claude.ai > Settings > Connectors > Add custom connector; it will not be shown again):");
+      console.log(minted.url);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
 const askLinkCommand = program.command("ask-link").description("Mint and manage short-lived, ask-only links (issue #158) — never a paired device");
 
 askLinkCommand
