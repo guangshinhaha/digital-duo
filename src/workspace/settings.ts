@@ -19,9 +19,18 @@ export class WorkspaceConfigError extends Error {
   }
 }
 
+/**
+ * Whether a hostname is on Railway's private network (`<service>.railway.internal`).
+ * Traffic to it never leaves the project, so plain http is acceptable there
+ * (docs/deploy/hosted-workspace.md §5); every other host still needs https.
+ */
+export function isRailwayInternalHost(hostname: string): boolean {
+  return hostname.toLowerCase().endsWith(".railway.internal");
+}
+
 /** The validated shape the transport and service are built from. */
 export interface WorkspaceSettings {
-  /** The org homeserver's base URL (https only — the access token rides this URL). */
+  /** The org homeserver's base URL (https, or http on a `*.railway.internal` host — the access token rides this URL). */
   readonly homeserverUrl: string;
   /**
    * The duo's own Matrix access token. Env-sourced (`DUO_WORKSPACE_ACCESS_TOKEN`)
@@ -83,9 +92,10 @@ export function workspaceSettingsFrom(config: DuoConfig): WorkspaceSettings | nu
   } catch {
     throw new WorkspaceConfigError(`DUO_WORKSPACE_HOMESERVER is not a parseable URL (got ${JSON.stringify(homeserverUrl)})`);
   }
-  if (parsed.protocol !== "https:") {
+  // http is allowed only on Railway's private network, where the token never leaves the project.
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isRailwayInternalHost(parsed.hostname))) {
     throw new WorkspaceConfigError(
-      `DUO_WORKSPACE_HOMESERVER must be https (got ${JSON.stringify(parsed.protocol)}) — the duo's access token rides this URL and must never be sent in plaintext`,
+      `DUO_WORKSPACE_HOMESERVER must be https (got ${JSON.stringify(parsed.protocol)}) — the duo's access token rides this URL and must never be sent in plaintext (plain http is accepted only for a *.railway.internal host)`,
     );
   }
   if (!userId!.startsWith("@") || !userId!.includes(":")) {

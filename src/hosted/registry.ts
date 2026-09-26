@@ -36,6 +36,39 @@ import {
  * are the reads later work (accounts, spaces, the org boundary) builds on.
  */
 
+/**
+ * A duo's Matrix accounts on the shared Synapse (docs/deploy/hosted-workspace.md §3, §4).
+ * Written once, when provisioning succeeds; the ids are a copy of the org taken at that time.
+ * The duo's access token is a credential: it lives here only as ciphertext under the master key
+ * and `HostedRegistry.duoMatrixToken` is the one way to read it.
+ */
+export interface HostedMatrixAccounts {
+  /** `@<orgId>.<handle>:<server>`. */
+  readonly personUserId: string;
+  /** `@duo-<orgId>.<handle>:<server>`, always `duoUserIdFor(personUserId)`. */
+  readonly duoUserId: string;
+  /** base64 of encrypt(duoAccessToken, masterKey), like `passphraseCipher`. Never leaves the daemon. */
+  readonly duoTokenCipher: string;
+  readonly provisionedAt: string;
+}
+
+/** What is safe to show an admin about a duo's accounts: no token, not even its ciphertext. */
+export type HostedMatrixAccountsView = Omit<HostedMatrixAccounts, "duoTokenCipher">;
+
+/** A duo whose accounts could not be created yet. Present only while pending; success clears it. */
+export interface MatrixPending {
+  readonly since: string;
+  readonly attempts: number;
+  readonly lastAttemptAt: string;
+  /** A scrubbed reason (status and Matrix errcode, never a body or a secret). */
+  readonly lastError: string;
+}
+
+export function matrixAccountsView(accounts: HostedMatrixAccounts): HostedMatrixAccountsView {
+  const { duoTokenCipher: _cipher, ...view } = accounts;
+  return view;
+}
+
 export interface HostedTenant {
   readonly id: string;
   readonly name: string;
@@ -49,6 +82,10 @@ export interface HostedTenant {
   readonly isAdmin?: boolean;
   /** The one org this duo belongs to. */
   readonly orgId: string;
+  /** Set once the duo's Matrix accounts exist (#232). Absent means not provisioned yet. */
+  readonly matrix?: HostedMatrixAccounts;
+  /** Set while provisioning is owed and failing, so an outage is visible and retried. */
+  readonly matrixPending?: MatrixPending;
 }
 
 /** Who has claimed the pre-hosted root duo by signing in (an admin email's first sign-in). */
@@ -85,6 +122,9 @@ interface RegistryFile {
   rootOrgId: string;
   /** Present once a server has served the pre-hosted root duo: makes it a member of `rootOrgId` without depending on any server having started since. */
   rootDuo?: { name: string } | null;
+  /** The root duo's Matrix accounts (handle `root`). Top level, not on `RootClaim`: the root duo needs accounts before any admin has claimed it. */
+  rootMatrix?: HostedMatrixAccounts;
+  rootMatrixPending?: MatrixPending;
 }
 
 /**
@@ -290,6 +330,68 @@ export class HostedRegistry {
 
   tenantBySubject(identitySubject: string): HostedTenant | undefined {
     return this.data.tenants.find((tenant) => tenant.identitySubject === identitySubject);
+  }
+
+  /** A duo's Matrix accounts (no token); `duoId` is a tenant id or `ROOT_DUO_ID`. */
+  matrixAccounts(duoId: string): HostedMatrixAccounts | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootMatrix : this.data.tenants.find((tenant) => tenant.id === duoId)?.matrix;
+  }
+
+  /** Why a duo's accounts are still owed, or undefined when it is provisioned or nothing has been tried. */
+  matrixPending(duoId: string): MatrixPending | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootMatrixPending : this.data.tenants.find((tenant) => tenant.id === duoId)?.matrixPending;
+  }
+
+  /**
+   * The duo's Matrix access token, decrypted. The only reader of it: for the
+   * daemon's own connection for that duo (#236), never for a route response,
+   * a log line or a duo's env.
+   */
+  duoMatrixToken(duoId: string): string | undefined {
+    const accounts = this.matrixAccounts(duoId);
+    return accounts && decrypt(Buffer.from(accounts.duoTokenCipher, "base64"), this.masterKey).toString("utf8");
+  }
+
+  /** Records a duo's provisioned accounts and encrypts its token in the same write; clears any pending mark. */
+  setMatrixAccounts(duoId: string, ids: { personUserId: string; duoUserId: string }, duoAccessToken: string): HostedMatrixAccountsView {
+    const accounts: HostedMatrixAccounts = {
+      ...ids,
+      duoTokenCipher: encrypt(Buffer.from(duoAccessToken, "utf8"), this.masterKey).toString("base64"),
+      provisionedAt: new Date().toISOString(),
+    };
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrix = accounts;
+        delete draft.rootMatrixPending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record Matrix accounts for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => {
+        const { matrixPending: _cleared, ...rest } = candidate;
+        return candidate.id === duoId ? { ...rest, matrix: accounts } : candidate;
+      });
+    });
+    return matrixAccountsView(accounts);
+  }
+
+  /** Marks a duo as owed accounts and failing, keeping when it started and counting attempts. */
+  recordMatrixFailure(duoId: string, reason: string): MatrixPending {
+    const now = new Date().toISOString();
+    const previous = this.matrixPending(duoId);
+    const pending: MatrixPending = { since: previous?.since ?? now, attempts: (previous?.attempts ?? 0) + 1, lastAttemptAt: now, lastError: reason };
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrixPending = pending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record a provisioning failure for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => (candidate.id === duoId ? { ...candidate, matrixPending: pending } : candidate));
+    });
+    return pending;
   }
 
   passphraseFor(tenant: HostedTenant): string {

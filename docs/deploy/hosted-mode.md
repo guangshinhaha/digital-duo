@@ -127,6 +127,46 @@ registry.createInvite(name, expiresAt, email?, orgId?)        // orgId defaults 
 (provisioned accounts, spaces, the org boundary) should read org membership through these and not
 re-derive it.
 
+## Matrix accounts (added 2026-09-26, #232)
+
+Decision record: `hosted-workspace.md`. When the Synapse admin variables (below) are set, the
+daemon creates every duo's two accounts through Synapse's admin API. Nobody registers on the
+homeserver, and neither account has a password.
+
+- **Names** carry the org: the person is `@<orgId>.<handle>:<server>`, their duo
+  `@duo-<orgId>.<handle>:<server>`. `<handle>` is the tenant id, or `root` for the pre-hosted root
+  duo (which gets accounts too). Display names are the person's name (from the Google profile
+  when there is one) and `<name>'s duo`.
+- **When.** After an invite is redeemed, before the sign-up answers, but bounded: sign-up waits a
+  few seconds for Synapse and then answers regardless. A Synapse that is down, slow or refusing
+  never blocks an invite. The duo is marked pending in the registry (`matrixPending`, with the
+  attempt count and a scrubbed reason) and retried every minute.
+- **Backfill.** At startup the daemon provisions every duo, and the root duo, that lacks accounts.
+  `duo hosted provision` (`POST /hosted/matrix/provision`, super admin) does the same on demand
+  and prints counts. Both are safe to repeat: a provisioned duo costs no call, and the account
+  calls are idempotent `PUT`s.
+- **The duo's access token** is minted through the admin login API without an expiry (the
+  daemon holds it for good), and stored in the registry encrypted under `DUO_HOSTED_MASTER_KEY`
+  like the duo's passphrase. It is read only by `registry.duoMatrixToken(duoId)`. No route
+  returns it or its ciphertext (`GET /hosted/duos` shows only the account ids and a date), it is
+  not logged, and it is not in a duo's env.
+- **A duo's env is an allowlist** (`TENANT_ENV_ALLOWLIST` in `src/hosted/server.ts`), no longer
+  the whole process env, so `DUO_WORKSPACE_ADMIN_TOKEN` (which acts as any user),
+  `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN` cannot reach a duo. The root duo keeps its
+  env minus those three.
+- **Not to do.** Never call `/logout/all` as `@workspace-admin`: it would expire every token the
+  daemon minted. Provisioning cannot recreate a token it has lost; it mints a new one only for a
+  duo that has none recorded.
+
+Read side, for the work that builds on this (`src/hosted/registry.ts`, `src/hosted/matrix-accounts.ts`):
+
+```ts
+registry.matrixAccounts(duoId): HostedMatrixAccounts | undefined  // { personUserId, duoUserId, duoTokenCipher, provisionedAt }
+registry.duoMatrixToken(duoId): string | undefined                // decrypted; daemon-internal only
+registry.matrixPending(duoId): MatrixPending | undefined
+hosted.matrix?.provision(duoId) / .provisionAll() / .pendingDuoIds()
+```
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -138,6 +178,10 @@ re-derive it.
 | `DUO_HOSTED_ROOT` | Optional. Defaults to `hosted` (under the volume). |
 | `DUO_HOSTED_GOOGLE_CLIENT_ID` | The Google OAuth web client id. Public, not a secret. |
 | `DUO_HOSTED_ADMIN_EMAILS` | Comma-separated admin Google emails. |
+| `DUO_WORKSPACE_PRIVATE_URL` | Synapse as the daemon reaches it, e.g. `http://synapse.railway.internal:8008` (https, or http on a `*.railway.internal` host). With `DUO_WORKSPACE_ADMIN_TOKEN` it turns provisioning on; one without the other refuses to start. |
+| `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin` service account's token. Acts as any user: never in a duo's env, a route or a log. |
+| `DUO_WORKSPACE_SERVER_NAME` | Optional. Synapse's `server_name` (`duo`). When unset it is read from the admin token's own user id. |
+| `DUO_WORKSPACE_PUBLIC_URL` | The https address clients are given for Synapse (used by the session work, #233). |
 
 ## Inviting someone
 
@@ -156,6 +200,10 @@ duo hosted org list                            # id, name, member count
 duo hosted org rename <id> "Platform"
 duo hosted org members <id>
 duo hosted invite "Kim" --org <id>             # without --org: the default org
+```
+
+```sh
+duo hosted provision                           # create any Matrix accounts still missing; safe to repeat
 ```
 
 Like `invite`, these talk to the running daemon with `DUO_HOSTED_ADMIN_TOKEN`.
