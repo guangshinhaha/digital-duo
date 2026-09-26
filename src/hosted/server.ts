@@ -9,8 +9,12 @@ import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
 import { createServer, type ServeDeps, type WorkspaceSessionAccess } from "../serve/server.js";
+import type { WorkspaceService } from "../workspace/service.js";
+import { WorkspaceConfigError } from "../workspace/settings.js";
+import type { WorkspaceTransportFactory } from "../workspace/transport.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
+import { DuoWorkspaceConnections, SDK_LOG_LEVELS, type SdkLogLevel } from "./duo-workspace.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
 import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
 import { OrgSpaceProvisioner, type SpaceSummary } from "./org-spaces.js";
@@ -47,6 +51,21 @@ export interface SynapseSettings {
   readonly publicUrl: string | undefined;
 }
 
+/**
+ * How the hosted duos' own workspace connections are started (#236). Every field is optional and
+ * defaults as `duo-workspace.ts` says; `hostedSettingsFrom` fills them from the environment.
+ */
+export interface WorkspaceConnectionSettings {
+  /** `DUO_HOSTED_WORKSPACE_CONNECT`: false stops hosted duos from opening any workspace connection (accounts are still provisioned). Default true. */
+  readonly enabled?: boolean;
+  /** `DUO_HOSTED_WORKSPACE_MAX_DIALS`: how many duos may be in their first dial at once. */
+  readonly maxConcurrentDials?: number;
+  /** `DUO_HOSTED_WORKSPACE_STAGGER_MS`: the least time between two duos starting to dial. */
+  readonly startStaggerMs?: number;
+  /** `DUO_HOSTED_WORKSPACE_SDK_LOG`: how much of matrix-js-sdk's own logging is let through (default `silent`). */
+  readonly sdkLogLevel?: SdkLogLevel;
+}
+
 export interface HostedSettings {
   readonly hostedRoot: string;
   readonly masterKey: string;
@@ -63,6 +82,8 @@ export interface HostedSettings {
   readonly adminEmails: readonly string[];
   /** Set when the Synapse admin variables are; without it no Matrix accounts are provisioned. */
   readonly synapse?: SynapseSettings;
+  /** Only used when `synapse` is set: each provisioned duo then also connects to the workspace. */
+  readonly workspaceConnections?: WorkspaceConnectionSettings;
 }
 
 export class HostedConfigError extends Error {
@@ -83,6 +104,7 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
   }
   return {
     synapse: synapseSettingsFrom(env),
+    workspaceConnections: workspaceConnectionSettingsFrom(env),
     hostedRoot: env.DUO_HOSTED_ROOT || "hosted",
     masterKey,
     adminToken,
@@ -127,6 +149,40 @@ export function synapseSettingsFrom(env: NodeJS.ProcessEnv): SynapseSettings | u
     adminToken,
     serverName: env.DUO_WORKSPACE_SERVER_NAME || undefined,
     publicUrl: env.DUO_WORKSPACE_PUBLIC_URL?.replace(/\/+$/, "") || undefined,
+  };
+}
+
+/** A whole number of at least `min`, or a refusal naming the variable: a value that would hot-loop or stall the duos' connections is not a setting. */
+function envInteger(env: NodeJS.ProcessEnv, key: string, min: number): number | undefined {
+  const raw = env[key];
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    throw new WorkspaceConfigError(`${key} must be a whole number of at least ${min} (got ${JSON.stringify(raw)})`);
+  }
+  return value;
+}
+
+function sdkLogLevelFrom(raw: string | undefined): SdkLogLevel | undefined {
+  const level = raw?.trim().toLowerCase();
+  if (level === undefined || level === "") {
+    return undefined;
+  }
+  if (!(SDK_LOG_LEVELS as readonly string[]).includes(level)) {
+    throw new WorkspaceConfigError(`DUO_HOSTED_WORKSPACE_SDK_LOG must be one of ${SDK_LOG_LEVELS.join(", ")} (got ${JSON.stringify(raw)})`);
+  }
+  return level as SdkLogLevel;
+}
+
+export function workspaceConnectionSettingsFrom(env: NodeJS.ProcessEnv): WorkspaceConnectionSettings {
+  const connect = env.DUO_HOSTED_WORKSPACE_CONNECT?.trim().toLowerCase();
+  return {
+    enabled: !(connect === "0" || connect === "false" || connect === "off" || connect === "no"),
+    maxConcurrentDials: envInteger(env, "DUO_HOSTED_WORKSPACE_MAX_DIALS", 1),
+    startStaggerMs: envInteger(env, "DUO_HOSTED_WORKSPACE_STAGGER_MS", 0),
+    sdkLogLevel: sdkLogLevelFrom(env.DUO_HOSTED_WORKSPACE_SDK_LOG),
   };
 }
 
@@ -202,9 +258,25 @@ export function rootEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return copy;
 }
 
-export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string, workspaceSession?: WorkspaceSessionAccess): ServeDeps {
+/**
+ * The duo's workspace service is created later than the duo's app (when its accounts exist), and
+ * the app reads `deps.workspace` on each request, so the field is a live view of whatever service
+ * the duo has now, and undefined until it has one.
+ */
+function withLiveWorkspace(deps: ServeDeps, current: () => WorkspaceService | undefined): ServeDeps {
+  return Object.defineProperty({ ...deps }, "workspace", { get: current, enumerable: true, configurable: true }) as ServeDeps;
+}
+
+export function tenantDeps(
+  shared: SharedDuoRuntime,
+  settings: HostedSettings,
+  tenant: HostedTenant,
+  passphrase: string,
+  workspaceSession?: WorkspaceSessionAccess,
+  workspace?: () => WorkspaceService | undefined,
+): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
-  return {
+  const deps: ServeDeps = {
     storePath: paths.storePath,
     passphrase,
     duoDir: paths.duoDir,
@@ -229,6 +301,7 @@ export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, t
     trustProxy: shared.trustProxy,
     ...(workspaceSession ? { workspaceSession } : {}),
   };
+  return workspace ? withLiveWorkspace(deps, workspace) : deps;
 }
 
 /** A provisioning outcome as an admin may see it: ids and status, never a token. */
@@ -285,6 +358,8 @@ export interface HostedServerExtras {
   readonly signupProvisionWaitMs?: number;
   /** Per-call timeout for Synapse admin requests (default 10s). Also the workspace-session mint's, which defaults to a shorter 5s so a hung Synapse does not hold a client's request. */
   readonly synapseTimeoutMs?: number;
+  /** How a duo's workspace transport is built (default: the matrix-js-sdk adapter). Tests hand in a fake. */
+  readonly workspaceTransportFactory?: WorkspaceTransportFactory;
   /** The clock the workspace-session cache judges token age and expiry by (default: real time). */
   readonly sessionNow?: () => number;
   /** How often owed provisioning is retried (default 60s). */
@@ -305,6 +380,8 @@ export interface HostedServer {
   readonly matrix: MatrixProvisioner | undefined;
   /** Each org's Space and `#general`, and members' joins into them (#234). Set with `matrix`. */
   readonly spaces: OrgSpaceProvisioner | undefined;
+  /** Each provisioned duo's own workspace connection (#236). Set with `matrix`, unless `DUO_HOSTED_WORKSPACE_CONNECT` turns it off. */
+  readonly workspace: DuoWorkspaceConnections | undefined;
   close(): Promise<void>;
 }
 
@@ -350,14 +427,41 @@ export async function createHostedServer(
       renew: () => sessions.renew(duoId),
       end: () => void sessions.end(duoId),
     };
+  // Each provisioned duo's own outbound workspace connection (#236), started from the registry's word
+  // that the duo has accounts and following it (a re-minted token restarts it). It only queues here: the
+  // dialing happens off a timer, so a Synapse that is down or slow never holds up boot or a sign-up.
+  const connections =
+    settings.synapse && settings.workspaceConnections?.enabled !== false
+      ? new DuoWorkspaceConnections({
+          registry,
+          config: shared.config,
+          homeserverUrl: settings.synapse.adminUrl,
+          transportFactory: extras.workspaceTransportFactory,
+          maxConcurrentDials: settings.workspaceConnections?.maxConcurrentDials,
+          startStaggerMs: settings.workspaceConnections?.startStaggerMs,
+          sdkLogLevel: settings.workspaceConnections?.sdkLogLevel,
+          log: extras.log,
+        })
+      : undefined;
+  const stopFollowingRegistry = connections ? registry.onChange(() => connections.reconcile()) : undefined;
+  const liveWorkspace = (duoId: string) => connections && (() => connections.serviceFor(duoId));
+  const mountTenant = async (tenant: HostedTenant, passphrase: string): Promise<MountedDuo> => {
+    const deps = tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), liveWorkspace(tenant.id));
+    const mounted = await mountDuo(deps);
+    connections?.attach(tenant.id, deps);
+    return mounted;
+  };
   const duos = new Map<string, MountedDuo>();
   for (const tenant of registry.tenants()) {
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant), sessionAccess(tenant.id))));
+    duos.set(tenant.id, await mountTenant(tenant, registry.passphraseFor(tenant)));
   }
   const rootAccess = sessionAccess(ROOT_DUO_ID);
-  const rootDuo = root ? await mountDuo(rootAccess ? { ...root, workspaceSession: rootAccess } : root) : undefined;
+  const rootLive = liveWorkspace(ROOT_DUO_ID);
+  const rootServed = root && { ...root, ...(rootAccess ? { workspaceSession: rootAccess } : {}) };
+  const rootDuo = rootServed ? await mountDuo(rootLive ? withLiveWorkspace(rootServed, rootLive) : rootServed) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
+    connections?.attach(ROOT_DUO_ID, root);
   }
 
   // Matrix accounts (#232). Only when the Synapse admin variables are set. A Synapse that is down
@@ -611,7 +715,7 @@ export async function createHostedServer(
       tenantId,
       identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
     );
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id))));
+    duos.set(tenant.id, await mountTenant(tenant, passphrase));
     if (matrix) {
       // Redeeming an invite must not depend on Synapse: wait a moment so the app can usually connect
       // straight away, then answer regardless. A failed or slow run leaves the duo pending for the retry.
@@ -720,12 +824,18 @@ export async function createHostedServer(
   });
 
   // Never the passphrase cipher and never the Matrix token cipher: a duo's accounts are shown as ids and a date.
-  control.get("/hosted/duos", { preHandler: requireAdmin }, async () =>
-    registry.tenants().map(({ passphraseCipher: _cipher, matrix: accounts, ...rest }) => ({
-      ...rest,
-      ...(accounts ? { matrix: matrixAccountsView(accounts) } : {}),
-    })),
-  );
+  // `workspace` is the duo's own workspace connection: its phase and failed attempts, from the daemon's memory.
+  control.get("/hosted/duos", { preHandler: requireAdmin }, async () => {
+    const connection = new Map(connections?.states().map((state) => [state.duoId, state]));
+    return registry.tenants().map(({ passphraseCipher: _cipher, matrix: accounts, ...rest }) => {
+      const state = connection.get(rest.id);
+      return {
+        ...rest,
+        ...(accounts ? { matrix: matrixAccountsView(accounts) } : {}),
+        ...(state ? { workspace: { phase: state.phase, attempts: state.attempts } } : {}),
+      };
+    });
+  });
 
   // Backfill on demand (`duo hosted provision`): creates the accounts every duo still lacks and answers
   // with counts and per-duo status, never a token. Startup already does this when Synapse is configured.
@@ -797,6 +907,7 @@ export async function createHostedServer(
     registry,
     matrix,
     spaces,
+    workspace: connections,
     close: async () => {
       if (retryTimer) {
         clearInterval(retryTimer);
@@ -806,6 +917,9 @@ export async function createHostedServer(
       spaces?.stop();
       await matrix?.whenIdle();
       await spaces?.whenIdle();
+      // Then the duos' own connections: nothing may start one after this, and each is stopped on its own.
+      stopFollowingRegistry?.();
+      await connections?.stop();
       await new Promise<void>((resolve) => front.close(() => resolve()));
       await Promise.all([control.close(), rootDuo?.app.close(), ...Array.from(duos.values(), (duo) => duo.app.close())]);
     },

@@ -45,6 +45,8 @@
    > mode, as a multi-org workspace on one shared Synapse, with each duo holding its own
    > provisioned account. Orgs, account naming, the org wall and its limits are decided in
    > `docs/deploy/hosted-workspace.md`. Per-duo inference billing stays out, as above.
+   >
+   > **Built 2026-09-26 (#236):** see "Each duo's own workspace connection" below.
 
 ## Sign-in (added 2026-09-26)
 
@@ -320,6 +322,64 @@ registry.matrixSpaces(duoId) / registry.spacePending(duoId)
 hosted.spaces?.ensureOrg(orgId) / .syncMember(duoId) / .syncAll() / .retryPending() / .hasRetryDue()
 ```
 
+## Each duo's own workspace connection (added 2026-09-26, #236)
+
+Decision record: `hosted-workspace.md` §8, §12. Every hosted duo (each tenant, and the root duo) whose Matrix
+accounts are provisioned holds ONE outbound connection to the workspace, as its own account
+(`@duo-<orgId>.<handle>:<server>`), and answers there exactly as a `duo serve` duo does: from its own
+corpus, with the same outcomes (answered, passed on, declined), and a passed-on question waits in that
+owner's Escalations. Source: `src/hosted/duo-workspace.ts` (`DuoWorkspaceConnections`), the per-duo service
+in `src/serve/workspace-wiring.ts` (the same function `duo serve` builds its service with).
+
+- **Credentials are the duo's, from the registry.** The token is `registry.duoMatrixToken(duoId)`, read
+  when the connection starts and held only by that duo's service. The homeserver is
+  `DUO_WORKSPACE_PRIVATE_URL` (https, or http on `*.railway.internal`; the same rule as `duo serve`'s
+  `DUO_WORKSPACE_HOMESERVER`, which hosted mode ignores along with `DUO_WORKSPACE_ACCESS_TOKEN` and
+  `DUO_WORKSPACE_USER_ID`). The timing knobs and the backlog policy (`DUO_WORKSPACE_RECONNECT_*`,
+  `DUO_WORKSPACE_PRESENCE_INTERVAL_MS`, `DUO_WORKSPACE_BACKLOG_MAX_AGE_MS`,
+  `DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE`) are shared by all duos, and a bad one refuses to boot.
+- **Lifecycle follows the registry.** The daemon subscribes to the registry's writes
+  (`registry.onChange`) and re-checks every duo on each one: accounts appear (after #232 provisioning, at
+  boot or later, including a sign-up that outran Synapse), the connection starts; the token is re-minted
+  (`setMatrixAccounts` again), it restarts on the new token; the accounts go, it stops. `close()` stops
+  every connection. `DuoWorkspaceConnections.detach(duoId)` stops one duo's (there is no duo-removal route
+  yet). A token Synapse refuses (`M_UNKNOWN_TOKEN`) ends that duo's connection, terminally, with a log line;
+  it comes back when the token is re-minted, never by retrying a dead credential.
+- **Never on the boot path.** Reconciling only queues. Building a duo's service (it decrypts that duo's
+  store once) and dialing happen later off a timer, one duo at a time, so a Synapse that is down or slow
+  costs the listener, sign-up and invite redemption nothing.
+- **A cap and a stagger on first dials.** At most `DUO_HOSTED_WORKSPACE_MAX_DIALS` duos (default 5) are in
+  their first dial at once, and dials start at least `DUO_HOSTED_WORKSPACE_STAGGER_MS` (default 500) apart,
+  so 100 duos at boot make a trickle of 2 new sessions a second, not a burst. A duo gives its slot back when
+  it connects, fails once, is refused, or has held it 30 seconds. After a failure the service's own backoff
+  takes over, with a fixed per-duo jitter (x1.0 to x1.5 on the delays) so duos that failed together do not
+  retry together.
+- **Isolated.** Each duo has its own service, transport, backoff, read state and consent record, and all
+  work on a duo runs on that duo's own chain: one duo's failure or hang waits on nothing of another's. A
+  duo whose store cannot be opened is `failed` alone. Two duos never share a corpus, a log, a member cache
+  or an answer path.
+- **Logs name the duo and never the token.** Every line is `hosted: duo <id>: ...`, and the duo's token (and
+  anything shaped like a Matrix access token) is replaced with `[redacted]` before a line leaves.
+  matrix-js-sdk's own logger is silent by default (it is process-wide, verbose, and cannot name a duo);
+  `DUO_HOSTED_WORKSPACE_SDK_LOG` raises it, and what it then says is prefixed with the duo's Matrix id.
+- **Observable.** `GET /hosted/duos` (admin) adds `workspace: { phase, attempts }` per duo: `none` (no
+  accounts yet), `queued`, `connecting`, `connected`, `revoked`, `stopped`, or `failed` (its store would
+  not open). It comes from the daemon's memory and carries no token.
+- **The owner's consent routes work per duo.** `GET /t/<id>/workspace/invites` and the allow/refuse/withdraw
+  routes act on that duo's own service (`deps.workspace` is a live view, undefined until the duo has one).
+  As on a personal daemon, a duo joins a room only on its owner's explicit allow: a colleague who starts a
+  direct room with `@duo-...` creates an invitation the owner decides on; nothing auto-joins.
+- **Off switch.** `DUO_HOSTED_WORKSPACE_CONNECT=0` provisions accounts as before but opens no connection.
+
+```ts
+hosted.workspace?.states(): DuoConnectionState[]          // { duoId, userId, phase, attempts }, no token
+hosted.workspace?.serviceFor(duoId): WorkspaceService | undefined
+hosted.workspace?.attach(duoId, duo) / .detach(duoId) / .reconcile() / .stop()
+registry.onChange(listener): () => void                   // called after every registry write that lands
+```
+
+Resource numbers for N connections in one process are in `hosted-workspace.md` §8.
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -335,6 +395,11 @@ hosted.spaces?.ensureOrg(orgId) / .syncMember(duoId) / .syncAll() / .retryPendin
 | `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin` service account's token. Acts as any user: never in a duo's env, a route or a log. |
 | `DUO_WORKSPACE_SERVER_NAME` | Optional. Synapse's `server_name` (`duo`). When unset it is read from the admin token's own user id. |
 | `DUO_WORKSPACE_PUBLIC_URL` | The https address clients are given for Synapse, returned as `homeserverUrl` by `POST <basePath>/workspace/session`. Without it that route answers 404. |
+| `DUO_HOSTED_WORKSPACE_CONNECT` | Optional. `0`, `false`, `off` or `no` stops hosted duos opening workspace connections (accounts are still provisioned). Default on, whenever the Synapse variables are set. |
+| `DUO_HOSTED_WORKSPACE_MAX_DIALS` | Optional. How many duos may be in their first dial at once. Whole number of at least 1. Default 5. |
+| `DUO_HOSTED_WORKSPACE_STAGGER_MS` | Optional. Least time between two duos starting to dial. 0 or more. Default 500. |
+| `DUO_HOSTED_WORKSPACE_SDK_LOG` | Optional. `silent` (default), `error`, `warn`, `info`, `debug` or `trace`: how much of matrix-js-sdk's own logging is let through, prefixed with the duo's Matrix id. For debugging a real Synapse. |
+| `DUO_WORKSPACE_RECONNECT_INITIAL_MS`, `_RECONNECT_MAX_MS`, `_PRESENCE_INTERVAL_MS`, `_BACKLOG_MAX_AGE_MS`, `_MAX_ANSWERS_PER_MINUTE` | The `duo serve` timing and backlog knobs; every hosted duo's connection uses them (defaults 1 s, 60 s, 4 min, 1 h, 30). |
 
 ## Inviting someone
 
