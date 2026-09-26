@@ -254,14 +254,14 @@ describe("hosted mode — many duos, one process, invite-only", () => {
       expect((await post(base, "/hosted/login", { credential: "sub-other|other@x.com|Other" })).status).toBe(404);
     });
 
-    it("an admin mints invites with their own device token; a non-admin cannot", async () => {
+    it("an admin mints invites with their own device token; a non-admin gets a 403", async () => {
       const { base } = await start(rootDeps(), { googleClientId: "cid", adminEmails: ["shin@x.com"] }, fakeIdentity);
       const admin = (await (await post(base, "/hosted/login", { credential: "sub-shin|shin@x.com|Shin" })).json()) as { token: string };
       const minted = await post(base, "/hosted/invites", { name: "Sam" }, admin.token);
       expect(minted.status).toBe(201);
       const { code } = (await minted.json()) as { code: string };
       const sam = (await (await post(base, "/hosted/signup", { invite: code, credential: "sub-sam|sam@x.com|Sam" })).json()) as { token: string };
-      expect((await post(base, "/hosted/invites", { name: "Eve" }, sam.token)).status).toBe(401);
+      expect((await post(base, "/hosted/invites", { name: "Eve" }, sam.token)).status).toBe(403);
       const listed = await fetch(`${base}/hosted/invites`, { headers: { authorization: `Bearer ${admin.token}` } });
       expect(listed.status).toBe(200);
       expect(JSON.stringify(await listed.json())).not.toContain("codeHash");

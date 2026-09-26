@@ -21,3 +21,13 @@ Lifecycle: expiry is mandatory and is the sole limit (there is no use count); th
 ### Answer outcome (answered / passed on / declined)
 The three-kind result every ask surface returns, regardless of who is asking or over which surface: answered (with sources), passed on (escalated to the owner), or declined (refused). The shared duo's flat decline states normalize into the same kinds — out of scope maps to passed on, not-a-decision-maker to declined.
 *Avoid:* inventing per-surface outcome vocabularies
+
+## Hosted workspace
+
+### Org (hosted)
+A named group of duos on one hosted server, held in the hosted registry: every duo, including the pre-hosted root duo, belongs to exactly one, and an invite names the org it admits people into. Duos made before orgs existed live in the default org (id `default`).
+*Avoid:* tenant (a tenant is one hosted duo, not a group of them), team
+
+### Super admin
+Anyone whose Google email is listed in `DUO_HOSTED_ADMIN_EMAILS`, plus the server-side admin token: the only callers who may create, rename and list orgs, list any org's members, and invite into an org. Read live from the env on every request, so removing an email withdraws the privilege. A caller with no credential is refused 401, any other caller 403.
+*Avoid:* org admin (an admin scoped to one org does not exist yet)
