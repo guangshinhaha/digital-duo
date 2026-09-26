@@ -8,3 +8,4 @@ duo-lifecycle-runtime/
 .claude/
 *.tsbuildinfo
 jev-spike-runtime/
+.env

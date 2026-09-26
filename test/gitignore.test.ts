@@ -27,7 +27,7 @@ describe("structural egress scan (R2/KTD10)", () => {
   const FETCH_CALL_RE = /\bfetch\s*\(/;
   const WEBSOCKET_USE_RE = /\bnew\s+WebSocket\b|\bWebSocket\s*\(/;
 
-  it("has no network primitive outside src/provider/ and src/serve/ — the adapter-only Jev footprint", () => {
+  it("has no network primitive outside src/provider/, src/serve/ and src/hosted/ — the adapter-only Jev footprint", () => {
     const srcRoot = fileURLToPath(new URL("../src", import.meta.url));
     const offenders: string[] = [];
     // src/provider/ is the sanctioned adapter boundary; src/serve/ is the
@@ -35,7 +35,9 @@ describe("structural egress scan (R2/KTD10)", () => {
     // documented function, client-tech-design.md Part 2). Everything else —
     // drafting, derivation, store, permissions, eval, corrections — must stay
     // free of network primitives so corpus paths have no unplanned egress.
-    const sanctioned = new Set(["provider", "serve"]);
+    // src/hosted/ is the multi-duo front (docs/deploy/hosted-mode.md) — the
+    // same serving role as src/serve/, one layer out.
+    const sanctioned = new Set(["provider", "serve", "hosted"]);
     const walk = (dir: string, isSrcRoot: boolean): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const path = join(dir, entry.name);

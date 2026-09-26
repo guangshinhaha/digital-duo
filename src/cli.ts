@@ -29,6 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -131,11 +132,86 @@ program
   )
   .option("--host <host>", "the address to bind — a tailnet IP, or 127.0.0.1 for local-only. Never a wildcard.")
   .option("--port <port>", "the port to bind", parseIntegerOption("--port"), 7717)
-  .action(async (options: { host?: string; port: number }) => {
+  .option(
+    "--behind-proxy",
+    "allow a wildcard --host — only for a container whose sole inbound path is a TLS-terminating front (e.g. Railway)",
+  )
+  .option("--hosted", "serve many duos from one process, invite-only (docs/deploy/hosted-mode.md)")
+  .action(async (options: { host?: string; port: number; behindProxy?: boolean; hosted?: boolean }) => {
     const config = loadConfig();
     try {
-      const { address } = await runServe({ host: options.host, port: options.port }, config);
+      const serveOptions = { host: options.host, port: options.port, behindProxy: options.behindProxy };
+      const { address } = options.hosted ? await runHostedServe(serveOptions, config) : await runServe(serveOptions, config);
       console.error(`duo serve listening on ${address}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const hostedCommand = program.command("hosted").description("Hosted mode administration: orgs, and inviting people to create their own duo on this server");
+
+hostedCommand
+  .command("invite <name>")
+  .description("Mint a single-use invite link for <name> (run on the server; talks to the running hosted daemon)")
+  .option("--expires-in-hours <n>", "hours before the invite expires", parseIntegerOption("--expires-in-hours"), 168)
+  .option("--org <id>", "the org the invitee joins (see `duo hosted org list`); default is the default org")
+  .action(async (name: string, options: { expiresInHours: number; org?: string }) => {
+    try {
+      const invite = await runHostedInvite(name, options.expiresInHours, process.env, options.org);
+      console.log(`Invite for "${invite.name}" into org ${invite.orgId} (expires ${invite.expiresAt}, single use):`);
+      console.log(invite.link ?? `code: ${invite.code} (set DUO_HOSTED_PUBLIC_URL and DUO_HOSTED_WEB_URL to get a full link)`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const hostedOrgCommand = hostedCommand.command("org").description("Orgs on this hosted server (talks to the running hosted daemon)");
+
+hostedOrgCommand
+  .command("create <name>")
+  .description("Create an org")
+  .action(async (name: string) => {
+    try {
+      const org = await runHostedOrgCreate(name);
+      console.log(`Created org "${org.name}" (id ${org.id}). Invite people into it: duo hosted invite "<name>" --org ${org.id}`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgCommand
+  .command("list")
+  .description("List orgs and how many duos are in each")
+  .action(async () => {
+    try {
+      for (const org of await runHostedOrgList()) {
+        console.log(`${org.id}\t${org.name}\t${org.memberCount} member${org.memberCount === 1 ? "" : "s"}`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgCommand
+  .command("rename <id> <name>")
+  .description("Rename an org")
+  .action(async (id: string, name: string) => {
+    try {
+      const org = await runHostedOrgRename(id, name);
+      console.log(`Renamed org ${org.id} to "${org.name}".`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgCommand
+  .command("members <id>")
+  .description("List the duos in an org")
+  .action(async (id: string) => {
+    try {
+      for (const member of await runHostedOrgMembers(id)) {
+        console.log(`${member.duoId}\t${member.name}\t${member.email ?? "-"}${member.isAdmin ? "\tadmin" : ""}`);
+      }
     } catch (error) {
       reportError(error);
     }

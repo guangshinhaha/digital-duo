@@ -17,4 +17,12 @@ describe("assertServableHost (client-design.md AR-12)", () => {
   it.each(["127.0.0.1", "100.64.1.5", "::1"])("accepts an explicit host %s", (host) => {
     expect(() => assertServableHost(host)).not.toThrow();
   });
+
+  it.each(["0.0.0.0", "::"])("accepts the wildcard host %s only behind a proxy", (host) => {
+    expect(() => assertServableHost(host, { behindProxy: true })).not.toThrow();
+  });
+
+  it("still refuses an absent host behind a proxy", () => {
+    expect(() => assertServableHost(undefined, { behindProxy: true })).toThrow(UnsafeBindHostError);
+  });
 });

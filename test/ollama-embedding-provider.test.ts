@@ -36,6 +36,19 @@ describe("OllamaEmbeddingProvider.embed", () => {
     await expect(provider.embed("hi")).resolves.toEqual([0.1, 0.2, 0.3]);
   });
 
+  it("sends DUO_OLLAMA_NUM_THREAD as Ollama's num_thread option", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        const body = JSON.parse(init.body as string);
+        expect(body).toEqual({ model: "nomic-embed-text", prompt: "hi", options: { num_thread: 4 } });
+        return new Response(JSON.stringify({ embedding: [0.1] }), { status: 200 });
+      }),
+    );
+    const provider = createOllamaEmbeddingProvider(loadConfig({ DUO_OLLAMA_NUM_THREAD: "4" }));
+    await expect(provider.embed("hi")).resolves.toEqual([0.1]);
+  });
+
   it("throws naming Ollama as unreachable when fetch rejects", async () => {
     vi.stubGlobal(
       "fetch",

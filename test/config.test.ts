@@ -51,6 +51,7 @@ describe("loadConfig", () => {
       DUO_OLLAMA_HOST: "http://h:1",
       DUO_OLLAMA_MODEL: "llama3",
       DUO_OLLAMA_EMBEDDING_MODEL: "custom-embed",
+      DUO_OLLAMA_NUM_THREAD: "4",
       DUO_CLASSIFICATION_CEILING: "secret",
       DUO_CONFIDENCE_WEIGHT_SELF_CONSISTENCY: "0.4",
       DUO_CONFIDENCE_WEIGHT_RETRIEVAL_STRENGTH: "0.2",
@@ -86,7 +87,8 @@ describe("loadConfig", () => {
       classificationCeiling: "secret",
       duoDir: "/tmp/duo-out",
       ownerName: "Priya Nair",
-      ollama: { host: "http://h:1", model: "llama3", embeddingModel: "custom-embed" },
+      ollama: { host: "http://h:1", model: "llama3", embeddingModel: "custom-embed", numThread: 4 },
+      openrouter: { apiKey: undefined, model: "openrouter/auto", baseUrl: "https://openrouter.ai/api/v1" },
       confidence: {
         weights: { selfConsistency: 0.4, retrievalStrength: 0.2, ruleHit: 0.2, recency: 0.15, selfReport: 0.05 },
         escalationThreshold: 0.6,

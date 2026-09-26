@@ -20,9 +20,20 @@ const WILDCARD_HOSTS = new Set(["0.0.0.0", "::", "*"]);
  * (a tailnet IP, a specific NIC) are both fine, because both are a
  * deliberate choice rather than a default nobody made.
  */
-export function assertServableHost(host: string | undefined): asserts host is string {
+export function assertServableHost(
+  host: string | undefined,
+  options: { behindProxy?: boolean } = {},
+): asserts host is string {
   if (host === undefined || host.length === 0) {
     throw new UnsafeBindHostError(host, "no host was given");
+  }
+  // Org mode (docs/workspace/org-mode-deployment.md §3): in a container whose
+  // only inbound path is a TLS-terminating front (Railway's edge), the
+  // container's interfaces ARE the private side, and the platform can only
+  // route to a wildcard listener. Still never by omission: the host must be
+  // given, and --behind-proxy must be passed alongside it.
+  if (WILDCARD_HOSTS.has(host) && options.behindProxy) {
+    return;
   }
   if (WILDCARD_HOSTS.has(host)) {
     throw new UnsafeBindHostError(host, "binding every interface is never allowed");

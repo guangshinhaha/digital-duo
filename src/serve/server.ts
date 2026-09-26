@@ -1,5 +1,5 @@
 import cors from "@fastify/cors";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyServerFactory } from "fastify";
 import { listActionAttempts } from "../actions/attempt-log.js";
 import { confirmAndExecuteT4Request, describePendingT4Requests } from "../actions/t4-guard.js";
 import { endDuoAndRecord, readLifecycle } from "../continuity/lifecycle.js";
@@ -33,6 +33,7 @@ import type { WorkspaceService } from "../workspace/service.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 import { EmbedJob } from "./embed-job.js";
+import { registerOwnerRoutes } from "./owner-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
 
@@ -83,6 +84,13 @@ export interface ServeDeps {
    * join or leave through.
    */
   readonly workspace?: WorkspaceService;
+  /**
+   * Trust `X-Forwarded-For` from the front (Railway's edge, org mode §3).
+   * Without it every request's `request.ip` is the proxy's, so the per-IP
+   * auth-failure limiter would lock every client out after ten bad tokens
+   * from anyone. Only set behind a front that overwrites the header.
+   */
+  readonly trustProxy?: boolean;
 }
 
 function errorBody(code: string, message: string) {
@@ -876,8 +884,13 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
  * function's, so tests can `fastify.inject()` against it with no open
  * socket at all.
  */
-export function createServer(deps: ServeDeps): FastifyInstance {
-  const app = Fastify({ logger: false });
+/**
+ * `serverFactory` lets hosted mode (src/hosted/) give each duo its own
+ * never-listening HTTP server that a front dispatches requests and upgrades
+ * into — one isolated app per duo, unchanged, in one process.
+ */
+export function createServer(deps: ServeDeps, options: { serverFactory?: FastifyServerFactory } = {}): FastifyInstance {
+  const app = Fastify({ logger: false, trustProxy: deps.trustProxy ?? false, ...(options.serverFactory ? { serverFactory: options.serverFactory } : {}) });
   // CORS registers *before* the auth hook on purpose: a browser preflight is
   // an OPTIONS request the browser will not attach `Authorization` to, so if
   // auth ran first every preflight would 401 and no browser-origin client
@@ -895,5 +908,6 @@ export function createServer(deps: ServeDeps): FastifyInstance {
   const draftReady = registerDraftReadySocket(app, deps);
   const embedJob = new EmbedJob();
   registerRoutes(app, deps, draftReady, auth, embedJob);
+  registerOwnerRoutes(app, deps);
   return app;
 }

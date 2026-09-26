@@ -1,0 +1,45 @@
+{
+  "tenants": [
+    {
+      "id": "e2etest001",
+      "name": "E2E Test",
+      "createdAt": "2026-09-26T03:00:00.000Z",
+      "passphraseCipher": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "id": "samsamsam2",
+      "name": "Sam Tan",
+      "createdAt": "2026-09-26T05:00:00.000Z",
+      "passphraseCipher": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "identitySubject": "sub-sam",
+      "email": "sam@example.com",
+      "isAdmin": false
+    }
+  ],
+  "invites": [
+    {
+      "id": "0b6a3f5e-8d0e-4f0e-9d3a-000000000001",
+      "name": "Sam",
+      "codeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "createdAt": "2026-09-26T04:00:00.000Z",
+      "expiresAt": "2026-10-03T04:00:00.000Z",
+      "usedAt": "2026-09-26T05:00:00.000Z",
+      "tenantId": "samsamsam2",
+      "email": null
+    },
+    {
+      "id": "0b6a3f5e-8d0e-4f0e-9d3a-000000000002",
+      "name": "Kim",
+      "codeHash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "createdAt": "2026-09-26T06:00:00.000Z",
+      "expiresAt": "2026-10-03T06:00:00.000Z",
+      "usedAt": null,
+      "tenantId": null
+    }
+  ],
+  "root": {
+    "identitySubject": "sub-shin",
+    "email": "shin@example.com",
+    "claimedAt": "2026-09-26T04:30:00.000Z"
+  }
+}
