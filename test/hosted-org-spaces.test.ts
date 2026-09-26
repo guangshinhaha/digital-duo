@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MatrixProvisioner, orgIdOfUserId } from "../src/hosted/matrix-accounts.js";
 import { OrgSpaceProvisioner, GENERAL_ROOM_NAME, orgSpaceComplete } from "../src/hosted/org-spaces.js";
 import { DEFAULT_ORG_ID, ROOT_DUO_ID } from "../src/hosted/orgs.js";
@@ -53,6 +53,55 @@ describe("OrgSpaceProvisioner: an org's Space and #general", () => {
     expect(space.members.has("@workspace-admin:duo.test")).toBe(true);
     expect(general.members.has("@workspace-admin:duo.test")).toBe(true);
     expect([...fake.rooms.values()].every((room) => room.joinRule === "invite" && room.visibility === "private")).toBe(true);
+  });
+
+  it("only the service account can invite into either room; only it can post in the Space", async () => {
+    const { registry, fake, accounts, spaces } = setup();
+    const org = registry.createOrg("Platform team");
+    const id = addDuo(registry, "Sam", org.id);
+    await accounts.provision(id);
+    await spaces.syncMember(id);
+    const stored = registry.org(org.id)!;
+    const space = fake.rooms.get(stored.spaceRoomId!)!;
+    const general = fake.rooms.get(stored.generalRoomId!)!;
+    const { personUserId, duoUserId } = registry.matrixAccounts(id)!;
+    const admin = "@workspace-admin:duo.test";
+
+    expect(space.powerLevels).toMatchObject({ invite: 100, events_default: 100 });
+    expect(general.powerLevels).toMatchObject({ invite: 100, events_default: 0 });
+    for (const room of [space, general]) {
+      expect(fake.mayInvite(room.roomId, admin)).toBe(true);
+      expect(fake.mayInvite(room.roomId, personUserId)).toBe(false);
+      expect(fake.mayInvite(room.roomId, duoUserId)).toBe(false);
+    }
+    // The service account can still link the child and rename the Space (state events), which the run just did.
+    expect(space.children.has(general.roomId)).toBe(true);
+    expect(space.name).toBe("Platform team");
+  });
+
+  it("creates each room under a stable transaction id, so a lost registry write does not make a second room", async () => {
+    const { registry, fake, spaces } = setup();
+    const org = registry.createOrg("Platform team");
+    const updateOrgSpace = vi.spyOn(registry, "updateOrgSpace");
+    updateOrgSpace.mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    updateOrgSpace.mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    // The Space was created but its id could not be written (twice): the run gives up, unrecorded.
+    await expect(spaces.ensureOrg(org.id)).rejects.toThrow("disk full");
+    expect(fake.rooms.size).toBe(1);
+    expect(registry.org(org.id)!.spaceRoomId).toBeUndefined();
+    const puts = fake.requests.filter((request) => request.method === "PUT" && request.path.includes("/createRoom/"));
+    expect(puts.map((request) => request.path)).toEqual([`/_matrix/client/v3/createRoom/org-${org.id}-space`]);
+
+    // The next attempt, inside Synapse's transaction window, gets the same room back.
+    updateOrgSpace.mockRestore();
+    expect((await spaces.ensureOrg(org.id)).status).toBe("provisioned");
+    expect(fake.rooms.size).toBe(2);
+    expect(registry.org(org.id)!.spaceRoomId).toBeDefined();
+    expect(fake.requests.some((request) => request.path === `/_matrix/client/v3/createRoom/org-${org.id}-general`)).toBe(true);
   });
 
   it("a second run is a no-op: no call at all", async () => {
@@ -109,7 +158,7 @@ describe("OrgSpaceProvisioner: an org's Space and #general", () => {
     const realFetch = fake.fetch;
     const flaky: typeof fetch = async (input, init) => {
       const path = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url).pathname;
-      if (path.endsWith("/createRoom") && (seen += 1) === 2) {
+      if (path.includes("/createRoom") && (seen += 1) === 2) {
         return new Response(JSON.stringify({ errcode: "M_UNKNOWN" }), { status: 500 });
       }
       return realFetch(input, init);
@@ -251,11 +300,77 @@ describe("OrgSpaceProvisioner: members", () => {
     });
     expect((await partial.syncMember(id)).status).toBe("pending");
     expect(registry.matrixSpaces(id)).toBeUndefined();
+    // The person's two joins are done; the retry must not re-join them (Synapse would answer 403) and does the duo's two.
+    const joinPosts = () => fake.requests.filter((request) => request.method === "POST" && request.path.includes("/join/")).length;
+    const before = joinPosts();
     expect((await partial.syncMember(id)).status).toBe("provisioned");
+    expect(joinPosts() - before).toBe(2);
     expect(fake.rooms.size).toBe(2);
     expect(fake.requests.length).toBeGreaterThan(start);
     const { duoUserId } = registry.matrixAccounts(id)!;
     expect(fake.rooms.get(registry.org(DEFAULT_ORG_ID)!.spaceRoomId!)!.members.has(duoUserId)).toBe(true);
+  });
+
+  it("a retry after one of four joins landed finishes the member, without joining again the account that is in", async () => {
+    const { registry, fake, accounts, spaces } = setup();
+    const id = addDuo(registry, "Sam");
+    await accounts.provision(id);
+    await spaces.ensureOrg(DEFAULT_ORG_ID);
+    const original = fake.fetch;
+    let joins = 0;
+    const flaky: typeof fetch = async (input, init) => {
+      const path = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url).pathname;
+      if (path.includes("/join/") && (joins += 1) === 2) {
+        return new Response(JSON.stringify({ errcode: "M_UNKNOWN" }), { status: 502 });
+      }
+      return original(input, init);
+    };
+    const partial = new OrgSpaceProvisioner({
+      registry,
+      admin: new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: flaky }),
+      serverName: "duo.test",
+      log: () => {},
+      retryBaseMs: 1,
+    });
+    expect((await partial.syncMember(id)).status).toBe("pending");
+    const { personUserId } = registry.matrixAccounts(id)!;
+    expect(fake.rooms.get(registry.org(DEFAULT_ORG_ID)!.spaceRoomId!)!.members.has(personUserId)).toBe(true);
+    expect(registry.matrixSpaces(id)).toBeUndefined();
+
+    const summary = await partial.retryPending(Date.now() + 10_000);
+    expect(summary.members).toMatchObject({ provisioned: 1, pending: 0, failed: 0 });
+    expect(registry.matrixSpaces(id)).toBeDefined();
+    expect(registry.spacePending(id)).toBeUndefined();
+    // The person's join to the Space was not repeated: 1 done + 1 refused + 3 on the retry.
+    expect(fake.requests.filter((request) => request.method === "POST" && request.path.includes("/join/"))).toHaveLength(4);
+  });
+
+  it("a pending rename re-runs a recorded member with no joins and no 403", async () => {
+    const { registry, fake, accounts, spaces } = setup();
+    const org = registry.createOrg("Platform team");
+    const id = addDuo(registry, "Sam", org.id);
+    await accounts.provision(id);
+    expect((await spaces.syncMember(id)).status).toBe("provisioned");
+    registry.renameOrg(org.id, "Platform");
+    const joinPosts = () => fake.requests.filter((request) => request.method === "POST" && request.path.includes("/join/")).length;
+    const before = joinPosts();
+
+    // The rename makes the member count as not done, so the whole member is walked again.
+    expect((await spaces.syncMember(id)).status).toBe("provisioned");
+    expect(joinPosts()).toBe(before);
+    expect(fake.rooms.get(registry.org(org.id)!.spaceRoomId!)!.name).toBe("Platform");
+    expect((await spaces.syncMember(id)).status).toBe("already");
+  });
+
+  it("after stop() a signup's join starts nothing and marks nothing", async () => {
+    const { registry, fake, accounts, spaces } = setup();
+    const id = addDuo(registry, "Sam");
+    await accounts.provision(id);
+    const calls = fake.requests.length;
+    spaces.stop();
+    expect((await spaces.syncMember(id)).status).toBe("waiting");
+    expect(fake.requests).toHaveLength(calls);
+    expect(registry.spacePending(id)).toBeUndefined();
   });
 
   it("the pre-hosted root duo is joined to its org's Space too", async () => {
@@ -318,17 +433,46 @@ describe("OrgSpaceProvisioner: the org wall", () => {
     expect(tampered.matrixSpaces(id)).toBeUndefined();
   });
 
-  it("the org wall in the fake also stops a stray cross-org join at Synapse (the module's job, #235)", async () => {
-    const { registry, fake, accounts, spaces } = setup();
+  it("a member whose accounts do not fit their org is not retried on every tick", async () => {
+    const { registry, fake, accounts, path, logs } = setup();
     const a = registry.createOrg("Org A");
     const b = registry.createOrg("Org B");
+    const id = addDuo(registry, "Ann", a.id);
+    await accounts.provision(id);
+    const file = JSON.parse(readFileSync(path, "utf8")) as { tenants: Array<{ id: string; matrix: { personUserId: string; duoUserId: string } }> };
+    const tenant = file.tenants.find((candidate) => candidate.id === id)!;
+    tenant.matrix.personUserId = `@${b.id}.${id}:duo.test`;
+    tenant.matrix.duoUserId = `@duo-${b.id}.${id}:duo.test`;
+    writeFileSync(path, JSON.stringify(file));
+    const tampered = new HostedRegistry(path, MASTER);
+    const strict = new OrgSpaceProvisioner({ registry: tampered, admin: new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch }), serverName: "duo.test", log: (line) => logs.push(line), retryBaseMs: 1 });
+
+    const first = await strict.syncAll();
+    expect(first.members.failed).toBe(1);
+    const later = Date.now() + 3_600_000;
+    expect(strict.hasRetryDue(later)).toBe(false);
+    expect((await strict.retryPending(later)).memberOutcomes).toEqual([]);
+    expect(logs.filter((line) => line.includes("do not belong to its org"))).toHaveLength(1);
+  });
+
+  it("a join the module refuses leaves the member pending, records nothing, and is retried", async () => {
+    const { registry, fake, accounts, spaces } = setup({ retryBaseMs: 1 });
+    const a = registry.createOrg("Org A");
     const inA = addDuo(registry, "Ann", a.id);
-    const inB = addDuo(registry, "Bob", b.id);
-    await accounts.provisionAll();
-    await spaces.syncAll();
-    const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
-    await expect(admin.joinUser(registry.org(a.id)!.spaceRoomId!, registry.matrixAccounts(inB)!.personUserId)).rejects.toMatchObject({ status: 403, errcode: "M_FORBIDDEN" });
-    expect(registry.matrixAccounts(inA)!.personUserId).not.toBe(registry.matrixAccounts(inB)!.personUserId);
+    await accounts.provision(inA);
+    await spaces.ensureOrg(a.id);
+    // The accounts fit their org, so the guard in runMember allows the join; but the room holds someone from another
+    // org (put there behind the daemon's back), so the wall (the fake standing in for #235) refuses it.
+    const spaceRoom = fake.rooms.get(registry.org(a.id)!.spaceRoomId!)!;
+    spaceRoom.members.add(`@zzz.stray:duo.test`);
+
+    const outcome = await spaces.syncMember(inA);
+    expect(outcome.status).toBe("pending");
+    expect(outcome.error).toContain("M_FORBIDDEN");
+    expect(registry.matrixSpaces(inA)).toBeUndefined();
+    expect(registry.spacePending(inA)).toMatchObject({ attempts: 1 });
+    expect(spaceRoom.members.has(registry.matrixAccounts(inA)!.personUserId)).toBe(false);
+    expect(spaces.hasRetryDue(Date.now() + 10_000)).toBe(true);
   });
 });
 
@@ -388,30 +532,41 @@ describe("the registry additions are backward compatible", () => {
 });
 
 describe("SynapseAdmin room calls (endpoint shapes per the Synapse and Matrix docs)", () => {
-  it("createPrivateRoom always sends a private, invite-only room; a Space adds the m.space type", async () => {
+  it("createPrivateRoom always sends a private, invite-only room under a transaction id; a Space adds the m.space type", async () => {
     const fake = createFakeSynapse();
     const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
-    const spaceId = await admin.createPrivateRoom({ name: "Org", space: true });
-    const roomId = await admin.createPrivateRoom({ name: "general" });
+    const spaceId = await admin.createPrivateRoom({ name: "Org", space: true, txnId: "org-x-space" });
+    const roomId = await admin.createPrivateRoom({ name: "general", txnId: "org-x-general" });
     expect(spaceId).toMatch(/^!.+:duo\.test$/);
-    const [space, room] = fake.requests.filter((request) => request.path === "/_matrix/client/v3/createRoom");
+    const [space, room] = fake.requests.filter((request) => request.path.startsWith("/_matrix/client/v3/createRoom"));
+    expect(space).toMatchObject({ method: "PUT", path: "/_matrix/client/v3/createRoom/org-x-space" });
     expect(space!.body).toEqual({
       name: "Org",
       visibility: "private",
       preset: "private_chat",
       creation_content: { type: "m.space" },
-      power_level_content_override: { events_default: 100 },
+      power_level_content_override: { invite: 100, events_default: 100 },
     });
-    expect(room!.body).toEqual({ name: "general", visibility: "private", preset: "private_chat" });
+    expect(room).toMatchObject({ method: "PUT", path: "/_matrix/client/v3/createRoom/org-x-general" });
+    expect(room!.body).toEqual({ name: "general", visibility: "private", preset: "private_chat", power_level_content_override: { invite: 100 } });
     expect(space!.authorization).toBe(`Bearer ${FAKE_ADMIN_TOKEN}`);
     expect(fake.rooms.get(roomId)!.joinRule).toBe("invite");
   });
 
-  it("addSpaceChild, setRoomName and joinUser hit the documented endpoints with the documented bodies", async () => {
+  it("the same transaction id returns the same room; a different one makes another", async () => {
     const fake = createFakeSynapse();
     const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
-    const space = await admin.createPrivateRoom({ name: "Org", space: true });
-    const general = await admin.createPrivateRoom({ name: "general" });
+    const first = await admin.createPrivateRoom({ name: "Org", space: true, txnId: "t1" });
+    expect(await admin.createPrivateRoom({ name: "Org", space: true, txnId: "t1" })).toBe(first);
+    expect(await admin.createPrivateRoom({ name: "Org", space: true, txnId: "t2" })).not.toBe(first);
+    expect(fake.rooms.size).toBe(2);
+  });
+
+  it("addSpaceChild, setRoomName, roomMembers and joinUser hit the documented endpoints with the documented bodies", async () => {
+    const fake = createFakeSynapse();
+    const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
+    const space = await admin.createPrivateRoom({ name: "Org", space: true, txnId: "s" });
+    const general = await admin.createPrivateRoom({ name: "general", txnId: "g" });
     await admin.addSpaceChild(space, general, ["duo.test"]);
     await admin.setRoomName(space, "New name");
     await fake.fetch(`${FAKE_SYNAPSE_URL}/_synapse/admin/v2/users/${encodeURIComponent("@a.b:duo.test")}`, {
@@ -420,23 +575,51 @@ describe("SynapseAdmin room calls (endpoint shapes per the Synapse and Matrix do
       body: JSON.stringify({}),
     });
     await admin.joinUser(space, "@a.b:duo.test");
+    const joinPosts = () => fake.requests.filter((request) => request.method === "POST" && request.path.includes("/join/")).length;
+    expect(joinPosts()).toBe(1);
+    // A repeat is a no-op here, by asking who is in first: Synapse itself would refuse it.
     await admin.joinUser(space, "@a.b:duo.test");
+    expect(joinPosts()).toBe(1);
+    expect(await admin.roomMembers(space)).toEqual(["@workspace-admin:duo.test", "@a.b:duo.test"]);
 
     const seen = fake.requests.map((request) => `${request.method} ${request.path}`);
     expect(seen).toContain(`PUT /_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/m.space.child/${encodeURIComponent(general)}`);
     expect(seen).toContain(`PUT /_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/m.room.name`);
     expect(seen).toContain(`POST /_synapse/admin/v1/join/${encodeURIComponent(space)}`);
+    expect(seen).toContain(`GET /_synapse/admin/v1/rooms/${encodeURIComponent(space)}/members`);
     expect(fake.requests.find((request) => request.path.includes("/join/"))!.body).toEqual({ user_id: "@a.b:duo.test" });
     expect(fake.rooms.get(space)!.name).toBe("New name");
     expect(fake.rooms.get(space)!.children.get(general)).toEqual({ via: ["duo.test"], suggested: true });
     expect(fake.rooms.get(space)!.members.has("@a.b:duo.test")).toBe(true);
   });
 
+  it("the fake answers as Synapse does: a repeat admin join of an invite-only room is 403, and an unknown room's members 404", async () => {
+    const fake = createFakeSynapse();
+    const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
+    const space = await admin.createPrivateRoom({ name: "Org", space: true, txnId: "s" });
+    await fake.fetch(`${FAKE_SYNAPSE_URL}/_synapse/admin/v2/users/${encodeURIComponent("@a.b:duo.test")}`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${FAKE_ADMIN_TOKEN}` },
+      body: JSON.stringify({}),
+    });
+    const join = () =>
+      fake.fetch(`${FAKE_SYNAPSE_URL}/_synapse/admin/v1/join/${encodeURIComponent(space)}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${FAKE_ADMIN_TOKEN}` },
+        body: JSON.stringify({ user_id: "@a.b:duo.test" }),
+      });
+    expect((await join()).status).toBe(200);
+    const again = await join();
+    expect(again.status).toBe(403);
+    expect(((await again.json()) as { errcode: string }).errcode).toBe("M_FORBIDDEN");
+    await expect(admin.roomMembers("!nope:duo.test")).rejects.toMatchObject({ status: 404 });
+  });
+
   it("errors carry the status and errcode, never the token", async () => {
     const fake = createFakeSynapse();
     fake.failNext(1, 500);
     const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
-    const error = await admin.createPrivateRoom({ name: "x" }).catch((caught: unknown) => caught as Error);
+    const error = await admin.createPrivateRoom({ name: "x", txnId: "x" }).catch((caught: unknown) => caught as Error);
     expect(error).toMatchObject({ status: 500, retryable: true });
     expect((error as Error).message).not.toContain(FAKE_ADMIN_TOKEN);
   });

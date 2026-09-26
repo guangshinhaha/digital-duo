@@ -22,7 +22,9 @@ import { SynapseAdminError, type SynapseAdmin } from "./synapse-admin.js";
  *   when both their account ids carry that org (`orgIdOfUserId`): a mismatch is reported, not joined.
  * - **Idempotent and retry-safe, like the accounts flow.** Progress is written to the registry step
  *   by step, so a room that exists is never created twice by a re-run and a member who is recorded
- *   in costs no call. Synapse trouble marks the org or member pending (visible, counted, retried
+ *   in costs no call. A member is recorded only after all four joins, and `SynapseAdmin.joinUser` skips
+ *   an account already in the room (Synapse refuses a repeat join of an invite-only room), so a run
+ *   that died part way is finished by the next one. Synapse trouble marks the org or member pending (visible, counted, retried
  *   with backoff) and never throws into org creation or invite redemption.
  * - **No tokens here.** Nothing in this module handles one; the admin client holds the only one.
  */
@@ -39,7 +41,7 @@ export type SpaceStatus =
   | "pending"
   /** Needs an operator (an account that does not fit its org) or an unexpected error; the org or duo is still retried if it owes work. */
   | "failed"
-  /** A member whose Matrix accounts are not provisioned yet: nothing to join, and not an error. */
+  /** A member whose Matrix accounts are not provisioned yet, or who was asked for after `stop()`: nothing was done, and not an error. */
   | "waiting";
 
 export interface OrgSpaceOutcome {
@@ -115,9 +117,14 @@ export class OrgSpaceProvisioner {
 
   /**
    * Puts a member's person and duo accounts into their org's Space and `#general`, first making sure
-   * those exist. `waiting` (not an error) when the member's accounts are not provisioned yet.
+   * those exist. `waiting` (not an error) when the member's accounts are not provisioned yet, or
+   * after `stop()`. Safe to repeat and to resume: each join first asks who is already in the room.
    */
   syncMember(duoId: string): Promise<MemberSpaceOutcome> {
+    if (this.stopped) {
+      // Shutting down: start nothing. Nothing is marked, so the next start's backfill picks the member up.
+      return Promise.resolve({ duoId, status: "waiting" });
+    }
     const running = this.memberInflight.get(duoId);
     if (running) {
       return running;
@@ -172,10 +179,22 @@ export class OrgSpaceProvisioner {
       .map((org) => org.id);
   }
 
-  /** Members with accounts who are not recorded in their org's current rooms and whose backoff has passed. */
+  /**
+   * Members with accounts that fit their org, who are not recorded in their org's current rooms and
+   * whose backoff has passed. A member whose accounts do not fit is left out: it needs an operator, no
+   * retry helps, and `runMember` (which still refuses it when called directly) records no pending mark
+   * for it, so it would otherwise be due, and logged, on every tick.
+   */
   private dueMemberIds(now: number): string[] {
     const { registry } = this.options;
-    return this.memberIds().filter((duoId) => registry.matrixAccounts(duoId) !== undefined && !this.memberDone(duoId) && this.backoffPassed(registry.spacePending(duoId), now));
+    return this.memberIds().filter((duoId) => this.accountsFitOrg(duoId) && !this.memberDone(duoId) && this.backoffPassed(registry.spacePending(duoId), now));
+  }
+
+  /** The member has Matrix accounts and both their ids carry the member's own org. */
+  private accountsFitOrg(duoId: string): boolean {
+    const accounts = this.options.registry.matrixAccounts(duoId);
+    const org = this.options.registry.orgOf(duoId);
+    return !!accounts && !!org && orgIdOfUserId(accounts.personUserId) === org.id && orgIdOfUserId(accounts.duoUserId) === org.id;
   }
 
   private memberDone(duoId: string): boolean {
@@ -262,9 +281,10 @@ export class OrgSpaceProvisioner {
   }
 
   /**
-   * A registry write that keeps a room id. A room cannot be looked up again by us (createRoom has no
-   * idempotency key), so a write that fails after a room was made would orphan it: one immediate
-   * retry, then log the id so an operator can find it, and rethrow.
+   * A registry write that keeps a room id. `createPrivateRoom` sends a stable transaction id, so a
+   * repeat inside Synapse's 30 minute in-memory cache returns the same room, but past that (or after
+   * a Synapse restart) a room whose id was not recorded is lost: one immediate retry of the write,
+   * then log the id so an operator can find it, and rethrow.
    */
   private record(orgId: string, patch: Parameters<HostedRegistry["updateOrgSpace"]>[1]): HostedOrg {
     const { registry } = this.options;
@@ -294,12 +314,12 @@ export class OrgSpaceProvisioner {
       let org: HostedOrg = start;
       for (let pass = 0; pass < MAX_PASSES; pass += 1) {
         if (org.spaceRoomId === undefined) {
-          const spaceRoomId = await admin.createPrivateRoom({ name: org.name, space: true });
+          const spaceRoomId = await admin.createPrivateRoom({ name: org.name, space: true, txnId: `org-${orgId}-space` });
           org = this.record(orgId, { spaceRoomId, spaceSyncedName: org.name });
           this.log(`hosted: created the Space for org ${orgId} (${spaceRoomId})`);
         }
         if (org.generalRoomId === undefined) {
-          const generalRoomId = await admin.createPrivateRoom({ name: GENERAL_ROOM_NAME });
+          const generalRoomId = await admin.createPrivateRoom({ name: GENERAL_ROOM_NAME, txnId: `org-${orgId}-general` });
           org = this.record(orgId, { generalRoomId });
           this.log(`hosted: created #general for org ${orgId} (${generalRoomId})`);
         }

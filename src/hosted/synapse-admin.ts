@@ -155,19 +155,31 @@ export class SynapseAdmin {
   }
 
   /**
-   * Creates a room as the service account (`POST /_matrix/client/v3/createRoom`, docs/deploy/hosted-workspace.md
+   * Creates a room as the service account (`PUT /_matrix/client/v3/createRoom/<txnId>`, docs/deploy/hosted-workspace.md
    * §6, §12). **Always private**: `visibility: "private"` and the `private_chat` preset (invite-only) are
    * fixed here and not options, so no caller can make a public room, which would put everyone in it in
    * every org's directory. A Space is the same room with `creation_content.type = "m.space"`, and only
    * the service account may post in it (`events_default: 100`, the spec's recommendation).
-   * Not idempotent by itself (Matrix has no idempotency key for createRoom); callers record the id at once.
+   *
+   * **Only the service account may invite** (`invite: 100` in both rooms). The `private_chat` preset
+   * sets `invite: 0`, so without this override any member could invite any user id, another org's
+   * included, and the caller's override replaces the preset's key whole (Synapse merges it with a
+   * shallow `update`). Only the daemon adds people, through the admin join API, and that invite is sent
+   * by the service account, who holds 100 as the creator and can also send `m.space.child` and
+   * `m.room.name` (state events need 50).
+   *
+   * `txnId` is Matrix's idempotency key (Synapse v1.161.0 `RoomCreateRestServlet`): a second request with
+   * the same id, by the same token, within 30 minutes returns the first request's room. The cache is in
+   * memory, so a Synapse restart or the 30 minutes ends it; after that the same id creates a new room.
+   * Callers therefore use a stable id per room (`org-<orgId>-space`) and still record the room id at once.
    */
-  async createPrivateRoom(options: { name: string; space?: boolean }): Promise<string> {
-    const { json } = await this.call("POST", "/_matrix/client/v3/createRoom", {
+  async createPrivateRoom(options: { name: string; txnId: string; space?: boolean }): Promise<string> {
+    const { json } = await this.call("PUT", `/_matrix/client/v3/createRoom/${encodeURIComponent(options.txnId)}`, {
       name: options.name,
       visibility: "private",
       preset: "private_chat",
-      ...(options.space ? { creation_content: { type: "m.space" }, power_level_content_override: { events_default: 100 } } : {}),
+      ...(options.space ? { creation_content: { type: "m.space" } } : {}),
+      power_level_content_override: { invite: 100, ...(options.space ? { events_default: 100 } : {}) },
     });
     const roomId = (json as { room_id?: unknown } | null)?.room_id;
     if (typeof roomId !== "string" || !roomId.startsWith("!")) {
@@ -190,12 +202,34 @@ export class SynapseAdmin {
   }
 
   /**
+   * Who is joined to the room (`GET /_synapse/admin/v1/rooms/<room>/members`): `{members: [user ids], total}`,
+   * joined users only, in one unpaginated answer (Synapse v1.161.0 `RoomMembersRestServlet`). 404 for an
+   * unknown room. An invited or left user is not listed.
+   */
+  async roomMembers(roomId: string): Promise<string[]> {
+    const { json } = await this.call("GET", `/_synapse/admin/v1/rooms/${encodeURIComponent(roomId)}/members`);
+    const members = (json as { members?: unknown } | null)?.members;
+    if (!Array.isArray(members) || !members.every((member) => typeof member === "string")) {
+      throw new SynapseAdminError("Synapse room members returned no member list", 200, null, false);
+    }
+    return members as string[];
+  }
+
+  /**
    * Puts a local account into a room with no invite to accept (`POST /_synapse/admin/v1/join/<room>`,
    * body `{user_id}`). The service account must be in the room with the right to invite; for a private
    * room Synapse invites the user as the admin and then joins them as themselves, so the join runs
-   * through Synapse's org module as that user (§6.2). Joining a user who is already in is a no-op.
+   * through Synapse's org module as that user (§6.2).
+   *
+   * **Idempotent here, not in Synapse.** That admin invite is refused with `403 M_FORBIDDEN` when the
+   * user is already in the room (v1.161.0 `event_auth.py`), so a repeat call would fail. This asks who is
+   * in first and does nothing for a user already joined. A 403 is never read as "already in": a module
+   * refusal is the same status and errcode, and errors do not carry the body that would tell them apart.
    */
   async joinUser(roomId: string, userId: string): Promise<void> {
+    if ((await this.roomMembers(roomId)).includes(userId)) {
+      return;
+    }
     await this.call("POST", `/_synapse/admin/v1/join/${encodeURIComponent(roomId)}`, { user_id: userId });
   }
 

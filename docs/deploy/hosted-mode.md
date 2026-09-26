@@ -272,7 +272,7 @@ to nobody else. It is a place and a directory scope; the wall itself is the Syna
   room would put everyone in it into every org's directory search. `@workspace-admin` stays in both,
   because the admin join API needs an admin in the room.
 - **Members are force-joined**, no invite to accept: `POST /_synapse/admin/v1/join/<room>` as the
-  service account, once per account per room (four calls per member). That call runs as the target
+  service account, once per account per room (four joins per member, each preceded by a members check). That call runs as the target
   user, so it passes through the org module like the user's own join. A member is joined only to
   their own org's rooms, and only when both account ids carry that org; a mismatch is reported as
   `failed` and nothing is joined.
@@ -283,10 +283,27 @@ to nobody else. It is a place and a directory scope; the wall itself is the Syna
   (`spacePending`, attempts and a scrubbed reason) and the same timer as the accounts retries it
   with the same backoff.
 - **Idempotent.** Progress is recorded step by step (Space id, `#general` id, the link, the name
-  written), so a run that dies half way resumes and a room that exists is never created twice. A
-  member who is recorded in (`matrixSpaces`) costs no call. The one window it cannot close: a
-  room is created and the registry write fails twice; the daemon logs the id and an operator can
-  delete the stray room.
+  written), so a run that dies half way resumes and a room that exists is not created again by a
+  re-run. A member who is recorded in (`matrixSpaces`) costs no call. Each join first asks Synapse
+  who is in the room (`GET /_synapse/admin/v1/rooms/<room>/members`) and skips an account already
+  there, because the admin join API invites first and Synapse refuses that invite with
+  `403 M_FORBIDDEN` for a user who is already in. A member is recorded only after all four joins, so
+  a run that died after one is finished by the next without that error.
+- **Room creation is deduplicated only inside Synapse's memory.** Each room is created with
+  `PUT /createRoom/<txnId>` and a stable id (`org-<orgId>-space`, `org-<orgId>-general`), which makes
+  Synapse return the same room to a repeat of the request by the same token for 30 minutes. That
+  cache is in memory, so a Synapse restart or the 30 minutes ends it. It covers a lost response
+  (a timeout, or a 5xx after Synapse made the room) and a registry write that fails, when the retry
+  comes inside the window. It does not cover a retry after the window or a Synapse restart: then
+  the same id makes another room, so a registry that keeps failing (or a failed write followed by a
+  late retry) leaves a stray, unreferenced room per attempt. The daemon logs the id of a room it
+  could not record, so an operator can find and delete it; a room whose response was lost past the
+  window has no logged id and is found by name among the service account's rooms.
+- **Only the service account can invite.** The `private_chat` preset lets any member invite
+  (`invite: 0`), so both rooms are created with `invite: 100` (and `events_default: 100` on the
+  Space, so members cannot post there). Until the org module (#235) lands, this is what stops a
+  member from inviting another org's user id into their org's rooms. The service account, who holds
+  100 as the creator, is unaffected: it still joins members and sends `m.space.child` and `m.room.name`.
 - **Backfill.** Startup and `duo hosted provision` (`POST /hosted/matrix/provision`) run the
   accounts first and then the spaces, for every org (the default org included, even when empty),
   every member, and the root duo. The answer keeps its old fields and gains `spaces`: org counts,

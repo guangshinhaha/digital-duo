@@ -151,6 +151,8 @@ describe("org spaces through the hosted server", () => {
     }
     writeFileSync(path, JSON.stringify(file));
     const rooms = fake.rooms.size;
+    // The old build's rooms are long past Synapse's 30 minute transaction window (else it would hand the same rooms back).
+    fake.expireTransactions();
 
     const { hosted, base } = await start(fake);
     await hosted.matrix!.whenIdle();
