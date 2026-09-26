@@ -159,6 +159,12 @@ export function registerAuth(app: FastifyInstance, storePath: string, passphrase
     if (request.url === "/ws" || request.url.startsWith("/ws?")) {
       return;
     }
+    // #227: the MCP connector's credential is the secret in its path
+    // (claude.ai's connector form takes a URL, not a header), so the MCP
+    // route checks it itself (serve/mcp.ts) and accepts nothing else.
+    if (request.url.startsWith("/mcp/")) {
+      return;
+    }
     const ip = request.ip;
     const existingWindow = failures.get(ip);
     // A cheap precheck so a client already over the cap doesn't pay for a

@@ -9,6 +9,7 @@ import { resolvePassphraseForServing } from "../serve/passphrase.js";
 import { createServer, type ServeDeps } from "../serve/server.js";
 import {
   createAskToken,
+  createConnectorToken,
   createDeviceToken,
   listAskTokens,
   listDeviceTokens,
@@ -17,6 +18,7 @@ import {
   type AskToken,
   type DeviceToken,
   type MintedAskLink,
+  type MintedConnectorToken,
   type PairedDevice,
 } from "../serve/tokens.js";
 import { DecryptionError } from "../store/crypto.js";
@@ -203,6 +205,23 @@ export function runPair(name: string, config: DuoConfig, env: NodeJS.ProcessEnv 
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   return createDeviceToken(config.storePath, passphrase, name);
+}
+
+/**
+ * Implements `duo connector new` (#227): mints this duo's claude.ai connector
+ * secret, revoking any earlier one, and returns the MCP URL to paste. The
+ * base is DUO_PUBLIC_URL, else Railway's RAILWAY_PUBLIC_DOMAIN, else only
+ * the path is known and the caller prefixes the daemon's address itself.
+ */
+export function runConnectorNew(
+  config: DuoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): MintedConnectorToken & { readonly url: string } {
+  requireStoreExists(config.storePath);
+  const passphrase = resolveOrCreatePassphrase(config.storePath, env);
+  const minted = createConnectorToken(config.storePath, passphrase);
+  const base = env.DUO_PUBLIC_URL?.replace(/\/+$/, "") ?? (env.RAILWAY_PUBLIC_DOMAIN ? `https://${env.RAILWAY_PUBLIC_DOMAIN}` : "");
+  return { ...minted, url: `${base}/mcp/${minted.token}` };
 }
 
 /** Implements `duo pair list`. */
