@@ -19,8 +19,8 @@
 2. **The daemon's hosted registry is the source of truth for orgs and membership.** Synapse
    holds accounts, rooms and messages, and nothing that decides who belongs to which org (§3).
 3. **The daemon creates every Matrix account, person and duo, through the Synapse admin API.**
-   Public registration is off, nobody has a password, and no one ever types a homeserver
-   address (§5).
+   Public registration is off, no person or duo account has a password (the one exception is the
+   service account, `@workspace-admin`, §5), and no one ever types a homeserver address (§5).
 4. **An account's org is written into its Matrix user id.** `@<orgId>.<handle>:<server>` for a
    person and `@duo-<orgId>.<handle>:<server>` for their duo. The Synapse module reads the org
    from the id string: no round trip, no lookup, no state to drift (§4).
@@ -78,7 +78,7 @@ interface HostedOrg {
 
 interface HostedMatrixAccounts {
   readonly personUserId: string;    // @<orgId>.<handle>:<server>
-  readonly duoUserId: string;       // duoUserIdFor(personUserId)
+  readonly duoUserId: string;       // duoUserIdFor(personUserId), which returns string | null: asserted non-null when provisioning
   readonly duoTokenCipher: string;  // base64 of encrypt(duoAccessToken, DUO_HOSTED_MASTER_KEY), like passphraseCipher
   readonly provisionedAt: string;
 }
@@ -172,11 +172,23 @@ The daemon holds one admin access token (`DUO_WORKSPACE_ADMIN_TOKEN`, a Railway 
 in the registry or the repo) and calls the admin API over Railway's private network. What #232,
 #233 and #234 may rely on, all checked against the Synapse admin docs and source on 2026-09-26:
 
+- **Two URLs, and the https rule (decided).** The daemon reaches Synapse on Railway's private
+  network, normally `http://<service>.railway.internal:<port>`, in `DUO_WORKSPACE_HOMESERVER`.
+  The URL handed to clients is a different, public https address, carried in
+  `DUO_WORKSPACE_PUBLIC_URL` (§8). Today `src/workspace/settings.ts` (lines 86-89) throws on any
+  `DUO_WORKSPACE_HOMESERVER` that is not `https:`, so the record cannot be followed as written.
+  **Decision:** hosted mode relaxes the https-only rule for hosts ending in `.railway.internal`,
+  because tokens on that URL never leave Railway's private network. Any other host still needs
+  https. That code change is owned by #232 (settings) and #236 (hosted wiring), not by this
+  docs-only record. The scheme of the private address is unverified against a live Railway
+  project (`railway.md` names no Synapse service yet): #230 confirms it.
+
 - **Create or update an account, idempotently.** `PUT /_synapse/admin/v2/users/<user_id>` with
   `displayname`, `admin: false` and no `password`. Answers `201` when it created the account and
   `200` when it modified an existing one, so re-running is a no-op. The docs say "it is possible
   to have active users without a password". Person and duo are both created this way, with no
-  password anywhere, which is what makes #232's "no stored password" true.
+  password on either, which is what makes #232's "no stored password" true. The one account
+  with a password is `@workspace-admin` (below).
 - **Get a token for an account.** `POST /_synapse/admin/v1/users/<user_id>/login` with an optional
   `valid_until_ms`. Returns `{"access_token": ...}`. Facts that matter:
   - "By default tokens do not expire." Person tokens therefore always set `valid_until_ms`.
@@ -189,8 +201,9 @@ in the registry or the repo) and calls the admin API over Railway's private netw
   - "The token will expire if the admin user calls `/logout/all`." Nothing in the daemon may
     ever call `/logout/all` as the service account, or every duo token dies at once.
   - The API "does not allow a user to login as themselves", so the service account can mint
-    tokens for others but not for itself. It is disabled if Matrix Authentication Service is
-    enabled. We do not run it.
+    tokens for others but not for itself (so this API cannot produce the service account's own
+    token: see the shared-secret bullet below). It is disabled if Matrix Authentication Service
+    is enabled. We do not run it.
 - **Put an account into a room.** `POST /_synapse/admin/v1/join/<room_id_or_alias>` with
   `{"user_id": ...}`. The user must be local, and "the server administrator must be in the room
   and have permission to invite users". Read from source: for a non-public room the admin
@@ -201,8 +214,16 @@ in the registry or the repo) and calls the admin API over Railway's private netw
   config docs, works "even if this setting [`enable_registration`] is disabled". So
   `enable_registration: false` does not close it: treat the shared secret as admin-equivalent,
   keep it only in Railway variables, and prefer `registration_shared_secret_path` (a file) to
-  an inline value in the config. #230 uses it once to create `@workspace-admin`, mints a token
-  for it, and stores that as `DUO_WORKSPACE_ADMIN_TOKEN`.
+  an inline value in the config, but note that with the `_path` form Synapse creates the secret
+  in that file itself when it is missing, so the secret then lives on Synapse's volume and no
+  Railway variable holds it. #230 uses the API once to create `@workspace-admin` with a random
+  password that is discarded after use. The register request needs a `password` (the MAC covers
+  the nonce, user, password and admin flag), and the response returns that account's
+  `access_token` and `device_id` directly, so no login step is needed. #230 stores the returned
+  token as `DUO_WORKSPACE_ADMIN_TOKEN`. `@workspace-admin` is the one account with a password;
+  every person and duo account has none (§1, item 3). After bootstrap #230 **unsets the shared
+  secret** (and removes the secret file if `_path` was used): with no shared secret configured
+  the API is off, which `enable_registration: false` alone does not achieve.
 
 ## 6. The org wall
 
@@ -228,11 +249,11 @@ creating, publishing or making a room public (§6.3), and the Space and `#genera
 |---|---|---|---|
 | `user_may_invite` | `async (inviter: str, invitee: str, room_id: str)` | Refuse when `org_of(inviter) != org_of(invitee)` | **Not called when the inviter is a server admin** (source: `room_member.py`). That is why the service account can seed rooms. |
 | `user_may_join_room` | `async (user: str, room: str, is_invited: bool)` | Refuse when the user's org differs from the org of any joined or invited member of the room | Docs: "isn't called if the join is performed by a server administrator, or in the context of a room creation". **Admin-API joins are different:** the admin API joins as the *target* user, and the bypass is decided on whether that user is a server admin, so a provisioning join **does** run the module. Our own provisioning must pass it, which is why the org has to be readable from the id before the person is in any room. |
-| `user_may_create_room` | `async (user_id: str, room_config: JsonDict)` | Refuse public rooms; refuse an `invite` list that crosses orgs or contains a 3pid | `room_config` argument added in **v1.132.0**. Pin Synapse at or above that. |
+| `user_may_create_room` | `async (user_id: str, room_config: JsonDict)` | Refuse public rooms; refuse an `invite` list that crosses orgs or contains a 3pid | `room_config` argument added in **v1.132.0**, and its `initial_state` shape on room upgrade fixed in **v1.140.0** (#18721; the module reads `initial_state` for rule 3). Pin Synapse at or above **v1.140.0**. **Not called when the creator is a server admin** (`room.py`), like the invite and join callbacks. |
 | `user_may_publish_room` | `async (user_id: str, room_id: str)` | Always refuse for non-service accounts | |
 | `user_may_send_3pid_invite` | `async (inviter, medium, address, room_id)` | Always refuse (no email or phone invites) | Local only. |
 | `check_username_for_spam` | `async (user_profile: UserProfile, requester_id: str) -> bool` | Directory filter: return `True` (hide) when `org_of(profile.user_id) != org_of(requester_id)`, and always for the service account | Returns `True` to **exclude**. `requester_id` was added in Synapse **v1.122.0** (changelog); pin at or above it. This is the belt to `search_all_users: false`'s braces. |
-| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting `join_rule: public`, so a private room cannot be flipped public later | Called for events from clients. **Verify in #235** that it sees state events sent by local clients. `user_may_send_state_event` exists but is documented as experimental. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
+| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting `join_rule: public`, so a private room cannot be flipped public later | Called for events from clients. **Verify in #235** that it sees state events sent by local clients, and that a room created with a public `m.room.join_rules` in `initial_state` is refused at creation by `user_may_create_room` (§6.3 rule 3), since `check_event_for_spam` does not see creation events. `user_may_send_state_event` exists but is documented as experimental. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
 
 Return values. **Return only `NOT_SPAM` or `Codes.FORBIDDEN`, never a boolean.** The docs and the
 code disagree on booleans: the docs say a deprecated `True` means `FORBIDDEN`, while
@@ -257,13 +278,23 @@ For any actor that is not the service account:
 2. **Joins.** Read the room's member events. If any member whose membership is `join` or `invite`
    has an org (the service account has none and is skipped) that differs from the joiner's,
    `FORBIDDEN`. An org-less non-service joiner is refused.
-3. **Room creation.** Refuse `visibility: public`, the `public_chat` preset, and any 3pid invite.
-   Every id in `invite` must share the creator's org.
+3. **Room creation.** Refuse `visibility: public`, the `public_chat` preset, any 3pid invite,
+   and any `initial_state` entry of type `m.room.join_rules` whose `join_rule` is not `invite`
+   (or `restricted` to the org's Space). Every id in `invite` must share the creator's org. The
+   `initial_state` check matters because a room can be created public that way with no
+   `visibility` and no preset, and rule 5 never sees it: the initial state events of a new room
+   are built by the room-creation handler (`synapse/handlers/room.py`) and do not pass through
+   `check_event_for_spam`, whose only call site is
+   `synapse/handlers/message.py` (`_create_and_send_nonmember_event_locked`).
 4. **Directory.** `check_username_for_spam` hides other orgs and the service account.
 5. **Join rules.** No room may be made `public` after creation (`check_event_for_spam`).
 
-The service account is exempt (it is a server admin, so Synapse already skips 1 and 2 for it)
-and the module also skips it in 3 and 5, because it creates the Spaces.
+The service account is exempt (it is a server admin, so Synapse already skips 1 and 2 for it).
+Synapse also never calls `user_may_create_room` for a server admin (`synapse/handlers/room.py`
+guards the call with `if not is_requester_admin`), so rule 3 is skipped for any admin account
+by Synapse, not by the module's choice, and the module skips it in 5 as well, because the
+service account creates the Spaces. This is one more reason never to promote a person account
+to admin (§6.4).
 
 ### 6.4 What the wall does not stop
 
@@ -328,8 +359,17 @@ Written plainly, because these are what a security reviewer will ask about.
 - **A duo's connection** uses the token from the registry (§3), decrypted in the daemon, in
   place of `DUO_WORKSPACE_ACCESS_TOKEN`. The existing single-owner env variables
   (`DUO_WORKSPACE_HOMESERVER`, `DUO_WORKSPACE_ACCESS_TOKEN`, `DUO_WORKSPACE_USER_ID`) are read
-  by the personal-hardware path; hosted mode reads only `DUO_WORKSPACE_HOMESERVER` (the private
-  URL) and ignores the other two.
+  by the personal-hardware path; hosted mode reads `DUO_WORKSPACE_HOMESERVER` (the private URL,
+  §5) and `DUO_WORKSPACE_PUBLIC_URL` (the https URL returned to clients) and ignores the other
+  two.
+- **A duo's own `env` is built from an allowlist.** `tenantDeps` in `src/hosted/server.ts`
+  (lines 117-118) currently spreads the whole process environment (`...shared.env`) into every
+  duo's `deps.env`, so once #230 sets `DUO_WORKSPACE_ADMIN_TOKEN` (an acts-as-any-user token)
+  each mounted duo's env would hold it, as `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN`
+  already do today. Hosted mode must build a duo's `env` from an allowlist that omits
+  `DUO_WORKSPACE_ADMIN_TOKEN`, `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN`. Owned by
+  #236 and #232. Not checked here: whether any per-duo route reads `deps.env` and returns or
+  logs values, which the allowlist makes moot.
 - **Resource numbers** for N concurrent sync loops in one process belong in this record once
   #236 measures them. Placeholder, to be filled by #236:
 
@@ -363,7 +403,18 @@ mint tokens. Synapse has both (§5, §6). Checked on 2026-09-26:
 We found no documented extension point in either that could refuse a cross-org invite, and no
 HTTP admin API to provision accounts. That is "not documented", not proof it cannot be done:
 revisit if either ships both. Everything about Synapse in this record is what its docs and
-source say for the version pinned in #230 (at least v1.132.0).
+source say for the version pinned in #230 (at least v1.140.0).
+
+**Licence consequence.** Synapse is AGPL-3.0. `workspace-platform.md` §4 calls the obligation
+effectively nil for an internal, unmodified deployment. This design is neither: it loads our own
+module into Synapse, and the POC is reachable from the internet. Whether a module loaded through
+`modules:` makes a modified Synapse is a legal question we do not settle here, but the safe
+reading is that AGPL §13 applies. The consequence to plan for is that **the module's source is
+published**: offered to every user who interacts with the server, in practice a public
+repository, with nothing secret in it (its config, including `service_accounts`, is deployment
+config and stays out of that source). The module being open source does not weaken the wall,
+which never rested on its secrecy. Owned by #235; `workspace-platform.md` §4 gets a dated note
+once that lands.
 
 ## 11. Synapse configuration the other issues rely on
 
@@ -371,7 +422,7 @@ source say for the version pinned in #230 (at least v1.132.0).
 |---|---|---|
 | `federation_domain_whitelist` | `[]` | The docs call an empty list "the recommended way of disabling federation". Also do not expose a federation listener. |
 | `enable_registration` | `false` | No self-registration. Does **not** disable the shared-secret admin API (§5). |
-| `registration_shared_secret` (or `_path`) | Railway variable | One-time creation of `@workspace-admin`. |
+| `registration_shared_secret` | Railway variable, set only while #230 bootstraps `@workspace-admin`, then **unset** | One-time creation of `@workspace-admin` (§5). Unsetting it disables the shared-secret API, which `enable_registration: false` does not. With `registration_shared_secret_path` Synapse creates the secret on its volume when missing, so no variable holds it: use the plain variable here, since a variable can be unset. |
 | `user_directory.search_all_users` | `false` | Directory scoping (§6.1). |
 | `user_directory.show_locked_users` | `false` (default) | |
 | `require_auth_for_profile_requests` | `true` | Prerequisite of the next line. |
@@ -380,33 +431,67 @@ source say for the version pinned in #230 (at least v1.132.0).
 | `allow_public_rooms_without_auth` | `false` (default) | Keep the public room directory private (it should stay empty). |
 | `modules` | Our module, with `service_accounts: ["@workspace-admin:<server>"]` | #235 |
 | `rc_joins`, `rc_invites`, `rc_message` | Defaults are fine for provisioning | The admin-API join calls the membership handler with `ratelimit=False` (source), so provisioning is not throttled by these. They still bound ordinary users, so #230 checks a burst of duo sync traffic and raises `rc_message` if the duos' answers are throttled. |
-| Synapse image tag | Pinned, at least v1.132.0 | `room_config` (v1.132.0), `requester_id` in `check_username_for_spam` (v1.122.0). Not `latest`. |
+| Synapse image tag | Pinned, at least v1.140.0 | `room_config` (v1.132.0), a correct `initial_state` in `room_config` on room upgrade (v1.140.0, #18721; before it, an upgrade passed a list of `((type, state_key), content)` tuples instead of `{type, state_key, content}` dicts), `requester_id` in `check_username_for_spam` (v1.122.0). Not `latest`. |
 
 ## 12. Corrections and flags for the child issues
 
 Nothing below is a change of scope. These are places where this record is more specific than
-the issue text, or where the issue text needs a small fix.
+the issue text, or where the issue text needs a small fix. The same corrections are posted as a
+comment on each child issue.
 
-- **#231** wants a non-admin to get `403` on org routes. Today's `requireAdmin` in
-  `src/hosted/server.ts` answers `401 unauthorized` for anyone who is not an admin. The new org
-  routes should return `403` for an authenticated non-admin, and existing invite routes may
-  keep their behaviour.
-- **#232** should name accounts as in §4 (org id in the localpart), not `@shin:<server>`. The
-  issue's own examples were "e.g.". Also, the root duo needs accounts too (handle `root`).
-- **#233** lists a "device id" in the session. An admin-minted token has no device, so the
-  route returns `deviceId: null` (the transport does not use one). A client needing a device
-  for end-to-end encryption would have to create one separately
+- **#230** (Synapse service):
+  - Pin Synapse at **v1.140.0 or later**, not `latest` (§11).
+  - Bootstrap `@workspace-admin` through the shared-secret `POST /_synapse/admin/v1/register`
+    with a random password that is discarded. The response carries the `access_token`; store it
+    as `DUO_WORKSPACE_ADMIN_TOKEN`. Login-as-user cannot mint it (§5). This is the one account
+    with a password.
+  - After bootstrap, **unset** `registration_shared_secret` (and delete the secret file if
+    `_path` was used). Unsetting disables the API; `enable_registration: false` does not.
+  - Confirm the scheme of the private address (`http://<service>.railway.internal:<port>`).
+- **#231** (orgs and super admin):
+  - Today's `requireAdmin` (`src/hosted/server.ts`) answers `401` for every caller that fails
+    the admin test, including a valid non-admin device. PR #241 (open when this record was
+    written) changes it to `401` for no credential and `403` for any presented credential that
+    is not a super admin's. That is simpler than resolving the device: a garbage token also
+    gets `403`. Word the issue's `403` as "a presented, non-admin credential", not "a signed-in
+    non-admin", unless #241 is changed to resolve the device first.
+  - Existing invite routes may keep their behaviour.
+- **#232** (provisioning):
+  - Name accounts as in §4 (org id in the localpart), not `@shin:<server>`. The issue's
+    examples were "e.g.". The root duo needs accounts too (handle `root`).
+  - `HostedMatrixAccounts.duoUserId` is a `string`, but `duoUserIdFor` returns `string | null`:
+    assert non-null when provisioning (§3).
+  - Relax the https-only rule in `src/workspace/settings.ts` for hosts ending in
+    `.railway.internal`, and read the client-facing URL from `DUO_WORKSPACE_PUBLIC_URL` (§5,
+    §8). Shared with #236.
+  - Build each duo's `env` from an allowlist, omitting `DUO_WORKSPACE_ADMIN_TOKEN`,
+    `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN` (§8). Shared with #236.
+- **#233** (sessions): an admin-minted token has no device, so the route returns
+  `deviceId: null` (the transport does not use one). A client needing a device for end-to-end
+  encryption would have to create one separately
   (`POST /_synapse/admin/v2/users/<user_id>/devices`); the POC does not depend on E2EE. The
-  daemon also cannot revoke a person's minted token, so "sign out revokes" means the client
-  calls `/logout` itself, and a short `valid_until_ms` is the server-side bound.
-- **#234** must create the Space and `#general` as non-public rooms, keep `@workspace-admin` in
-  each, and treat its provisioning joins as calls that pass through the module (§6.2).
-- **#235** should read the org from the id (§4). The issue's "server-admin exemption" is
-  automatic for invites and for its own joins, but not for the target-user joins it performs on
-  members' behalf. It should add `user_may_publish_room`, `user_may_send_3pid_invite` and a
-  join-rules guard (§6.2) so public rooms cannot reintroduce directory leakage.
-- **#236** owns the resource measurement in §8. The hosted process does not open a workspace
-  connection until #232 has stored a token for that duo.
+  daemon cannot revoke a person's minted token, so "sign out revokes" means the client calls
+  `/logout` itself, and a short `valid_until_ms` is the server-side bound. Return the public
+  URL from `DUO_WORKSPACE_PUBLIC_URL`, not the private one.
+- **#234** (Spaces) must create the Space and `#general` as non-public rooms, keep
+  `@workspace-admin` in each, and treat its provisioning joins as calls that pass through the
+  module (§6.2).
+- **#235** (module):
+  - Read the org from the id (§4). The issue's "server-admin exemption" is automatic for
+    invites and for its own joins, but not for the target-user joins it performs on members'
+    behalf.
+  - Add `user_may_publish_room`, `user_may_send_3pid_invite` and a join-rules guard (§6.2).
+  - In `user_may_create_room`, also refuse an `initial_state` `m.room.join_rules` that is not
+    `invite` (or `restricted` to the org's Space) (§6.3 rule 3): `check_event_for_spam` never
+    sees creation events. Verify with a test.
+  - Synapse never calls `user_may_create_room` for a server admin, so rule 3 cannot constrain
+    any admin account.
+  - Requires Synapse v1.140.0 or later for a correct `initial_state` on room upgrade.
+  - Licence: the module is loaded into an internet-reachable AGPL Synapse, so plan to publish
+    its source (§10).
+- **#236** (hosted wiring) owns the resource measurement in §8. The hosted process does not
+  open a workspace connection until #232 has stored a token for that duo. It also shares the
+  `.railway.internal` https relaxation and the per-duo `env` allowlist with #232.
 
 ## 13. Sources (checked 2026-09-26)
 
@@ -439,7 +524,8 @@ All Synapse docs are the `element-hq/synapse` repository's `develop` branch (v1.
   (`JoinRoomAliasServlet`), `synapse/module_api/callbacks/spamchecker_callbacks.py`
   (callback return handling, no exception handler on the invite path),
   `synapse/module_api/__init__.py` (`get_room_state`, added v1.47.0), and `CHANGES.md`
-  (`room_config` argument v1.132.0; `requester_id` for `check_username_for_spam` v1.122.0).
+  (`room_config` argument v1.132.0; `initial_state` room-upgrade fix v1.140.0, #18721;
+  `requester_id` for `check_username_for_spam` v1.122.0).
   Latest release v1.161.0 per the GitHub releases API.
 - Tuwunel: <https://github.com/matrix-construct/tuwunel> and
   <https://matrix-construct.github.io/tuwunel/>. Continuwuity: <https://continuwuity.org/introduction>.
