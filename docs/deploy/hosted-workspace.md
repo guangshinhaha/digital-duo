@@ -225,6 +225,14 @@ in the registry or the repo) and calls the admin API over Railway's private netw
   secret** (and removes the secret file if `_path` was used): with no shared secret configured
   the API is off, which `enable_registration: false` alone does not achieve.
 
+  > **Deviation, 2026-09-26 (#230, PR #242).** The bootstrap password is **not** discarded.
+  > `@workspace-admin`'s password stays in the Railway variable `SYNAPSE_ADMIN_PASSWORD`, because
+  > without it a lost or rotated token could only be replaced by re-registering a differently
+  > named admin or editing the database. The cost is a second credential on the public listener
+  > (password login, `rc_login` at its defaults). It is mitigated by making it a long random
+  > value: `create_admin.py` refuses a password under 32 characters, and the runbook uses
+  > `openssl rand -hex 32` (256 bits). Every other account still has no password.
+
 ## 6. The org wall
 
 ### 6.1 Three layers, and which one is a wall

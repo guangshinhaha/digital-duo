@@ -1,7 +1,8 @@
 """Render Synapse's homeserver.yaml and log config from env (run by start.sh).
 
 The output is JSON, which is valid YAML, so values (passwords included) are
-quoted correctly without a templating library. Secrets are read from env and
+quoted correctly without a templating library (checked: see checked_yaml).
+Secrets are read from env and
 written only inside the container: the shared secret to a 0600 file that
 homeserver.yaml points at, the database password into the 0600 config.
 Nothing here logs a value.
@@ -43,8 +44,8 @@ def build_config(env, secret_path):
         "public_baseurl": env["SYNAPSE_PUBLIC_BASEURL"],
         "pid_file": "/tmp/homeserver.pid",
         "report_stats": False,
-        # One listener, client API only (which is where /_synapse/admin lives
-        # too). No `federation` resource: the federation endpoints 404.
+        # One listener, the client resource (which is where /_synapse/admin
+        # lives too). No `federation` resource: the federation endpoints 404.
         "listeners": [
             {
                 "port": int(env.get("PORT", "8008")),
@@ -120,6 +121,27 @@ def build_log_config():
     }
 
 
+def checked_yaml(config):
+    """The homeserver.yaml text, proven to load back as exactly `config`.
+
+    json.dumps writes a character above U+FFFF as a surrogate-pair escape and
+    PyYAML (which Synapse reads the file with) loads that as two lone
+    surrogates: a password or server name with an emoji would then break at
+    the first .encode(), after this script had already reported success. So
+    fail closed here rather than write a file that does not mean what the env
+    said. PyYAML is a Synapse dependency, so it is in the image.
+    """
+    import yaml
+
+    text = json.dumps(config, indent=2) + "\n"
+    if yaml.safe_load(text) != config:
+        raise SystemExit(
+            "render_config: a variable value does not survive a YAML round trip "
+            "(a character above U+FFFF, such as an emoji?); nothing was written"
+        )
+    return text
+
+
 def write_private(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -129,9 +151,10 @@ def write_private(path, text):
 
 def main(env=os.environ, out_dir="/etc/synapse", secret_path="/run/synapse-secrets/registration_shared_secret"):
     config = build_config(env, secret_path)
+    homeserver_yaml = checked_yaml(config)
     if config.get("registration_shared_secret_path"):
         write_private(secret_path, env["SYNAPSE_REGISTRATION_SHARED_SECRET"])
-    write_private(out_dir + "/homeserver.yaml", json.dumps(config, indent=2) + "\n")
+    write_private(out_dir + "/homeserver.yaml", homeserver_yaml)
     write_private(out_dir + "/log.config", json.dumps(build_log_config(), indent=2) + "\n")
     print("rendered homeserver.yaml for " + config["server_name"], flush=True)
 

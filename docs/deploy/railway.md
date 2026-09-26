@@ -15,7 +15,7 @@ One Railway project, five services, two repos:
 | `duo-daemon` | `guangshinhaha/digital-duo` (root) | yes, HTTPS | `duo serve`, with a volume at `/data` |
 | `ollama` | `guangshinhaha/digital-duo`, root dir `deploy/ollama` | **no** (private network only) | `nomic-embed-text` embeddings on CPU, volume at `/root/.ollama` |
 | `duo-web` | `guangshinhaha/duo` (root) | yes, HTTPS | The static web client (Caddy) |
-| `synapse` | `guangshinhaha/digital-duo`, root dir `deploy/synapse` | yes, HTTPS (client API only) | The Matrix homeserver for the hosted workspace, media on a volume at `/data` |
+| `synapse` | `guangshinhaha/digital-duo`, root dir `deploy/synapse` | yes, HTTPS (the client listener: client API and `/_synapse/admin`; no federation) | The Matrix homeserver for the hosted workspace, media on a volume at `/data` |
 | `Postgres` | Railway's PostgreSQL template | **no** (private network only) | Synapse's database, volume at `/var/lib/postgresql/data` |
 
 `synapse` and `Postgres` are the hosted workspace's message store ("Synapse and Postgres" below).
@@ -93,7 +93,11 @@ The `duo-daemon` reaches Synapse over the **private** URL for the admin API; cli
 **public** URL. `homeserver.yaml` is not in the repo as a fixed file: `deploy/synapse/start.sh`
 renders it from env at every boot (`render_config.py`), after `ensure_db.py` has created the
 `synapse` database with the `C` collation Synapse insists on (Railway's Postgres ships only its
-default database, so it is made from `template0` the first time). The rendered config, in short:
+default database, so it is made from `template0` the first time; it waits up to about a minute
+for Postgres to accept connections, so a slower Postgres does not use up Railway's restart
+retries). Synapse itself does **not** run as root: `start.sh` does the setup as root, chowns `/data`,
+`/etc/synapse` and the secret file to `991:991` and starts Synapse with `gosu 991:991`, as the base
+image's own `/start.py` would. The rendered config, in short:
 
 - **Federation off.** `federation_domain_whitelist: []`, no `federation` listener resource (the
   federation and key routes answer 404), no key servers.
@@ -118,7 +122,7 @@ connected): `cd deploy/synapse && railway up --service synapse --detach`.
 | `SYNAPSE_PUBLIC_BASEURL` | `https://${{RAILWAY_PUBLIC_DOMAIN}}` |
 | `PORT` | `8008` (the listener port and the domain's target port) |
 | `SYNAPSE_REGISTRATION_SHARED_SECRET` | **Set only for the one-time bootstrap, then unset.** A random secret (`openssl rand -hex 32`). It is admin-equivalent: it can create admin accounts even with `enable_registration: false`. With it unset the shared-secret API is off. Rendered into a `0600` file inside the container, never into `homeserver.yaml`. Currently unset. |
-| `SYNAPSE_ADMIN_PASSWORD` | A random secret (`openssl rand -hex 32`). The password of `@workspace-admin`, the one account that has one; kept so a fresh token can be minted (below). |
+| `SYNAPSE_ADMIN_PASSWORD` | A long random secret (`openssl rand -hex 32`; `create_admin.py` refuses anything under 32 characters). The password of `@workspace-admin`, the one account that has one. Kept permanently, unlike the record's "discarded" (`hosted-workspace.md` §5, dated note): it is how a fresh token is minted (below). |
 | `SYNAPSE_DB_HOST` / `_PORT` / `_USER` / `_PASSWORD` | `${{Postgres.RAILWAY_PRIVATE_DOMAIN}}`, `5432`, `${{Postgres.PGUSER}}`, `${{Postgres.PGPASSWORD}}` |
 | `SYNAPSE_DB_ADMIN_DATABASE` | `${{Postgres.PGDATABASE}}`: the service's default database, connected to once to create Synapse's |
 | `SYNAPSE_DB_NAME` | `synapse` |
@@ -162,7 +166,10 @@ Bootstrap (once, on a fresh server), from inside Synapse. The token is the only 
 To mint a fresh token later (rotation, or a lost one), run the same command: with the secret
 unset it logs in with `SYNAPSE_ADMIN_PASSWORD` instead. Set the new token on `duo-daemon`, then
 log the old one out (`POST /_matrix/client/v3/logout` with it). This account is the one
-exception to "nobody has a password": its password exists only in that Synapse variable.
+exception to "nobody has a password": its password exists only in that Synapse variable. Password
+login is on the public listener, which is why the value must be long and random. If the shared
+secret is not set (or the service was not restarted since it was), `create_admin.py` says
+"shared-secret registration is not enabled" instead of registering.
 
 **The admin API is on the public domain too.** Synapse serves `/_synapse/admin` from the same
 client listener as the client API, and Railway's edge cannot filter paths, so it answers on the
@@ -198,6 +205,8 @@ sees `DUO_WORKSPACE_*` once it has been redeployed after they were set.)
   is a no-op once the database exists), and the config is re-rendered from env each boot. Verified
   on 2026-09-26: after a redeploy the admin account, its token, the signing key and an uploaded
   media file were all intact.
+  The first boot of the image that drops to `991:991` chowns the existing (root-owned) volume
+  contents once, recursively; check the media and the login still work after it.
 - **Upgrading Synapse:** bump the tag in `deploy/synapse/Dockerfile` and `railway up`. Synapse
   migrates its schema on start and does not support downgrades: take a Postgres backup first.
 - `SYNAPSE_ADMIN_PASSWORD` lives only in that Railway variable; if it is lost, the account

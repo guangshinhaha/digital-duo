@@ -4,18 +4,42 @@ Synapse insists on a database with LC_COLLATE/LC_CTYPE "C" (index order must not
 depend on the OS locale). Railway's Postgres service only ships its default
 database, which is not created that way, so this makes a dedicated one from
 template0 the first time. Idempotent: a no-op once the database exists.
-Connects to SYNAPSE_DB_ADMIN_DATABASE (the service's default database).
+Connects to SYNAPSE_DB_ADMIN_DATABASE (the service's default database), waiting
+for Postgres to accept connections first: on a cold project start it can come up
+after Synapse, and Railway's restart policy only retries a few times.
 """
 import os
 import sys
+import time
 
 import psycopg2
 from psycopg2 import sql
 
 
-def main(env=os.environ):
+def connect_with_retry(attempts=30, delay=2, connect=None, sleep=time.sleep, **params):
+    """psycopg2.connect, retried while Postgres is not accepting connections yet.
+
+    30 tries 2 seconds apart is about a minute. Only the error's first line is
+    logged (it names the host, never the password); the last error is raised
+    once the tries run out, so a wrong password still fails, just slowly.
+    """
+    connect = connect or psycopg2.connect
+    for attempt in range(1, attempts + 1):
+        try:
+            return connect(**params)
+        except psycopg2.OperationalError as error:
+            if attempt == attempts:
+                raise
+            reason = (str(error).strip().splitlines() or [type(error).__name__])[0]
+            print(f"waiting for postgres ({attempt}/{attempts}): {reason}", flush=True)
+            sleep(delay)
+
+
+def main(env=os.environ, connect=None, sleep=time.sleep):
     target = env.get("SYNAPSE_DB_NAME", "synapse")
-    conn = psycopg2.connect(
+    conn = connect_with_retry(
+        connect=connect,
+        sleep=sleep,
         host=env["SYNAPSE_DB_HOST"],
         port=int(env.get("SYNAPSE_DB_PORT", "5432")),
         user=env["SYNAPSE_DB_USER"],

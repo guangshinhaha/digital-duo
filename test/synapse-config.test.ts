@@ -10,7 +10,9 @@ import { useTempDir } from "./helpers/temp-dir.js";
 // on the parsed document. python3 is the only dependency; skip when absent.
 const tempDir = useTempDir();
 const script = join(__dirname, "..", "deploy", "synapse", "render_config.py");
-const hasPython = spawnSync("python3", ["--version"]).status === 0;
+// render_config.py proves its output loads back through PyYAML (a Synapse
+// dependency, so always in the image); a host without it cannot run the script.
+const hasPython = spawnSync("python3", ["-c", "import yaml"]).status === 0;
 
 const SECRET = "shared-secret-for-tests";
 const BASE_ENV = {
@@ -43,6 +45,15 @@ describe.skipIf(!hasPython)("deploy/synapse/render_config.py", () => {
     expect(config.federation_domain_whitelist).toEqual([]);
     expect(config.user_directory.search_all_users).toBe(false);
     expect(config.report_stats).toBe(false);
+
+    // Federation is off in both directions, and the org walls (§6, §11) hold:
+    // profiles need auth and a shared room, invites carry no profile data.
+    expect(config.trusted_key_servers).toEqual([]);
+    expect(config.allow_public_rooms_over_federation).toBe(false);
+    expect(config.url_preview_enabled).toBe(false);
+    expect(config.require_auth_for_profile_requests).toBe(true);
+    expect(config.limit_profile_requests_to_users_who_share_rooms).toBe(true);
+    expect(config.include_profile_data_on_invite).toBe(false);
 
     // One client-only listener: no `federation` resource, so those routes 404.
     expect(config.listeners).toHaveLength(1);
@@ -88,6 +99,26 @@ describe.skipIf(!hasPython)("deploy/synapse/render_config.py", () => {
     expect(config.registration_shared_secret).toBeUndefined();
     expect(config.enable_registration).toBe(false);
     expect(existsSync(secretPath)).toBe(false);
+  });
+
+  it("fails cleanly, writing nothing, when a value cannot survive YAML (astral-plane character)", () => {
+    const { result, dir } = render({ ...BASE_ENV, SYNAPSE_DB_PASSWORD: "pass-\u{1F600}-word" });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("YAML round trip");
+    expect(result.stderr).not.toContain("Traceback");
+    expect(result.stderr).not.toContain("pass-");
+    expect(existsSync(join(dir, "homeserver.yaml"))).toBe(false);
+    expect(existsSync(join(dir, "secrets", "registration_shared_secret"))).toBe(false);
+  });
+
+  it("loads back through YAML as exactly the rendered config, hostile characters included", () => {
+    const { dir } = render(BASE_ENV);
+    const check = spawnSync(
+      "python3",
+      ["-c", "import json,sys,yaml; t=open(sys.argv[1]).read(); assert yaml.safe_load(t)==json.loads(t)", join(dir, "homeserver.yaml")],
+      { encoding: "utf8" },
+    );
+    expect(check.status).toBe(0);
   });
 
   it("honours the server name and refuses to boot with a required variable missing", () => {
