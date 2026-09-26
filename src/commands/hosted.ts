@@ -68,4 +68,4 @@ export async function runHostedServe(
   return { address, close: hosted.close };
 }
 
-export { runHostedInvite } from "../hosted/invite.js";
+export { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename } from "../hosted/invite.js";

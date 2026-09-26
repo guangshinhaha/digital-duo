@@ -2,6 +2,19 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { decrypt, encrypt } from "../store/crypto.js";
+import {
+  DEFAULT_ORG_ID,
+  DEFAULT_ORG_NAME,
+  normalizeOrgName,
+  OrgNameTakenError,
+  OrgNotFoundError,
+  REGISTRY_VERSION,
+  RegistryVersionError,
+  ROOT_DUO_ID,
+  type HostedOrg,
+  type HostedOrgSummary,
+  type OrgMember,
+} from "./orgs.js";
 
 /**
  * Hosted mode's account registry (docs/deploy/hosted-mode.md): who has a
@@ -16,6 +29,10 @@ import { decrypt, encrypt } from "../store/crypto.js";
  * disk) opens nothing; the running process, which has the master key,
  * opens everything. That is the operator concession org mode §6 states,
  * applied to every hosted duo.
+ *
+ * Orgs live here too (orgs.ts): every duo belongs to exactly one, and an
+ * invite names the org it admits people into. `orgOf` and `listOrgMembers`
+ * are the reads later work (accounts, spaces, the org boundary) builds on.
  */
 
 export interface HostedTenant {
@@ -27,8 +44,10 @@ export interface HostedTenant {
   /** The identity provider's subject this duo is bound to; absent for a duo made before sign-in existed. */
   readonly identitySubject?: string;
   readonly email?: string;
-  /** May mint invites from the app. */
+  /** Set at sign-up from the admin emails then in force; the server decides admin-ness live from the email (`DUO_HOSTED_ADMIN_EMAILS`), so this is a record, not the authority. */
   readonly isAdmin?: boolean;
+  /** The one org this duo belongs to. */
+  readonly orgId: string;
 }
 
 /** Who has claimed the pre-hosted root duo by signing in (an admin email's first sign-in). */
@@ -50,12 +69,51 @@ export interface HostedInvite {
   readonly tenantId: string | null;
   /** When set, only a sign-in with this (lowercased) email may redeem the invite. */
   readonly email?: string | null;
+  /** The org the person who redeems this invite joins. */
+  readonly orgId: string;
 }
 
 interface RegistryFile {
+  /** Absent in files written before orgs; `migrateRegistryFile` fills everything in. */
+  version: number;
+  orgs: HostedOrg[];
   tenants: HostedTenant[];
   invites: HostedInvite[];
   root?: RootClaim | null;
+  /** The org the pre-hosted root duo (not a tenant) belongs to. */
+  rootOrgId: string;
+}
+
+/**
+ * Brings a parsed registry file up to the current version, in memory. Lazy:
+ * nothing is written until the registry next persists, so starting the
+ * server never rewrites the file, and migrating the same file twice gives
+ * the same result (the default org has a fixed id).
+ *
+ * v1 (no `version`, no orgs): a default org is created and every tenant,
+ * invite and the root duo go into it, so no id, URL or pairing changes.
+ */
+export function migrateRegistryFile(raw: unknown, now = new Date().toISOString()): { data: RegistryFile; migrated: boolean } {
+  const file = (raw ?? {}) as Partial<RegistryFile>;
+  if (file.version !== undefined && file.version > REGISTRY_VERSION) {
+    throw new RegistryVersionError(file.version);
+  }
+  if (file.version === REGISTRY_VERSION) {
+    return { data: file as RegistryFile, migrated: false };
+  }
+  const tenants = file.tenants ?? [];
+  const oldest = tenants.map((tenant) => tenant.createdAt).sort()[0] ?? now;
+  return {
+    migrated: true,
+    data: {
+      ...file,
+      version: REGISTRY_VERSION,
+      orgs: [{ id: DEFAULT_ORG_ID, name: DEFAULT_ORG_NAME, createdAt: oldest }],
+      tenants: tenants.map((tenant) => ({ ...tenant, orgId: tenant.orgId ?? DEFAULT_ORG_ID })),
+      invites: (file.invites ?? []).map((invite) => ({ ...invite, orgId: invite.orgId ?? DEFAULT_ORG_ID })),
+      rootOrgId: file.rootOrgId ?? DEFAULT_ORG_ID,
+    },
+  };
 }
 
 export class InviteInvalidError extends Error {
@@ -70,9 +128,9 @@ function hashCode(code: string): string {
 }
 
 /** A short, URL-safe, lowercase id — it appears in every URL the duo's owner and askers use. */
-function newTenantId(): string {
+function newShortId(length: number): string {
   const alphabet = "abcdefghijkmnpqrstuvwxyz23456789";
-  const bytes = randomBytes(10);
+  const bytes = randomBytes(length);
   return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
 }
 
@@ -83,7 +141,14 @@ export class HostedRegistry {
     private readonly path: string,
     private readonly masterKey: string,
   ) {
-    this.data = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as RegistryFile) : { tenants: [], invites: [] };
+    this.data = migrateRegistryFile(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {}).data;
+  }
+
+  /** Set by the server when a pre-hosted root duo is being served, so it shows up as an org member. Not persisted. */
+  private rootDuoName: string | null = null;
+
+  declareRootDuo(name: string): void {
+    this.rootDuoName = name;
   }
 
   tenants(): readonly HostedTenant[] {
@@ -105,6 +170,79 @@ export class HostedRegistry {
     return claim;
   }
 
+  orgs(): readonly HostedOrg[] {
+    return this.data.orgs;
+  }
+
+  org(orgId: string): HostedOrg | undefined {
+    return this.data.orgs.find((org) => org.id === orgId);
+  }
+
+  /** Orgs with their member counts, oldest first. */
+  listOrgs(): HostedOrgSummary[] {
+    return this.data.orgs.map((org) => ({ ...org, memberCount: this.listOrgMembers(org.id).length }));
+  }
+
+  /** Creates an org. Names are unique, ignoring case, so a listing is never ambiguous. */
+  createOrg(name: string): HostedOrg {
+    const clean = normalizeOrgName(name);
+    this.assertOrgNameFree(clean);
+    let id = newShortId(8);
+    while (this.org(id)) {
+      id = newShortId(8);
+    }
+    const org: HostedOrg = { id, name: clean, createdAt: new Date().toISOString() };
+    this.data.orgs.push(org);
+    this.persist();
+    return org;
+  }
+
+  renameOrg(orgId: string, name: string): HostedOrg {
+    const existing = this.org(orgId);
+    if (!existing) {
+      throw new OrgNotFoundError(orgId);
+    }
+    const clean = normalizeOrgName(name);
+    this.assertOrgNameFree(clean, orgId);
+    const renamed: HostedOrg = { ...existing, name: clean };
+    this.data.orgs = this.data.orgs.map((org) => (org.id === orgId ? renamed : org));
+    this.persist();
+    return renamed;
+  }
+
+  /**
+   * The org a duo belongs to: a tenant id, or `ROOT_DUO_ID` for the
+   * pre-hosted root duo. Undefined for an id this registry does not know.
+   */
+  orgOf(duoId: string): HostedOrg | undefined {
+    const orgId = duoId === ROOT_DUO_ID ? this.data.rootOrgId : this.data.tenants.find((tenant) => tenant.id === duoId)?.orgId;
+    return orgId === undefined ? undefined : this.org(orgId);
+  }
+
+  /** The duos in an org. Throws OrgNotFoundError for an unknown org. */
+  listOrgMembers(orgId: string): OrgMember[] {
+    if (!this.org(orgId)) {
+      throw new OrgNotFoundError(orgId);
+    }
+    const members: OrgMember[] = [];
+    if (this.rootDuoName !== null && this.data.rootOrgId === orgId) {
+      members.push({ duoId: ROOT_DUO_ID, name: this.rootDuoName, email: this.data.root?.email ?? null, isRoot: true, joinedAt: null });
+    }
+    for (const tenant of this.data.tenants) {
+      if (tenant.orgId === orgId) {
+        members.push({ duoId: tenant.id, name: tenant.name, email: tenant.email ?? null, isRoot: false, joinedAt: tenant.createdAt });
+      }
+    }
+    return members;
+  }
+
+  private assertOrgNameFree(name: string, exceptOrgId?: string): void {
+    const taken = this.data.orgs.some((org) => org.id !== exceptOrgId && org.name.toLowerCase() === name.toLowerCase());
+    if (taken) {
+      throw new OrgNameTakenError(name);
+    }
+  }
+
   tenantBySubject(identitySubject: string): HostedTenant | undefined {
     return this.data.tenants.find((tenant) => tenant.identitySubject === identitySubject);
   }
@@ -114,7 +252,15 @@ export class HostedRegistry {
   }
 
   /** Mints an invite; the returned code is the only copy that will ever exist. */
-  createInvite(name: string, expiresAt: string, email: string | null = null): { invite: HostedInvite; code: string } {
+  createInvite(
+    name: string,
+    expiresAt: string,
+    email: string | null = null,
+    orgId: string = DEFAULT_ORG_ID,
+  ): { invite: HostedInvite; code: string } {
+    if (!this.org(orgId)) {
+      throw new OrgNotFoundError(orgId);
+    }
     const code = randomBytes(24).toString("base64url");
     const invite: HostedInvite = {
       id: randomUUID(),
@@ -125,6 +271,7 @@ export class HostedRegistry {
       usedAt: null,
       tenantId: null,
       email,
+      orgId,
     };
     this.data.invites.push(invite);
     this.persist();
@@ -142,18 +289,21 @@ export class HostedRegistry {
   }
 
   /**
-   * Records a new duo and marks its invite spent, in one write. The caller
-   * has already created the duo's store under `passphrase`.
+   * Records a new duo and marks its invite spent, in one write. The duo
+   * joins the org its invite named. The caller has already created the
+   * duo's store under `passphrase`.
    */
   addTenant(
     inviteId: string,
     name: string,
     passphrase: string,
-    id = newTenantId(),
+    id = newShortId(10),
     identity: { identitySubject?: string; email?: string; isAdmin?: boolean } = {},
   ): HostedTenant {
+    const orgId = this.data.invites.find((invite) => invite.id === inviteId)?.orgId ?? DEFAULT_ORG_ID;
     const tenant: HostedTenant = {
       id,
+      orgId,
       name,
       createdAt: new Date().toISOString(),
       passphraseCipher: encrypt(Buffer.from(passphrase, "utf8"), this.masterKey).toString("base64"),
@@ -168,9 +318,9 @@ export class HostedRegistry {
   }
 
   newTenantId(): string {
-    let id = newTenantId();
+    let id = newShortId(10);
     while (this.data.tenants.some((tenant) => tenant.id === id)) {
-      id = newTenantId();
+      id = newShortId(10);
     }
     return id;
   }

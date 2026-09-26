@@ -12,6 +12,7 @@ import { createServer, type ServeDeps } from "../serve/server.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
+import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
 import { HostedRegistry, InviteInvalidError, type HostedTenant } from "./registry.js";
 
 /** Where a hosted duo lives: everything under one directory per duo, nothing shared between them. */
@@ -36,7 +37,7 @@ export interface HostedSettings {
   readonly webUrl: string | undefined;
   /** Google OAuth web client id. When set, sign-up and login require a Google sign-in; when unset, sign-up takes a typed name (local/dev). */
   readonly googleClientId: string | undefined;
-  /** Lowercased emails that are admins: they may mint invites from the app, and the first of them to sign in claims the root duo. */
+  /** Lowercased emails of the super admins: they create and rename orgs, invite people into any org, and the first of them to sign in claims the root duo. */
   readonly adminEmails: readonly string[];
 }
 
@@ -132,6 +133,20 @@ function sendError(reply: FastifyReply, status: number, code: string, message: s
   reply.code(status).send({ error: { code, message } });
 }
 
+/** Answers an org error as its HTTP status; false means it is not an org error and the caller rethrows. */
+function sendOrgError(reply: FastifyReply, error: unknown): boolean {
+  if (error instanceof OrgNotFoundError) {
+    sendError(reply, 404, "org_not_found", error.message);
+  } else if (error instanceof OrgNameTakenError) {
+    sendError(reply, 409, "org_name_taken", error.message);
+  } else if (error instanceof OrgNameError) {
+    sendError(reply, 400, "bad_request", error.message);
+  } else {
+    return false;
+  }
+  return true;
+}
+
 function constantTimeEquals(a: string, b: string): boolean {
   const left = createHash("sha256").update(a).digest();
   const right = createHash("sha256").update(b).digest();
@@ -172,6 +187,9 @@ export async function createHostedServer(
     duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant))));
   }
   const rootDuo = root ? await mountDuo(root) : undefined;
+  if (root) {
+    registry.declareRootDuo(root.ownerName);
+  }
 
   let controlServer: Server | undefined;
   const control = Fastify({
@@ -190,24 +208,32 @@ export async function createHostedServer(
 
   const isAdminEmail = (email: string | undefined) => email !== undefined && settings.adminEmails.includes(email.toLowerCase());
 
-  /** A device token paired to an admin's duo — the root duo once an admin has claimed it, or any admin tenant. */
+  /** Super admin is live from DUO_HOSTED_ADMIN_EMAILS, so removing an email withdraws the privilege on the next request. */
+  const isSuperAdminTenant = (tenant: HostedTenant) => isAdminEmail(tenant.email);
+
+  /** A device token paired to a super admin's duo — the root duo once an admin has claimed it, or any admin tenant. */
   const isAdminDevice = (token: string): boolean => {
-    if (root && registry.root() && verifyDeviceToken(root.storePath, root.passphrase, token)) {
+    const claim = registry.root();
+    if (root && claim && isAdminEmail(claim.email) && verifyDeviceToken(root.storePath, root.passphrase, token)) {
       return true;
     }
     return registry
       .tenants()
-      .filter((tenant) => tenant.isAdmin)
+      .filter(isSuperAdminTenant)
       .some((tenant) => verifyDeviceToken(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant), token) !== undefined);
   };
 
-  // The server-side admin token (for `duo hosted invite` on the box) or an
-  // admin's own signed-in device (for the app's Invite people page).
+  // The super admin: the server-side admin token (for `duo hosted ...` on the
+  // box) or a super admin's own signed-in device (the app's admin pages). No
+  // credential is a 401; a credential that is not a super admin's is a 403,
+  // so a member of an org learns "not allowed" rather than "log in".
   const requireAdmin = async (request: FastifyRequest, reply: FastifyReply) => {
     const header = request.headers.authorization;
     const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-    if (!token || !(constantTimeEquals(token, settings.adminToken) || isAdminDevice(token))) {
+    if (!token) {
       sendError(reply, 401, "unauthorized", "Only an admin can do this.");
+    } else if (!(constantTimeEquals(token, settings.adminToken) || isAdminDevice(token))) {
+      sendError(reply, 403, "forbidden", "Only an admin can do this.");
     }
   };
 
@@ -267,7 +293,7 @@ export async function createHostedServer(
     const tenant = registry.tenantBySubject(identity.subject);
     if (tenant) {
       const device = mintDevice(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant));
-      return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: tenant.isAdmin === true };
+      return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
     }
     // The root duo belongs to whichever admin signs in first; after that,
     // only that same Google account opens it.
@@ -277,7 +303,7 @@ export async function createHostedServer(
         registry.claimRoot(identity.subject, identity.email);
       }
       const device = mintDevice(root.storePath, root.passphrase);
-      return { tenantId: null, basePath: "", token: device.token, ownerName: root.ownerName, isAdmin: true };
+      return { tenantId: null, basePath: "", token: device.token, ownerName: root.ownerName, isAdmin: true, orgId: registry.orgOf(ROOT_DUO_ID)?.id ?? null };
     }
     sendError(reply, 404, "no_duo", "There's no duo for this Google account yet. Ask for an invite link.");
   });
@@ -344,10 +370,10 @@ export async function createHostedServer(
     );
     duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
     reply.code(201);
-    return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: tenant.isAdmin === true };
+    return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
   });
 
-  control.post<{ Body: { name?: unknown; email?: unknown; expiresInHours?: unknown } }>(
+  control.post<{ Body: { name?: unknown; email?: unknown; expiresInHours?: unknown; orgId?: unknown } }>(
     "/hosted/invites",
     { preHandler: requireAdmin },
     async (request, reply) => {
@@ -363,19 +389,75 @@ export async function createHostedServer(
         return;
       }
       const email = typeof rawEmail === "string" && rawEmail.trim() ? rawEmail.trim().toLowerCase() : null;
-      const { invite, code } = registry.createInvite(name, new Date(Date.now() + hours * 3_600_000).toISOString(), email);
+      const rawOrgId = request.body?.orgId;
+      if (rawOrgId !== undefined && rawOrgId !== null && (typeof rawOrgId !== "string" || rawOrgId.length === 0)) {
+        sendError(reply, 400, "bad_request", "orgId, when given, must be an org id");
+        return;
+      }
+      let created;
+      try {
+        // No org named means the default org, so an invite made the old way still works.
+        created = registry.createInvite(name, new Date(Date.now() + hours * 3_600_000).toISOString(), email, typeof rawOrgId === "string" ? rawOrgId : undefined);
+      } catch (error) {
+        if (sendOrgError(reply, error)) {
+          return;
+        }
+        throw error;
+      }
+      const { invite, code } = created;
       const link =
         settings.webUrl && settings.publicUrl
           ? `${settings.webUrl}/#join?host=${encodeURIComponent(settings.publicUrl)}&invite=${encodeURIComponent(code)}`
           : null;
       reply.code(201);
-      return { id: invite.id, name: invite.name, email: invite.email ?? null, expiresAt: invite.expiresAt, code, link };
+      return { id: invite.id, name: invite.name, email: invite.email ?? null, orgId: invite.orgId, expiresAt: invite.expiresAt, code, link };
     },
   );
 
   control.get("/hosted/invites", { preHandler: requireAdmin }, async () =>
     registry.invites().map(({ codeHash: _codeHash, ...rest }) => rest),
   );
+
+  // Org administration — super admin only (requireAdmin: 401 with no
+  // credential, 403 for anyone who is not a super admin). POST for rename
+  // because the CORS policy allows only GET and POST.
+  control.get("/hosted/orgs", { preHandler: requireAdmin }, async () => registry.listOrgs());
+
+  control.post<{ Body: { name?: unknown } }>("/hosted/orgs", { preHandler: requireAdmin }, async (request, reply) => {
+    try {
+      const org = registry.createOrg(request.body?.name as string);
+      reply.code(201);
+      return { ...org, memberCount: 0 };
+    } catch (error) {
+      if (sendOrgError(reply, error)) {
+        return;
+      }
+      throw error;
+    }
+  });
+
+  control.post<{ Params: { orgId: string }; Body: { name?: unknown } }>("/hosted/orgs/:orgId/rename", { preHandler: requireAdmin }, async (request, reply) => {
+    try {
+      const org = registry.renameOrg(request.params.orgId, request.body?.name as string);
+      return { ...org, memberCount: registry.listOrgMembers(org.id).length };
+    } catch (error) {
+      if (sendOrgError(reply, error)) {
+        return;
+      }
+      throw error;
+    }
+  });
+
+  control.get<{ Params: { orgId: string } }>("/hosted/orgs/:orgId/members", { preHandler: requireAdmin }, async (request, reply) => {
+    try {
+      return registry.listOrgMembers(request.params.orgId).map((member) => ({ ...member, isAdmin: isAdminEmail(member.email ?? undefined) }));
+    } catch (error) {
+      if (sendOrgError(reply, error)) {
+        return;
+      }
+      throw error;
+    }
+  });
 
   control.get("/hosted/duos", { preHandler: requireAdmin }, async () =>
     registry.tenants().map(({ passphraseCipher: _cipher, ...rest }) => rest),
