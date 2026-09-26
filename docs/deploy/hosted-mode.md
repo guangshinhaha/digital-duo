@@ -301,8 +301,9 @@ to nobody else. It is a place and a directory scope; the wall itself is the Syna
   window has no logged id and is found by name among the service account's rooms.
 - **Only the service account can invite.** The `private_chat` preset lets any member invite
   (`invite: 0`), so both rooms are created with `invite: 100` (and `events_default: 100` on the
-  Space, so members cannot post there). Until the org module (#235) lands, this is what stops a
-  member from inviting another org's user id into their org's rooms. The service account, who holds
+  Space, so members cannot post there). This is a second lock: the org module (#235,
+  `railway.md`, "The org wall module") refuses a cross-org invite whatever the power levels say, and
+  refuses the admin-API join of another org's account into these rooms. The service account, who holds
   100 as the creator, is unaffected: it still joins members and sends `m.space.child` and `m.room.name`.
 - **Backfill.** Startup and `duo hosted provision` (`POST /hosted/matrix/provision`) run the
   accounts first and then the spaces, for every org (the default org included, even when empty),

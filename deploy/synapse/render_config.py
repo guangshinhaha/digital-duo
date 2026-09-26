@@ -22,6 +22,12 @@ REQUIRED = [
 ]
 
 
+# The service account's localpart: create_admin.py registers it and src/hosted/
+# matrix-accounts.ts (SERVICE_ACCOUNT_LOCALPART) names it. The org wall module
+# exempts exactly this account (hosted-workspace.md §4.1).
+SERVICE_ACCOUNT_LOCALPART = "workspace-admin"
+
+
 def rate(per_second, burst):
     return {"per_second": per_second, "burst_count": burst}
 
@@ -39,8 +45,9 @@ def build_config(env, secret_path):
     # failed-login throttling is what protects it (tokens are minted by the
     # admin API, which does not go through rc_login).
     generous = rate(1000, 10000)
+    server_name = env.get("SYNAPSE_SERVER_NAME", "duo")
     config = {
-        "server_name": env.get("SYNAPSE_SERVER_NAME", "duo"),
+        "server_name": server_name,
         "public_baseurl": env["SYNAPSE_PUBLIC_BASEURL"],
         "pid_file": "/tmp/homeserver.pid",
         "report_stats": False,
@@ -95,6 +102,20 @@ def build_config(env, secret_path):
         "rc_joins_per_room": generous,
         "rc_invites": {"per_room": generous, "per_user": generous, "per_issuer": generous},
         "rc_third_party_invite": generous,
+        # The org wall itself (#235): the only layer that enforces anything.
+        # deploy/synapse/modules/duo_org_wall, on PYTHONPATH in the image. The
+        # module reads an account's org from its id and refuses cross-org
+        # invites and joins, public rooms and directory hits. Its config is
+        # rendered here, never baked into the image.
+        "modules": [
+            {
+                "module": "duo_org_wall.module.DuoOrgWall",
+                "config": {
+                    "server_name": server_name,
+                    "service_accounts": ["@" + SERVICE_ACCOUNT_LOCALPART + ":" + server_name],
+                },
+            }
+        ],
     }
     # The shared secret lets an operator create an admin even with
     # registration off (docs), so it is admin-equivalent. It is only wanted

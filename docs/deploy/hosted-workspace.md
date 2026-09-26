@@ -148,6 +148,15 @@ org_of(user_id):
 lists it (`service_accounts`). Any other account without an org marker is refused everything,
 because it can only exist if something bypassed the provisioner.
 
+> **Deviation, 2026-09-26 (#235).** The shipped parse is stricter than the sketch: the localpart
+> must match `^(duo-)?[a-z0-9]+\.[a-z0-9]+$` and the server part must equal the configured
+> `server_name`, or the account has no org. So `@orga.b.c:duo` (a second dot, which the sketch
+> would read as org `orga`), an uppercase id and an id on another server are all org-less and
+> refused everything. It agrees with the sketch, and with `orgIdOfUserId` in
+> `src/hosted/matrix-accounts.ts`, on every id the provisioner can make (org ids and handles are
+> `[a-z0-9]+`). The two only differ on ids the provisioner never produces, where "no org" is the
+> fail-closed answer the record asks for.
+
 ### 4.3 Why this and not the alternatives
 
 We picked **an org marker in the user id**. The others were weighed against four needs: the
@@ -261,17 +270,32 @@ creating, publishing or making a room public (§6.3), and the Space and `#genera
 | `user_may_publish_room` | `async (user_id: str, room_id: str)` | Always refuse for non-service accounts | |
 | `user_may_send_3pid_invite` | `async (inviter, medium, address, room_id)` | Always refuse (no email or phone invites) | Local only. |
 | `check_username_for_spam` | `async (user_profile: UserProfile, requester_id: str) -> bool` | Directory filter: return `True` (hide) when `org_of(profile.user_id) != org_of(requester_id)`, and always for the service account | Returns `True` to **exclude**. `requester_id` was added in Synapse **v1.122.0** (changelog); pin at or above it. This is the belt to `search_all_users: false`'s braces. |
-| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting `join_rule: public`, so a private room cannot be flipped public later | Called for events from clients. **Verify in #235** that it sees state events sent by local clients, and that a room created with a public `m.room.join_rules` in `initial_state` is refused at creation by `user_may_create_room` (§6.3 rule 3), since `check_event_for_spam` does not see creation events. `user_may_send_state_event` exists but is documented as experimental. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
+| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting a join rule other than `invite` (or `restricted` to a room of the sender's org), so a private room cannot be flipped public later | Called for events from clients. **Verified 2026-09-26 (#235)** on v1.161.0: it sees a `PUT /rooms/<id>/state/m.room.join_rules` from a local client, and the `(Codes, dict)` answer reaches the client with our sentence. It does not see room creation, so `user_may_create_room` reads `initial_state` (rule 3), also verified. **Not `user_may_send_state_event`:** it is documented as experimental, it runs before `check_event_for_spam`, and on v1.161.0 it accepts only `NOT_SPAM` or a bare `Codes` (a `(Codes, dict)` pair is logged as an invalid value and answered with a fixed sentence), so it is not registered. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
 
 Return values. **Return only `NOT_SPAM` or `Codes.FORBIDDEN`, never a boolean.** The docs and the
 code disagree on booleans: the docs say a deprecated `True` means `FORBIDDEN`, while
 `SpamCheckerModuleApiCallbacks.user_may_invite` in current source treats `True` as allowed. For
 `check_username_for_spam` a boolean is the documented contract, and there `True` means hide.
 
+> **Deviation, 2026-09-26 (#235).** A refusal is `(Codes.FORBIDDEN, {"error": "<sentence>"})`,
+> not a bare `Codes.FORBIDDEN`: it is still `M_FORBIDDEN` and never a boolean, and it is what makes
+> "refused with a clear error" true, because Synapse otherwise answers with its own fixed text
+> ("Invites have been disabled on this server"). On v1.161.0 this pair is accepted by
+> `user_may_invite`, `user_may_join_room`, `user_may_create_room`, `user_may_publish_room`,
+> `user_may_send_3pid_invite` and `check_event_for_spam` (checked in the source and against a
+> running server: the sentence arrives in `error`). A Synapse that stopped accepting the pair would
+> log an invalid value and reject, so the failure is still a refusal. The sentences never name
+> another org.
+
 Failure mode. The invite path in current source calls each callback with no exception handler,
 so a module that raises makes the request fail rather than pass, and a callback that returns
-anything unrecognised is logged and treated as a rejection. Both fail closed. **Verify in #235**
-for the join and create-room paths too.
+anything unrecognised is logged and treated as a rejection. Both fail closed.
+**Verified 2026-09-26 (#235)** on v1.161.0 for the join, create-room, invite and directory paths,
+with a bare module whose callbacks raise: `createRoom`, an invite, a join and a directory search
+each answered `500`, and nothing was created or joined. The module does not rely on that: every
+callback catches its own errors, refuses (or hides the directory hit) and logs the error's class
+name and nothing else, checked with an exception whose message was a marker string that never
+reached the log.
 
 Loading. The module is a Python class named in `homeserver.yaml` under `modules:` with a
 `config:` block; it receives its parsed config and a `ModuleApi`. For the join check it needs
@@ -296,6 +320,10 @@ For any actor that is not the service account:
    `synapse/handlers/message.py` (`_create_and_send_nonmember_event_locked`).
 4. **Directory.** `check_username_for_spam` hides other orgs and the service account.
 5. **Join rules.** No room may be made `public` after creation (`check_event_for_spam`).
+   "Restricted to the org's Space" is read strictly (2026-09-26, #235): a `restricted` rule is
+   allowed only when every `allow` entry names a room whose joined and invited members are all in
+   the actor's org (the service account skipped) and that has at least one; `knock`, `public`,
+   the legacy `private`, and anything unrecognised are refused, in rules 3 and 5 alike.
 
 The service account is exempt (it is a server admin, so Synapse already skips 1 and 2 for it).
 Synapse also never calls `user_may_create_room` for a server admin (`synapse/handlers/room.py`
@@ -344,6 +372,66 @@ Written plainly, because these are what a security reviewer will ask about.
 - **Federation.** Off, so no remote server can invite or join. The federation-only callbacks
   (`federated_user_may_invite`) are then unreachable. Turning federation on would need a fresh
   decision.
+
+### 6.5 Verified against a real Synapse (#235, 2026-09-26)
+
+The module (`deploy/synapse/modules/duo_org_wall/`) was run inside `matrix-synapse==1.161.0`
+from PyPI (Python 3.13), configured by `render_config.py`'s own output (only the database, port
+and paths swapped: SQLite, loopback, a temp dir), with `@workspace-admin` created by
+`create_admin.py` and two orgs' people and duos created through the admin API. 69 checks over
+HTTP (`tests/real_synapse.py`) plus the daemon's TypeScript provisioning (`MatrixProvisioner`,
+`OrgSpaceProvisioner`) against the same server. Both are opt-in; how to run them:
+`docs/deploy/railway.md`. What was **observed**:
+
+- **Provisioning joins pass.** The Spaces and `#general` rooms, created the way
+  `SynapseAdmin.createPrivateRoom` does, take same-org admin-API joins of a person and a duo
+  (`user_may_join_room` is called, with `is_invited=True`, and accepts). The daemon's own
+  `OrgSpaceProvisioner.syncMember` did the same for two orgs, and its re-run was a no-op.
+- **Cross-org is refused.** An admin-API join of another org's person or duo into a Space or
+  `#general`, an org-less account, and a malformed id (two dots) all answer `403 M_FORBIDDEN`. A
+  cross-org invite, a DM to another org, a `createRoom` with one cross-org id in `invite`, and a
+  3pid invite (both in `createRoom` and on an existing room) are refused with our sentence.
+- **Public rooms, every way in.** `visibility: public`, `preset: public_chat`, and an
+  `initial_state` `m.room.join_rules` of `public`, `knock` or `private` with no visibility and no
+  preset, are refused at creation. A `PUT` of a public `m.room.join_rules` into an existing
+  private room is refused (`check_event_for_spam` fired). Publishing to the room directory is
+  refused. Room upgrade works and passes `initial_state` as a list of dicts on 1.161.0, so the
+  v1.140.0 shape holds. `initial_state` with `restricted` allowed only for a room of the
+  creator's org.
+- **Directory.** With `search_all_users: false`, alice sees her org and never the other org, the
+  service account, or org-less accounts. With `search_all_users: true` the module alone does the
+  same, and a control run with **no module** shows the other org and lets a cross-org invite and
+  a public room through, so the checks can detect a missing wall.
+- **The service account.** Invites across orgs, sends state events, sees every org in its own
+  search, and **creates a public room without the module being asked** (Synapse skips
+  `user_may_create_room` for a server admin, as the record says).
+- **A module that cannot load stops Synapse** (exit 1: an unknown module path, and a config the
+  module's `parse_config` rejects). The wall is not silently absent.
+- **A mutation check:** with the invite and join comparisons disabled the run fails six checks.
+
+Findings the record did not have, which the next reader should know:
+
+- **A refused admin-API join leaves the admin's invite pending.** The admin API invites as the
+  service account before it joins as the target, and only the join is judged. So after a refused
+  cross-org join the target has a pending invite to that room, and its `invite_state` carries the
+  room's create, join-rules, member and **name** events (`include_profile_data_on_invite: false`
+  does not remove the name). The target cannot accept it (their own join is refused too). The
+  daemon never asks for a cross-org join (`OrgSpaceProvisioner` compares both ids' orgs first),
+  so this needs a bug or a misused admin token to occur, but it is why that check must stay.
+- **A room holding only the service account has no org to compare with.** The first person the
+  service account joins there is accepted whatever their org; that person then sets the room's
+  org, and another org's join is refused. Not exploitable by a member (only the service account
+  can seed such a room, and org rooms are created and joined by the daemon in order), but the
+  daemon, not the module, is what puts the right org's first member in.
+- **Synapse's own validation 500s on a non-object `initial_state` entry** before the module is
+  asked. Nothing is created; the module's own handling of it is unit-tested.
+
+**Not verified.** The image was not built (no Docker): the `COPY`, `compileall` and
+`ENV PYTHONPATH` lines are read, not run; the base image's Python (3.13) and lack of a
+`PYTHONPATH` were read from its registry config. Nothing ran on Railway or against Postgres (the
+module does no database work of its own; `get_room_state` is Synapse's). The two-orgs end-to-end
+check on Railway is **not done**. Federation was not exercised (off in the config). Load: one
+room-state read per join, none for invites, publishes or directory hits; not measured.
 
 ## 7. Super admin, and no org admins
 
@@ -433,8 +521,8 @@ reading is that AGPL §13 applies. The consequence to plan for is that **the mod
 published**: offered to every user who interacts with the server, in practice a public
 repository, with nothing secret in it (its config, including `service_accounts`, is deployment
 config and stays out of that source). The module being open source does not weaken the wall,
-which never rested on its secrecy. Owned by #235; `workspace-platform.md` §4 gets a dated note
-once that lands.
+which never rested on its secrecy. Owned by #235; `workspace-platform.md` §4 has the dated note
+(2026-09-26).
 
 ## 11. Synapse configuration the other issues rely on
 
@@ -449,7 +537,7 @@ once that lands.
 | `limit_profile_requests_to_users_who_share_rooms` | `true` | Stops profile lookups across orgs. |
 | `include_profile_data_on_invite` | `false` | Stops the invite event carrying a profile. |
 | `allow_public_rooms_without_auth` | `false` (default) | Keep the public room directory private (it should stay empty). |
-| `modules` | Our module, with `service_accounts: ["@workspace-admin:<server>"]` | #235 |
+| `modules` | Our module, with `server_name` and `service_accounts: ["@workspace-admin:<server>"]` | Shipped in #235 (`deploy/synapse/modules/duo_org_wall`, rendered by `render_config.py`) |
 | `rc_joins`, `rc_invites`, `rc_message` | Defaults are fine for provisioning | The admin-API join calls the membership handler with `ratelimit=False` (source), so provisioning is not throttled by these. They still bound ordinary users, so #230 checks a burst of duo sync traffic and raises `rc_message` if the duos' answers are throttled. |
 | Synapse image tag | Pinned, at least v1.140.0 | `room_config` (v1.132.0), a correct `initial_state` in `room_config` on room upgrade (v1.140.0, #18721; before it, an upgrade passed a list of `((type, state_key), content)` tuples instead of `{type, state_key, content}` dicts), `requester_id` in `check_username_for_spam` (v1.122.0). Not `latest`. |
 
@@ -512,6 +600,8 @@ comment on each child issue.
   - Requires Synapse v1.140.0 or later for a correct `initial_state` on room upgrade.
   - Licence: the module is loaded into an internet-reachable AGPL Synapse, so plan to publish
     its source (§10).
+  - **Shipped 2026-09-26** as `deploy/synapse/modules/duo_org_wall/`, with the deviations in §4.2
+    and §6.2 and what was observed in §6.5. Every "verify in #235" above is now settled there.
 - **#236** (hosted wiring) owns the resource measurement in §8. The hosted process does not
   open a workspace connection until #232 has stored a token for that duo. It also shares the
   `.railway.internal` https relaxation and the per-duo `env` allowlist with #232.
