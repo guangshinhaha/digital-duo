@@ -136,14 +136,33 @@ export class SynapseAdmin {
     return userId;
   }
 
-  private async call(method: "GET" | "PUT" | "POST", path: string, body?: unknown): Promise<{ status: number; json: unknown }> {
+  /**
+   * The user a person's OWN access token belongs to (`GET /_matrix/client/v3/account/whoami`, with that
+   * token as the bearer), or null when Synapse no longer accepts it (expired, or the client logged out).
+   * Used to check a token the daemon minted earlier before handing it out again (#233). The token
+   * travels only in the `Authorization` header, like the admin token; an outage throws as elsewhere.
+   */
+  async whoAmIAs(accessToken: string): Promise<string | null> {
+    try {
+      const { json } = await this.call("GET", "/_matrix/client/v3/account/whoami", undefined, accessToken);
+      const userId = (json as { user_id?: unknown } | null)?.user_id;
+      return typeof userId === "string" && userId.startsWith("@") ? userId : null;
+    } catch (error) {
+      if (error instanceof SynapseAdminError && error.status === 401) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async call(method: "GET" | "PUT" | "POST", path: string, body?: unknown, bearer: string = this.adminToken): Promise<{ status: number; json: unknown }> {
     const label = `${method} ${path.replace(/\/users\/[^/]+/, "/users/<id>")}`;
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, {
         method,
         headers: {
-          authorization: `Bearer ${this.adminToken}`,
+          authorization: `Bearer ${bearer}`,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),

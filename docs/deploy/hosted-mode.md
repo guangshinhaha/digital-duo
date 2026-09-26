@@ -184,6 +184,65 @@ registry.matrixPending(duoId): MatrixPending | undefined
 hosted.matrix?.provision(duoId) / .provisionAll() / .retryPending() / .pendingDuoIds() / .stop()
 ```
 
+## Workspace session for the signed-in app (added 2026-09-26, #233)
+
+The app has no homeserver form. A signed-in person asks the daemon for a Matrix session, and the
+daemon mints one for their own account and returns it with the public homeserver URL.
+
+`POST /hosted/workspace/session` with `Authorization: Bearer <the caller's device token>` (the one
+`/hosted/login` or `/hosted/signup` returned). The body is ignored: nothing the caller sends can
+name an account. CORS as the other `/hosted/*` routes. Source: `src/hosted/workspace-session.ts`.
+
+```jsonc
+// 200, Cache-Control: no-store
+{
+  "homeserverUrl": "https://matrix.example.com",   // DUO_WORKSPACE_PUBLIC_URL, never the private URL
+  "userId": "@<orgId>.<handle>:<server>",          // the caller's own person account
+  "accessToken": "syt_...",
+  "deviceId": null,                                 // admin-minted tokens have no device (below)
+  "expiresAt": "2026-09-27T12:00:00.000Z"           // ISO 8601; the token stops working then
+}
+```
+
+| Status | `error.code` | When |
+|---|---|---|
+| 401 | `unauthorized` | No bearer token, or one that is no duo's device (unknown or revoked). Sign in again. |
+| 403 | `no_duo` | The server-side `DUO_HOSTED_ADMIN_TOKEN`: it belongs to no duo, so it has no account. A super admin's own signed-in device is a duo and works. |
+| 404 | `workspace_not_configured` | No Synapse admin variables, or no `DUO_WORKSPACE_PUBLIC_URL`. Hide the workspace feature. |
+| 429 | `rate_limited` | Too many unrecognised tokens from this address (the sign-in limiter: 10 per 15 minutes). |
+| 503 | `workspace_pending` | The duo's accounts are not created yet (Synapse was down at sign-up; the retry timer is on it). `Retry-After: 60`. Costs Synapse no call. |
+| 503 | `workspace_unavailable` | Synapse is down, slow (5 second cut-off), or refused. `Retry-After: 60`. |
+
+Errors are `{ "error": { "code", "message" } }`, never a stack or Synapse's own text.
+
+- **Own account only.** The caller is identified by the device token alone (the root duo's store,
+  then each tenant's), and the account is the person id recorded for that duo. The route never
+  reads the duo's token and takes no `userId` or `duoId`. A recorded person id that is a `duo-`
+  account or the service account is refused. The identity lookup is cached for 5 seconds, the
+  same window as a duo's own auth, so a revoked device stops opening sessions within seconds.
+- **Expiry, and when to call again.** Every token is minted with a 24 hour `valid_until_ms`
+  (Synapse's default is a token that never expires, and the daemon cannot revoke one it did not
+  keep). Call again when `expiresAt` is within an hour, or when Matrix answers `M_UNKNOWN_TOKEN`.
+  Schedule from `expiresAt`, not on a fixed interval.
+- **A client loop cannot mint without bound.** A token with at least 6 hours left is handed out
+  again, kept in daemon memory only (never on disk or in the registry), so a duo costs at most
+  one mint per 18 hours plus one per daemon restart. Concurrent calls share one mint, and a failed
+  mint is remembered for 5 seconds so a Synapse that is down is not asked once per request.
+  Unrecognised tokens count against the caller's address. The mint has its own 5 second timeout
+  (`synapseTimeoutMs` to override), not provisioning's 10.
+- **No device.** Synapse creates no device for an admin-minted token, so `deviceId` is `null`.
+  Creating one is only needed for end-to-end encryption, which the POC does not use.
+- **Sign-out is the client's.** The daemon cannot revoke a person's token: Synapse's only ways
+  are `/logout` with that token, or `/logout/all` as the service account, which would expire every
+  token the daemon minted. So sign-out means the client calls Matrix `POST /_matrix/client/v3/logout`
+  with its own `accessToken` on `homeserverUrl`, then forgets the session. If it cannot (offline, a
+  lost device), the token stays valid until `expiresAt`; that bound is why the expiry is short.
+- **A signed-out token is not handed out again.** The daemon never sees the client's `/logout`, so
+  before reusing a token it asks Synapse (`whoami` as that token, a read) at most once per 5
+  seconds, and replaces one Synapse no longer accepts. A client that signs out and asks again
+  within those 5 seconds can be given the token it just signed out; if Matrix answers
+  `M_UNKNOWN_TOKEN` it should ask again. If Synapse cannot be asked, the cached token is returned.
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -198,7 +257,7 @@ hosted.matrix?.provision(duoId) / .provisionAll() / .retryPending() / .pendingDu
 | `DUO_WORKSPACE_PRIVATE_URL` | Synapse as the daemon reaches it, e.g. `http://synapse.railway.internal:8008` (https, or http on a `*.railway.internal` host). With `DUO_WORKSPACE_ADMIN_TOKEN` it turns provisioning on; one without the other refuses to start. |
 | `DUO_WORKSPACE_ADMIN_TOKEN` | The `@workspace-admin` service account's token. Acts as any user: never in a duo's env, a route or a log. |
 | `DUO_WORKSPACE_SERVER_NAME` | Optional. Synapse's `server_name` (`duo`). When unset it is read from the admin token's own user id. |
-| `DUO_WORKSPACE_PUBLIC_URL` | The https address clients are given for Synapse (used by the session work, #233). |
+| `DUO_WORKSPACE_PUBLIC_URL` | The https address clients are given for Synapse, returned as `homeserverUrl` by `POST /hosted/workspace/session`. Without it that route answers 404. |
 
 ## Inviting someone
 
