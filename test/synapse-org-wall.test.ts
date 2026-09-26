@@ -30,6 +30,8 @@ describe("the image ships the module", () => {
   it("copies it, compiles it and puts it on PYTHONPATH, without its tests", () => {
     expect(dockerfile).toContain("COPY modules/ /modules/");
     expect(dockerfile).toContain("ENV PYTHONPATH=/modules");
+    // Not left to .dockerignore alone, and readable by uid 991 whatever the build context's modes were.
+    expect(dockerfile).toMatch(/rm -rf \/modules\/duo_org_wall\/tests[\s\\&]+python -m compileall -q \/modules[\s\\&]+chmod -R a\+rX \/modules/);
     expect(readFileSync(join(__dirname, "..", "deploy", "synapse", ".dockerignore"), "utf8")).toContain("**/tests");
   });
 });

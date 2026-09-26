@@ -17,16 +17,32 @@ from typing import Iterable, Optional
 
 # Lowercase letters and digits on each side of exactly one dot, `duo-` optional.
 # The record's parse is looser (first dot wins); this is stricter on purpose so
-# that a malformed id has no org rather than a surprising one.
-_LOCALPART = re.compile(r"^(?:duo-)?([a-z0-9]+)\.([a-z0-9]+)$")
-_USER_ID = re.compile(r"^@([^:@]+):([^:@]+)$")
+# that a malformed id has no org rather than a surprising one. Both are used with
+# fullmatch, never match plus `$`: `$` also matches before a trailing newline, so
+# `@orga1111.zzz\n:duo` would otherwise read as org `orga1111`.
+_LOCALPART = re.compile(r"(?:duo-)?([a-z0-9]+)\.([a-z0-9]+)")
+_USER_ID = re.compile(r"@([^:@\s]+):([^:@\s]+)")
+# A bare hostname (what src/hosted/matrix-accounts.ts assertServerName also accepts): no port,
+# because `@x:host:8448` cannot be split into localpart and server by the parse above.
+_SERVER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
 
 # The only join rules a member-created room may have. `restricted` is allowed
 # only when every allow entry points at a room holding just the creator's org
 # (that is what "restricted to the org's Space" means).
 ALLOWED_JOIN_RULES = ("invite", "restricted")
 ALLOWED_PRESETS = (None, "private_chat", "trusted_private_chat")
+# What a member may set history visibility to: never `world_readable`, which lets any account
+# that has the room id (an alias is enough) read the room without being in it.
+READABLE_HISTORY = ("invited", "joined", "shared")
+# Guests: a member may not turn `can_join` on afterwards (guests are also off on the server). Not judged in
+# createRoom's initial_state: Synapse's own `private_chat` preset writes `can_join`, and a room upgrade copies
+# it (found by the real-Synapse upgrade check), so refusing it there would break every upgrade.
+GUEST_ACCESS_ALLOWED = ("forbidden",)
 JOIN_RULES_EVENT = "m.room.join_rules"
+HISTORY_EVENT = "m.room.history_visibility"
+GUEST_EVENT = "m.room.guest_access"
+MEMBER_EVENT = "m.room.member"
+READABILITY_EVENTS = (HISTORY_EVENT, GUEST_EVENT)
 
 ERR_INVITE = "Invites across organisations are not allowed."
 ERR_JOIN = "This room has members from another organisation."
@@ -42,13 +58,16 @@ def parse_config(config: object) -> tuple[str, frozenset[str]]:
     if not isinstance(config, Mapping):
         raise ValueError("duo_org_wall: config must be a mapping")
     server_name = config.get("server_name")
-    if not isinstance(server_name, str) or not server_name or ":" in server_name or "@" in server_name:
-        raise ValueError("duo_org_wall: config.server_name must be the homeserver's server_name")
+    if not isinstance(server_name, str) or _SERVER_NAME.fullmatch(server_name) is None:
+        raise ValueError(
+            "duo_org_wall: config.server_name must be the homeserver's bare server_name, a hostname without a port "
+            "(the org parse cannot read `@x:host:port`)"
+        )
     accounts = config.get("service_accounts")
     if not isinstance(accounts, (list, tuple)) or not accounts:
         raise ValueError("duo_org_wall: config.service_accounts must be a non-empty list")
     for account in accounts:
-        match = _USER_ID.match(account) if isinstance(account, str) else None
+        match = _USER_ID.fullmatch(account) if isinstance(account, str) else None
         if match is None or match.group(2) != server_name:
             raise ValueError("duo_org_wall: every service account must be @localpart:" + server_name)
     return server_name, frozenset(accounts)
@@ -90,10 +109,10 @@ class OrgWall:
         """The org in this account's id, or None (no org: refuse, unless it is the service account)."""
         if not isinstance(user_id, str):
             return None
-        id_match = _USER_ID.match(user_id)
+        id_match = _USER_ID.fullmatch(user_id)
         if id_match is None or id_match.group(2) != self.server_name:
             return None
-        local_match = _LOCALPART.match(id_match.group(1))
+        local_match = _LOCALPART.fullmatch(id_match.group(1))
         return local_match.group(1) if local_match else None
 
     def _same_org(self, actor: str, other: object) -> bool:
@@ -146,6 +165,15 @@ class OrgWall:
                 return ERR_PUBLIC
         return None
 
+    @staticmethod
+    def history_problem(content: Mapping) -> Optional[str]:
+        """A history visibility that would let a non-member read the room (only `world_readable` does)."""
+        return None if content.get("history_visibility") in READABLE_HISTORY else ERR_PUBLIC
+
+    @staticmethod
+    def guest_problem(content: Mapping) -> Optional[str]:
+        return None if content.get("guest_access") in GUEST_ACCESS_ALLOWED else ERR_PUBLIC
+
     def may_create_room(self, user_id: str, room_config: object, restricted_orgs: Mapping[str, frozenset]) -> Optional[str]:
         if self.is_service(user_id):
             return None
@@ -173,10 +201,19 @@ class OrgWall:
         for entry in initial_state:
             if not isinstance(entry, Mapping):
                 return ERR_CREATE
+            # Synapse writes initial_state events with no invite, join or spam callback, so this is the only
+            # place to stop them. A fresh room needs no member entry (invites go in `invite`, checked above),
+            # and one for another org's user would deliver that user an invite carrying the sender's text.
+            if entry.get("type") == MEMBER_EVENT:
+                return ERR_INVITE
             if entry.get("type") == JOIN_RULES_EVENT:
                 problem = self.join_rule_problem(org, as_mapping(entry.get("content")), restricted_orgs)
-                if problem:
-                    return problem
+            elif entry.get("type") == HISTORY_EVENT:
+                problem = self.history_problem(as_mapping(entry.get("content")))
+            else:
+                problem = None
+            if problem:
+                return problem
         return None
 
     def may_send_join_rules(self, user_id: str, content: object, restricted_orgs: Mapping[str, frozenset]) -> Optional[str]:
@@ -187,6 +224,17 @@ class OrgWall:
         if org is None:
             return ERR_NO_ORG
         return self.join_rule_problem(org, as_mapping(content), restricted_orgs)
+
+    def may_send_readability(self, user_id: str, event_type: object, content: object) -> Optional[str]:
+        """A client-sent m.room.history_visibility or m.room.guest_access event: no room may be opened to non-members."""
+        if self.is_service(user_id):
+            return None
+        if event_type not in READABILITY_EVENTS:
+            return None
+        if self.org_of(user_id) is None:
+            return ERR_NO_ORG
+        check = self.history_problem if event_type == HISTORY_EVENT else self.guest_problem
+        return check(as_mapping(content))
 
     def may_publish(self, user_id: str) -> Optional[str]:
         return None if self.is_service(user_id) else ERR_PUBLISH

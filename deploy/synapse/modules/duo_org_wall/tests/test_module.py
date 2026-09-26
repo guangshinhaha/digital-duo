@@ -122,7 +122,30 @@ class Verdicts(unittest.TestCase):
         self.assertTrue(refusal(run(cb["user_may_send_3pid_invite"](A1, "email", "a@b.c", "!r:duo")), "email or phone"))
         self.assertEqual(run(cb["user_may_publish_room"](ADMIN, "!r:duo")), "NOT_SPAM")
 
-    def test_event_check_only_looks_at_join_rules(self):
+    def test_a_member_entry_in_initial_state_is_refused_without_reading_any_room(self):
+        api = build()
+        entry = {"type": "m.room.member", "state_key": B1, "content": {"membership": "invite", "reason": "hi"}}
+        result = run(api.callbacks["user_may_create_room"](A1, {"initial_state": [entry]}))
+        self.assertTrue(refusal(result, "across organisations"))
+        self.assertEqual(api.asked, [])
+        self.assertEqual(run(api.callbacks["user_may_create_room"](ADMIN, {"initial_state": [entry]})), "NOT_SPAM")
+
+    def test_create_room_refuses_a_world_readable_room_but_not_the_presets_guest_access(self):
+        cb = build().callbacks
+        world = {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": "world_readable"}}
+        self.assertTrue(refusal(run(cb["user_may_create_room"](A1, {"initial_state": [world]})), "Public rooms"))
+        # A room upgrade copies the guest_access the private_chat preset wrote (can_join): it must still work.
+        guest = {"type": "m.room.guest_access", "state_key": "", "content": {"guest_access": "can_join"}}
+        self.assertEqual(run(cb["user_may_create_room"](A1, {"initial_state": [guest]})), "NOT_SPAM")
+        shared = {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": "shared"}}
+        self.assertEqual(run(cb["user_may_create_room"](A1, {"initial_state": [shared]})), "NOT_SPAM")
+
+    def test_a_join_reads_the_room_state_once(self):
+        api = build({"!r:duo": {A2: "join", ADMIN: "join"}})
+        self.assertEqual(run(api.callbacks["user_may_join_room"](A1, "!r:duo", True)), "NOT_SPAM")
+        self.assertEqual(api.asked, [("!r:duo", [("m.room.member", None)])])
+
+    def test_event_check_looks_at_join_rules_history_visibility_and_guest_access(self):
         cb = build().callbacks
 
         class Ev:
@@ -133,6 +156,13 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(run(cb["check_event_for_spam"](Ev("m.room.join_rules", A1, {"join_rule": "invite"}))), "NOT_SPAM")
         self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev("m.room.join_rules", A1, {"join_rule": "public"}))), "Public rooms"))
         self.assertEqual(run(cb["check_event_for_spam"](Ev("m.room.join_rules", ADMIN, {"join_rule": "public"}))), "NOT_SPAM")
+        # Other state that makes a room readable or joinable by everyone.
+        for value in ("shared", "joined", "invited"):
+            self.assertEqual(run(cb["check_event_for_spam"](Ev("m.room.history_visibility", A1, {"history_visibility": value}))), "NOT_SPAM")
+        self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev("m.room.history_visibility", A1, {"history_visibility": "world_readable"}))), "Public rooms"))
+        self.assertEqual(run(cb["check_event_for_spam"](Ev("m.room.history_visibility", ADMIN, {"history_visibility": "world_readable"}))), "NOT_SPAM")
+        self.assertEqual(run(cb["check_event_for_spam"](Ev("m.room.guest_access", A1, {"guest_access": "forbidden"}))), "NOT_SPAM")
+        self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev("m.room.guest_access", A1, {"guest_access": "can_join"}))), "Public rooms"))
 
     def test_directory_returns_a_boolean_true_to_hide(self):
         cb = build().callbacks

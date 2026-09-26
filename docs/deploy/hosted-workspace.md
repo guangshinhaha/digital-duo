@@ -266,11 +266,11 @@ creating, publishing or making a room public (§6.3), and the Space and `#genera
 |---|---|---|---|
 | `user_may_invite` | `async (inviter: str, invitee: str, room_id: str)` | Refuse when `org_of(inviter) != org_of(invitee)` | **Not called when the inviter is a server admin** (source: `room_member.py`). That is why the service account can seed rooms. |
 | `user_may_join_room` | `async (user: str, room: str, is_invited: bool)` | Refuse when the user's org differs from the org of any joined or invited member of the room | Docs: "isn't called if the join is performed by a server administrator, or in the context of a room creation". **Admin-API joins are different:** the admin API joins as the *target* user, and the bypass is decided on whether that user is a server admin, so a provisioning join **does** run the module. Our own provisioning must pass it, which is why the org has to be readable from the id before the person is in any room. |
-| `user_may_create_room` | `async (user_id: str, room_config: JsonDict)` | Refuse public rooms; refuse an `invite` list that crosses orgs or contains a 3pid | `room_config` argument added in **v1.132.0**, and its `initial_state` shape on room upgrade fixed in **v1.140.0** (#18721; the module reads `initial_state` for rule 3). Pin Synapse at or above **v1.140.0**. **Not called when the creator is a server admin** (`room.py`), like the invite and join callbacks. |
+| `user_may_create_room` | `async (user_id: str, room_config: JsonDict)` | Refuse public rooms; refuse an `invite` list that crosses orgs or contains a 3pid; refuse an `initial_state` `m.room.member` entry and a `world_readable` history visibility | `room_config` argument added in **v1.132.0**, and its `initial_state` shape on room upgrade fixed in **v1.140.0** (#18721; the module reads `initial_state` for rule 3, and it is the only check that sees it: Synapse writes those events with no invite, join or spam callback). Pin Synapse at or above **v1.140.0**. **Not called when the creator is a server admin** (`room.py`), like the invite and join callbacks. |
 | `user_may_publish_room` | `async (user_id: str, room_id: str)` | Always refuse for non-service accounts | |
 | `user_may_send_3pid_invite` | `async (inviter, medium, address, room_id)` | Always refuse (no email or phone invites) | Local only. |
-| `check_username_for_spam` | `async (user_profile: UserProfile, requester_id: str) -> bool` | Directory filter: return `True` (hide) when `org_of(profile.user_id) != org_of(requester_id)`, and always for the service account | Returns `True` to **exclude**. `requester_id` was added in Synapse **v1.122.0** (changelog); pin at or above it. This is the belt to `search_all_users: false`'s braces. |
-| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting a join rule other than `invite` (or `restricted` to a room of the sender's org), so a private room cannot be flipped public later | Called for events from clients. **Verified 2026-09-26 (#235)** on v1.161.0: it sees a `PUT /rooms/<id>/state/m.room.join_rules` from a local client, and the `(Codes, dict)` answer reaches the client with our sentence. It does not see room creation, so `user_may_create_room` reads `initial_state` (rule 3), also verified. **Not `user_may_send_state_event`:** it is documented as experimental, it runs before `check_event_for_spam`, and on v1.161.0 it accepts only `NOT_SPAM` or a bare `Codes` (a `(Codes, dict)` pair is logged as an invalid value and answered with a fixed sentence), so it is not registered. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
+| `check_username_for_spam` | `async (user_profile: UserProfile, requester_id: str) -> bool` | Directory filter: return `True` (hide) when `org_of(profile.user_id) != org_of(requester_id)`, and always for the service account | Returns `True` to **exclude**. `requester_id` was added in Synapse **v1.122.0** (changelog); pin at or above it. **A filter, not a scope:** Synapse applies the search `limit` before this callback (see §6.4), so `search_all_users: false` (shipped) is the real control and this is the second lock. |
+| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting a join rule other than `invite` (or `restricted` to a room of the sender's org), a `m.room.history_visibility` other than `invited`/`joined`/`shared`, and a `m.room.guest_access` other than `forbidden`, so a private room cannot be flipped public or world-readable later | Called for events from clients. **Verified 2026-09-26 (#235)** on v1.161.0: it sees a `PUT /rooms/<id>/state/m.room.join_rules` from a local client, and the `(Codes, dict)` answer reaches the client with our sentence. It does not see room creation, so `user_may_create_room` reads `initial_state` (rule 3), also verified. **Not `user_may_send_state_event`:** it is documented as experimental, it runs before `check_event_for_spam`, and on v1.161.0 it accepts only `NOT_SPAM` or a bare `Codes` (a `(Codes, dict)` pair is logged as an invalid value and answered with a fixed sentence), so it is not registered. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
 
 Return values. **Return only `NOT_SPAM` or `Codes.FORBIDDEN`, never a boolean.** The docs and the
 code disagree on booleans: the docs say a deprecated `True` means `FORBIDDEN`, while
@@ -300,7 +300,13 @@ reached the log.
 Loading. The module is a Python class named in `homeserver.yaml` under `modules:` with a
 `config:` block; it receives its parsed config and a `ModuleApi`. For the join check it needs
 the room's members: `ModuleApi.get_room_state(room_id, [("m.room.member", None)])` is an async,
-local database read (added v1.47.0), not a network call.
+local database read (added v1.47.0), not a network call. It is read fresh on every join, on purpose:
+a cache of a room's orgs would go stale when the service account invites someone (its invites are
+not judged), and the wall's answer would then be wrong. Measured 2026-09-26 on v1.161.0 (SQLite,
+one org room, admin-API joins of 400 people one after another): the join took 34 ms at the start
+and 78 ms at the end with the module, 33 ms and 75 ms without it, so the read is about 3 ms at 400
+members and the growth is Synapse's own. Provisioning an org of N people is N reads of up to N
+members (quadratic in count, small in cost); not measured on Postgres or on Railway.
 
 ### 6.3 What the module enforces, exactly
 
@@ -312,14 +318,26 @@ For any actor that is not the service account:
    `FORBIDDEN`. An org-less non-service joiner is refused.
 3. **Room creation.** Refuse `visibility: public`, the `public_chat` preset, any 3pid invite,
    and any `initial_state` entry of type `m.room.join_rules` whose `join_rule` is not `invite`
-   (or `restricted` to the org's Space). Every id in `invite` must share the creator's org. The
+   (or `restricted` to the org's Space), any `m.room.member` entry (whatever it says: a fresh room
+   needs none, and Synapse writes these events without asking anyone, so one for another org's user
+   would deliver that user an invite with the sender's text), and any `m.room.history_visibility`
+   other than `invited`, `joined` or `shared`. Every id in `invite` must share the creator's org. The
    `initial_state` check matters because a room can be created public that way with no
    `visibility` and no preset, and rule 5 never sees it: the initial state events of a new room
    are built by the room-creation handler (`synapse/handlers/room.py`) and do not pass through
    `check_event_for_spam`, whose only call site is
    `synapse/handlers/message.py` (`_create_and_send_nonmember_event_locked`).
 4. **Directory.** `check_username_for_spam` hides other orgs and the service account.
-5. **Join rules.** No room may be made `public` after creation (`check_event_for_spam`).
+5. **Join rules, and who can read.** No room may be made `public` after creation, none may be
+   made readable by people outside it (`m.room.history_visibility: world_readable`, which lets any
+   account holding the room id read `/messages`, `/initialSync` and `/state`, and an alias is enough
+   to get the id), and none may allow guests (`m.room.guest_access` other than `forbidden`), all in
+   `check_event_for_spam`. Read this as "no room can be made public *by a member, with the state
+   events the module knows*", not "no room can be public": rooms that existed before the module
+   are not rewritten, the service account is exempt, and `guest_access: can_join` is **not**
+   judged in `createRoom`'s `initial_state`, because Synapse's own `private_chat` preset writes it
+   and a room upgrade copies it (the upgrade check in the real-Synapse run found this; guests are
+   off on the server, so it has no effect today). Other ways to reach another org are in §6.4.
    "Restricted to the org's Space" is read strictly (2026-09-26, #235): a `restricted` rule is
    allowed only when every `allow` entry names a room whose joined and invited members are all in
    the actor's org (the service account skipped) and that has at least one; `knock`, `public`,
@@ -346,11 +364,15 @@ Written plainly, because these are what a security reviewer will ask about.
 - **A super admin, in the registry.** The super admin sees every org's name and membership, and
   chooses which org an invite joins. That is metadata, not message content, but it is not
   walled.
-- **A module that is missing or wrong.** If the module fails to load, is mis-configured, or has
-  a bug, the wall is gone and Synapse still runs. Mitigation: #235's end-to-end check with two
-  orgs, and a startup check in the daemon that refuses to provision accounts until a probe
-  (a deliberate cross-org invite between two throwaway accounts) is refused. That probe is
-  recommended; #235 decides whether to build it.
+- **A module that loads but is wrong.** A module that cannot load at all stops Synapse (exit 1,
+  §6.5), so that case is loud. A module that loads and has a bug, or is configured in a way that
+  weakens it, leaves the wall gone while Synapse still runs. Mitigations: the real-Synapse harness
+  (`tests/real_synapse.py`, with `--mutate-all` to show it notices a weakened wall, §6.5), and
+  #235's end-to-end check with two orgs on Railway, **which is not done**. The daemon-side probe
+  this section used to recommend (refuse to provision accounts until a deliberate cross-org invite
+  between two throwaway accounts is refused) is **not built**: #235 did not build it, and nothing
+  in the daemon checks that the wall is up. Building it is the owner's call, and worth making
+  before a second organisation is on the server.
 - **Message content.** The module is about who can be invited and who can join. It does not
   encrypt anything. Rooms are not required to be end-to-end encrypted in the POC, and even an
   encrypted room does not protect against the operator's access to accounts and tokens.
@@ -361,6 +383,46 @@ Written plainly, because these are what a security reviewer will ask about.
   `include_profile_data_on_invite: false`. Even so, media sits in one shared store; authenticated
   media is on by default (`enable_authenticated_media`), which prevents anonymous download but
   not reading by an authenticated user who has a media URL.
+- **Device keys and device names.** `limit_profile_requests_to_users_who_share_rooms` covers
+  `/profile` only. `POST /keys/query` answers for any local user id, across orgs, with no shared
+  room: the device id, its public keys and `unsigned.device_display_name` (often a personal
+  string such as "Carol's private laptop"), observed on v1.161.0. It is a metadata leak, and an
+  id that has a device answers differently from one that has none, so it is a weak check that an
+  account exists. Synapse has no setting for it. Closing it means refusing or rewriting
+  `POST /_matrix/client/*/keys/query` in a proxy in front of the client listener, which also
+  breaks end-to-end key exchange; see the to-device bullet for the decision. Recorded, not closed.
+  `real_synapse.py` asserts the leak as it is today (labelled `KNOWN GAP`), so a Synapse upgrade
+  that closes it is noticed.
+- **To-device messages.** Synapse delivers a `PUT /sendToDevice/<type>/<txn>` message to any
+  local user id, across orgs, with no shared room and arbitrary content, and the message arrives
+  in the recipient's next `/sync` under `to_device` with the sender's id (observed on v1.161.0,
+  both directions). The module cannot see it: Synapse has no spam-checker callback for to-device
+  messages. That is a one-way message channel across the wall. Closing it needs a proxy rule that
+  refuses `sendToDevice` in front of the client listener, and that same rule stops key sharing for
+  end-to-end encrypted rooms (Megolm keys travel as to-device messages). **Decision (POC):
+  documented as a known gap, not closed.** Duos do not use end-to-end encryption today (§12,
+  `#233`: the POC does not depend on E2EE, and admin-minted tokens have no device), so a proxy block, here and for `/keys/query`, is
+  feasible later at the price of ruling encrypted rooms out; whether to add it, and before which
+  org joins, is the owner's decision (the person who accepted §9's POC posture). Until then, a
+  user with a login can send another org's user a message the wall does not stop, so the wall is
+  a hard wall for rooms, invites, joins and the directory, not for every Matrix API. `real_synapse.py`
+  asserts the delivery as it is today (labelled `KNOWN GAP`).
+- **Aliases.** Room aliases resolve for any authenticated user (`GET /directory/room/<alias>`),
+  so another org that guesses an alias learns the room id. That alone reads nothing (the room
+  stays unreadable while its history visibility is not `world_readable`, which the module now
+  refuses); the harness records it as observed. The daemon creates no aliases.
+- **Directory `limited`, if `search_all_users` is ever turned on.** With `search_all_users: true`
+  (not shipped) Synapse applies the search `limit` in the database query and only then calls
+  `check_username_for_spam`, so another org's matches use up result slots, and a short page can
+  drop a same-org user, and `limited: true` with no results tells the searcher a matching account
+  exists somewhere. The module is a filter, not a scope. The shipped `search_all_users: false`
+  queries only users who share a room, so no other-org row reaches the callback; the harness
+  asserts that answer for a term matching another org and a term matching nobody is identical
+  (no leak), and asserts the leak as it is with the setting on (labelled `KNOWN GAP`).
+- **Rooms that already exist, and the service account.** The module changes what can happen from
+  now on; a room that was public or world-readable before the redeploy stays so (`railway.md`).
+  The service account, being a server admin, is exempt from every callback, including making a
+  public room.
 - **Guessable ids.** Ids embed the org id and a tenant id. Neither is secret. The wall does not
   rely on ids being unguessable, so this is a metadata note, not a hole.
 - **A leaked person token.** Bounded by `valid_until_ms` only (§5). Use a short expiry with
@@ -378,7 +440,7 @@ Written plainly, because these are what a security reviewer will ask about.
 The module (`deploy/synapse/modules/duo_org_wall/`) was run inside `matrix-synapse==1.161.0`
 from PyPI (Python 3.13), configured by `render_config.py`'s own output (only the database, port
 and paths swapped: SQLite, loopback, a temp dir), with `@workspace-admin` created by
-`create_admin.py` and two orgs' people and duos created through the admin API. 69 checks over
+`create_admin.py` and two orgs' people and duos created through the admin API. 101 checks over
 HTTP (`tests/real_synapse.py`) plus the daemon's TypeScript provisioning (`MatrixProvisioner`,
 `OrgSpaceProvisioner`) against the same server. Both are opt-in; how to run them:
 `docs/deploy/railway.md`. What was **observed**:
@@ -394,7 +456,11 @@ HTTP (`tests/real_synapse.py`) plus the daemon's TypeScript provisioning (`Matri
 - **Public rooms, every way in.** `visibility: public`, `preset: public_chat`, and an
   `initial_state` `m.room.join_rules` of `public`, `knock` or `private` with no visibility and no
   preset, are refused at creation. A `PUT` of a public `m.room.join_rules` into an existing
-  private room is refused (`check_event_for_spam` fired). Publishing to the room directory is
+  private room is refused (`check_event_for_spam` fired). So is a `world_readable` history
+  visibility, in `createRoom`'s `initial_state` and in a state `PUT`; with the alias attack
+  (alice aliases a private room, carol resolves the alias and reads `/messages`, `/initialSync`
+  and `/state` with the room id) the reads answer `403`, and a control run with **no module**
+  shows the same reads answering `200` with the message. Publishing to the room directory is
   refused. Room upgrade works and passes `initial_state` as a list of dicts on 1.161.0, so the
   v1.140.0 shape holds. `initial_state` with `restricted` allowed only for a room of the
   creator's org.
@@ -407,7 +473,25 @@ HTTP (`tests/real_synapse.py`) plus the daemon's TypeScript provisioning (`Matri
   `user_may_create_room` for a server admin, as the record says).
 - **A module that cannot load stops Synapse** (exit 1: an unknown module path, and a config the
   module's `parse_config` rejects). The wall is not silently absent.
-- **A mutation check:** with the invite and join comparisons disabled the run fails six checks.
+- **Mutation check, re-runnable.** `real_synapse.py --mutate NAME` runs every phase against a
+  copy of the module with one line made wrong, and `--mutate-all` runs each of them (`--mutate
+  list` names them). The earlier claim that "disabling the invite and join comparisons fails six
+  checks" is withdrawn: it could not be reproduced. What is observed now (2026-09-27, v1.161.0;
+  a count can differ by one when a wait times out on a loaded machine, what matters is that it is
+  not zero): `invite-off` 2, `join-off` 7, `join-ignores-invited` 1, `two-dots` 2,
+  `create-invite-list-off` 1, `create-public-off` 1, `create-member-entry-off` 3,
+  `create-join-rules-off` 4, `create-history-off` 2, `history-world-readable-ok` 5,
+  `event-join-rules-off` 3, `event-history-off` 5, `publish-off` 2, `3pid-off` 1,
+  `directory-off` 5, `fails-open` 2. **Two that broke nothing before now break something**: an id
+  with two dots is joined into a fresh room (the earlier check was refused only because carol's
+  invite already made the room unjoinable), and an org-B invitee who has only been invited counts
+  against an org-A joiner. **One is unit-test-only, by design:** `newline-anchor` (parsing with
+  `$` instead of a full match, so a trailing newline in an id still parses), because Synapse never
+  lets an id with a newline exist and no real request can carry one; `test_rules.py` covers it.
+- **Known gaps, asserted as they are** (labelled `KNOWN GAP` in the harness, §6.4): a cross-org
+  `sendToDevice` is delivered, `/keys/query` returns another org's device keys and display name,
+  and with `search_all_users: true` a limit-1 search answers `limited: true`. If Synapse changes
+  one of these the check fails, which is the point: read what it does now and update §6.4.
 
 Findings the record did not have, which the next reader should know:
 
@@ -423,14 +507,28 @@ Findings the record did not have, which the next reader should know:
   org, and another org's join is refused. Not exploitable by a member (only the service account
   can seed such a room, and org rooms are created and joined by the daemon in order), but the
   daemon, not the module, is what puts the right org's first member in.
+- **`initial_state` is written without any callback but `user_may_create_room`.** A `createRoom`
+  with an `m.room.member` invite entry for another org's user answered `200` and delivered the
+  invite (with the sender's `reason`) to that user's next `/sync`; a `world_readable` entry made
+  the room readable to other orgs. The first version of the module read only the join rules there.
+  Both are now refused, with a check that the invite is not delivered, and each was run against
+  the module before the fix (both succeeded) and after (both `403`).
+- **The `private_chat` preset writes `guest_access: can_join`,** and a room upgrade copies the
+  old room's state into the new room's `initial_state`. Refusing `can_join` at creation therefore
+  broke every upgrade (found when the upgrade check failed), so `initial_state` guest access is
+  not judged; a member setting `can_join` later by state `PUT` is refused. Guests are off on the
+  server, so this has no effect today. A room that already has `world_readable` history cannot be
+  upgraded (its `initial_state` carries it): a consequence of the wall, and only for rooms that
+  predate it.
 - **Synapse's own validation 500s on a non-object `initial_state` entry** before the module is
   asked. Nothing is created; the module's own handling of it is unit-tested.
 
-**Not verified.** The image was not built (no Docker): the `COPY`, `compileall` and
-`ENV PYTHONPATH` lines are read, not run; the base image's Python (3.13) and lack of a
+**Not verified.** The image was not built (no Docker): the `COPY`, the `rm -rf` of the tests,
+`compileall`, `chmod -R a+rX` and `ENV PYTHONPATH` lines, and the `gosu` 991 read of `/modules`,
+are read, not run; the base image's Python (3.13) and lack of a
 `PYTHONPATH` were read from its registry config. Nothing ran on Railway or against Postgres (the
 module does no database work of its own; `get_room_state` is Synapse's). The two-orgs end-to-end
-check on Railway is **not done**. Federation was not exercised (off in the config). Load: one
+check on Railway is **not done** (#235 stays open until it is). Federation was not exercised (off in the config). Load: one
 room-state read per join, none for invites, publishes or directory hits; not measured.
 
 ## 7. Super admin, and no org admins

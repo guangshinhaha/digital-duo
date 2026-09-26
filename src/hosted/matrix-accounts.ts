@@ -24,12 +24,18 @@ export const SERVICE_ACCOUNT_LOCALPART = "workspace-admin";
 
 /** A tenant id, or `root`: what may follow the first dot. */
 const HANDLE_PATTERN = /^[a-z0-9]+$/;
-/** A Matrix server_name: a hostname, optionally with a port. Permanent once accounts exist. */
-const SERVER_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.-]*(:\d{1,5})?$/;
+/**
+ * A Matrix server_name: a bare hostname. No port: Synapse's org-wall module (deploy/synapse/modules/duo_org_wall)
+ * splits `@local:server` and cannot read `@x:host:8448`, and refuses to start on a server_name with a port, so
+ * accepting one here would provision accounts the wall then treats as having no org. Permanent once accounts exist.
+ */
+const SERVER_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.-]*$/;
 
 export function assertServerName(serverName: string): string {
   if (!SERVER_NAME_PATTERN.test(serverName)) {
-    throw new Error(`Matrix server name ${JSON.stringify(serverName)} is not a hostname (optionally with a port).`);
+    throw new Error(
+      `Matrix server name ${JSON.stringify(serverName)} is not a bare hostname (a port is not supported: the org wall cannot read \`@x:host:port\` ids).`
+    );
   }
   return serverName;
 }

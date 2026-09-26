@@ -36,6 +36,12 @@ class OrgOf(unittest.TestCase):
             "orga1111.alice:duo",
             "@orga-1111.alice:duo",
             "@orga1111.alice:duo:extra",
+            # `$` matches before a trailing newline; the parse must not (fullmatch), or these read as org orga1111.
+            "@orga1111.zzz\n:duo",
+            "@orga1111.alice:duo\n",
+            "@orga1111\n.alice:duo",
+            "@orga1111.alice\n:duo",
+            "@duo-orga1111.alice\n:duo",
             "",
             None,
             42,
@@ -98,6 +104,18 @@ class Joins(unittest.TestCase):
         self.assertEqual(wall.orgs_in_room({"@mallory:duo": "join"}), frozenset({None}))
 
 
+def member(who, membership="invite"):
+    return {"type": "m.room.member", "state_key": who, "content": {"membership": membership, "reason": "spam"}}
+
+
+def history(value):
+    return {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": value}}
+
+
+def guests(value):
+    return {"type": "m.room.guest_access", "state_key": "", "content": {"guest_access": value}}
+
+
 def state(rule, **extra):
     return {"type": "m.room.join_rules", "state_key": "", "content": {"join_rule": rule, **extra}}
 
@@ -151,6 +169,39 @@ class CreateRoom(unittest.TestCase):
         self.assertEqual(self.create(None), rules.ERR_CREATE)
         self.assertEqual(self.create([]), rules.ERR_CREATE)
 
+    def test_a_member_entry_in_initial_state_is_refused(self):
+        # Synapse writes initial_state events with no invite check, so an invite for another org's user would be delivered.
+        for entry in [
+            member(B1),
+            member(B1_DUO),
+            member(A2),  # a fresh room needs none, even a same-org one: refuse them all
+            member(A1, "join"),
+            member(B1, "join"),
+            member(B1, "leave"),
+            {"type": "m.room.member", "content": {"membership": "invite"}},
+            {"type": "m.room.member"},
+        ]:
+            self.assertEqual(self.create({"initial_state": [entry]}), rules.ERR_INVITE, entry)
+            self.assertEqual(self.create({"initial_state": [state("invite"), {"type": "m.room.name", "content": {"name": "n"}}, entry]}), rules.ERR_INVITE, entry)
+        self.assertIsNone(self.create({"initial_state": [member(B1)]}, user=ADMIN))
+
+    def test_history_visibility_may_not_make_the_room_readable_by_others(self):
+        for value in ("invited", "joined", "shared"):
+            self.assertIsNone(self.create({"initial_state": [history(value)]}), value)
+        for value in ("world_readable", "WORLD_READABLE", "bogus", "", None, 3, ["shared"]):
+            self.assertEqual(self.create({"initial_state": [history(value)]}), rules.ERR_PUBLIC, value)
+        self.assertEqual(self.create({"initial_state": [{"type": "m.room.history_visibility", "content": {}}]}), rules.ERR_PUBLIC)
+        self.assertEqual(self.create({"initial_state": [{"type": "m.room.history_visibility"}]}), rules.ERR_PUBLIC)
+        self.assertEqual(self.create({"initial_state": [history("shared"), history("world_readable")]}), rules.ERR_PUBLIC)
+
+    def test_guest_access_in_initial_state_is_not_judged(self):
+        # Synapse's private_chat preset writes can_join itself and a room upgrade copies it; refusing it here breaks upgrades.
+        for value in ("forbidden", "can_join"):
+            self.assertIsNone(self.create({"initial_state": [guests(value)]}), value)
+
+    def test_the_service_account_may_still_set_any_of_it(self):
+        self.assertIsNone(self.create({"initial_state": [history("world_readable"), member(B1)]}, user=ADMIN))
+
     def test_restricted_only_to_a_room_of_the_creators_org(self):
         good = {"!space:duo": frozenset({"orga1111"})}
         self.assertIsNone(self.create({"initial_state": [state("restricted", allow=ALLOW("!space:duo"))]}, restricted=good))
@@ -191,6 +242,24 @@ class JoinRulesEvents(unittest.TestCase):
             self.assertEqual(wall.may_send_join_rules(A1, content, {}), rules.ERR_PUBLIC, content)
         self.assertEqual(wall.may_send_join_rules("@mallory:duo", {"join_rule": "invite"}, {}), rules.ERR_NO_ORG)
         self.assertIsNone(wall.may_send_join_rules(ADMIN, {"join_rule": "public"}, {}))
+
+
+class ReadabilityEvents(unittest.TestCase):
+    def test_no_room_becomes_readable_by_others_afterwards(self):
+        for value in ("invited", "joined", "shared"):
+            self.assertIsNone(wall.may_send_readability(A1, rules.HISTORY_EVENT, {"history_visibility": value}), value)
+        for content in [{"history_visibility": "world_readable"}, {"history_visibility": "x"}, {}, None, "world_readable"]:
+            self.assertEqual(wall.may_send_readability(A1, rules.HISTORY_EVENT, content), rules.ERR_PUBLIC, content)
+        self.assertIsNone(wall.may_send_readability(A1, rules.GUEST_EVENT, {"guest_access": "forbidden"}))
+        for content in [{"guest_access": "can_join"}, {}, None]:
+            self.assertEqual(wall.may_send_readability(A1, rules.GUEST_EVENT, content), rules.ERR_PUBLIC, content)
+
+    def test_org_less_senders_are_refused_and_the_service_account_is_exempt(self):
+        self.assertEqual(wall.may_send_readability("@mallory:duo", rules.HISTORY_EVENT, {"history_visibility": "shared"}), rules.ERR_NO_ORG)
+        self.assertIsNone(wall.may_send_readability(ADMIN, rules.HISTORY_EVENT, {"history_visibility": "world_readable"}))
+
+    def test_other_event_types_are_not_judged_here(self):
+        self.assertIsNone(wall.may_send_readability(A1, "m.room.message", {"body": "x"}))
 
 
 class PublishAnd3pid(unittest.TestCase):
@@ -238,9 +307,21 @@ class Config(unittest.TestCase):
             {"server_name": "duo", "service_accounts": ["workspace-admin"]},
             {"server_name": "duo", "service_accounts": [42]},
             {"server_name": "duo:8448", "service_accounts": ["@workspace-admin:duo:8448"]},
+            {"server_name": "duo\n", "service_accounts": ["@workspace-admin:duo\n"]},
+            {"server_name": "duo", "service_accounts": ["@workspace-admin:duo\n"]},
+            {"server_name": "duo", "service_accounts": ["@workspace-admin\n:duo"]},
+            {"server_name": "du o", "service_accounts": ["@workspace-admin:du o"]},
+            {"server_name": "@duo", "service_accounts": ["@workspace-admin:@duo"]},
         ]:
             with self.assertRaises(ValueError, msg=repr(bad)):
                 rules.parse_config(bad)
+
+    def test_a_server_name_with_a_port_is_refused_with_a_clear_reason(self):
+        # `@x:host:8448` cannot be split into localpart and server by this parse; src/hosted/matrix-accounts.ts
+        # (assertServerName) refuses a port for the same reason, so the two agree.
+        with self.assertRaises(ValueError) as caught:
+            rules.parse_config({"server_name": "duo:8448", "service_accounts": ["@workspace-admin:duo:8448"]})
+        self.assertIn("port", str(caught.exception))
 
 
 if __name__ == "__main__":

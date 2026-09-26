@@ -10,8 +10,14 @@ RUN chmod +x /start.sh
 # `modules:` block render_config.py writes. On PYTHONPATH, not pip-installed:
 # it is three small files, and the base image has no build step for it.
 # Compiled here because Synapse runs as 991, which cannot write __pycache__.
+# The tests are removed here as well as by .dockerignore (which depends on the uploader
+# honouring it): faulty.py is a module that raises, and none of it belongs on PYTHONPATH.
+# chmod after the compile, so 991 can read the sources and the .pyc whatever mode the build
+# context had (a checkout made under umask 077 would otherwise stop Synapse starting).
 COPY modules/ /modules/
-RUN python -m compileall -q /modules
+RUN rm -rf /modules/duo_org_wall/tests \
+ && python -m compileall -q /modules \
+ && chmod -R a+rX /modules
 ENV PYTHONPATH=/modules
 # The base image's entrypoint (/start.py) generates config from SYNAPSE_* env
 # and then drops to 991:991 with gosu; ours renders a fixed, reviewed config

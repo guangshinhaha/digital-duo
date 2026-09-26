@@ -69,7 +69,12 @@ class DuoOrgWall:
         return Codes.FORBIDDEN, {"error": "This request cannot be checked right now."}
 
     async def _members(self, room_id: str) -> dict[str, str]:
-        """user id -> membership, from the local room state (a database read, no network)."""
+        """user id -> membership, from the local room state (a database read, no network).
+
+        Read fresh on every call and not cached: a room's orgs change when the service account invites
+        someone (its invites are not judged, so no callback would clear a cache), and a stale answer is a
+        hole in the wall. The cost was measured (hosted-workspace.md §6.2): about 3 ms at 400 members.
+        """
         state = await self._api.get_room_state(room_id, [("m.room.member", None)])
         return {
             key[1]: str(event.content.get("membership"))
@@ -127,14 +132,17 @@ class DuoOrgWall:
 
     async def check_event_for_spam(self, event):
         # Runs for every event a local client sends: answer at once unless it is
-        # a join-rules event. (Room creation never comes through here, which is
-        # why user_may_create_room reads initial_state.) Not user_may_send_state_event:
+        # a join-rules, history-visibility or guest-access event (the state that can
+        # open a room to people outside it). Room creation never comes through here,
+        # which is why user_may_create_room reads initial_state. Not user_may_send_state_event:
         # experimental, and on v1.161.0 it drops the (Codes, dict) pair, so the person
         # would get Synapse's fixed sentence instead of ours.
         try:
-            if event.type != rules.JOIN_RULES_EVENT:
-                return NOT_SPAM
-            return await self._join_rules_verdict("check_event_for_spam", event.sender, event.content)
+            if event.type == rules.JOIN_RULES_EVENT:
+                return await self._join_rules_verdict("check_event_for_spam", event.sender, event.content)
+            if event.type in rules.READABILITY_EVENTS:
+                return self._verdict("check_event_for_spam", self._wall.may_send_readability(event.sender, event.type, event.content))
+            return NOT_SPAM
         except Exception as error:
             return self._failed("check_event_for_spam", error)
 

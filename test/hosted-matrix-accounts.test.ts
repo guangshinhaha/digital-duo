@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertServerName,
   duoUserIdOrThrow,
   MatrixProvisioner,
   orgIdOfUserId,
@@ -61,6 +62,12 @@ describe("account naming (docs/deploy/hosted-workspace.md §4)", () => {
     expect(() => personUserIdFor("org", "a.b", "duo")).toThrow(/handle/);
     expect(() => personUserIdFor("org", "abc", "duo/evil")).toThrow(/server name/);
     expect(() => duoUserIdOrThrow("not-shaped")).toThrow(/not @localpart:server shaped/);
+  });
+
+  it("refuses a server name with a port, as the org wall's module does (it cannot read @x:host:port)", () => {
+    expect(() => personUserIdFor("org", "abc", "duo.example:8448")).toThrow(/port is not supported/);
+    expect(() => assertServerName("duo:8448")).toThrow(/bare hostname/);
+    expect(assertServerName("duo.example.com")).toBe("duo.example.com");
   });
 });
 
