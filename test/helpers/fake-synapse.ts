@@ -41,6 +41,8 @@ export interface FakeSynapse {
   failNext(count: number, status: number, errcode?: string): void;
   /** Make the next call hang until its abort signal fires. */
   hangNext(): void;
+  /** #233: the clock `whoami` judges a minted token's `valid_until_ms` by (default: real time). */
+  now?: () => number;
 }
 
 export function createFakeSynapse(options: { adminToken?: string; serverName?: string } = {}): FakeSynapse {
@@ -51,6 +53,7 @@ export function createFakeSynapse(options: { adminToken?: string; serverName?: s
   const requests: FakeRequest[] = [];
   let failures: { count: number; status: number; errcode: string } | null = null;
   let hang = false;
+  const loggedOut = new Set<string>(); // #233
 
   const json = (status: number, body: unknown) =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -92,6 +95,27 @@ export function createFakeSynapse(options: { adminToken?: string; serverName?: s
         failures.count -= 1;
         return json(failures.status, { errcode: failures.errcode, error: `Injected failure (token ${adminToken})` });
       }
+      // --- #233: a minted token is a real credential on the fake, as it is on Synapse. ---
+      // `whoami` with a minted token answers as that token's own user, so a test can prove whose
+      // session it was handed. A token past its `valid_until_ms` (per `fake.now`) is refused.
+      if (method === "GET" && url.pathname === "/_matrix/client/v3/account/whoami") {
+        const bearer = headers.get("authorization")?.replace(/^Bearer /, "");
+        const session = minted.find((entry) => entry.token === bearer);
+        if (session) {
+          const expired = loggedOut.has(session.token) || (session.validUntilMs !== null && session.validUntilMs <= (fake.now?.() ?? Date.now()));
+          return expired ? json(401, { errcode: "M_UNKNOWN_TOKEN", error: "Access token has expired" }) : json(200, { user_id: session.userId });
+        }
+      }
+      // A client signing out: `POST /_matrix/client/v3/logout` with its own token expires that token only.
+      if (method === "POST" && url.pathname === "/_matrix/client/v3/logout") {
+        const bearer = headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+        if (minted.some((entry) => entry.token === bearer) && !loggedOut.has(bearer)) {
+          loggedOut.add(bearer);
+          return json(200, {});
+        }
+        return json(401, { errcode: "M_UNKNOWN_TOKEN", error: "Invalid access token" });
+      }
+      // --- end #233 ---
       if (headers.get("authorization") !== `Bearer ${adminToken}`) {
         return json(401, { errcode: "M_UNKNOWN_TOKEN", error: "Invalid access token" });
       }

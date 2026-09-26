@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
-import { createServer, type ServeDeps } from "../serve/server.js";
+import { createServer, type ServeDeps, type WorkspaceSessionAccess } from "../serve/server.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
@@ -16,6 +16,7 @@ import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
 import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedTenant } from "./registry.js";
 import { assertSynapseBaseUrl, SynapseAdmin, SynapseConfigError } from "./synapse-admin.js";
+import { WorkspaceSessions } from "./workspace-session.js";
 
 /** Where a hosted duo lives: everything under one directory per duo, nothing shared between them. */
 export function tenantPaths(hostedRoot: string, tenantId: string) {
@@ -200,7 +201,7 @@ export function rootEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return copy;
 }
 
-export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string): ServeDeps {
+export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string, workspaceSession?: WorkspaceSessionAccess): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
   return {
     storePath: paths.storePath,
@@ -225,6 +226,7 @@ export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, t
       DUO_SHARED_USAGE_LOG_PATH: paths.sharedUsageLogPath,
     },
     trustProxy: shared.trustProxy,
+    ...(workspaceSession ? { workspaceSession } : {}),
   };
 }
 
@@ -270,14 +272,19 @@ export interface HostedServerExtras {
   readonly log?: (line: string) => void;
   /** How long a sign-up waits for provisioning before answering anyway (default 5s). */
   readonly signupProvisionWaitMs?: number;
-  /** Per-call timeout for Synapse admin requests (default 10s). */
+  /** Per-call timeout for Synapse admin requests (default 10s). Also the workspace-session mint's, which defaults to a shorter 5s so a hung Synapse does not hold a client's request. */
   readonly synapseTimeoutMs?: number;
+  /** The clock the workspace-session cache judges token age and expiry by (default: real time). */
+  readonly sessionNow?: () => number;
   /** How often owed provisioning is retried (default 60s). */
   readonly provisionRetryMs?: number;
 }
 
 const DEFAULT_SIGNUP_PROVISION_WAIT_MS = 5_000;
 const DEFAULT_PROVISION_RETRY_MS = 60_000;
+const DEFAULT_SESSION_TIMEOUT_MS = 5_000;
+/** `POST|DELETE /workspace/session` at the bare origin (the root duo) or under `/t/<id>` (a tenant duo). */
+const WORKSPACE_SESSION_PATH = /^(?:\/t\/[a-z0-9]+)?\/workspace\/session(?:\?.*)?$/;
 
 export interface HostedServer {
   /** The front: dispatches `/hosted/*` to the control app, `/t/<id>/*` to that duo, anything else to the root duo when there is one. */
@@ -306,11 +313,36 @@ export async function createHostedServer(
   extras: HostedServerExtras = {},
 ): Promise<HostedServer> {
   const registry = new HostedRegistry(join(settings.hostedRoot, "registry.json"), settings.masterKey);
+  // A person's own Matrix session for the signed-in app (#233). Needs the public URL clients are given;
+  // without it the per-duo route answers as if workspace sign-in were not set up. Each duo gets a handle
+  // bound to its own id, so the route never takes an account from the request.
+  const sessions =
+    settings.synapse?.publicUrl
+      ? new WorkspaceSessions({
+          registry,
+          admin: new SynapseAdmin({
+            baseUrl: settings.synapse.adminUrl,
+            adminToken: settings.synapse.adminToken,
+            fetch: extras.synapseFetch,
+            timeoutMs: extras.synapseTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
+          }),
+          publicUrl: settings.synapse.publicUrl,
+          log: extras.log,
+          now: extras.sessionNow,
+        })
+      : undefined;
+  const sessionAccess = (duoId: string): WorkspaceSessionAccess | undefined =>
+    sessions && {
+      session: () => sessions.sessionFor(duoId),
+      renew: () => sessions.renew(duoId),
+      end: () => void sessions.end(duoId),
+    };
   const duos = new Map<string, MountedDuo>();
   for (const tenant of registry.tenants()) {
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant))));
+    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant), sessionAccess(tenant.id))));
   }
-  const rootDuo = root ? await mountDuo(root) : undefined;
+  const rootAccess = sessionAccess(ROOT_DUO_ID);
+  const rootDuo = root ? await mountDuo(rootAccess ? { ...root, workspaceSession: rootAccess } : root) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
   }
@@ -541,7 +573,7 @@ export async function createHostedServer(
       tenantId,
       identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
     );
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
+    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id))));
     if (matrix) {
       // Redeeming an invite must not depend on Synapse: wait a moment so the app can usually connect
       // straight away, then answer regardless. A failed or slow run leaves the duo pending for the retry.
@@ -682,6 +714,17 @@ export async function createHostedServer(
   };
 
   const front = createHttpServer((request: IncomingMessage, response: ServerResponse) => {
+    // The server-side admin token belongs to no duo, so the duo's own auth would call it an unknown device
+    // (401). The workspace-session route tells it apart (403 no_duo, as the admin token is not a bad
+    // credential, just not a person's) before dispatching. Constant-time, no store is read.
+    if (request.method !== "OPTIONS" && WORKSPACE_SESSION_PATH.test(request.url ?? "")) {
+      const header = request.headers.authorization;
+      if (header?.startsWith("Bearer ") && constantTimeEquals(header.slice("Bearer ".length), settings.adminToken)) {
+        response.writeHead(403, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({ error: { code: "no_duo", message: "The admin token belongs to no duo and has no workspace account. Sign in as a person." } }));
+        return;
+      }
+    }
     const target = route(request);
     if (!target) {
       response.writeHead(404, { "content-type": "application/json" });

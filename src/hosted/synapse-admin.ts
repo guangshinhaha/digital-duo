@@ -136,14 +136,32 @@ export class SynapseAdmin {
     return userId;
   }
 
-  private async call(method: "GET" | "PUT" | "POST", path: string, body?: unknown): Promise<{ status: number; json: unknown }> {
+  /**
+   * Ends a person's OWN access token (`POST /_matrix/client/v3/logout`, with that token as the bearer).
+   * Used when a device of the duo is revoked, so a session the daemon handed out stops working now and
+   * not at its expiry (#233). A token Synapse already refuses (401) is already ended, so that is not an
+   * error; an outage throws as elsewhere and the caller treats this as best effort. The token travels
+   * only in the `Authorization` header, like the admin token.
+   */
+  async logoutAs(accessToken: string): Promise<void> {
+    try {
+      await this.call("POST", "/_matrix/client/v3/logout", {}, accessToken);
+    } catch (error) {
+      if (error instanceof SynapseAdminError && error.status === 401) {
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async call(method: "GET" | "PUT" | "POST", path: string, body?: unknown, bearer: string = this.adminToken): Promise<{ status: number; json: unknown }> {
     const label = `${method} ${path.replace(/\/users\/[^/]+/, "/users/<id>")}`;
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, {
         method,
         headers: {
-          authorization: `Bearer ${this.adminToken}`,
+          authorization: `Bearer ${bearer}`,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),

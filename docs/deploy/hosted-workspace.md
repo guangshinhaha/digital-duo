@@ -363,7 +363,19 @@ Written plainly, because these are what a security reviewer will ask about.
 
 - **A person's session** is minted on demand for the Google-signed-in caller's own account only:
   `POST /_synapse/admin/v1/users/<personUserId>/login` with `valid_until_ms`, returned to the app
-  with the public homeserver URL. The daemon does not keep it. The route never mints the duo's.
+  with the public homeserver URL. The route never mints the duo's. The route is per duo
+  (`POST /t/<tenantId>/workspace/session`, or `/workspace/session` for the root duo), served by
+  that duo's own device-token auth, so the token is verified in one store and no request field
+  names an account. **The daemon keeps the token, in memory only** (one live bearer per active
+  person, at most 24 hours, never on disk or in the registry, gone on restart), so that it can
+  hand the same token out again instead of minting per request, and can end it: when a device of
+  the duo is revoked, or the duo is ended, it makes a best-effort Matrix `POST /_matrix/client/v3/logout`
+  with that token and forgets it. The daemon never probes the token at Synapse (not even
+  `whoami`): any authenticated call as the person makes Synapse record the caller's address and
+  user agent against the token (`user_ips`), which would be the daemon's, every few minutes. A
+  client whose token Matrix refuses (`M_UNKNOWN_TOKEN`) calls `DELETE` on the same route and asks
+  again. The trade-off is that this process's memory holds a live bearer for the people who are
+  active in every org.
 - **A duo's connection** uses the token from the registry (§3), decrypted in the daemon, in
   place of `DUO_WORKSPACE_ACCESS_TOKEN`. The existing single-owner env variables
   (`DUO_WORKSPACE_HOMESERVER`, `DUO_WORKSPACE_ACCESS_TOKEN`, `DUO_WORKSPACE_USER_ID`) are read
@@ -478,9 +490,12 @@ comment on each child issue.
   `deviceId: null` (the transport does not use one). A client needing a device for end-to-end
   encryption would have to create one separately
   (`POST /_synapse/admin/v2/users/<user_id>/devices`); the POC does not depend on E2EE. The
-  daemon cannot revoke a person's minted token, so "sign out revokes" means the client calls
-  `/logout` itself, and a short `valid_until_ms` is the server-side bound. Return the public
-  URL from `DUO_WORKSPACE_PUBLIC_URL`, not the private one.
+  daemon does hold the token it minted (in memory, §8), so revoking a device ends it with a
+  best-effort `/logout`; "sign out revokes" for the client's own sign-out is still the client
+  calling `/logout`, and a short `valid_until_ms` is the server-side bound when either fails.
+  Return the public URL from `DUO_WORKSPACE_PUBLIC_URL`, not the private one. Shipped in
+  PR #244: the route lives on each duo (`/t/<id>/workspace/session`), not under `/hosted`, so the
+  device token is verified in the one store it names.
 - **#234** (Spaces) must create the Space and `#general` as non-public rooms, keep
   `@workspace-admin` in each, and treat its provisioning joins as calls that pass through the
   module (§6.2).
