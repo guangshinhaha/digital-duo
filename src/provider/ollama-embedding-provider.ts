@@ -15,6 +15,7 @@ class OllamaEmbeddingProvider implements EmbeddingProvider {
   constructor(
     private readonly host: string,
     readonly model: string,
+    private readonly numThread: number | undefined,
   ) {}
 
   async embed(text: string): Promise<readonly number[]> {
@@ -23,7 +24,11 @@ class OllamaEmbeddingProvider implements EmbeddingProvider {
       response = await fetch(`${this.host}/api/embeddings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model, prompt: text }),
+        body: JSON.stringify({
+          model: this.model,
+          prompt: text,
+          ...(this.numThread === undefined ? {} : { options: { num_thread: this.numThread } }),
+        }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (cause) {
@@ -65,5 +70,5 @@ export function createOllamaEmbeddingProvider(config: DuoConfig): EmbeddingProvi
   if (!config.ollama.embeddingModel) {
     throw new ProviderConfigError("DUO_OLLAMA_EMBEDDING_MODEL");
   }
-  return new OllamaEmbeddingProvider(config.ollama.host, config.ollama.embeddingModel);
+  return new OllamaEmbeddingProvider(config.ollama.host, config.ollama.embeddingModel, config.ollama.numThread);
 }

@@ -127,6 +127,11 @@ function parseNumberEnv(raw: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parsePositiveIntEnv(raw: string | undefined): number | undefined {
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 export interface DuoConfig {
   /** Raw configured provider name, or undefined when DUO_PROVIDER is unset. */
   providerName: string | undefined;
@@ -145,6 +150,8 @@ export interface DuoConfig {
     model: string | undefined;
     /** Ollama embedding model name. Defaults to "nomic-embed-text". */
     embeddingModel: string;
+    /** DUO_OLLAMA_NUM_THREAD, sent as Ollama's `num_thread` option; undefined leaves Ollama's own choice. Set it to the container's CPU quota: Ollama counts host cores, and a 48-thread runner in an 8-vCPU container throttles to ~15s per embedding. */
+    numThread: number | undefined;
   };
   /** The OpenRouter completion provider (DUO_PROVIDER=openrouter). Undefined apiKey means "not configured" — the provider refuses at construction rather than guessing. */
   openrouter: {
@@ -246,6 +253,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
       model: env.DUO_OLLAMA_MODEL || undefined,
       embeddingModel: env.DUO_OLLAMA_EMBEDDING_MODEL || DEFAULT_OLLAMA_EMBEDDING_MODEL,
+      numThread: parsePositiveIntEnv(env.DUO_OLLAMA_NUM_THREAD),
     },
     openrouter: {
       apiKey: env.DUO_OPENROUTER_API_KEY || undefined,

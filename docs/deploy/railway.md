@@ -31,6 +31,7 @@ Railway's edge terminates TLS and is the only inbound path, so the daemon binds 
 | `DUO_OPENROUTER_API_KEY` | Your OpenRouter key |
 | `DUO_OPENROUTER_MODEL` | Optional. Defaults to `openrouter/auto` (OpenRouter picks the model per prompt). |
 | `DUO_OLLAMA_HOST` | `http://${{ollama.RAILWAY_PRIVATE_DOMAIN}}:11434` |
+| `DUO_OLLAMA_NUM_THREAD` | The `ollama` service's vCPU limit, e.g. `4`. Ollama sizes its threads to the host's 48 cores, not the container's quota, and the throttling makes each embedding take 15–30s (the "Ollama unreachable … timeout" on the Embed step). |
 | `DUO_CORS_ORIGINS` | `https://${{duo-web.RAILWAY_PUBLIC_DOMAIN}}` |
 | `DUO_OWNER_NAME` | Your name, as public answers attribute it |
 
