@@ -87,6 +87,7 @@ describe("loadConfig", () => {
       duoDir: "/tmp/duo-out",
       ownerName: "Priya Nair",
       ollama: { host: "http://h:1", model: "llama3", embeddingModel: "custom-embed" },
+      openrouter: { apiKey: undefined, model: "openrouter/auto", baseUrl: "https://openrouter.ai/api/v1" },
       confidence: {
         weights: { selfConsistency: 0.4, retrievalStrength: 0.2, ruleHit: 0.2, recency: 0.15, selfReport: 0.05 },
         escalationThreshold: 0.6,

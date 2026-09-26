@@ -39,6 +39,8 @@ export class ServePassphraseMismatchError extends Error {
 export interface ServeOptions {
   readonly host: string | undefined;
   readonly port: number;
+  /** Allows a wildcard host — only for a container behind a TLS-terminating front (see assertServableHost). */
+  readonly behindProxy?: boolean;
 }
 
 /**
@@ -72,7 +74,7 @@ export async function runServe(
   workspaceTransportFactory: WorkspaceTransportFactory = defaultWorkspaceTransportFactory,
 ): Promise<{ address: string; close: () => Promise<void> }> {
   requireStoreExists(config.storePath);
-  assertServableHost(options.host);
+  assertServableHost(options.host, { behindProxy: options.behindProxy });
   // Boot refusals in the assertServableHost family: a half-configured
   // workspace (or a plaintext homeserver URL) must fail loudly before any
   // socket opens, not surface later as a duo that silently isn't there.

@@ -131,10 +131,14 @@ program
   )
   .option("--host <host>", "the address to bind — a tailnet IP, or 127.0.0.1 for local-only. Never a wildcard.")
   .option("--port <port>", "the port to bind", parseIntegerOption("--port"), 7717)
-  .action(async (options: { host?: string; port: number }) => {
+  .option(
+    "--behind-proxy",
+    "allow a wildcard --host — only for a container whose sole inbound path is a TLS-terminating front (e.g. Railway)",
+  )
+  .action(async (options: { host?: string; port: number; behindProxy?: boolean }) => {
     const config = loadConfig();
     try {
-      const { address } = await runServe({ host: options.host, port: options.port }, config);
+      const { address } = await runServe({ host: options.host, port: options.port, behindProxy: options.behindProxy }, config);
       console.error(`duo serve listening on ${address}`);
     } catch (error) {
       reportError(error);

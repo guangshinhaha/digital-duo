@@ -8,6 +8,12 @@ const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 // — unlike the completion model, this doesn't wait on G1, so it gets a real
 // default rather than requiring explicit configuration.
 const DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text";
+// The hosted completion provider for the Railway POC (docs/deploy/railway.md).
+// "openrouter/auto" is OpenRouter's own router — the owner's call was to let
+// OpenRouter pick the model rather than pin one. The key has no default on
+// purpose, same as DUO_JEV_API_KEY.
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_OPENROUTER_MODEL = "openrouter/auto";
 // The classification ceiling is policy-set, not owner-set (#48 AC: "set by
 // configuration under policy control, not by the owner in the UI"), and
 // defaults to the most conservative real-world default rather than the
@@ -140,6 +146,15 @@ export interface DuoConfig {
     /** Ollama embedding model name. Defaults to "nomic-embed-text". */
     embeddingModel: string;
   };
+  /** The OpenRouter completion provider (DUO_PROVIDER=openrouter). Undefined apiKey means "not configured" — the provider refuses at construction rather than guessing. */
+  openrouter: {
+    /** DUO_OPENROUTER_API_KEY, or undefined when unset — there is deliberately no default. */
+    apiKey: string | undefined;
+    /** Model slug. Defaults to "openrouter/auto" (OpenRouter's Auto Router picks per prompt). */
+    model: string;
+    /** API base URL. Defaults to "https://openrouter.ai/api/v1". */
+    baseUrl: string;
+  };
   /** #33: the draft pipeline's composite-confidence knobs, all configuration rather than code so the eval harness can sweep them. */
   confidence: {
     weights: {
@@ -231,6 +246,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
       host: env.DUO_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
       model: env.DUO_OLLAMA_MODEL || undefined,
       embeddingModel: env.DUO_OLLAMA_EMBEDDING_MODEL || DEFAULT_OLLAMA_EMBEDDING_MODEL,
+    },
+    openrouter: {
+      apiKey: env.DUO_OPENROUTER_API_KEY || undefined,
+      model: env.DUO_OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL,
+      baseUrl: env.DUO_OPENROUTER_BASE_URL || DEFAULT_OPENROUTER_BASE_URL,
     },
     confidence: {
       weights: {

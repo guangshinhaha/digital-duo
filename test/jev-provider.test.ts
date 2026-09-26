@@ -271,7 +271,7 @@ describe("JevProvider.decide — answer-shape edges and accounting coercion (wir
 });
 
 describe("registry guard — Jev never enters the production registry (KTD3/G1)", () => {
-  it("defaultRegistry keys remain exactly ['ollama']", () => {
-    expect(Object.keys(defaultRegistry)).toEqual(["ollama"]);
+  it("defaultRegistry never gains a jev entry", () => {
+    expect(Object.keys(defaultRegistry)).toEqual(["ollama", "openrouter"]);
   });
 });

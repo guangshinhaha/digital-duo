@@ -1,0 +1,14 @@
+node_modules
+dist
+data
+duo
+shared-duo-runtime
+duo-lifecycle-runtime
+jev-spike-runtime
+.git
+.claude
+test
+eval
+docs
+*.log
+.env
