@@ -137,19 +137,18 @@ export class SynapseAdmin {
   }
 
   /**
-   * The user a person's OWN access token belongs to (`GET /_matrix/client/v3/account/whoami`, with that
-   * token as the bearer), or null when Synapse no longer accepts it (expired, or the client logged out).
-   * Used to check a token the daemon minted earlier before handing it out again (#233). The token
-   * travels only in the `Authorization` header, like the admin token; an outage throws as elsewhere.
+   * Ends a person's OWN access token (`POST /_matrix/client/v3/logout`, with that token as the bearer).
+   * Used when a device of the duo is revoked, so a session the daemon handed out stops working now and
+   * not at its expiry (#233). A token Synapse already refuses (401) is already ended, so that is not an
+   * error; an outage throws as elsewhere and the caller treats this as best effort. The token travels
+   * only in the `Authorization` header, like the admin token.
    */
-  async whoAmIAs(accessToken: string): Promise<string | null> {
+  async logoutAs(accessToken: string): Promise<void> {
     try {
-      const { json } = await this.call("GET", "/_matrix/client/v3/account/whoami", undefined, accessToken);
-      const userId = (json as { user_id?: unknown } | null)?.user_id;
-      return typeof userId === "string" && userId.startsWith("@") ? userId : null;
+      await this.call("POST", "/_matrix/client/v3/logout", {}, accessToken);
     } catch (error) {
       if (error instanceof SynapseAdminError && error.status === 401) {
-        return null;
+        return;
       }
       throw error;
     }

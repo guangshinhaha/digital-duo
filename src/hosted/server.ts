@@ -8,9 +8,9 @@ import { join } from "node:path";
 import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
-import { createServer, type ServeDeps } from "../serve/server.js";
+import { createServer, type ServeDeps, type WorkspaceSessionAccess } from "../serve/server.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
-import { createEncryptedStore, StoreNotInitializedError } from "../store/store.js";
+import { createEncryptedStore } from "../store/store.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
 import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
@@ -201,7 +201,7 @@ export function rootEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return copy;
 }
 
-export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string): ServeDeps {
+export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string, workspaceSession?: WorkspaceSessionAccess): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
   return {
     storePath: paths.storePath,
@@ -226,6 +226,7 @@ export function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, t
       DUO_SHARED_USAGE_LOG_PATH: paths.sharedUsageLogPath,
     },
     trustProxy: shared.trustProxy,
+    ...(workspaceSession ? { workspaceSession } : {}),
   };
 }
 
@@ -273,6 +274,8 @@ export interface HostedServerExtras {
   readonly signupProvisionWaitMs?: number;
   /** Per-call timeout for Synapse admin requests (default 10s). Also the workspace-session mint's, which defaults to a shorter 5s so a hung Synapse does not hold a client's request. */
   readonly synapseTimeoutMs?: number;
+  /** The clock the workspace-session cache judges token age and expiry by (default: real time). */
+  readonly sessionNow?: () => number;
   /** How often owed provisioning is retried (default 60s). */
   readonly provisionRetryMs?: number;
 }
@@ -280,8 +283,8 @@ export interface HostedServerExtras {
 const DEFAULT_SIGNUP_PROVISION_WAIT_MS = 5_000;
 const DEFAULT_PROVISION_RETRY_MS = 60_000;
 const DEFAULT_SESSION_TIMEOUT_MS = 5_000;
-/** How long a device token that identified its duo is trusted without re-checking every store: the same window as `src/serve/auth.ts`, so a revoked device stops opening sessions as soon as it stops opening anything else. */
-const SESSION_IDENTITY_TTL_MS = 5_000;
+/** `POST|DELETE /workspace/session` at the bare origin (the root duo) or under `/t/<id>` (a tenant duo). */
+const WORKSPACE_SESSION_PATH = /^(?:\/t\/[a-z0-9]+)?\/workspace\/session(?:\?.*)?$/;
 
 export interface HostedServer {
   /** The front: dispatches `/hosted/*` to the control app, `/t/<id>/*` to that duo, anything else to the root duo when there is one. */
@@ -310,11 +313,36 @@ export async function createHostedServer(
   extras: HostedServerExtras = {},
 ): Promise<HostedServer> {
   const registry = new HostedRegistry(join(settings.hostedRoot, "registry.json"), settings.masterKey);
+  // A person's own Matrix session for the signed-in app (#233). Needs the public URL clients are given;
+  // without it the per-duo route answers as if workspace sign-in were not set up. Each duo gets a handle
+  // bound to its own id, so the route never takes an account from the request.
+  const sessions =
+    settings.synapse?.publicUrl
+      ? new WorkspaceSessions({
+          registry,
+          admin: new SynapseAdmin({
+            baseUrl: settings.synapse.adminUrl,
+            adminToken: settings.synapse.adminToken,
+            fetch: extras.synapseFetch,
+            timeoutMs: extras.synapseTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
+          }),
+          publicUrl: settings.synapse.publicUrl,
+          log: extras.log,
+          now: extras.sessionNow,
+        })
+      : undefined;
+  const sessionAccess = (duoId: string): WorkspaceSessionAccess | undefined =>
+    sessions && {
+      session: () => sessions.sessionFor(duoId),
+      renew: () => sessions.renew(duoId),
+      end: () => void sessions.end(duoId),
+    };
   const duos = new Map<string, MountedDuo>();
   for (const tenant of registry.tenants()) {
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant))));
+    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant), sessionAccess(tenant.id))));
   }
-  const rootDuo = root ? await mountDuo(root) : undefined;
+  const rootAccess = sessionAccess(ROOT_DUO_ID);
+  const rootDuo = root ? await mountDuo(rootAccess ? { ...root, workspaceSession: rootAccess } : root) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
   }
@@ -331,22 +359,6 @@ export async function createHostedServer(
         retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
       })
     : undefined;
-  // A person's own Matrix session for the signed-in app (#233). Needs the public URL clients are given;
-  // without it the route answers as if workspace sign-in were not set up.
-  const sessions =
-    settings.synapse?.publicUrl
-      ? new WorkspaceSessions({
-          registry,
-          admin: new SynapseAdmin({
-            baseUrl: settings.synapse.adminUrl,
-            adminToken: settings.synapse.adminToken,
-            fetch: extras.synapseFetch,
-            timeoutMs: extras.synapseTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
-          }),
-          publicUrl: settings.synapse.publicUrl,
-          log: extras.log,
-        })
-      : undefined;
   // An unexpected failure is logged by name only (a message could quote something it should not), and never stops the server.
   const logUnexpected = (error: unknown): void => {
     (extras.log ?? ((line) => console.error(line)))(`hosted: Matrix provisioning failed unexpectedly (${error instanceof Error ? error.name : "error"})`);
@@ -561,7 +573,7 @@ export async function createHostedServer(
       tenantId,
       identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
     );
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
+    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id))));
     if (matrix) {
       // Redeeming an invite must not depend on Synapse: wait a moment so the app can usually connect
       // straight away, then answer regardless. A failed or slow run leaves the duo pending for the retry.
@@ -677,83 +689,6 @@ export async function createHostedServer(
     return { ...summary, outcomes: summary.outcomes.map(publicOutcome) };
   });
 
-  /**
-   * Which duo a device token belongs to, judged by the token alone (a request field never names a duo).
-   * Checks the root duo and every tenant's store, so it is cached briefly by the token's hash (the
-   * cost and the window are `src/serve/auth.ts`'s), and a wrong token counts against the caller's
-   * address like a failed sign-in, so scanning cannot be turned into a way to burn the server's CPU.
-   */
-  const identifiedDevices = new Map<string, { duoId: string; verifiedAt: number }>();
-  const duoOfDevice = (token: string): string | undefined => {
-    const key = createHash("sha256").update(token).digest("hex");
-    const cached = identifiedDevices.get(key);
-    if (cached && Date.now() - cached.verifiedAt <= SESSION_IDENTITY_TTL_MS) {
-      return cached.duoId;
-    }
-    identifiedDevices.delete(key);
-    const owns = (storePath: string, passphrase: string): boolean => {
-      try {
-        return verifyDeviceToken(storePath, passphrase, token) !== undefined;
-      } catch (error) {
-        // A duo whose store is gone cannot own a device; it must not fail everyone else's lookup.
-        if (error instanceof StoreNotInitializedError) {
-          return false;
-        }
-        throw error;
-      }
-    };
-    const duoId =
-      root && owns(root.storePath, root.passphrase)
-        ? ROOT_DUO_ID
-        : registry.tenants().find((tenant) => owns(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant)))?.id;
-    if (duoId !== undefined) {
-      identifiedDevices.set(key, { duoId, verifiedAt: Date.now() });
-    }
-    return duoId;
-  };
-
-  // The signed-in app's Matrix session (#233): a token for the caller's OWN person account, with the
-  // public homeserver URL. POST because it mints; the body is ignored, so nothing the caller sends can
-  // name another account. Only a duo's own device token is accepted: the server-side admin token has
-  // no duo, and an ask link is not in any `device_tokens` table.
-  control.post("/hosted/workspace/session", async (request, reply) => {
-    reply.header("cache-control", "no-store");
-    const header = request.headers.authorization;
-    const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-    if (!token) {
-      sendError(reply, 401, "unauthorized", "Sign in to get a workspace session.");
-      return;
-    }
-    if (constantTimeEquals(token, settings.adminToken)) {
-      sendError(reply, 403, "no_duo", "The admin token belongs to no duo and has no workspace account. Sign in as a person.");
-      return;
-    }
-    if (signupBlocked(request.ip)) {
-      sendError(reply, 429, "rate_limited", "Too many failed attempts from this address; try again later.");
-      return;
-    }
-    if (!sessions) {
-      sendError(reply, 404, "workspace_not_configured", "This server has no workspace to sign in to.");
-      return;
-    }
-    const duoId = duoOfDevice(token);
-    if (duoId === undefined) {
-      recordSignupFailure(request.ip);
-      sendError(reply, 401, "unauthorized", "Sign in again: this device is not recognised.");
-      return;
-    }
-    const outcome = await sessions.sessionFor(duoId);
-    if (outcome.status === "ok") {
-      return outcome.session;
-    }
-    reply.header("retry-after", "60");
-    if (outcome.status === "pending") {
-      sendError(reply, 503, "workspace_pending", "Your workspace account is still being set up. Try again in a minute.");
-    } else {
-      sendError(reply, 503, "workspace_unavailable", "The workspace is unreachable right now. Try again in a minute.");
-    }
-  });
-
   await control.ready();
   if (!controlServer) {
     throw new Error("hosted: the control server factory was never called");
@@ -779,6 +714,17 @@ export async function createHostedServer(
   };
 
   const front = createHttpServer((request: IncomingMessage, response: ServerResponse) => {
+    // The server-side admin token belongs to no duo, so the duo's own auth would call it an unknown device
+    // (401). The workspace-session route tells it apart (403 no_duo, as the admin token is not a bad
+    // credential, just not a person's) before dispatching. Constant-time, no store is read.
+    if (request.method !== "OPTIONS" && WORKSPACE_SESSION_PATH.test(request.url ?? "")) {
+      const header = request.headers.authorization;
+      if (header?.startsWith("Bearer ") && constantTimeEquals(header.slice("Bearer ".length), settings.adminToken)) {
+        response.writeHead(403, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({ error: { code: "no_duo", message: "The admin token belongs to no duo and has no workspace account. Sign in as a person." } }));
+        return;
+      }
+    }
     const target = route(request);
     if (!target) {
       response.writeHead(404, { "content-type": "application/json" });
