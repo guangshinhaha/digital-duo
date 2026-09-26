@@ -13,7 +13,7 @@ const hasPython = spawnSync("python3", ["--version"]).status === 0;
 function py(program: string, env: Record<string, string> = {}) {
   const result = spawnSync("python3", ["-c", program], {
     cwd: dir,
-    env: { PATH: process.env.PATH ?? "", ...env },
+    env: { PATH: process.env.PATH ?? "", PYTHONDONTWRITEBYTECODE: "1", ...env },
     encoding: "utf8",
   });
   return result;
