@@ -10,6 +10,7 @@ import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
 import { DuoWorkspaceConnections, jitterFactor, sdkLoggerFor } from "../src/hosted/duo-workspace.js";
+import type { IdentityVerifier } from "../src/hosted/google.js";
 import { HostedRegistry } from "../src/hosted/registry.js";
 import {
   createHostedServer,
@@ -91,6 +92,7 @@ async function start(
     settings?: Partial<HostedSettings>;
     inference?: InferenceProvider;
     extras?: HostedServerExtras;
+    identityVerifier?: IdentityVerifier;
   },
 ): Promise<Started> {
   const logs: string[] = [];
@@ -116,7 +118,7 @@ async function start(
     },
     settings,
     undefined,
-    undefined,
+    options.identityVerifier,
     {
       synapseFetch: options.fake.fetch,
       log: (line) => logs.push(line),
@@ -381,6 +383,36 @@ describe("each hosted duo connects to the workspace as itself and answers there 
     await expect.poll(async () => (await held(sam)).length).toBe(1);
     expect((await held(sam))[0]!.roomId).toBe("!room:duo.test");
     expect(await held(kim)).toEqual([]);
+  });
+
+  it("#261: a tenant's held invitations still reach its consent routes when the claude.ai connector is configured", async () => {
+    // `withConnector` only wraps deps when oauth is built, which needs an identityVerifier (Google sign-in) on
+    // top of the publicUrl/webUrl `start()` already sets. With one configured, sign-up needs a credential too
+    // (see `/hosted/signup`), so this fake resolves one instead of the plain-name path `joinDuo` uses.
+    const identityVerifier: IdentityVerifier = { verify: () => Promise.resolve({ subject: "google-sam", email: "sam@example.com", name: "Sam" }) };
+    const fake = createFakeSynapse();
+    const transports = new Transports();
+    const { hosted, base } = await start({ fake, transports, identityVerifier });
+    const invite = (await (
+      await fetch(`${base}/hosted/invites`, { method: "POST", headers: { "content-type": "application/json", ...admin }, body: JSON.stringify({ name: "Sam" }) })
+    ).json()) as { code: string };
+    const signupResponse = await fetch(`${base}/hosted/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ invite: invite.code, credential: "fake-google-credential" }),
+    });
+    expect(signupResponse.status).toBe(201);
+    const sam = (await signupResponse.json()) as { tenantId: string; token: string };
+    await connected(hosted, sam.tenantId);
+    const samUser = duoUserOf(hosted, sam.tenantId);
+    transports.latest(samUser).deliverInvite({ roomId: "!room:duo.test", inviterId: "@default.someone:duo.test", name: "Lunch", joinedMemberCount: 2 });
+
+    const held = async () =>
+      ((await (await fetch(`${base}/t/${sam.tenantId}/workspace/invites`, { headers: { authorization: `Bearer ${sam.token}` } })).json()) as { invites: Array<{ roomId: string }> }).invites;
+    // Before the fix: `deps.workspace` was frozen at `undefined` when withConnector spread it at mount time,
+    // so this held invitation would never be visible, forever, even after the connection came up above.
+    await expect.poll(async () => (await held()).length).toBe(1);
+    expect((await held())[0]!.roomId).toBe("!room:duo.test");
   });
 });
 
