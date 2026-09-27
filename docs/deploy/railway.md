@@ -41,6 +41,17 @@ Railway's edge terminates TLS and is the only inbound path, so the daemon binds 
 Volume: mount at `/data`. The store (`data/duo.db`), the derived `duo/` files and the runtime logs
 all live there. The container `cd`s into the volume, and `duo` on its PATH does the same.
 
+### Push notifications (optional, #251)
+
+| Variable | Value |
+|---|---|
+| `DUO_PUSH_VAPID_SUBJECT` | A `mailto:` address or `https:` URL — the VAPID spec's own "who to contact about abuse" field. Not set: push is silently off, nothing crashes, nothing sends a made-up contact address to a real push service. |
+
+Nothing else to set: the daemon generates its own VAPID key pair the first time anything asks for
+it (`GET /push/vapid-public-key`, or the first push send) and keeps it in the duo's own encrypted
+store — one identity, never rotated, the same one every registered device's subscription is tied
+to. The client's own contract for what a push carries and why is `docs/push.md` in the `duo` repo.
+
 ## First use
 
 ```sh

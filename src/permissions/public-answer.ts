@@ -160,6 +160,20 @@ export async function answerPublicly(
    * and are gone (#183 §3).
    */
   attachments?: readonly WorkspaceGroundedAttachment[],
+  /**
+   * digital-duo#251: called exactly when this resolves to `passed_on` —
+   * a draft the owner needs to look at, never for `answered` (already
+   * resolved with no owner action) or `declined_refused` (a boundary
+   * already set, nothing to decide). Optional and fire-and-forget by
+   * design: the CLI (`commands/permissions.ts`) and the MCP connector
+   * (`serve/mcp-tools.ts`) omit it — the owner does not need a push about
+   * a question they, or Claude on their behalf, just asked from where
+   * they already are. `POST /ask` and the workspace answering pipeline
+   * (`serve/server.ts`, `serve/workspace-wiring.ts`) are the two callers
+   * that pass one, since those are exactly "someone asked while the owner
+   * was elsewhere."
+   */
+  onEscalated?: (draftId: string) => void,
 ): Promise<PublicAnswerOutcome> {
   // The asker-context fields every one of the three log appends below
   // carries identically — only topicId/outcome/text/draftId vary by branch.
@@ -193,9 +207,11 @@ export async function answerPublicly(
       text: message,
       draftId: pipelineResult.draftId,
     });
-    return pipelineResult.refused
-      ? { kind: "declined_refused", draftId: pipelineResult.draftId, logEntryId, message }
-      : { kind: "passed_on", draftId: pipelineResult.draftId, logEntryId, message, topicId: undefined, ownerNotice: undefined };
+    if (pipelineResult.refused) {
+      return { kind: "declined_refused", draftId: pipelineResult.draftId, logEntryId, message };
+    }
+    onEscalated?.(pipelineResult.draftId);
+    return { kind: "passed_on", draftId: pipelineResult.draftId, logEntryId, message, topicId: undefined, ownerNotice: undefined };
   }
 
   const topicId = pipelineResult.topicId;
@@ -219,6 +235,7 @@ export async function answerPublicly(
       text: message,
       draftId: pipelineResult.draftId,
     });
+    onEscalated?.(pipelineResult.draftId);
     return {
       kind: "passed_on",
       draftId: pipelineResult.draftId,

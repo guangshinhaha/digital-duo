@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { deleteSubscriptionRow } from "../push/subscriptions.js";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 
@@ -101,7 +102,19 @@ export class DeviceTokenNotFoundError extends Error {
   }
 }
 
-/** Revokes a device immediately. Losing a phone means revoking one token, never re-keying the store (client-tech-design.md Part 2). */
+/**
+ * Revokes a device immediately. Losing a phone means revoking one token,
+ * never re-keying the store (client-tech-design.md Part 2).
+ *
+ * digital-duo#251: a revoked device's push subscription goes with it, in
+ * the very same write — this file's own runtime-state cascade (the
+ * WebSocket close, the auth cache evict) lives one layer up, at the
+ * `POST /devices/:id/revoke` route, because only the currently-running
+ * daemon process can know about those; but a push subscription is a plain
+ * row in this same encrypted store, so it is deleted here, the one place
+ * every revoke path — the route, and the CLI's `duo pair revoke`, which
+ * has no in-process daemon to reach into — actually goes through.
+ */
 export function revokeDeviceToken(storePath: string, passphrase: string, id: string): void {
   withDatabase(storePath, passphrase, true, (db) => {
     ensureDeviceTokenSchema(db);
@@ -113,6 +126,7 @@ export function revokeDeviceToken(storePath: string, passphrase: string, id: str
       }
       // Already revoked — revoking twice is a no-op, not an error.
     }
+    deleteSubscriptionRow(db, id);
   });
 }
 

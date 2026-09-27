@@ -253,10 +253,11 @@ async function mountDuo(deps: ServeDeps): Promise<MountedDuo> {
  * The only process-env variables a hosted tenant's duo may see. The process env holds the
  * master key, the admin tokens and (with #232) the Synapse admin token, which acts as any
  * user; a duo's `deps.env` is reachable from per-duo routes, so it is built from this list
- * and not spread from the whole env. What a duo's routes actually read is CORS and the
- * websocket re-verify interval; the per-duo paths and identity are set explicitly below.
+ * and not spread from the whole env. What a duo's routes actually read is CORS, the
+ * websocket re-verify interval, and (#251) the VAPID contact push notifications go out
+ * under; the per-duo paths and identity are set explicitly below.
  */
-export const TENANT_ENV_ALLOWLIST = ["DUO_CORS_ORIGINS", "DUO_WS_REVERIFY_MS", "TZ"] as const;
+export const TENANT_ENV_ALLOWLIST = ["DUO_CORS_ORIGINS", "DUO_WS_REVERIFY_MS", "TZ", "DUO_PUSH_VAPID_SUBJECT"] as const;
 
 /** The variables that must never reach any duo, tenant or root. */
 export const HOSTED_SECRET_ENV = ["DUO_HOSTED_MASTER_KEY", "DUO_HOSTED_ADMIN_TOKEN", "DUO_WORKSPACE_ADMIN_TOKEN"] as const;

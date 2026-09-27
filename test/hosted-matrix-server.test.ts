@@ -489,6 +489,12 @@ describe("a duo's env is built from an allowlist", () => {
     expect(Object.keys(tenantEnvFrom(processEnv)).sort()).toEqual(["DUO_CORS_ORIGINS", "DUO_WS_REVERIFY_MS"]);
   });
 
+  it("passes DUO_PUSH_VAPID_SUBJECT through to a tenant duo — a hosted duo can send push too, not only a personal one (digital-duo#251 review)", () => {
+    const withPush = { ...processEnv, DUO_PUSH_VAPID_SUBJECT: "mailto:owner@example.org" };
+    expect(Object.keys(tenantEnvFrom(withPush)).sort()).toEqual(["DUO_CORS_ORIGINS", "DUO_PUSH_VAPID_SUBJECT", "DUO_WS_REVERIFY_MS"]);
+    expect(tenantEnvFrom(withPush).DUO_PUSH_VAPID_SUBJECT).toBe("mailto:owner@example.org");
+  });
+
   it("the root duo keeps its env minus the three hosted secrets", () => {
     const env = rootEnvFrom(processEnv);
     for (const key of HOSTED_SECRET_ENV) {
