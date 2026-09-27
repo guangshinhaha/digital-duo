@@ -34,7 +34,7 @@ import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } f
 import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 import { EmbedJob } from "./embed-job.js";
-import { registerMcpRoutes } from "./mcp.js";
+import { registerMcpRoutes, type ConnectorAccess } from "./mcp.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
@@ -107,6 +107,13 @@ export interface ServeDeps {
    * from anyone. Only set behind a front that overwrites the header.
    */
   readonly trustProxy?: boolean;
+  /**
+   * #240: sign-in connectors for claude.ai, supplied by hosted mode. When
+   * set, the connector routes report and manage those connections and the
+   * secret connector URLs are refused; when absent the secret URL is the
+   * connector (#227).
+   */
+  readonly connectorAccess?: ConnectorAccess;
   /** #233: set by hosted mode when a workspace is configured; absent, `/workspace/session` answers 404 `workspace_not_configured`. */
   readonly workspaceSession?: WorkspaceSessionAccess;
 }
