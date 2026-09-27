@@ -34,6 +34,7 @@ import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } f
 import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 import { EmbedJob } from "./embed-job.js";
+import { registerMcpRoutes } from "./mcp.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
@@ -989,5 +990,6 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   registerRoutes(app, deps, draftReady, auth, embedJob);
   registerOwnerRoutes(app, deps);
   registerWorkspaceSessionRoutes(app, deps);
+  registerMcpRoutes(app, deps);
   return app;
 }
