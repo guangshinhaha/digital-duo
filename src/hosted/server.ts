@@ -506,7 +506,12 @@ export async function createHostedServer(
   const stopFollowingRegistry = connections ? registry.onChange(() => connections.reconcile()) : undefined;
   const liveWorkspace = (duoId: string) => connections && (() => connections.serviceFor(duoId));
   const mountTenant = async (tenant: HostedTenant, passphrase: string): Promise<MountedDuo> => {
-    const deps = withConnector(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), liveWorkspace(tenant.id), orgAdmin.forDuo(tenant.id)), tenant.id);
+    // #261: `withConnector`'s `{ ...deps, connectorAccess }` spread reads `deps.workspace` once, so it must run on
+    // deps that do NOT yet carry the live getter — `withLiveWorkspace` goes last, same order as the root duo below,
+    // or a tenant's workspace consent routes would freeze at whatever `workspace()` returned at mount time.
+    const base = withConnector(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), undefined, orgAdmin.forDuo(tenant.id)), tenant.id);
+    const tenantLive = liveWorkspace(tenant.id);
+    const deps = tenantLive ? withLiveWorkspace(base, tenantLive) : base;
     const mounted = await mountDuo(deps);
     connections?.attach(tenant.id, deps);
     return mounted;
