@@ -108,11 +108,73 @@ image's own `/start.py` would. The rendered config, in short:
   burst 10000) so provisioning bursts and many duos' sync traffic are not throttled. `rc_login`
   stays at Synapse's defaults on purpose: the service account's password is the only one on the
   server and failed-login throttling protects it.
+- **The org wall module** (`modules:`, next section): `duo_org_wall.module.DuoOrgWall`, configured
+  with `server_name` and the one service account, `@workspace-admin:<server_name>`.
 - **Postgres backend**, media and signing key on the volume, one client listener bound to `::`
   (Railway's private network is IPv6) with `x_forwarded` (Railway's edge terminates TLS).
 
 Deploy or update it from a checkout, the same way `ollama` is deployed (no GitHub source is
 connected): `cd deploy/synapse && railway up --service synapse --detach`.
+
+### The org wall module (added 2026-09-26, #235)
+
+`deploy/synapse/modules/duo_org_wall/` is a Python Synapse module that refuses cross-org invites
+and joins, any public room, and directory hits across orgs (rules and callbacks:
+`hosted-workspace.md` §6.2, §6.3). It reads an account's org from its Matrix id, so it needs no
+variable, no daemon call and no database of its own. The Dockerfile copies it to `/modules`
+(its tests are removed by an `rm -rf` in the Dockerfile as well as by `.dockerignore`, so an
+uploader that ignores the latter still cannot put `faulty.py`, a module that raises, on
+`PYTHONPATH`), compiles it, makes it readable by uid 991 (`chmod -R a+rX`, so a checkout made
+under `umask 077` cannot stop Synapse starting) and sets `PYTHONPATH=/modules`;
+`render_config.py` writes the `modules:` block. There is nothing to set on Railway.
+
+- **Not built.** Docker was not available where this was written, so the image with the module in
+  it has **not been built or booted**: the `COPY`, the `rm -rf` / `compileall` / `chmod` `RUN`, the
+  `ENV PYTHONPATH` line and uid 991's read of `/modules` are read, not run. To check once Docker is
+  available: `docker run --rm --entrypoint sh <image> -c "ls /modules/duo_org_wall; gosu 991:991
+  python -c 'import duo_org_wall.module'"` (no `tests` directory, and the import succeeds). The module was run against `matrix-synapse==1.161.0`
+  installed from PyPI (the Dockerfile's pin, on the same Python 3.13 the base image ships), with
+  the config `render_config.py` renders (SQLite in place of Postgres). What that does and does
+  not cover: "Verified against a real Synapse" in `hosted-workspace.md` §6.5. The base image
+  sets no `PYTHONPATH` of its own (read from its registry config), so `ENV PYTHONPATH=/modules`
+  replaces nothing.
+- **Redeploying `synapse` with it turns the wall on for every account that already exists.** An
+  account whose id is not `@<orgId>.<handle>:<server>` or `@duo-<orgId>.<handle>:<server>` (lowercase
+  letters and digits, one dot) has no org and is refused every invite, join, room and search, and
+  `@workspace-admin` is the one exemption. Before the redeploy, list the accounts and check them
+  (`GET /_synapse/admin/v2/users?limit=100&deactivated=false` with the admin token, on the
+  private URL) and the rooms (`GET /_synapse/admin/v1/rooms`: any with `"public": true`). A
+  smoke-test account such as `@shin:duo` would be locked out; deactivate it first or accept that.
+  Existing rooms are not rewritten: a room that is already public stays public, and its members stay
+  findable to each other, until it is closed or deleted through the admin API.
+- **A module that cannot load stops Synapse, it does not open the wall.** A missing or
+  misspelled module path, or a `config` the module rejects, made the process exit 1 at boot when
+  tried on 1.161.0. Railway would then show a failed deploy; nothing serves requests without the
+  module. (`render_config.py` always renders a valid block, so this means a broken image.)
+- **Checking it after the redeploy.** With two throwaway orgs' accounts (or any two accounts whose
+  ids carry different orgs): a cross-org invite answers `403 M_FORBIDDEN` with "Invites across
+  organisations are not allowed."; `POST /createRoom` with `{"visibility":"public"}` answers 403.
+  The log line `duo_org_wall loaded` appears at boot, and each refusal logs one
+  `duo_org_wall: <callback> refused: <sentence>` line (never an id). The two-orgs end-to-end check
+  on Railway itself (the story's last criterion, #235) is **not done**: it needs a deploy, so #235
+  stays open. To do it, with two throwaway orgs: a cross-org invite, a cross-org join, a
+  public-room create and a directory search must all be refused, and same-org invites, DMs and
+  rooms must work.
+- **Test it without Railway.** The decisions and the Synapse glue have unit tests that run in the
+  default suite (`test/synapse-org-wall.test.ts`, python3 only). The module against a real
+  Synapse is opt-in, about 15 seconds, nothing leaves 127.0.0.1:
+
+  ```
+  python3.13 -m venv /tmp/wall-venv && /tmp/wall-venv/bin/pip install matrix-synapse==1.161.0
+  /tmp/wall-venv/bin/python deploy/synapse/modules/duo_org_wall/tests/real_synapse.py       # 101 checks
+  /tmp/wall-venv/bin/python deploy/synapse/modules/duo_org_wall/tests/real_synapse.py --mutate-all   # each weakened wall must fail a check
+  DUO_TEST_SYNAPSE_PYTHON=/tmp/wall-venv/bin/python npx vitest run test/synapse-org-wall.test.ts test/synapse-org-wall-daemon.test.ts
+  ```
+
+  The second command also runs the daemon's own provisioning (`MatrixProvisioner`,
+  `OrgSpaceProvisioner`) against that Synapse. Use the Synapse version the Dockerfile pins.
+- **Licence.** The module runs inside an internet-reachable AGPL Synapse: its source is meant to
+  be public (`workspace-platform.md` §4). It holds no secret.
 
 ### `synapse` variables
 

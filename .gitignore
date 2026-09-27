@@ -9,3 +9,4 @@ duo-lifecycle-runtime/
 *.tsbuildinfo
 jev-spike-runtime/
 .env
+__pycache__/

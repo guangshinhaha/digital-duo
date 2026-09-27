@@ -84,6 +84,21 @@ binary runs is a deployment decision — the locked decision is *protocol + SDK 
 What the org must publish, if anyone asks: **nothing publicly**, provided unmodified servers are
 used, or modifications are offered to the internal users they serve.
 
+> **Amended 2026-09-26 (#235, `docs/deploy/hosted-workspace.md` §10; this is the record that
+> section promised).** The paragraph above assumed an internal, unmodified server. The hosted
+> workspace is neither: its Synapse loads our own module (`deploy/synapse/modules/duo_org_wall/`,
+> through `modules:`) and is reachable from the internet. Whether a module loaded through `modules:`
+> makes a modified Synapse under AGPL §13 is a legal question this record does not settle, but the
+> safe reading is that it does, and that the users are then anyone who can reach the server. So
+> plan on **publishing the module's source**: it is in this repository, which is the offer, and it
+> holds nothing secret (its config, the service account's id, is rendered at boot from the
+> deployment's environment and is not part of the source). Its being public does not weaken the
+> org wall, which never rested on its secrecy. Two things stay open for the owner: this repository
+> has no `LICENSE` file, so the module has no stated licence yet (AGPL-3.0 is the natural choice, to
+> match Synapse, but it is the owner's to state); and the repository must be reachable by those users
+> (public, or otherwise offered) for the "offer" to be real. The unmodified-Synapse case in the
+> paragraph above is unchanged.
+
 ## 5. The boundary: what the workspace stores, and what it is forbidden to store
 
 The workspace server holds **identity, conversations, messages, read state and files** — and

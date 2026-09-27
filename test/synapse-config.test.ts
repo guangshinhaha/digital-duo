@@ -80,6 +80,20 @@ describe.skipIf(!hasPython)("deploy/synapse/render_config.py", () => {
     expect(config.rc_login).toBeUndefined();
   });
 
+  it("loads the org wall module with the server name and the service account", () => {
+    const { dir } = render({ ...BASE_ENV, SYNAPSE_SERVER_NAME: "workspace" });
+    const config = JSON.parse(readFileSync(join(dir, "homeserver.yaml"), "utf8"));
+    expect(config.modules).toEqual([
+      {
+        module: "duo_org_wall.module.DuoOrgWall",
+        config: { server_name: "workspace", service_accounts: ["@workspace-admin:workspace"] },
+      },
+    ]);
+    // The default server name, as create_admin.py registers the account under.
+    const fallback = JSON.parse(readFileSync(join(render(BASE_ENV).dir, "homeserver.yaml"), "utf8"));
+    expect(fallback.modules[0].config).toEqual({ server_name: "duo", service_accounts: ["@workspace-admin:duo"] });
+  });
+
   it("keeps the shared secret out of homeserver.yaml, in a private file", () => {
     const { dir, secretPath } = render(BASE_ENV);
     const yaml = readFileSync(join(dir, "homeserver.yaml"), "utf8");
