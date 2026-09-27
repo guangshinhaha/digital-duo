@@ -1,3 +1,5 @@
+import type { MatrixPending } from "./registry.js";
+
 /**
  * Orgs in hosted mode (docs/deploy/hosted-mode.md, "Orgs"): the unit the
  * workspace walls follow. The registry is the source of truth; nothing here
@@ -44,6 +46,19 @@ export interface HostedOrg {
   readonly id: string;
   readonly name: string;
   readonly createdAt: string;
+  /**
+   * The org's Matrix Space and `#general` (#234), private rooms the service account created and stays in.
+   * Absent until Synapse has made them. They are optional fields on a v2 registry, so an older build
+   * reads the file and ignores them, and a file without them is simply "no space yet".
+   */
+  readonly spaceRoomId?: string;
+  readonly generalRoomId?: string;
+  /** The org name last written to the Space, so a rename is noticed and pushed (and a synced Space costs no call). */
+  readonly spaceSyncedName?: string;
+  /** True once `#general` is a child of the Space. */
+  readonly generalLinked?: boolean;
+  /** Set while the org's rooms are owed and failing; cleared when they are complete and named right. */
+  readonly spacePending?: MatrixPending;
 }
 
 /** An org plus how many duos are in it, for listings. */

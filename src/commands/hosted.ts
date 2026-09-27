@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import type { DuoConfig } from "../config.js";
-import { createHostedServer, hostedSettingsFrom } from "../hosted/server.js";
+import { createHostedServer, hostedSettingsFrom, rootEnvFrom } from "../hosted/server.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
 import { assertServableHost } from "../serve/bind.js";
@@ -15,8 +15,9 @@ import { ServePassphraseMismatchError, type ServeOptions } from "./serve.js";
  *
  * A pre-existing single-owner store at DUO_STORE_PATH, with DUO_PASSPHRASE
  * set, keeps being served at the bare origin — the deployment this mode
- * replaced keeps its pairings and ask links. No workspace (Matrix) in hosted
- * mode: one outbound connection per duo is a later decision, not a default.
+ * replaced keeps its pairings and ask links. Matrix accounts are provisioned
+ * when DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN are set (docs/deploy/hosted-workspace.md),
+ * and each provisioned duo then holds its own outbound workspace connection (#236, src/hosted/duo-workspace.ts).
  */
 export async function runHostedServe(
   options: ServeOptions,
@@ -50,7 +51,8 @@ export async function runHostedServe(
       confidenceConfig: config.confidence,
       classificationCeiling: config.classificationCeiling,
       ownerName: config.ownerName,
-      env,
+      // The root duo keeps its process env, minus the hosted secrets (master key, admin tokens).
+      env: rootEnvFrom(env),
       trustProxy,
     };
   }
@@ -68,4 +70,4 @@ export async function runHostedServe(
   return { address, close: hosted.close };
 }
 
-export { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename } from "../hosted/invite.js";
+export { runHostedInvite, runHostedProvision, runHostedRemint, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename } from "../hosted/invite.js";

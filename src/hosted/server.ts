@@ -8,12 +8,20 @@ import { join } from "node:path";
 import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
-import { createServer, type ServeDeps } from "../serve/server.js";
+import { createServer, type ServeDeps, type WorkspaceSessionAccess } from "../serve/server.js";
+import type { WorkspaceService } from "../workspace/service.js";
+import { WorkspaceConfigError } from "../workspace/settings.js";
+import type { WorkspaceTransportFactory } from "../workspace/transport.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
+import { DuoWorkspaceConnections, SDK_LOG_LEVELS, type SdkLogLevel } from "./duo-workspace.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
+import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
+import { OrgSpaceProvisioner, type SpaceSummary } from "./org-spaces.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
-import { HostedRegistry, InviteInvalidError, type HostedTenant } from "./registry.js";
+import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedTenant } from "./registry.js";
+import { assertSynapseBaseUrl, SynapseAdmin, SynapseConfigError } from "./synapse-admin.js";
+import { WorkspaceSessions } from "./workspace-session.js";
 
 /** Where a hosted duo lives: everything under one directory per duo, nothing shared between them. */
 export function tenantPaths(hostedRoot: string, tenantId: string) {
@@ -26,6 +34,36 @@ export function tenantPaths(hostedRoot: string, tenantId: string) {
     sharedPersonaPath: join(root, "shared-duo", "persona.json"),
     sharedUsageLogPath: join(root, "shared-duo-runtime", "usage.json"),
   };
+}
+
+/**
+ * How the daemon reaches Synapse to create accounts (docs/deploy/hosted-workspace.md §5). Absent
+ * means no workspace provisioning: hosted mode behaves as it did before #232.
+ */
+export interface SynapseSettings {
+  /** `DUO_WORKSPACE_PRIVATE_URL`: the private-network URL the daemon calls, e.g. `http://synapse.railway.internal:8008`. https, or http on `*.railway.internal`. Not `DUO_WORKSPACE_HOMESERVER`, which stays the personal-hardware trio's variable. */
+  readonly adminUrl: string;
+  /** `DUO_WORKSPACE_ADMIN_TOKEN`: the service account's token. Never given to a duo, a route or a log. */
+  readonly adminToken: string;
+  /** `DUO_WORKSPACE_SERVER_NAME`: Synapse's `server_name` (`duo`). When unset it is read from the admin token's own user id. */
+  readonly serverName: string | undefined;
+  /** `DUO_WORKSPACE_PUBLIC_URL`: the https address clients are given (#233); not used to call Synapse. */
+  readonly publicUrl: string | undefined;
+}
+
+/**
+ * How the hosted duos' own workspace connections are started (#236). Every field is optional and
+ * defaults as `duo-workspace.ts` says; `hostedSettingsFrom` fills them from the environment.
+ */
+export interface WorkspaceConnectionSettings {
+  /** `DUO_HOSTED_WORKSPACE_CONNECT`: false stops hosted duos from opening any workspace connection (accounts are still provisioned). Default true. */
+  readonly enabled?: boolean;
+  /** `DUO_HOSTED_WORKSPACE_MAX_DIALS`: how many duos may be in their first dial at once. */
+  readonly maxConcurrentDials?: number;
+  /** `DUO_HOSTED_WORKSPACE_STAGGER_MS`: the least time between two duos starting to dial. */
+  readonly startStaggerMs?: number;
+  /** `DUO_HOSTED_WORKSPACE_SDK_LOG`: how much of matrix-js-sdk's own logging is let through (default `silent`). */
+  readonly sdkLogLevel?: SdkLogLevel;
 }
 
 export interface HostedSettings {
@@ -42,6 +80,10 @@ export interface HostedSettings {
    * From `hostedSettingsFrom` this is read from the env on every access, so editing `DUO_HOSTED_ADMIN_EMAILS` takes effect on the next request.
    */
   readonly adminEmails: readonly string[];
+  /** Set when the Synapse admin variables are; without it no Matrix accounts are provisioned. */
+  readonly synapse?: SynapseSettings;
+  /** Only used when `synapse` is set: each provisioned duo then also connects to the workspace. */
+  readonly workspaceConnections?: WorkspaceConnectionSettings;
 }
 
 export class HostedConfigError extends Error {
@@ -61,6 +103,8 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
     throw new HostedConfigError("DUO_HOSTED_ADMIN_TOKEN");
   }
   return {
+    synapse: synapseSettingsFrom(env),
+    workspaceConnections: workspaceConnectionSettingsFrom(env),
     hostedRoot: env.DUO_HOSTED_ROOT || "hosted",
     masterKey,
     adminToken,
@@ -75,6 +119,90 @@ export function hostedSettingsFrom(env: NodeJS.ProcessEnv): HostedSettings {
     get adminEmails() {
       return parseAdminEmails(env.DUO_HOSTED_ADMIN_EMAILS);
     },
+  };
+}
+
+/**
+ * The Synapse admin variables are all-or-nothing, like the workspace ones: a URL with no token (or
+ * the reverse) is a half-finished setup, and provisioning would quietly not happen. Neither set
+ * means no provisioning.
+ */
+export function synapseSettingsFrom(env: NodeJS.ProcessEnv): SynapseSettings | undefined {
+  const adminUrl = env.DUO_WORKSPACE_PRIVATE_URL || undefined;
+  const adminToken = env.DUO_WORKSPACE_ADMIN_TOKEN || undefined;
+  if (adminUrl === undefined && adminToken === undefined) {
+    return undefined;
+  }
+  if (adminUrl === undefined || adminToken === undefined) {
+    throw new HostedConfigError(adminUrl === undefined ? "DUO_WORKSPACE_PRIVATE_URL (it is needed with DUO_WORKSPACE_ADMIN_TOKEN)" : "DUO_WORKSPACE_ADMIN_TOKEN (it is needed with DUO_WORKSPACE_PRIVATE_URL)");
+  }
+  try {
+    assertSynapseBaseUrl(adminUrl);
+  } catch (error) {
+    if (error instanceof SynapseConfigError) {
+      throw new HostedConfigError(`DUO_WORKSPACE_PRIVATE_URL (${error.message})`);
+    }
+    throw error;
+  }
+  return {
+    adminUrl,
+    adminToken,
+    serverName: env.DUO_WORKSPACE_SERVER_NAME || undefined,
+    publicUrl: env.DUO_WORKSPACE_PUBLIC_URL?.replace(/\/+$/, "") || undefined,
+  };
+}
+
+/** A whole number of at least `min`, or a refusal naming the variable: a value that would hot-loop or stall the duos' connections is not a setting. */
+function envInteger(env: NodeJS.ProcessEnv, key: string, min: number): number | undefined {
+  const raw = env[key];
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    throw new WorkspaceConfigError(`${key} must be a whole number of at least ${min} (got ${JSON.stringify(raw)})`);
+  }
+  return value;
+}
+
+function sdkLogLevelFrom(raw: string | undefined): SdkLogLevel | undefined {
+  const level = raw?.trim().toLowerCase();
+  if (level === undefined || level === "") {
+    return undefined;
+  }
+  if (!(SDK_LOG_LEVELS as readonly string[]).includes(level)) {
+    throw new WorkspaceConfigError(`DUO_HOSTED_WORKSPACE_SDK_LOG must be one of ${SDK_LOG_LEVELS.join(", ")} (got ${JSON.stringify(raw)})`);
+  }
+  return level as SdkLogLevel;
+}
+
+const CONNECT_ON = ["", "1", "true", "on", "yes"];
+const CONNECT_OFF = ["0", "false", "off", "no"];
+
+/**
+ * The one off switch for the hosted duos' connections, so it fails closed on nonsense: a value that is
+ * neither plainly on nor plainly off (`disabled`, `none`, `n`, `false.`) is refused at boot, like the
+ * variables beside it, and not read as "on" while an operator believes the connections are off.
+ */
+function connectFrom(raw: string | undefined): boolean {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (CONNECT_ON.includes(value)) {
+    return true;
+  }
+  if (CONNECT_OFF.includes(value)) {
+    return false;
+  }
+  throw new WorkspaceConfigError(
+    `DUO_HOSTED_WORKSPACE_CONNECT must be one of ${[...CONNECT_ON.slice(1), ...CONNECT_OFF].join(", ")}, or empty for on (got ${JSON.stringify(raw)})`,
+  );
+}
+
+export function workspaceConnectionSettingsFrom(env: NodeJS.ProcessEnv): WorkspaceConnectionSettings {
+  return {
+    enabled: connectFrom(env.DUO_HOSTED_WORKSPACE_CONNECT),
+    maxConcurrentDials: envInteger(env, "DUO_HOSTED_WORKSPACE_MAX_DIALS", 1),
+    startStaggerMs: envInteger(env, "DUO_HOSTED_WORKSPACE_STAGGER_MS", 0),
+    sdkLogLevel: sdkLogLevelFrom(env.DUO_HOSTED_WORKSPACE_SDK_LOG),
   };
 }
 
@@ -115,9 +243,60 @@ async function mountDuo(deps: ServeDeps): Promise<MountedDuo> {
   return { app, server };
 }
 
-function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string): ServeDeps {
+/**
+ * The only process-env variables a hosted tenant's duo may see. The process env holds the
+ * master key, the admin tokens and (with #232) the Synapse admin token, which acts as any
+ * user; a duo's `deps.env` is reachable from per-duo routes, so it is built from this list
+ * and not spread from the whole env. What a duo's routes actually read is CORS and the
+ * websocket re-verify interval; the per-duo paths and identity are set explicitly below.
+ */
+export const TENANT_ENV_ALLOWLIST = ["DUO_CORS_ORIGINS", "DUO_WS_REVERIFY_MS", "TZ"] as const;
+
+/** The variables that must never reach any duo, tenant or root. */
+export const HOSTED_SECRET_ENV = ["DUO_HOSTED_MASTER_KEY", "DUO_HOSTED_ADMIN_TOKEN", "DUO_WORKSPACE_ADMIN_TOKEN"] as const;
+
+/** A tenant duo's base env: the allowlisted variables of `env`, and nothing else. */
+export function tenantEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const picked: NodeJS.ProcessEnv = {};
+  for (const key of TENANT_ENV_ALLOWLIST) {
+    if (env[key] !== undefined) {
+      picked[key] = env[key];
+    }
+  }
+  return picked;
+}
+
+/**
+ * The pre-hosted root duo keeps the whole process env (its shared-duo paths and provider settings
+ * come from it, as they did before hosted mode), minus the hosted secrets.
+ */
+export function rootEnvFrom(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...env };
+  for (const key of HOSTED_SECRET_ENV) {
+    delete copy[key];
+  }
+  return copy;
+}
+
+/**
+ * The duo's workspace service is created later than the duo's app (when its accounts exist), and
+ * the app reads `deps.workspace` on each request, so the field is a live view of whatever service
+ * the duo has now, and undefined until it has one.
+ */
+function withLiveWorkspace(deps: ServeDeps, current: () => WorkspaceService | undefined): ServeDeps {
+  return Object.defineProperty({ ...deps }, "workspace", { get: current, enumerable: true, configurable: true }) as ServeDeps;
+}
+
+export function tenantDeps(
+  shared: SharedDuoRuntime,
+  settings: HostedSettings,
+  tenant: HostedTenant,
+  passphrase: string,
+  workspaceSession?: WorkspaceSessionAccess,
+  workspace?: () => WorkspaceService | undefined,
+): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
-  return {
+  const deps: ServeDeps = {
     storePath: paths.storePath,
     passphrase,
     duoDir: paths.duoDir,
@@ -130,7 +309,7 @@ function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: 
     // Every env-derived path a route reads points inside this duo's own
     // directory, so no route can reach another duo's files through env.
     env: {
-      ...shared.env,
+      ...tenantEnvFrom(shared.env),
       DUO_STORE_PATH: paths.storePath,
       DUO_DIR: paths.duoDir,
       DUO_PASSPHRASE: passphrase,
@@ -140,6 +319,23 @@ function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: 
       DUO_SHARED_USAGE_LOG_PATH: paths.sharedUsageLogPath,
     },
     trustProxy: shared.trustProxy,
+    ...(workspaceSession ? { workspaceSession } : {}),
+  };
+  return workspace ? withLiveWorkspace(deps, workspace) : deps;
+}
+
+/** A provisioning outcome as an admin may see it: ids and status, never a token. */
+function publicOutcome(outcome: ProvisionOutcome) {
+  return { duoId: outcome.duoId, status: outcome.status, ...(outcome.accounts ? { accounts: outcome.accounts } : {}), ...(outcome.error ? { error: outcome.error } : {}) };
+}
+
+/** The org-space sweep as an admin may see it: counts and per-item status, no secret exists in it to leave out. */
+function publicSpaces(summary: SpaceSummary) {
+  return {
+    orgs: summary.orgs,
+    members: summary.members,
+    orgOutcomes: summary.orgOutcomes,
+    memberOutcomes: summary.memberOutcomes,
   };
 }
 
@@ -172,10 +368,43 @@ const SIGNUP_MAX_FAILURES = 10;
 const DEFAULT_INVITE_HOURS = 7 * 24;
 const MAX_NAME_LENGTH = 80;
 
+/** Test seams for `createHostedServer`; production passes none. */
+export interface HostedServerExtras {
+  /** The `fetch` used for Synapse admin calls. */
+  readonly synapseFetch?: typeof fetch;
+  /** One line per provisioning event (default: stderr). Carries duo ids and scrubbed reasons only. */
+  readonly log?: (line: string) => void;
+  /** How long a sign-up waits for provisioning before answering anyway (default 5s). */
+  readonly signupProvisionWaitMs?: number;
+  /** Per-call timeout for Synapse admin requests (default 10s). Also the workspace-session mint's, which defaults to a shorter 5s so a hung Synapse does not hold a client's request. */
+  readonly synapseTimeoutMs?: number;
+  /** How a duo's workspace transport is built (default: the matrix-js-sdk adapter). Tests hand in a fake. */
+  readonly workspaceTransportFactory?: WorkspaceTransportFactory;
+  /** Tests: shorten the wait before a failed duo is retried or a refused duo re-minted (default one minute, capped at thirty). */
+  readonly workspaceRecoveryBaseMs?: number;
+  readonly workspaceRecoveryMaxMs?: number;
+  /** The clock the workspace-session cache judges token age and expiry by (default: real time). */
+  readonly sessionNow?: () => number;
+  /** How often owed provisioning is retried (default 60s). */
+  readonly provisionRetryMs?: number;
+}
+
+const DEFAULT_SIGNUP_PROVISION_WAIT_MS = 5_000;
+const DEFAULT_PROVISION_RETRY_MS = 60_000;
+const DEFAULT_SESSION_TIMEOUT_MS = 5_000;
+/** `POST|DELETE /workspace/session` at the bare origin (the root duo) or under `/t/<id>` (a tenant duo). */
+const WORKSPACE_SESSION_PATH = /^(?:\/t\/[a-z0-9]+)?\/workspace\/session(?:\?.*)?$/;
+
 export interface HostedServer {
   /** The front: dispatches `/hosted/*` to the control app, `/t/<id>/*` to that duo, anything else to the root duo when there is one. */
   readonly server: Server;
   readonly registry: HostedRegistry;
+  /** Set when the Synapse admin variables are configured. */
+  readonly matrix: MatrixProvisioner | undefined;
+  /** Each org's Space and `#general`, and members' joins into them (#234). Set with `matrix`. */
+  readonly spaces: OrgSpaceProvisioner | undefined;
+  /** Each provisioned duo's own workspace connection (#236). Set with `matrix`, unless `DUO_HOSTED_WORKSPACE_CONNECT` turns it off. */
+  readonly workspace: DuoWorkspaceConnections | undefined;
   close(): Promise<void>;
 }
 
@@ -194,15 +423,141 @@ export async function createHostedServer(
   settings: HostedSettings,
   root: ServeDeps | undefined,
   identityVerifier: IdentityVerifier | undefined = settings.googleClientId ? googleIdentityVerifier(settings.googleClientId) : undefined,
+  extras: HostedServerExtras = {},
 ): Promise<HostedServer> {
   const registry = new HostedRegistry(join(settings.hostedRoot, "registry.json"), settings.masterKey);
+  // A person's own Matrix session for the signed-in app (#233). Needs the public URL clients are given;
+  // without it the per-duo route answers as if workspace sign-in were not set up. Each duo gets a handle
+  // bound to its own id, so the route never takes an account from the request.
+  const sessions =
+    settings.synapse?.publicUrl
+      ? new WorkspaceSessions({
+          registry,
+          admin: new SynapseAdmin({
+            baseUrl: settings.synapse.adminUrl,
+            adminToken: settings.synapse.adminToken,
+            fetch: extras.synapseFetch,
+            timeoutMs: extras.synapseTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
+          }),
+          publicUrl: settings.synapse.publicUrl,
+          log: extras.log,
+          now: extras.sessionNow,
+        })
+      : undefined;
+  const sessionAccess = (duoId: string): WorkspaceSessionAccess | undefined =>
+    sessions && {
+      session: () => sessions.sessionFor(duoId),
+      renew: () => sessions.renew(duoId),
+      end: () => void sessions.end(duoId),
+    };
+  // Each provisioned duo's own outbound workspace connection (#236), started from the registry's word
+  // that the duo has accounts and following it (a re-minted token restarts it). It only queues here: the
+  // dialing happens off a timer, so a Synapse that is down or slow never holds up boot or a sign-up.
+  // The provisioner is built below (it needs the admin client); the connections call it lazily, from timers, never during boot.
+  let remintable: MatrixProvisioner | undefined;
+  const connections =
+    settings.synapse && settings.workspaceConnections?.enabled !== false
+      ? new DuoWorkspaceConnections({
+          registry,
+          config: shared.config,
+          homeserverUrl: settings.synapse.adminUrl,
+          transportFactory: extras.workspaceTransportFactory,
+          maxConcurrentDials: settings.workspaceConnections?.maxConcurrentDials,
+          startStaggerMs: settings.workspaceConnections?.startStaggerMs,
+          sdkLogLevel: settings.workspaceConnections?.sdkLogLevel,
+          remint: (duoId) => (remintable ? remintable.remintToken(duoId) : Promise.resolve({ status: "pending", error: "the Matrix provisioner is not up yet" })),
+          recoveryBaseMs: extras.workspaceRecoveryBaseMs,
+          recoveryMaxMs: extras.workspaceRecoveryMaxMs,
+          log: extras.log,
+        })
+      : undefined;
+  const stopFollowingRegistry = connections ? registry.onChange(() => connections.reconcile()) : undefined;
+  const liveWorkspace = (duoId: string) => connections && (() => connections.serviceFor(duoId));
+  const mountTenant = async (tenant: HostedTenant, passphrase: string): Promise<MountedDuo> => {
+    const deps = tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), liveWorkspace(tenant.id));
+    const mounted = await mountDuo(deps);
+    connections?.attach(tenant.id, deps);
+    return mounted;
+  };
   const duos = new Map<string, MountedDuo>();
   for (const tenant of registry.tenants()) {
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant))));
+    duos.set(tenant.id, await mountTenant(tenant, registry.passphraseFor(tenant)));
   }
-  const rootDuo = root ? await mountDuo(root) : undefined;
+  const rootAccess = sessionAccess(ROOT_DUO_ID);
+  const rootLive = liveWorkspace(ROOT_DUO_ID);
+  const rootServed = root && { ...root, ...(rootAccess ? { workspaceSession: rootAccess } : {}) };
+  const rootDuo = rootServed ? await mountDuo(rootLive ? withLiveWorkspace(rootServed, rootLive) : rootServed) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
+    connections?.attach(ROOT_DUO_ID, root);
+  }
+
+  // Matrix accounts (#232). Only when the Synapse admin variables are set. A Synapse that is down
+  // never stops a duo from being served or a person from joining: the duo is marked pending and
+  // the timer below retries it.
+  const synapseAdmin = settings.synapse
+    ? new SynapseAdmin({ baseUrl: settings.synapse.adminUrl, adminToken: settings.synapse.adminToken, fetch: extras.synapseFetch, timeoutMs: extras.synapseTimeoutMs })
+    : undefined;
+  const matrix = synapseAdmin
+    ? new MatrixProvisioner({
+        registry,
+        admin: synapseAdmin,
+        serverName: settings.synapse?.serverName,
+        log: extras.log,
+        retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
+      })
+    : undefined;
+  // Each org's Space and `#general` (#234), and members' joins into them. Same rules as the accounts:
+  // a Synapse that is down marks the org or member pending and never blocks creating an org or redeeming an invite.
+  const spaces = synapseAdmin
+    ? new OrgSpaceProvisioner({
+        registry,
+        admin: synapseAdmin,
+        serverName: settings.synapse?.serverName,
+        log: extras.log,
+        retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
+      })
+    : undefined;
+  remintable = matrix;
+  const settleWithin = async (attempt: Promise<unknown>): Promise<void> => {
+    await Promise.race([attempt, new Promise<void>((resolve) => setTimeout(resolve, extras.signupProvisionWaitMs ?? DEFAULT_SIGNUP_PROVISION_WAIT_MS).unref())]);
+  };
+  // An unexpected failure is logged by name only (a message could quote something it should not), and never stops the server.
+  const logUnexpected = (error: unknown): void => {
+    (extras.log ?? ((line) => console.error(line)))(`hosted: Matrix provisioning failed unexpectedly (${error instanceof Error ? error.name : "error"})`);
+  };
+  // One sweep at a time: a tick that finds the last sweep still running (a slow Synapse) skips itself
+  // instead of piling a second sweep onto it. The provisioner's own backoff spaces out each failed duo.
+  let sweeping = false;
+  const runSweep = (sweep: () => Promise<unknown>): void => {
+    if (!matrix || sweeping) {
+      return;
+    }
+    sweeping = true;
+    sweep()
+      .catch(logUnexpected)
+      .finally(() => {
+        sweeping = false;
+      });
+  };
+  // Accounts first: a member can be joined to their org's Space only once their accounts exist.
+  const runProvisioning = (): void =>
+    runSweep(async () => {
+      await matrix!.provisionAll();
+      await spaces!.syncAll();
+    });
+  let retryTimer: NodeJS.Timeout | undefined;
+  if (matrix) {
+    runProvisioning();
+    retryTimer = setInterval(() => {
+      if (matrix.hasRetryDue() || spaces!.hasRetryDue()) {
+        runSweep(async () => {
+          await matrix.retryPending();
+          await spaces!.retryPending();
+        });
+      }
+    }, extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS);
+    retryTimer.unref();
   }
 
   let controlServer: Server | undefined;
@@ -389,7 +744,17 @@ export async function createHostedServer(
       tenantId,
       identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
     );
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
+    duos.set(tenant.id, await mountTenant(tenant, passphrase));
+    if (matrix) {
+      // Redeeming an invite must not depend on Synapse: wait a moment so the app can usually connect
+      // straight away, then answer regardless. A failed or slow run leaves the duo pending for the retry.
+      // The accounts come first, then the person and their duo are put into the org's Space (#234).
+      const attempt = matrix
+        .provision(tenant.id)
+        .then(() => spaces!.syncMember(tenant.id))
+        .catch(logUnexpected);
+      await settleWithin(attempt);
+    }
     reply.code(201);
     return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
   });
@@ -446,9 +811,13 @@ export async function createHostedServer(
 
   control.post<{ Body: { name?: unknown } }>("/hosted/orgs", { preHandler: requireAdmin }, async (request, reply) => {
     try {
-      const org = registry.createOrg(request.body?.name as string);
+      const created = registry.createOrg(request.body?.name as string);
+      // The org exists whatever Synapse does; its Space is made now if Synapse answers in time, else by the retry.
+      if (spaces) {
+        await settleWithin(spaces.ensureOrg(created.id).catch(logUnexpected));
+      }
       reply.code(201);
-      return { ...org, memberCount: 0 };
+      return { ...(registry.org(created.id) ?? created), memberCount: 0 };
     } catch (error) {
       if (sendOrgError(reply, error)) {
         return;
@@ -459,8 +828,11 @@ export async function createHostedServer(
 
   control.post<{ Params: { orgId: string }; Body: { name?: unknown } }>("/hosted/orgs/:orgId/rename", { preHandler: requireAdmin }, async (request, reply) => {
     try {
-      const org = registry.renameOrg(request.params.orgId, request.body?.name as string);
-      return { ...org, memberCount: registry.listOrgMembers(org.id).length };
+      const renamed = registry.renameOrg(request.params.orgId, request.body?.name as string);
+      if (spaces) {
+        await settleWithin(spaces.ensureOrg(renamed.id).catch(logUnexpected));
+      }
+      return { ...(registry.org(renamed.id) ?? renamed), memberCount: registry.listOrgMembers(renamed.id).length };
     } catch (error) {
       if (sendOrgError(reply, error)) {
         return;
@@ -480,9 +852,55 @@ export async function createHostedServer(
     }
   });
 
-  control.get("/hosted/duos", { preHandler: requireAdmin }, async () =>
-    registry.tenants().map(({ passphraseCipher: _cipher, ...rest }) => rest),
-  );
+  // Never the passphrase cipher and never the Matrix token cipher: a duo's accounts are shown as ids and a date.
+  // `workspace` is the duo's own workspace connection: its phase and failed attempts, from the daemon's memory.
+  control.get("/hosted/duos", { preHandler: requireAdmin }, async () => {
+    const connection = new Map(connections?.states().map((state) => [state.duoId, state]));
+    return registry.tenants().map(({ passphraseCipher: _cipher, matrix: accounts, ...rest }) => {
+      const state = connection.get(rest.id);
+      return {
+        ...rest,
+        ...(accounts ? { matrix: matrixAccountsView(accounts) } : {}),
+        ...(state ? { workspace: { phase: state.phase, attempts: state.attempts } } : {}),
+      };
+    });
+  });
+
+  // Backfill on demand (`duo hosted provision`): creates the accounts every duo still lacks and answers
+  // with counts and per-duo status, never a token. Startup already does this when Synapse is configured.
+  control.post("/hosted/matrix/provision", { preHandler: requireAdmin }, async (_request, reply) => {
+    if (!matrix) {
+      sendError(reply, 400, "matrix_not_configured", "Set DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN to provision Matrix accounts.");
+      return;
+    }
+    const summary = await matrix.provisionAll();
+    const spaceSummary = await spaces!.syncAll();
+    return { ...summary, outcomes: summary.outcomes.map(publicOutcome), spaces: publicSpaces(spaceSummary) };
+  });
+
+  // Gives one duo a new Matrix token (`duo hosted provision --remint <duoId>`): for a duo Synapse
+  // refuses (the daemon also does this itself, with a backoff and a cap). The token goes to the registry and the
+  // duo's connection restarts with it; the answer is the status and ids, never the token.
+  control.post("/hosted/matrix/remint", { preHandler: requireAdmin }, async (request, reply) => {
+    if (!matrix) {
+      sendError(reply, 400, "matrix_not_configured", "Set DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN to mint Matrix tokens.");
+      return;
+    }
+    const duoId = (request.body as { duoId?: unknown } | null)?.duoId;
+    if (typeof duoId !== "string" || duoId.length === 0) {
+      sendError(reply, 400, "invalid_request", "Send { duoId }.");
+      return;
+    }
+    if (duoId !== ROOT_DUO_ID && !registry.tenants().some((tenant) => tenant.id === duoId)) {
+      sendError(reply, 404, "duo_not_found", `No hosted duo "${duoId}".`);
+      return;
+    }
+    try {
+      return publicOutcome(await matrix.remintToken(duoId));
+    } catch {
+      sendError(reply, 500, "remint_failed", "Minting the token failed unexpectedly; see the daemon log.");
+    }
+  });
 
   await control.ready();
   if (!controlServer) {
@@ -509,6 +927,17 @@ export async function createHostedServer(
   };
 
   const front = createHttpServer((request: IncomingMessage, response: ServerResponse) => {
+    // The server-side admin token belongs to no duo, so the duo's own auth would call it an unknown device
+    // (401). The workspace-session route tells it apart (403 no_duo, as the admin token is not a bad
+    // credential, just not a person's) before dispatching. Constant-time, no store is read.
+    if (request.method !== "OPTIONS" && WORKSPACE_SESSION_PATH.test(request.url ?? "")) {
+      const header = request.headers.authorization;
+      if (header?.startsWith("Bearer ") && constantTimeEquals(header.slice("Bearer ".length), settings.adminToken)) {
+        response.writeHead(403, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({ error: { code: "no_duo", message: "The admin token belongs to no duo and has no workspace account. Sign in as a person." } }));
+        return;
+      }
+    }
     const target = route(request);
     if (!target) {
       response.writeHead(404, { "content-type": "application/json" });
@@ -529,7 +958,21 @@ export async function createHostedServer(
   return {
     server: front,
     registry,
+    matrix,
+    spaces,
+    workspace: connections,
     close: async () => {
+      if (retryTimer) {
+        clearInterval(retryTimer);
+      }
+      // Stop the sweep from starting its next duo, then wait for the one in flight.
+      matrix?.stop();
+      spaces?.stop();
+      await matrix?.whenIdle();
+      await spaces?.whenIdle();
+      // Then the duos' own connections: nothing may start one after this, and each is stopped on its own.
+      stopFollowingRegistry?.();
+      await connections?.stop();
       await new Promise<void>((resolve) => front.close(() => resolve()));
       await Promise.all([control.close(), rootDuo?.app.close(), ...Array.from(duos.values(), (duo) => duo.app.close())]);
     },

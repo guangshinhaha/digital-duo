@@ -197,4 +197,16 @@ describe("durableDuoReadState — the encrypted-store implementation", () => {
     await flushed();
     expect(rows(storePath).map((row) => row.event_id)).toEqual(["$flood-1", "$flood-2"]);
   });
+
+  it("a store with no read-state table yet loads quietly (every new duo starts there), and one that cannot be opened throws instead of pretending (#236)", () => {
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    const lines: string[] = [];
+    const fresh = initStore();
+    expect(durableDuoReadState(fresh, PASSPHRASE, 3_600_000, (line) => lines.push(line)).hasRead("$x")).toBe(false);
+    expect(lines).toEqual([]);
+    expect(quiet).not.toHaveBeenCalled();
+
+    expect(() => durableDuoReadState(fresh, "the wrong passphrase", 3_600_000, (line) => lines.push(line))).toThrow();
+    quiet.mockRestore();
+  });
 });

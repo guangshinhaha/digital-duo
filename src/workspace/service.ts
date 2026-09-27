@@ -105,6 +105,19 @@ export interface WorkspaceServiceOptions {
    * what the seam-level tests run with.
    */
   readonly attachmentDoor?: WorkspaceAttachmentDoor;
+  /**
+   * #236: where this service's own log lines go. Absent is the `duo serve` behavior exactly
+   * (`console.error("workspace: <what>:", <message>)`). A hosted daemon runs one service per duo
+   * in one process, so it passes a logger that names the duo (and scrubs the duo's token);
+   * the line handed over is the same text, one string.
+   */
+  readonly log?: (line: string) => void;
+  /**
+   * #236: what to tell the operator when the homeserver refuses the token for good. Absent is the
+   * single-owner remedy (the owner re-pairs on their own machine); a hosted duo has no owner's
+   * machine, so the hosted daemon passes what actually fixes it there.
+   */
+  readonly revokedRemedy?: string;
 }
 
 /** Where the consent record lives — the owner's `duo/` directory (consent.ts states why a file and not the store). */
@@ -592,7 +605,7 @@ export class WorkspaceService {
         // explicit later start() may re-dial and re-discover the revocation;
         // nothing automatic does.
         this.consoleError(
-          "workspace access token rejected — not retrying; re-pair the duo on the owner's machine (DUO_WORKSPACE_ACCESS_TOKEN) and restart duo serve",
+          `workspace access token rejected — not retrying; ${this.options.revokedRemedy ?? "re-pair the duo on the owner's machine (DUO_WORKSPACE_ACCESS_TOKEN) and restart duo serve"}`,
           error,
         );
         this.running = false;
@@ -948,6 +961,11 @@ export class WorkspaceService {
     // The daemon runs with no logger wired (the /ask route's own
     // convention, U2 in its plan): console.error is the owner-side error
     // surface for a service that has no request to attach a reply to.
-    console.error(`workspace: ${what}:`, error instanceof Error ? error.message : error);
+    const detail = error instanceof Error ? error.message : error;
+    if (this.options.log) {
+      this.options.log(`workspace: ${what}: ${String(detail)}`);
+      return;
+    }
+    console.error(`workspace: ${what}:`, detail);
   }
 }
