@@ -31,6 +31,7 @@ import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
 import type { WorkspaceService } from "../workspace/service.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
+import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 import { EmbedJob } from "./embed-job.js";
 import { registerMcpRoutes, type ConnectorAccess } from "./mcp.js";
@@ -44,6 +45,20 @@ import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
  * argument and touches no process-level state itself, so tests construct
  * it against a temp store the same way the existing command tests do.
  */
+/**
+ * #233: what a hosted duo's app calls to give its owner's signed-in app a Matrix session. Bound to
+ * one duo by whoever builds the deps (hosted mode), so the route never names an account: the duo is
+ * the one this app's device-token auth just verified the caller against.
+ */
+export interface WorkspaceSessionAccess {
+  /** The owner's own person session (a token that is kept and handed out again until it nears expiry). */
+  session(): Promise<SessionOutcome>;
+  /** The client was told `M_UNKNOWN_TOKEN`: drop the cached token so the next `session()` mints a new one. */
+  renew(): Promise<void>;
+  /** A device of this duo was revoked, or the duo was ended: end the session the daemon holds. Best effort, never throws. */
+  end(): void;
+}
+
 export interface ServeDeps {
   readonly storePath: string;
   readonly passphrase: string;
@@ -99,6 +114,8 @@ export interface ServeDeps {
    * connector (#227).
    */
   readonly connectorAccess?: ConnectorAccess;
+  /** #233: set by hosted mode when a workspace is configured; absent, `/workspace/session` answers 404 `workspace_not_configured`. */
+  readonly workspaceSession?: WorkspaceSessionAccess;
 }
 
 function errorBody(code: string, message: string) {
@@ -362,6 +379,8 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       revokeDeviceToken(deps.storePath, deps.passphrase, request.params.id);
       draftReady.closeDevice(request.params.id);
       auth.evictDevice(request.params.id);
+      // #233: the Matrix session the daemon minted for this duo's owner must not outlive the device.
+      deps.workspaceSession?.end();
       return getDeviceToken(deps.storePath, deps.passphrase, request.params.id);
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
@@ -774,6 +793,7 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     const result = endDuoAndRecord(deps.storePath, deps.duoDir, deps.lifecycleLogPath, decidedBy, confirmed === true);
     if (result.confirmed) {
       auth.evictAll();
+      deps.workspaceSession?.end();
     }
     return result;
   });
@@ -893,6 +913,63 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
  * socket at all.
  */
 /**
+ * #233: the signed-in app's Matrix session. The device-token auth hook above has already verified the
+ * caller against THIS duo's store (with its 5 second cache, same-tick revoke eviction and per-address
+ * failure limiter), so there is no lookup, no scan of other duos, and no way for a request field to name
+ * an account: the duo is the app the request was mounted on. Only a device token gets here (an ask link
+ * is refused by the hook on every route but `/ask`).
+ *
+ * Encapsulated in its own scope so the body parser below applies to these two routes alone. The body is
+ * ignored by contract, so a client that sends `Content-Type: application/json` with no body (or any body)
+ * must not get Fastify's `FST_ERR_CTP_EMPTY_JSON_BODY` 400.
+ */
+function registerWorkspaceSessionRoutes(app: FastifyInstance, deps: ServeDeps): void {
+  app.register(async (scope) => {
+    scope.removeAllContentTypeParsers();
+    scope.addContentTypeParser("*", (_request, _payload, done) => done(null, undefined));
+
+    scope.post("/workspace/session", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      const access = deps.workspaceSession;
+      if (request.principal?.kind !== "device") {
+        reply.code(401).send(errorBody("unauthorized", "Sign in to get a workspace session."));
+        return;
+      }
+      if (!access) {
+        reply.code(404).send(errorBody("workspace_not_configured", "This server has no workspace to sign in to."));
+        return;
+      }
+      const outcome = await access.session();
+      if (outcome.status === "ok") {
+        return outcome.session;
+      }
+      reply.header("retry-after", "60");
+      if (outcome.status === "pending") {
+        reply.code(503).send(errorBody("workspace_pending", "Your workspace account is still being set up. Try again in a minute."));
+      } else {
+        reply.code(503).send(errorBody("workspace_unavailable", "The workspace is unreachable right now. Try again in a minute."));
+      }
+    });
+
+    // The client's answer to Matrix's `M_UNKNOWN_TOKEN` (it signed out, or Synapse dropped the token): forget
+    // the token so the next POST mints a new one. 204 whether or not one was cached or the cooldown held it.
+    scope.delete("/workspace/session", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      if (request.principal?.kind !== "device") {
+        reply.code(401).send(errorBody("unauthorized", "Sign in to end a workspace session."));
+        return;
+      }
+      if (!deps.workspaceSession) {
+        reply.code(404).send(errorBody("workspace_not_configured", "This server has no workspace to sign in to."));
+        return;
+      }
+      await deps.workspaceSession.renew();
+      reply.code(204).send();
+    });
+  });
+}
+
+/**
  * `serverFactory` lets hosted mode (src/hosted/) give each duo its own
  * never-listening HTTP server that a front dispatches requests and upgrades
  * into — one isolated app per duo, unchanged, in one process.
@@ -910,6 +987,8 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   app.register(cors, {
     origin: corsOrigins,
     allowedHeaders: [...CORS_ALLOWED_HEADERS],
+    // Not CORS-safelisted, so a browser page cannot read it otherwise: the workspace-session route's 503s carry it (#233).
+    exposedHeaders: ["Retry-After"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
   const auth = registerAuth(app, deps.storePath, deps.passphrase);
@@ -917,6 +996,7 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   const embedJob = new EmbedJob();
   registerRoutes(app, deps, draftReady, auth, embedJob);
   registerOwnerRoutes(app, deps);
+  registerWorkspaceSessionRoutes(app, deps);
   registerMcpRoutes(app, deps);
   return app;
 }

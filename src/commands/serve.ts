@@ -1,7 +1,4 @@
 import type { DuoConfig } from "../config.js";
-import { attachmentGroundingDoor } from "../drafting/attachment-grounding.js";
-import { parseClassificationCeiling } from "../permissions/classification.js";
-import { answerPublicly } from "../permissions/public-answer.js";
 import { createOllamaEmbeddingProvider } from "../provider/ollama-embedding-provider.js";
 import { tryResolveProvider } from "../provider/registry.js";
 import { assertServableHost } from "../serve/bind.js";
@@ -21,13 +18,11 @@ import {
   type MintedConnectorToken,
   type PairedDevice,
 } from "../serve/tokens.js";
+import { createDuoWorkspaceService } from "../serve/workspace-wiring.js";
 import { DecryptionError } from "../store/crypto.js";
 import { resolveOrCreatePassphrase } from "../store/passphrase.js";
 import { requireStoreExists, withDatabase } from "../store/store.js";
-import { durableDuoReadState } from "../serve/workspace-read-state.js";
-import { askerContextForSender } from "../workspace/asker.js";
 import { workspaceSettingsFrom, type WorkspaceSettings } from "../workspace/settings.js";
-import { WorkspaceService } from "../workspace/service.js";
 import type { WorkspaceTransport, WorkspaceTransportFactory } from "../workspace/transport.js";
 
 /** Thrown by `runServe` when the resolved passphrase doesn't decrypt the store — checked once at boot, before binding, so a typo'd `DUO_PASSPHRASE` fails loudly here instead of the daemon reporting "listening" and then 500ing every request forever (every route's first real store access would otherwise be the first place this surfaces). */
@@ -95,77 +90,22 @@ export async function runServe(
   const embeddingProvider = createOllamaEmbeddingProvider(config);
   const inferenceProvider = tryResolveProvider(config);
 
-  // Annotated, not inferred: the answer closure below reaches back into
-  // `workspace` for the member cache (the #187 feed), and a self-referencing
-  // initializer is exactly the shape TS refuses to infer through.
-  const workspace: WorkspaceService | undefined = workspaceSettings
-    ? new WorkspaceService({
-        settings: workspaceSettings,
-        transportFactory: workspaceTransportFactory,
-        // #189: durable read state in the same encrypted store the answers
-        // themselves log to — which events previous processes handled, so a
-        // restart no longer re-answers the sync window. The impl lives in
-        // src/serve/ (the workspace boundary scan forbids the store import
-        // there); its retention is the backlog age window, one concept.
-        readState: durableDuoReadState(config.storePath, passphrase, workspaceSettings.backlog.maxAgeMs),
-        // #192: the consent surface — held invitations, the shared-room
-        // gate, allow/refuse/withdrawal — over the same `duo/` directory
-        // every other owner policy lives in (consent.ts states why a file
-        // and not the store). Wired whenever a workspace exists at all, so
-        // the owner surface is never half-configured.
-        consent: { duoDir: config.duoDir },
-        // #190: the attachment grounding door, wired with the owner's own
-        // classification ceiling — the same parsed value every ingest
-        // boundary reads, because this is the same policy applied at a
-        // different door. Parsed here, at wiring, in the boot-refusal
-        // family: a workspace-configured daemon with an unparseable
-        // DUO_CLASSIFICATION_CEILING must not come up guessing what a door
-        // should admit (every other surface already fails the same value
-        // at its own point of use).
-        attachmentDoor: attachmentGroundingDoor(parseClassificationCeiling(config.classificationCeiling)),
-        // THE answering pipeline, not a workspace twin: the identical
-        // answerPublicly call POST /ask makes, argument for argument, with
-        // the asking Matrix user resolved through the same directory
-        // lookup. A question over the workspace connection and a question
-        // over an ask link cannot diverge, because this is one call.
-        answer: (question) =>
-          answerPublicly(
-            config.storePath,
-            passphrase,
-            config.duoDir,
-            // POST /ask hands answerPublicly a trimmed question; a chat
-            // client's body can carry trailing whitespace. The trim keeps
-            // "argument for argument" true (the body itself is non-blank —
-            // directQuestionFrom already rejected whitespace-only).
-            question.body.trim(),
-            // #187's feed: the sender's workspace member record when the
-            // daemon's connect-time listing has one, through the same
-            // resolver either way (asker.ts — the member is the mapping's
-            // input, never a second resolution path).
-            askerContextForSender(question.senderId, config.duoDir, workspace?.memberFor(question.senderId)),
-            embeddingProvider,
-            inferenceProvider,
-            config.confidence,
-            config.ownerName,
-            // #190: what the door admitted — the asker's files, decoded
-            // and marking-stripped, grounding this one draft call. The
-            // door refused, or the question rode with nothing, and this is
-            // undefined — the pre-#190 call shape, byte-identical.
-            question.grounding,
-          ),
-      })
-    : undefined;
-
-  const deps: ServeDeps = {
+  // The duo's own store, folder and providers: what its workspace connection answers from.
+  const duo = {
     storePath: config.storePath,
     passphrase,
     duoDir: config.duoDir,
-    lifecycleLogPath: config.lifecycleLogPath,
     embeddingProvider,
     inferenceProvider,
     confidenceConfig: config.confidence,
     classificationCeiling: config.classificationCeiling,
     ownerName: config.ownerName,
+  };
+  const workspace = workspaceSettings ? createDuoWorkspaceService(duo, { settings: workspaceSettings, transportFactory: workspaceTransportFactory }) : undefined;
+
+  const deps: ServeDeps = {
+    ...duo,
+    lifecycleLogPath: config.lifecycleLogPath,
     env,
     // #192: the consent routes' service — present exactly when the workspace
     // is (the consent surface is wired with it, one configuration).

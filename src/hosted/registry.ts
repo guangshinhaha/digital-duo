@@ -36,6 +36,50 @@ import {
  * are the reads later work (accounts, spaces, the org boundary) builds on.
  */
 
+/**
+ * A duo's Matrix accounts on the shared Synapse (docs/deploy/hosted-workspace.md §3, §4).
+ * Written once, when provisioning succeeds; the ids are a copy of the org taken at that time.
+ * The duo's access token is a credential: it lives here only as ciphertext under the master key
+ * and `HostedRegistry.duoMatrixToken` is the one way to read it.
+ */
+export interface HostedMatrixAccounts {
+  /** `@<orgId>.<handle>:<server>`. */
+  readonly personUserId: string;
+  /** `@duo-<orgId>.<handle>:<server>`, always `duoUserIdFor(personUserId)`. */
+  readonly duoUserId: string;
+  /** base64 of encrypt(duoAccessToken, masterKey), like `passphraseCipher`. Never leaves the daemon. */
+  readonly duoTokenCipher: string;
+  readonly provisionedAt: string;
+}
+
+/** What is safe to show an admin about a duo's accounts: no token, not even its ciphertext. */
+export type HostedMatrixAccountsView = Omit<HostedMatrixAccounts, "duoTokenCipher">;
+
+/** A duo whose accounts could not be created yet. Present only while pending; success clears it. */
+export interface MatrixPending {
+  readonly since: string;
+  readonly attempts: number;
+  readonly lastAttemptAt: string;
+  /** A scrubbed reason (status and Matrix errcode, never a body or a secret). */
+  readonly lastError: string;
+}
+
+/**
+ * Which org rooms a duo's two accounts have been put into (#234). Written when both the person and
+ * the duo are in the Space and `#general`; the ids say which rooms, so a member recorded against a
+ * room that is no longer their org's is seen as not joined.
+ */
+export interface HostedMatrixSpaces {
+  readonly spaceRoomId: string;
+  readonly generalRoomId: string;
+  readonly joinedAt: string;
+}
+
+export function matrixAccountsView(accounts: HostedMatrixAccounts): HostedMatrixAccountsView {
+  const { duoTokenCipher: _cipher, ...view } = accounts;
+  return view;
+}
+
 export interface HostedTenant {
   readonly id: string;
   readonly name: string;
@@ -49,6 +93,14 @@ export interface HostedTenant {
   readonly isAdmin?: boolean;
   /** The one org this duo belongs to. */
   readonly orgId: string;
+  /** Set once the duo's Matrix accounts exist (#232). Absent means not provisioned yet. */
+  readonly matrix?: HostedMatrixAccounts;
+  /** Set while provisioning is owed and failing, so an outage is visible and retried. */
+  readonly matrixPending?: MatrixPending;
+  /** Set once the person and the duo are in their org's Space and `#general` (#234). */
+  readonly matrixSpaces?: HostedMatrixSpaces;
+  /** Set while joining the org's rooms is owed and failing. */
+  readonly spacePending?: MatrixPending;
 }
 
 /** Who has claimed the pre-hosted root duo by signing in (an admin email's first sign-in). */
@@ -85,6 +137,12 @@ interface RegistryFile {
   rootOrgId: string;
   /** Present once a server has served the pre-hosted root duo: makes it a member of `rootOrgId` without depending on any server having started since. */
   rootDuo?: { name: string } | null;
+  /** The root duo's Matrix accounts (handle `root`). Top level, not on `RootClaim`: the root duo needs accounts before any admin has claimed it. */
+  rootMatrix?: HostedMatrixAccounts;
+  rootMatrixPending?: MatrixPending;
+  /** The root duo's accounts' membership of its org's rooms (#234), and why it is owed. */
+  rootMatrixSpaces?: HostedMatrixSpaces;
+  rootSpacePending?: MatrixPending;
 }
 
 /**
@@ -146,6 +204,7 @@ export class HostedRegistry {
   private data: RegistryFile;
   /** True while the file on disk is still a pre-orgs (v1) one, so the first write keeps a copy of it. */
   private backupBeforeWrite: boolean;
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(
     private readonly path: string,
@@ -167,6 +226,19 @@ export class HostedRegistry {
         draft.rootDuo = { name };
       });
     }
+  }
+
+  /**
+   * Calls `listener` after every write that lands (never for a write that fails), so something that
+   * follows the registry (a duo's workspace connection, #236) hears of a new duo, new accounts or a
+   * re-minted token without every writer knowing about it. The listener runs synchronously inside the
+   * write's caller, so it must be cheap and must not throw (one that does is ignored). Returns the unsubscribe.
+   */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
   }
 
   tenants(): readonly HostedTenant[] {
@@ -292,6 +364,165 @@ export class HostedRegistry {
     return this.data.tenants.find((tenant) => tenant.identitySubject === identitySubject);
   }
 
+  /** A duo's Matrix accounts (no token); `duoId` is a tenant id or `ROOT_DUO_ID`. */
+  matrixAccounts(duoId: string): HostedMatrixAccounts | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootMatrix : this.data.tenants.find((tenant) => tenant.id === duoId)?.matrix;
+  }
+
+  /** Why a duo's accounts are still owed, or undefined when it is provisioned or nothing has been tried. */
+  matrixPending(duoId: string): MatrixPending | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootMatrixPending : this.data.tenants.find((tenant) => tenant.id === duoId)?.matrixPending;
+  }
+
+  /**
+   * The duo's Matrix access token, decrypted. The only reader of it: for the
+   * daemon's own connection for that duo (#236), never for a route response,
+   * a log line or a duo's env.
+   */
+  duoMatrixToken(duoId: string): string | undefined {
+    const accounts = this.matrixAccounts(duoId);
+    return accounts && decrypt(Buffer.from(accounts.duoTokenCipher, "base64"), this.masterKey).toString("utf8");
+  }
+
+  /** Records a duo's provisioned accounts and encrypts its token in the same write; clears any pending mark. */
+  setMatrixAccounts(duoId: string, ids: { personUserId: string; duoUserId: string }, duoAccessToken: string): HostedMatrixAccountsView {
+    const accounts: HostedMatrixAccounts = {
+      ...ids,
+      duoTokenCipher: encrypt(Buffer.from(duoAccessToken, "utf8"), this.masterKey).toString("base64"),
+      provisionedAt: new Date().toISOString(),
+    };
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrix = accounts;
+        delete draft.rootMatrixPending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record Matrix accounts for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => {
+        const { matrixPending: _cleared, ...rest } = candidate;
+        return candidate.id === duoId ? { ...rest, matrix: accounts } : candidate;
+      });
+    });
+    return matrixAccountsView(accounts);
+  }
+
+  /** Marks a duo as owed accounts and failing, keeping when it started and counting attempts. */
+  recordMatrixFailure(duoId: string, reason: string): MatrixPending {
+    const now = new Date().toISOString();
+    const previous = this.matrixPending(duoId);
+    const pending: MatrixPending = { since: previous?.since ?? now, attempts: (previous?.attempts ?? 0) + 1, lastAttemptAt: now, lastError: reason };
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrixPending = pending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record a provisioning failure for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => (candidate.id === duoId ? { ...candidate, matrixPending: pending } : candidate));
+    });
+    return pending;
+  }
+
+  /** The org rooms a duo's accounts are in (#234), or undefined when they are still owed. */
+  matrixSpaces(duoId: string): HostedMatrixSpaces | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootMatrixSpaces : this.data.tenants.find((tenant) => tenant.id === duoId)?.matrixSpaces;
+  }
+
+  /** Why a duo's room joins are still owed, or undefined when done or not yet tried. */
+  spacePending(duoId: string): MatrixPending | undefined {
+    return duoId === ROOT_DUO_ID ? this.data.rootSpacePending : this.data.tenants.find((tenant) => tenant.id === duoId)?.spacePending;
+  }
+
+  /** Records that a duo's person and duo accounts are in these rooms; clears any pending mark. */
+  setMatrixSpaces(duoId: string, rooms: { spaceRoomId: string; generalRoomId: string }): HostedMatrixSpaces {
+    const spaces: HostedMatrixSpaces = { ...rooms, joinedAt: new Date().toISOString() };
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrixSpaces = spaces;
+        delete draft.rootSpacePending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record org rooms for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => {
+        const { spacePending: _cleared, ...rest } = candidate;
+        return candidate.id === duoId ? { ...rest, matrixSpaces: spaces } : candidate;
+      });
+    });
+    return spaces;
+  }
+
+  /** Marks a duo's room joins as owed and failing, keeping when it started and counting attempts. */
+  recordSpaceFailure(duoId: string, reason: string): MatrixPending {
+    const pending = this.nextPending(this.spacePending(duoId), reason);
+    this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootSpacePending = pending;
+        return;
+      }
+      if (!draft.tenants.some((candidate) => candidate.id === duoId)) {
+        throw new Error(`No duo "${duoId}" to record a room-join failure for.`);
+      }
+      draft.tenants = draft.tenants.map((candidate) => (candidate.id === duoId ? { ...candidate, spacePending: pending } : candidate));
+    });
+    return pending;
+  }
+
+  /**
+   * Records progress on an org's Space, `#general` and their link, merging into the org in one write.
+   * Progress is recorded step by step so a run that dies half way is finished, not redone: a room
+   * that exists is never created twice.
+   */
+  updateOrgSpace(
+    orgId: string,
+    patch: { spaceRoomId?: string; generalRoomId?: string; spaceSyncedName?: string; generalLinked?: boolean },
+  ): HostedOrg {
+    return this.commit((draft) => {
+      const org = draft.orgs.find((candidate) => candidate.id === orgId);
+      if (!org) {
+        throw new OrgNotFoundError(orgId);
+      }
+      const updated: HostedOrg = { ...org, ...patch };
+      draft.orgs = draft.orgs.map((candidate) => (candidate.id === orgId ? updated : candidate));
+      return updated;
+    });
+  }
+
+  /** Clears an org's pending mark: its rooms exist, are linked and carry its current name. */
+  clearOrgSpacePending(orgId: string): void {
+    if (this.org(orgId)?.spacePending === undefined) {
+      return;
+    }
+    this.commit((draft) => {
+      draft.orgs = draft.orgs.map((org) => {
+        const { spacePending: _cleared, ...rest } = org;
+        return org.id === orgId ? rest : org;
+      });
+    });
+  }
+
+  /** Marks an org's rooms as owed and failing. */
+  recordOrgSpaceFailure(orgId: string, reason: string): MatrixPending {
+    const existing = this.org(orgId);
+    if (!existing) {
+      throw new OrgNotFoundError(orgId);
+    }
+    const pending = this.nextPending(existing.spacePending, reason);
+    this.commit((draft) => {
+      draft.orgs = draft.orgs.map((org) => (org.id === orgId ? { ...org, spacePending: pending } : org));
+    });
+    return pending;
+  }
+
+  private nextPending(previous: MatrixPending | undefined, reason: string): MatrixPending {
+    const now = new Date().toISOString();
+    return { since: previous?.since ?? now, attempts: (previous?.attempts ?? 0) + 1, lastAttemptAt: now, lastError: reason };
+  }
+
   passphraseFor(tenant: HostedTenant): string {
     return decrypt(Buffer.from(tenant.passphraseCipher, "base64"), this.masterKey).toString("utf8");
   }
@@ -381,6 +612,13 @@ export class HostedRegistry {
     const result = change(draft);
     this.persist(draft);
     this.data = draft;
+    for (const listener of this.changeListeners) {
+      try {
+        listener();
+      } catch {
+        // A follower's trouble is never the writer's.
+      }
+    }
     return result;
   }
 

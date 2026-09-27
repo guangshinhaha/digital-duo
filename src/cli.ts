@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedServe } from "./commands/hosted.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runConnectorNew, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -160,6 +160,45 @@ hostedCommand
       const invite = await runHostedInvite(name, options.expiresInHours, process.env, options.org);
       console.log(`Invite for "${invite.name}" into org ${invite.orgId} (expires ${invite.expiresAt}, single use):`);
       console.log(invite.link ?? `code: ${invite.code} (set DUO_HOSTED_PUBLIC_URL and DUO_HOSTED_WEB_URL to get a full link)`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedCommand
+  .command("provision")
+  .description("Create the Matrix accounts every hosted duo still lacks, then each org's Space and #general and put members in them (safe to re-run; talks to the running hosted daemon, which needs DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN)")
+  .option("--remint <duoId>", "instead, give this one duo a new Matrix token (for a duo whose token Synapse no longer knows, e.g. after its database was reset); the connection restarts with it")
+  .action(async (options: { remint?: string }) => {
+    try {
+      if (options.remint !== undefined) {
+        const outcome = await runHostedRemint(options.remint);
+        console.log(
+          outcome.status === "reminted"
+            ? `Minted a new token for ${outcome.duoId}; its connection is restarting with it.`
+            : `${outcome.duoId}: ${outcome.status}${outcome.error ? ` (${outcome.error})` : ""}. Nothing was changed.`,
+        );
+        return;
+      }
+      const summary = await runHostedProvision();
+      console.log(`Provisioned ${summary.provisioned}, already done ${summary.already}, pending ${summary.pending}, needs attention ${summary.failed}.`);
+      for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "pending")) {
+        console.log(`  ${outcome.duoId}: pending (${outcome.error ?? "unknown"}) — it will be retried`);
+      }
+      for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "failed")) {
+        console.log(`  ${outcome.duoId}: needs attention (${outcome.error ?? "unknown"}) — see the daemon log`);
+      }
+      const { orgs, members } = summary.spaces;
+      console.log(
+        `Org spaces: ${orgs.provisioned} made, ${orgs.already} already done, ${orgs.pending} pending, ${orgs.failed} need attention. ` +
+          `Members joined: ${members.provisioned} now, ${members.already} already, ${members.pending} pending, ${members.failed} need attention, ${members.waiting} waiting for their accounts.`,
+      );
+      for (const outcome of summary.spaces.orgOutcomes.filter((candidate) => candidate.status === "pending" || candidate.status === "failed")) {
+        console.log(`  org ${outcome.orgId}: ${outcome.status} (${outcome.error ?? "unknown"})`);
+      }
+      for (const outcome of summary.spaces.memberOutcomes.filter((candidate) => candidate.status === "pending" || candidate.status === "failed")) {
+        console.log(`  ${outcome.duoId}: space join ${outcome.status} (${outcome.error ?? "unknown"})`);
+      }
     } catch (error) {
       reportError(error);
     }

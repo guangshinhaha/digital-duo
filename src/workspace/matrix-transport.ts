@@ -165,13 +165,18 @@ function attachmentsForQuestion(room: Room, questionEventId: string, senderId: s
   return attachments;
 }
 
-export function createMatrixTransport(settings: WorkspaceSettings): WorkspaceTransport {
+/** The SDK's own logger interface, for a caller that wants this client's SDK logging elsewhere (a hosted daemon runs many clients in one process, #236). */
+export type MatrixSdkLogger = NonNullable<Parameters<typeof createClient>[0]["logger"]>;
+
+export function createMatrixTransport(settings: WorkspaceSettings, options: { readonly sdkLogger?: MatrixSdkLogger } = {}): WorkspaceTransport {
   // The access token lives in the client and in the env var it came from,
   // and nowhere else: it is never logged, never persisted by this code.
   const client: MatrixClient = createClient({
     baseUrl: settings.homeserverUrl,
     accessToken: settings.accessToken,
     userId: settings.userId,
+    // Absent: the SDK's global logger, exactly as before (`duo serve`, one client).
+    ...(options.sdkLogger ? { logger: options.sdkLogger } : {}),
   });
   let stopped = false;
   let pendingConnectReject: ((error: Error) => void) | undefined;
