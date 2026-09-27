@@ -12,6 +12,8 @@ import { createServer, type ServeDeps } from "../serve/server.js";
 import { createDeviceToken, verifyDeviceToken } from "../serve/tokens.js";
 import { createEncryptedStore } from "../store/store.js";
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
+import { OAuthStore, CLAUDE_REDIRECT_URIS } from "./oauth.js";
+import { registerOAuthRoutes } from "./oauth-routes.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
 import { HostedRegistry, InviteInvalidError, type HostedTenant } from "./registry.js";
 
@@ -98,6 +100,8 @@ export interface SharedDuoRuntime {
 interface MountedDuo {
   readonly app: FastifyInstance;
   readonly server: Server;
+  /** Kept so the OAuth-authenticated MCP address can serve a request against this duo. */
+  readonly deps: ServeDeps;
 }
 
 async function mountDuo(deps: ServeDeps): Promise<MountedDuo> {
@@ -112,7 +116,7 @@ async function mountDuo(deps: ServeDeps): Promise<MountedDuo> {
   if (!server) {
     throw new Error("hosted: the duo's server factory was never called");
   }
-  return { app, server };
+  return { app, server, deps };
 }
 
 function tenantDeps(shared: SharedDuoRuntime, settings: HostedSettings, tenant: HostedTenant, passphrase: string): ServeDeps {
@@ -196,11 +200,25 @@ export async function createHostedServer(
   identityVerifier: IdentityVerifier | undefined = settings.googleClientId ? googleIdentityVerifier(settings.googleClientId) : undefined,
 ): Promise<HostedServer> {
   const registry = new HostedRegistry(join(settings.hostedRoot, "registry.json"), settings.masterKey);
+  // #240: sign-in connectors for claude.ai need somewhere to send the owner (the web app), an address to be (the public
+  // URL) and a way to know who signed in. Without all three a duo keeps the secret-URL connector.
+  const oauth =
+    settings.publicUrl && settings.webUrl && identityVerifier
+      ? new OAuthStore(join(settings.hostedRoot, "oauth.json"), [
+          ...CLAUDE_REDIRECT_URIS,
+          ...(shared.env.DUO_OAUTH_REDIRECT_URIS ?? "").split(",").map((uri) => uri.trim()).filter((uri) => uri.length > 0),
+        ])
+      : undefined;
+  const withConnector = (deps: ServeDeps, duoId: string): ServeDeps =>
+    oauth && settings.publicUrl
+      ? { ...deps, connectorAccess: { url: `${settings.publicUrl}/mcp`, connections: () => oauth.connections(duoId), revoke: (id) => oauth.revoke(duoId, id) } }
+      : deps;
+
   const duos = new Map<string, MountedDuo>();
   for (const tenant of registry.tenants()) {
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant))));
+    duos.set(tenant.id, await mountDuo(withConnector(tenantDeps(shared, settings, tenant, registry.passphraseFor(tenant)), tenant.id)));
   }
-  const rootDuo = root ? await mountDuo(root) : undefined;
+  const rootDuo = root ? await mountDuo(withConnector(root, ROOT_DUO_ID)) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
   }
@@ -389,7 +407,7 @@ export async function createHostedServer(
       tenantId,
       identity ? { identitySubject: identity.subject, email: identity.email, isAdmin: isAdminEmail(identity.email) } : {},
     );
-    duos.set(tenant.id, await mountDuo(tenantDeps(shared, settings, tenant, passphrase)));
+    duos.set(tenant.id, await mountDuo(withConnector(tenantDeps(shared, settings, tenant, passphrase), tenant.id)));
     reply.code(201);
     return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
   });
@@ -484,6 +502,29 @@ export async function createHostedServer(
     registry.tenants().map(({ passphraseCipher: _cipher, ...rest }) => rest),
   );
 
+  if (oauth && settings.publicUrl && settings.webUrl) {
+    registerOAuthRoutes(control, {
+      publicUrl: settings.publicUrl,
+      webUrl: settings.webUrl,
+      store: oauth,
+      identify,
+      signInBlocked: signupBlocked,
+      // The same account-to-duo rule as /hosted/login, minus its "first admin claims the root duo" step: connecting
+      // Claude never creates or claims a duo.
+      duoForIdentity: (identity) => {
+        const tenant = registry.tenantBySubject(identity.subject);
+        if (tenant) {
+          return { duoId: tenant.id, ownerName: tenant.name };
+        }
+        if (root && registry.root()?.identitySubject === identity.subject) {
+          return { duoId: ROOT_DUO_ID, ownerName: root.ownerName };
+        }
+        return undefined;
+      },
+      depsFor: (duoId) => (duoId === ROOT_DUO_ID ? rootDuo?.deps : duos.get(duoId)?.deps),
+    });
+  }
+
   await control.ready();
   if (!controlServer) {
     throw new Error("hosted: the control server factory was never called");
@@ -494,6 +535,11 @@ export async function createHostedServer(
   const route = (request: IncomingMessage): Server | undefined => {
     const url = request.url ?? "/";
     if (url === "/hosted" || url.startsWith("/hosted/") || url.startsWith("/hosted?")) {
+      return controlTarget;
+    }
+    // #240: the OAuth server and the signed-in MCP address are the front's own, not any one duo's. `/mcp/<secret>` (with
+    // a secret after the slash) is not this: it stays with the duo that minted it.
+    if (oauth && (url === "/mcp" || url.startsWith("/mcp?") || url.startsWith("/oauth/") || url.startsWith("/.well-known/oauth-"))) {
       return controlTarget;
     }
     const match = /^\/t\/([a-z0-9]+)(\/[^?]*)?(\?.*)?$/.exec(url);

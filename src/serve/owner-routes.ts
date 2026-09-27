@@ -144,21 +144,40 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
     return createDeviceToken(deps.storePath, deps.passphrase, name);
   });
 
-  // #227: the claude.ai connector. POST mints this duo's connector secret
-  // (revoking any earlier one) and returns its path once; the client joins
-  // it to the daemon base it already talks to, which under hosted mode
-  // carries the duo's /t/<id> prefix. GET reports whether one is live, plus
-  // the prompt the owner pastes into claude.ai to feed their past chats.
+  // #227: the claude.ai connector. Where hosted mode supplies sign-in access
+  // (#240), Claude connects by signing in: GET reports the one plain URL to
+  // paste and the connected Claudes, POST /connector is refused (there is no
+  // secret to mint) and a connection is revoked by id. Otherwise POST mints
+  // this duo's connector secret (revoking any earlier one) and returns its
+  // path once; the client joins it to the daemon base it already talks to,
+  // which under hosted mode carries the duo's /t/<id> prefix. Either way GET
+  // also returns the prompt the owner pastes into claude.ai to feed their
+  // past chats.
   app.post("/connector", async (_request, reply) => {
+    if (deps.connectorAccess) {
+      sendError(reply, 409, "connector_uses_sign_in", "This duo connects Claude by signing in; there is no secret URL to generate.");
+      return;
+    }
     const minted = createConnectorToken(deps.storePath, deps.passphrase);
     reply.code(201);
     return { id: minted.id, createdAt: minted.createdAt, path: `/mcp/${minted.token}` };
   });
 
-  app.get("/connector", async () => ({
-    connector: getConnectorToken(deps.storePath, deps.passphrase) ?? null,
-    historyPrompt: buildHistoryPrompt(deps.classificationCeiling),
-  }));
+  app.get("/connector", async () => {
+    const historyPrompt = buildHistoryPrompt(deps.classificationCeiling);
+    if (deps.connectorAccess) {
+      return { mode: "signin", connector: null, url: deps.connectorAccess.url, connections: deps.connectorAccess.connections(), historyPrompt };
+    }
+    return { mode: "secret", connector: getConnectorToken(deps.storePath, deps.passphrase) ?? null, historyPrompt };
+  });
+
+  app.post<{ Params: { id: string } }>("/connector/connections/:id/revoke", async (request, reply) => {
+    if (!deps.connectorAccess?.revoke(request.params.id)) {
+      sendError(reply, 404, "connection_not_found", `No connected Claude with id "${request.params.id}".`);
+      return;
+    }
+    return { ok: true };
+  });
 
   app.get("/trust/promotions", async () => getPendingPromotionOffers(deps.storePath, deps.passphrase, deps.duoDir));
 

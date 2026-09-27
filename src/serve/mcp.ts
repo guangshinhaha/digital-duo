@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { embedRecords } from "../ingest/embeddings.js";
 import { createRecord } from "../ingest/record.js";
@@ -144,6 +144,28 @@ export function describeBatchOutcome(outcome: SaveBatchOutcome): string {
   return outcome.embedded ? line : `${line} The saved notes are not searchable by meaning yet: embedding failed (${outcome.embedError}). The next embed run will pick them up.`;
 }
 
+/** One connected Claude, as its owner sees it: never a token, only that it exists and when it was last used. */
+export interface ConnectorConnection {
+  readonly id: string;
+  readonly clientName: string;
+  readonly createdAt: string;
+  readonly lastUsedAt: string | null;
+}
+
+/**
+ * Issue #240: how a duo's owner connects Claude by signing in, instead of by
+ * a secret URL. Hosted mode supplies it (it is the one that knows who signed
+ * in); a duo without it keeps the secret-URL connector. Where it is present
+ * the secret URLs are refused, so a leaked one is worth nothing.
+ */
+export interface ConnectorAccess {
+  /** The one address the owner pastes into claude.ai; it carries no secret. */
+  readonly url: string;
+  connections(): readonly ConnectorConnection[];
+  /** Revokes one connection at once; false when this duo has no such connection. */
+  revoke(connectionId: string): boolean;
+}
+
 /**
  * The prompt an owner pastes into claude.ai after adding the connector, to
  * have Claude feed their past chats into the duo. It lives here, beside the
@@ -196,35 +218,53 @@ function buildMcpServer(deps: ServeDeps): McpServer {
 }
 
 /**
- * Issue #227: the MCP endpoint claude.ai's custom connector calls. The
- * secret in the path is the credential (claude.ai's connector form takes a
- * URL, not a header), so the bearer hook skips `/mcp/` and this route checks
- * the secret itself. Under hosted mode the front rewrites `/t/<duo>/mcp/…`
- * to `/mcp/…` inside that duo's own app, so a secret only ever reaches the
- * duo that minted it.
+ * Serves one MCP request against a duo, once the caller has established who
+ * it is for. Stateless Streamable HTTP: a fresh server and transport per
+ * request, no session to track.
+ */
+export async function handleMcpRequest(deps: ServeDeps, request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const server = buildMcpServer(deps);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+  reply.hijack();
+  reply.raw.on("close", () => {
+    void transport.close();
+    void server.close();
+  });
+  await server.connect(transport);
+  await transport.handleRequest(request.raw, reply.raw, request.body);
+}
+
+export const MCP_METHOD_NOT_ALLOWED = { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null };
+
+/**
+ * Issue #227: the secret-URL MCP endpoint claude.ai's custom connector calls.
+ * The secret in the path is the credential (claude.ai's connector form takes
+ * a URL, not a header), so the bearer hook skips `/mcp/` and this route
+ * checks the secret itself. Under hosted mode the front rewrites
+ * `/t/<duo>/mcp/…` to `/mcp/…` inside that duo's own app, so a secret only
+ * ever reaches the duo that minted it. Refused outright once the duo has
+ * sign-in connectors (#240).
  *
- * Stateless Streamable HTTP: a fresh server and transport per request, no
- * session to track. GET (a standalone event stream) and DELETE (ending a
- * session) are answered 405, which the transport spec allows.
+ * GET (a standalone event stream) and DELETE (ending a session) are
+ * answered 405, which the transport spec allows.
  */
 export function registerMcpRoutes(app: FastifyInstance, deps: ServeDeps): void {
   app.post<{ Params: { secret: string } }>("/mcp/:secret", async (request, reply) => {
+    if (deps.connectorAccess) {
+      reply.code(401).send({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Secret connector URLs are turned off for this duo. Add the connector again from your duo's Settings and sign in." },
+        id: null,
+      });
+      return;
+    }
     if (!verifyConnectorToken(deps.storePath, deps.passphrase, request.params.secret)) {
       reply.code(401).send({ jsonrpc: "2.0", error: { code: -32001, message: "This connector URL is not valid. Copy a new one from your duo." }, id: null });
       return;
     }
-    const server = buildMcpServer(deps);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-    reply.hijack();
-    reply.raw.on("close", () => {
-      void transport.close();
-      void server.close();
-    });
-    await server.connect(transport);
-    await transport.handleRequest(request.raw, reply.raw, request.body);
+    await handleMcpRequest(deps, request, reply);
   });
 
-  const methodNotAllowed = { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null };
-  app.get("/mcp/:secret", async (_request, reply) => reply.code(405).header("Allow", "POST").send(methodNotAllowed));
-  app.delete("/mcp/:secret", async (_request, reply) => reply.code(405).header("Allow", "POST").send(methodNotAllowed));
+  app.get("/mcp/:secret", async (_request, reply) => reply.code(405).header("Allow", "POST").send(MCP_METHOD_NOT_ALLOWED));
+  app.delete("/mcp/:secret", async (_request, reply) => reply.code(405).header("Allow", "POST").send(MCP_METHOD_NOT_ALLOWED));
 }

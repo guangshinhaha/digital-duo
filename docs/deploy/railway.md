@@ -65,7 +65,23 @@ duo derive pairs && duo derive topics && duo derive rules && duo derive voice
 **One writer at a time** (README "Known limitations"): the CLI and the running daemon each write
 the whole store file. Don't use the app while a `duo import`, `duo embed` or `duo derive` runs.
 
+## Connect to claude.ai by signing in (hosted mode)
+
+When the daemon has `DUO_HOSTED_PUBLIC_URL`, `DUO_HOSTED_WEB_URL` and Google sign-in configured, claude.ai connects by
+signing in and the secret URLs below are turned off. Settings, "Connect to Claude" shows one plain address (the public
+URL plus `/mcp`); paste it into claude.ai under Settings, Connectors, Add custom connector. Claude registers itself, sends
+you to the web app's `#connect` page to sign in with Google, and is given tokens for the duo that Google account owns.
+
+- One address serves every duo: the token names the duo, so Kim's sign-in can only ever reach Kim's duo.
+- Access tokens last an hour and refresh tokens 30 days (rotated on use; a reused one revokes the connection). Revoke a
+  connection from Settings, Connect to Claude; the next save is refused.
+- Grants live in `<DUO_HOSTED_ROOT>/oauth.json`, hashed. Losing the file signs every connector out, nothing else.
+- Only Claude's own callback addresses can register. `DUO_OAUTH_REDIRECT_URIS` (comma separated) adds more, for another
+  MCP client; leave it unset otherwise.
+- The sign-in page is the web app, so Google needs no new authorised origin.
+
 ## Connect to claude.ai (save from any chat)
+(a duo without sign-in connectors, e.g. a plain `duo serve`)
 
 The daemon serves an MCP endpoint at `/mcp/<secret>`; the secret is the credential. Mint the URL from a
 shell on the daemon:
