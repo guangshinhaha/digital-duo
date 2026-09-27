@@ -92,7 +92,8 @@ export type DraftProvenance =
  */
 export type DraftDelivery =
   | { readonly state: "pending" }
-  | { readonly state: "delivered" }
+  /** `eventId` is the channel's own reference for the posted message (a Matrix event id, opaque to the client) — present only when the adapter that delivered it had one to give (digital-duo#247). */
+  | { readonly state: "delivered"; readonly eventId?: string }
   | { readonly state: "failed"; readonly reason: string };
 
 /**
@@ -183,6 +184,10 @@ const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: st
   // rowToDraft reads that as delivery null.
   { column: "delivery_state", ddl: "ALTER TABLE drafts ADD COLUMN delivery_state TEXT" },
   { column: "delivery_reason", ddl: "ALTER TABLE drafts ADD COLUMN delivery_reason TEXT" },
+  // NULL on a pre-existing row and on any delivery whose adapter had no
+  // reference to give — rowToDraft reads a NULL event id as simply absent,
+  // never a fabricated one (digital-duo#247).
+  { column: "delivery_event_id", ddl: "ALTER TABLE drafts ADD COLUMN delivery_event_id TEXT" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -206,7 +211,8 @@ export function ensureDraftLogSchema(db: Database): void {
       escalation_threshold REAL NOT NULL DEFAULT 0.55,
       provenance TEXT,
       delivery_state TEXT,
-      delivery_reason TEXT
+      delivery_reason TEXT,
+      delivery_event_id TEXT
     ) STRICT
   `);
 
@@ -327,8 +333,13 @@ export function recordDeliveryOutcome(
   withDatabase(storePath, passphrase, true, (db) => {
     ensureDraftLogSchema(db);
     const result = db
-      .prepare(`UPDATE drafts SET delivery_state = ?, delivery_reason = ? WHERE id = ?`)
-      .run(delivery.state, delivery.state === "failed" ? delivery.reason : null, draftId);
+      .prepare(`UPDATE drafts SET delivery_state = ?, delivery_reason = ?, delivery_event_id = ? WHERE id = ?`)
+      .run(
+        delivery.state,
+        delivery.state === "failed" ? delivery.reason : null,
+        delivery.state === "delivered" ? (delivery.eventId ?? null) : null,
+        draftId,
+      );
     if (result.changes === 0) {
       throw new DraftNotFoundError(draftId);
     }
@@ -353,6 +364,7 @@ interface DraftRow {
   provenance: string | null;
   delivery_state: string | null;
   delivery_reason: string | null;
+  delivery_event_id: string | null;
 }
 
 /**
@@ -413,7 +425,7 @@ function rowToDraft(row: DraftRow): DraftRecord {
       row.delivery_state === "pending"
         ? { state: "pending" }
         : row.delivery_state === "delivered"
-          ? { state: "delivered" }
+          ? { state: "delivered", ...(row.delivery_event_id !== null ? { eventId: row.delivery_event_id } : {}) }
           : row.delivery_state === "failed"
             ? { state: "failed", reason: row.delivery_reason ?? "delivery failed" }
             : null,

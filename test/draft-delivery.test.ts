@@ -66,6 +66,47 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toEqual({ state: "delivered" });
   });
 
+  it("carries the adapter's own reference for the posted message, once delivered (digital-duo#247)", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+    const slack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver() {
+        return "$abc123:example.org";
+      },
+    };
+
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { channelAdapters: [slack] });
+
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toEqual({ state: "delivered", eventId: "$abc123:example.org" });
+  });
+
+  it("carries no eventId when the adapter has none to give — never a fabricated one", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+    const slack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver() {
+        // Resolves with nothing — an adapter with no reference to give.
+      },
+    };
+
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { channelAdapters: [slack] });
+
+    const delivery = getDraft(storePath, PASSPHRASE, draftId)?.delivery;
+    expect(delivery).toEqual({ state: "delivered" });
+    expect(delivery && "eventId" in delivery).toBe(false);
+  });
+
+
   it("an edited outcome delivers the edited text, not the original draft", async () => {
     const storePath = initStore();
     const draftId = appendChannelDraft(storePath, "the original draft text");

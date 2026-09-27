@@ -34,11 +34,16 @@ export interface ChannelAdapter {
    */
   status(): Promise<ChannelStatus>;
   /**
-   * Hands the final text to the channel. Resolves on success; throws on
-   * transport failure (the message becomes the draft's recorded failure
-   * reason). Async by nature — a real transport is a network call.
+   * Hands the final text to the channel. Resolves on success — with that
+   * channel's own reference for the message it just posted (a Matrix
+   * event id, a Slack message ts, …), when the adapter has one to give
+   * (digital-duo#247); an adapter with none simply resolves with nothing,
+   * which the delivery record then carries no `eventId` for — never a
+   * fabricated one. Throws on transport failure (the message becomes the
+   * draft's recorded failure reason). Async by nature — a real transport
+   * is a network call.
    */
-  deliver(request: ChannelDeliveryRequest): Promise<void>;
+  deliver(request: ChannelDeliveryRequest): Promise<string | undefined | void>;
 }
 
 /** A channel's connection state plus when it last carried anything — both reported by the adapter, which is the only side that can know (#171). */
@@ -135,13 +140,21 @@ export async function deliverSentDraft(
   // handoff, so a daemon that dies mid-delivery leaves an honest row.
   recordDeliveryOutcome(storePath, passphrase, draft.id, { state: "pending" });
   try {
-    await adapter.deliver({
+    const reference = await adapter.deliver({
       askerRef: provenance.askerRef,
       threadId: provenance.threadId,
       permalink: provenance.permalink,
       text,
     });
-    recordDeliveryOutcome(storePath, passphrase, draft.id, { state: "delivered" });
+    // #247: only a real string is an eventId — an adapter that resolves
+    // with nothing (void, undefined) reports delivered with none, which
+    // is the honest default rather than inventing one.
+    recordDeliveryOutcome(
+      storePath,
+      passphrase,
+      draft.id,
+      typeof reference === "string" ? { state: "delivered", eventId: reference } : { state: "delivered" },
+    );
   } catch (error) {
     recordDeliveryOutcome(storePath, passphrase, draft.id, {
       state: "failed",
