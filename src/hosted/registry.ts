@@ -423,14 +423,12 @@ export class HostedRegistry {
 
   /**
    * Takes the org admin role from a member of `orgId` and keeps them as a member, recording who did it and when. Revoking a duo that
-   * holds no role changes nothing. Unless `allowLast` (only the super admin's routes pass it), the last org admin of an org cannot be
+   * holds no role changes nothing; the root duo is refused (`RootNotAppointableError`) as it is when appointed. Unless `allowLast` (only the super admin's routes pass it), the last org admin of an org cannot be
    * revoked: `LastOrgAdminError`, and nothing changes. The whole check-and-write is synchronous, so two admins revoking each other
    * at once run one after the other and the second finds itself the last.
    */
   revokeOrgAdmin(orgId: string, duoId: string, by: string, options: { allowLast: boolean }): { member: OrgMember; changed: boolean } {
-    if (duoId === ROOT_DUO_ID && this.rootIn(orgId)) {
-      return { member: this.memberOf(orgId, duoId), changed: false };
-    }
+    // The root duo never holds the role, so revoking it is refused exactly as appointing it is (`RootNotAppointableError`, from `tenantInOrg`).
     const tenant = this.tenantInOrg(orgId, duoId);
     if (!tenant.orgAdmin) {
       return { member: this.memberOf(orgId, duoId), changed: false };
@@ -662,6 +660,7 @@ export class HostedRegistry {
     expiresAt: string,
     email: string | null = null,
     orgId: string = DEFAULT_ORG_ID,
+    options: { pruneExpired?: boolean } = {},
   ): { invite: HostedInvite; code: string } {
     if (!this.org(orgId)) {
       throw new OrgNotFoundError(orgId);
@@ -679,6 +678,11 @@ export class HostedRegistry {
       orgId,
     };
     this.commit((draft) => {
+      if (options.pruneExpired) {
+        // In the same write: this org's unused invites that have lapsed can no longer be redeemed, so they are dead weight.
+        const now = Date.now();
+        draft.invites = draft.invites.filter((candidate) => candidate.orgId !== orgId || candidate.usedAt !== null || Date.parse(candidate.expiresAt) > now);
+      }
       draft.invites.push(invite);
     });
     return { invite, code };

@@ -448,6 +448,7 @@ export async function createHostedServer(
   const orgAdmin = new OrgAdmin({
     registry,
     isAdminEmail,
+    log: extras.log,
     renameOrg: (orgId, name) => renameOrgAndSpace(orgId, name),
     inviteLink: (code) =>
       settings.webUrl && settings.publicUrl ? `${settings.webUrl}/#join?host=${encodeURIComponent(settings.publicUrl)}&invite=${encodeURIComponent(code)}` : null,

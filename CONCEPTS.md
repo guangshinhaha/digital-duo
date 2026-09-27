@@ -29,7 +29,7 @@ A named group of duos on one hosted server, held in the hosted registry: every d
 *Avoid:* tenant (a tenant is one hosted duo, not a group of them), team
 
 ### Super admin
-Anyone whose Google email is listed in `DUO_HOSTED_ADMIN_EMAILS`, plus the server-side admin token: the only callers who may create, rename and list orgs, list any org's members, and invite into an org. Read live from the env on every request, so removing an email withdraws the privilege. A caller with no credential is refused 401, any other caller 403.
+Anyone whose Google email is listed in `DUO_HOSTED_ADMIN_EMAILS`, plus the server-side admin token: the only callers who may create orgs, list all orgs, and act on any org. An org admin does the same for their own org only. Read live from the env on every request, so removing an email withdraws the privilege. On the `/hosted/*` routes a caller with no credential is refused 401, any other caller 403.
 *Avoid:* org admin (a different role: it manages one org only)
 
 ### Org admin

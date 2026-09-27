@@ -18,9 +18,12 @@ import {
   RootNotAppointableError,
   SUPER_ADMIN_ACTOR,
 } from "../src/hosted/orgs.js";
+import { CLAUDE_REDIRECT_URIS } from "../src/hosted/oauth.js";
+import { MAX_PENDING_INVITES_PER_ORG } from "../src/hosted/org-admin.js";
 import { HostedRegistry } from "../src/hosted/registry.js";
 import { createHostedServer, tenantPaths, type HostedServer, type HostedSettings } from "../src/hosted/server.js";
 import type { ServeDeps } from "../src/serve/server.js";
+import { createHash, randomBytes } from "node:crypto";
 import { createAskToken } from "../src/serve/tokens.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
@@ -77,13 +80,13 @@ function rootDeps(): ServeDeps {
   };
 }
 
-async function start(fake: FakeSynapse, hostedSettings: HostedSettings = settings(), root?: ServeDeps) {
+async function start(fake: FakeSynapse, hostedSettings: HostedSettings = settings(), root?: ServeDeps, log: (line: string) => void = () => {}) {
   const hosted = await createHostedServer(
     { config: loadConfig({}), env: { DUO_CORS_ORIGINS: "https://web.example" }, embeddingProvider: createFakeEmbeddingProvider(), inferenceProvider: undefined, trustProxy: false },
     hostedSettings,
     root,
     fakeIdentity,
-    { synapseFetch: fake.fetch, log: () => {}, provisionRetryMs: 3_600_000 },
+    { synapseFetch: fake.fetch, log, provisionRetryMs: 3_600_000 },
   );
   running.push(hosted);
   await new Promise<void>((resolve) => hosted.server.listen(0, "127.0.0.1", () => resolve()));
@@ -138,9 +141,9 @@ async function join_(base: string, orgId: string, who: string): Promise<Person> 
   return json(await call(base, "POST", "/hosted/signup", undefined, { invite: code, credential: `sub-${who}|${who}@x.com|${who}` }), 201);
 }
 
-async function world(options: { root?: boolean; settings?: HostedSettings } = {}): Promise<World> {
+async function world(options: { root?: boolean; settings?: HostedSettings; log?: (line: string) => void } = {}): Promise<World> {
   const fake = createFakeSynapse({ orgWall: true });
-  const { hosted, base } = await start(fake, options.settings ?? settings(), options.root ? rootDeps() : undefined);
+  const { hosted, base } = await start(fake, options.settings ?? settings(), options.root ? rootDeps() : undefined, options.log);
   const orgA = await json(await call(base, "POST", "/hosted/orgs", ADMIN, { name: "Alpha" }), 201);
   const orgB = await json(await call(base, "POST", "/hosted/orgs", ADMIN, { name: "Beta" }), 201);
   const ann = await join_(base, orgA.id, "ann");
@@ -206,7 +209,9 @@ describe("org admin — registry", () => {
     registry.declareRootDuo("Shin");
     expect(() => registry.grantOrgAdmin(DEFAULT_ORG_ID, ROOT_DUO_ID, SUPER_ADMIN_ACTOR)).toThrow(RootNotAppointableError);
     expect(() => registry.grantOrgAdmin(org.id, ROOT_DUO_ID, SUPER_ADMIN_ACTOR)).toThrow(OrgMemberNotFoundError);
-    expect(registry.revokeOrgAdmin(DEFAULT_ORG_ID, ROOT_DUO_ID, SUPER_ADMIN_ACTOR, { allowLast: true }).changed).toBe(false);
+    // Revoking it is refused the same way as appointing it (it never holds the role); elsewhere it is an unknown id.
+    expect(() => registry.revokeOrgAdmin(DEFAULT_ORG_ID, ROOT_DUO_ID, SUPER_ADMIN_ACTOR, { allowLast: true })).toThrow(RootNotAppointableError);
+    expect(() => registry.revokeOrgAdmin(org.id, ROOT_DUO_ID, SUPER_ADMIN_ACTOR, { allowLast: true })).toThrow(OrgMemberNotFoundError);
   });
 
   it("keeps the last org admin unless the caller may override, and the failed revoke writes nothing", () => {
@@ -481,7 +486,11 @@ describe("org admin — own org only", () => {
     expect((await json<any[]>(await w.admin("GET", "/hosted/orgs"), 200)).find((org) => org.id === w.orgA.id).name).toBe("Platform");
 
     // Names stay unique (case-insensitively) and bounded; another org's id in the body is refused, not followed.
-    expect((await json(await w.as(w.ann, "POST", "/org/rename", { name: "beta" }), 409)).error.code).toBe("org_name_taken");
+    // An org admin learns nothing about other orgs' names: a taken name is a generic refusal, and the super admin's route stays specific.
+    const unavailable = await json(await w.as(w.ann, "POST", "/org/rename", { name: "beta" }), 409);
+    expect(unavailable.error).toEqual({ code: "name_unavailable", message: "That name isn't available." });
+    expect(JSON.stringify(unavailable)).not.toContain("Beta");
+    expect((await json(await w.admin("POST", `/hosted/orgs/${w.orgA.id}/rename`, { name: "beta" }), 409)).error.code).toBe("org_name_taken");
     expect((await w.as(w.ann, "POST", "/org/rename", { name: "" })).status).toBe(400);
     expect((await json(await w.as(w.ann, "POST", "/org/rename", { name: "Hijack", orgId: w.orgB.id }), 403)).error.code).toBe("forbidden");
     expect(w.hosted.registry.org(w.orgB.id)!.name).toBe("Beta");
@@ -776,5 +785,184 @@ describe("duo hosted org admin … (terminal)", () => {
     const base = { duoId: "d", name: "N", email: "n@x.com", isRoot: false, joinedAt: null, isAdmin: true, orgAdminLog: [], appointedBy: null, appointedByName: null, appointedAt: null };
     expect(formatOrgMemberLine({ ...base, superAdmin: true, orgRole: "member" })).toBe("d\tN\tn@x.com\tsuper admin");
     expect(formatOrgMemberLine({ ...base, superAdmin: false, orgRole: "member" })).toBe("d\tN\tn@x.com");
+  });
+});
+
+describe("org admin — invites are bounded for an org admin", () => {
+  it("refuses a name longer than 80 characters, for the org admin and the super admin alike", async () => {
+    const w = await world();
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    const before = w.hosted.registry.invites().length;
+    expect((await json(await w.as(w.ann, "POST", "/org/invites", { name: "x".repeat(81) }), 400)).error.code).toBe("bad_request");
+    expect((await w.admin("POST", "/hosted/invites", { name: "x".repeat(81), orgId: w.orgA.id })).status).toBe(400);
+    expect(w.hosted.registry.invites().length).toBe(before);
+    expect((await w.as(w.ann, "POST", "/org/invites", { name: "x".repeat(80) })).status).toBe(201);
+  });
+
+  it("caps the org's pending invites at 50 for an org admin, drops lapsed ones as it goes, and leaves the super admin unlimited", async () => {
+    const w = await world();
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    const pending = () => w.hosted.registry.invites().filter((invite) => invite.orgId === w.orgA.id && invite.usedAt === null && Date.parse(invite.expiresAt) > Date.now()).length;
+    // Beta's invites do not count against Alpha.
+    await json(await w.admin("POST", "/hosted/invites", { name: "Beta hire", orgId: w.orgB.id }), 201);
+    for (let index = 0; index < MAX_PENDING_INVITES_PER_ORG; index += 1) {
+      w.hosted.registry.createInvite(`Fill ${index}`, new Date(Date.now() + 3_600_000).toISOString(), null, w.orgA.id);
+    }
+    expect(pending()).toBe(MAX_PENDING_INVITES_PER_ORG);
+    const refused = await json(await w.as(w.ann, "POST", "/org/invites", { name: "One too many" }), 409);
+    expect(refused.error).toMatchObject({ code: "too_many_invites", message: expect.stringContaining("50") });
+    expect(pending()).toBe(MAX_PENDING_INVITES_PER_ORG);
+    // The super admin's limits stay as they were.
+    expect((await w.admin("POST", "/hosted/invites", { name: "Via admin", orgId: w.orgA.id })).status).toBe(201);
+    expect(pending()).toBe(MAX_PENDING_INVITES_PER_ORG + 1);
+  });
+
+  it("drops the org's lapsed unused invites when an org admin makes one, and keeps used, unexpired and other orgs' invites", async () => {
+    const w = await world();
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    const past = new Date(Date.now() - 1_000).toISOString();
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    w.hosted.registry.createInvite("Stale A", past, null, w.orgA.id);
+    w.hosted.registry.createInvite("Stale B", past, null, w.orgB.id);
+    w.hosted.registry.createInvite("Live A", future, null, w.orgA.id);
+    const used = w.hosted.registry.invites().filter((invite) => invite.usedAt !== null).length;
+    expect(used).toBe(4);
+
+    await json(await w.as(w.ann, "POST", "/org/invites", { name: "Fresh" }), 201);
+    const names = w.hosted.registry.invites().map((invite) => invite.name);
+    expect(names).not.toContain("Stale A");
+    expect(names).toEqual(expect.arrayContaining(["Stale B", "Live A", "Fresh"]));
+    expect(w.hosted.registry.invites().filter((invite) => invite.usedAt !== null)).toHaveLength(used);
+    // The super admin's invite path does not prune.
+    w.hosted.registry.createInvite("Stale A2", past, null, w.orgA.id);
+    await json(await w.admin("POST", "/hosted/invites", { name: "Admin made", orgId: w.orgA.id }), 201);
+    expect(w.hosted.registry.invites().map((invite) => invite.name)).toContain("Stale A2");
+  });
+});
+
+describe("org admin — a super admin who is also an org admin", () => {
+  /** Alpha has Ann (org admin) and Ari; Ari's email is then added to the super admin list, as an operator might after appointing them. */
+  async function dual(appointSecond: boolean) {
+    const admins = ["shin@x.com"];
+    const w = await world({ settings: settings({ adminEmails: admins }) });
+    await grantByAdmin(w, w.orgA.id, w.ari);
+    if (appointSecond) {
+      await grantByAdmin(w, w.orgA.id, w.ann);
+    }
+    admins.push("ari@x.com");
+    return w;
+  }
+
+  it("may step down from the org admin role while another org admin remains", async () => {
+    const w = await dual(true);
+    expect(await json(await w.as(w.ari, "GET", "/org"), 200)).toMatchObject({ role: "org_admin", superAdmin: true });
+    const steppedDown = await json(await w.as(w.ari, "POST", `/org/admins/${w.ari.tenantId}/revoke`), 200);
+    expect(steppedDown).toMatchObject({ changed: true, member: { orgRole: "member", superAdmin: true } });
+    expect(w.hosted.registry.orgAdminCount(w.orgA.id)).toBe(1);
+  });
+
+  it("is refused as the last org admin when nobody else holds the role, not as a protected super admin", async () => {
+    const w = await dual(false);
+    const refused = await json(await w.as(w.ari, "POST", `/org/admins/${w.ari.tenantId}/revoke`), 409);
+    expect(refused.error.code).toBe("last_org_admin");
+    expect(w.hosted.registry.orgRoleOf(w.ari.tenantId)).toBe("org_admin");
+  });
+
+  it("still cannot be revoked, or appointed, by another org admin", async () => {
+    const w = await dual(true);
+    expect((await json(await w.as(w.ann, "POST", `/org/admins/${w.ari.tenantId}/revoke`), 409)).error.code).toBe("super_admin_protected");
+    expect((await json(await w.as(w.ann, "POST", `/org/admins/${w.ari.tenantId}/grant`), 409)).error.code).toBe("super_admin_protected");
+    expect(w.hosted.registry.orgRoleOf(w.ari.tenantId)).toBe("org_admin");
+  });
+});
+
+describe("org admin — every appoint and revoke reaches the server log", () => {
+  it("writes one line per change, ids and the action only, and none for a no-op or a refusal", async () => {
+    const lines: string[] = [];
+    const w = await world({ log: (line) => lines.push(line) });
+    const mine = () => lines.filter((line) => line.startsWith("hosted: org admin"));
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    await w.as(w.ann, "POST", `/org/admins/${w.ari.tenantId}/grant`);
+    // A no-op grant, a refused revoke of the last admin's peer by a member, and an unknown id log nothing.
+    await w.as(w.ann, "POST", `/org/admins/${w.ari.tenantId}/grant`);
+    await w.as(w.abe, "POST", `/org/admins/${w.ari.tenantId}/revoke`);
+    await w.as(w.ann, "POST", `/org/admins/zzzzzzzzzz/grant`);
+    await w.as(w.ann, "POST", `/org/admins/${w.ari.tenantId}/revoke`);
+    await w.admin("POST", `/hosted/orgs/${w.orgA.id}/admins/${w.ann.tenantId}/revoke`);
+
+    expect(mine()).toEqual([
+      `hosted: org admin grant org=${w.orgA.id} duo=${w.ann.tenantId} by=${SUPER_ADMIN_ACTOR}`,
+      `hosted: org admin grant org=${w.orgA.id} duo=${w.ari.tenantId} by=${w.ann.tenantId}`,
+      `hosted: org admin revoke org=${w.orgA.id} duo=${w.ari.tenantId} by=${w.ann.tenantId}`,
+      `hosted: org admin revoke org=${w.orgA.id} duo=${w.ann.tenantId} by=${SUPER_ADMIN_ACTOR}`,
+    ]);
+    for (const secret of ["@", "Alpha", w.ann.token, w.ari.token, ADMIN]) {
+      expect(mine().join("\n"), secret).not.toContain(secret);
+    }
+  });
+
+  it("still holds the grant after an org admin has toggled a role enough to push it out of the registry's capped list", async () => {
+    const lines: string[] = [];
+    const w = await world({ log: (line) => lines.push(line) });
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    await grantByAdmin(w, w.orgA.id, w.ari);
+    for (let round = 0; round < ORG_ADMIN_LOG_CAP / 2 + 1; round += 1) {
+      await w.as(w.ann, "POST", `/org/admins/${w.abe.tenantId}/grant`);
+      await w.as(w.ann, "POST", `/org/admins/${w.abe.tenantId}/revoke`);
+    }
+    const abe = (await json<any[]>(await w.as(w.ari, "GET", "/org/members"), 200)).find((member) => member.duoId === w.abe.tenantId);
+    expect(abe.orgAdminLog).toHaveLength(ORG_ADMIN_LOG_CAP);
+    expect(lines.filter((line) => line.includes(`duo=${w.abe.tenantId}`))).toHaveLength(ORG_ADMIN_LOG_CAP + 2);
+    // The super admin's own appointment of Ann is in the log, whatever the registry kept.
+    expect(lines).toContain(`hosted: org admin grant org=${w.orgA.id} duo=${w.ann.tenantId} by=${SUPER_ADMIN_ACTOR}`);
+  });
+});
+
+describe("org admin — POST /org/admins/:duoId/grant and /revoke need a signed-in device", () => {
+  const REDIRECT = CLAUDE_REDIRECT_URIS[0];
+  const form = (path: string, body: unknown) => fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  /** claude.ai's sign-in for Ari's Google identity, start to finish: the access token it ends with. */
+  async function connectorToken(base: string): Promise<string> {
+    const clientId = ((await (await form(`${base}/oauth/register`, { client_name: "Claude", redirect_uris: [REDIRECT] })).json()) as { client_id: string }).client_id;
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const params = new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: "S256", state: "s" });
+    const started = await fetch(`${base}/oauth/authorize?${params}`, { redirect: "manual" });
+    const requestId = new URL((started.headers.get("location") ?? "").replace("/#", "/?")).searchParams.get("request") ?? "";
+    const approved = await form(`${base}/oauth/requests/${requestId}/approve`, { credential: "sub-ann|ann@x.com|ann" });
+    const { redirectTo } = (await approved.json()) as { redirectTo: string };
+    const exchanged = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code: new URL(redirectTo).searchParams.get("code") ?? "", redirect_uri: REDIRECT, client_id: clientId, code_verifier: verifier }),
+    });
+    return ((await exchanged.json()) as { access_token: string }).access_token;
+  }
+
+  it("answers 401 for no token, a bad token, an ask link and a connector token, and changes nothing", async () => {
+    const w = await world();
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    await grantByAdmin(w, w.orgA.id, w.ari);
+    const paths = tenantPaths(join(tempDir(), "hosted"), w.ann.tenantId);
+    const ask = createAskToken(paths.storePath, w.hosted.registry.passphraseFor(w.hosted.registry.tenants().find((tenant) => tenant.id === w.ann.tenantId)!), "a visitor", 24 * 3_600_000);
+    const connector = await connectorToken(w.base);
+    expect(connector.length).toBeGreaterThan(20);
+
+    const before = JSON.stringify(w.hosted.registry.listOrgMembers(w.orgA.id));
+    for (const action of ["grant", "revoke"]) {
+      // Each caller is Ann's own duo, whose device token would succeed: only the credential differs.
+      const target = action === "grant" ? w.abe.tenantId : w.ari.tenantId;
+      for (const [label, token] of [["no token", undefined], ["a bad token", "not-a-real-token"], ["an ask link", ask.token], ["a connector token", connector]] as const) {
+        // No body but a JSON content type, as the app sends. (Eight failures in all: the auth hook rate-limits an address at ten a minute.)
+        const response = await call(w.base, "POST", `${w.ann.basePath}/org/admins/${target}/${action}`, token);
+        expect(response.status, `${action} with ${label}`).toBe(401);
+        expect(JSON.parse(await response.text()).error.code).toBe("unauthorized");
+      }
+    }
+    expect(JSON.stringify(w.hosted.registry.listOrgMembers(w.orgA.id))).toBe(before);
+    // The control: Ann's own device token is what works.
+    expect((await w.as(w.ann, "POST", `/org/admins/${w.abe.tenantId}/grant`)).status).toBe(200);
+    expect((await w.as(w.ann, "POST", `/org/admins/${w.abe.tenantId}/revoke`)).status).toBe(200);
   });
 });

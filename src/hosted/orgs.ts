@@ -124,10 +124,10 @@ export class OrgMemberNotFoundError extends Error {
   }
 }
 
-/** The pre-hosted root duo is served for the super admin and cannot hold the org admin role. */
+/** The pre-hosted root duo is served for the super admin and cannot hold the org admin role: appointing it and revoking it are both refused with this. */
 export class RootNotAppointableError extends Error {
   constructor() {
-    super("The root duo cannot be made an org admin.");
+    super("The root duo cannot hold the org admin role.");
     this.name = "RootNotAppointableError";
   }
 }

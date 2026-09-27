@@ -573,7 +573,13 @@ changing a role makes no Matrix call).
   does not exist. It reveals nothing. An id that is not a member of the caller's org (unknown or
   another org's) is one 404 `not_found`. The role is read from the registry on every request, so
   an appointment or a revoke reaches a signed-in person on their next request, and `GET /org`
-  is how the app learns and refreshes it.
+  is how the app learns and refreshes it. Org names are unique server-wide, so a rename could reveal
+  a taken name: an org admin's rename to a name another org has is the generic 409
+  `name_unavailable` ("That name isn't available."), never `org_name_taken`, which only the super
+  admin's route answers. Invites an org admin makes are bounded, because each one rewrites the whole
+  registry file for every duo on the server: the name is at most 80 characters, an org holds at most
+  50 unused, unexpired invites at once (409 `too_many_invites`), and lapsed unused invites of the
+  org are dropped as a new one is made. The super admin's invites keep their old limits.
 - **The last-admin rule.** An org admin cannot revoke the last org admin of their org, themselves
   included: 409 `last_org_admin`, nothing changes. Stepping down while another org admin remains
   is allowed. The super admin (terminal or app) may revoke the last one, and an org with no org
@@ -584,7 +590,11 @@ changing a role makes no Matrix call).
 - **Appointments are recorded.** Each tenant keeps `orgAdminLog`, an append-only list of grants
   and revocations (`{ at, action, by }`), capped at the latest 50 per duo. It survives a revoke.
   The super admin and the org's org admins see it in the member list (`appointedBy`,
-  `appointedByName`, `appointedAt` and the `orgAdminLog` per member).
+  `appointedByName`, `appointedAt` and the `orgAdminLog` per member). Because of the cap an org admin
+  could push old entries out by toggling a role, so every appoint or revoke that changes something
+  also writes one line to the server's log, which no org admin can reach:
+  `hosted: org admin grant|revoke org=<orgId> duo=<duoId> by=<actor>` (`by` is `super-admin` or the
+  acting duo's id; ids and the action only, never a name, email or token). That log is the durable record.
 - **Upgrade and restart.** `orgAdmin` and `orgAdminLog` are optional additions to a v2 registry:
   no version bump, a registry from before has nobody as an org admin and nothing lost, an older
   build that rewrites the file keeps the fields, and the role survives a restart.
@@ -592,6 +602,9 @@ changing a role makes no Matrix call).
   deleting an org, inviting someone directly as an org admin, and any role beyond these three.
   If the super admin list changes so an existing org admin becomes a super admin, they hold both
   and the super admin's rules win; revoke the org admin role from the terminal if it is unwanted.
+  Such a duo may still step down from the role itself (`/org/admins/<own id>/revoke`); the
+  last-admin rule applies to them as to any org admin, and an org admin still cannot touch
+  another super admin's duo (409 `super_admin_protected`).
 
 ## 8. Sessions and duo connections (context for #233 and #236)
 

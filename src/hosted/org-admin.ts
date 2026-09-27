@@ -30,6 +30,12 @@ const NOT_FOUND: OrgAdminRefusal = { ok: false, status: 404, code: "not_found", 
 
 const DEFAULT_INVITE_HOURS = 7 * 24;
 
+/** The longest invite name, the bound sign-up puts on a person's name. */
+const MAX_INVITE_NAME_LENGTH = 80;
+
+/** How many unused, unexpired invites one org may hold at once when an org admin makes them (every invite rewrites the whole registry file). The super admin's invites are not limited. */
+export const MAX_PENDING_INVITES_PER_ORG = 50;
+
 /** An org member as an admin may see it. `isAdmin` and `superAdmin` are the same fact (the super admin, decided live from the emails), kept under both names: `isAdmin` is what the admin screens have always read. */
 export interface OrgMemberView {
   readonly duoId: string;
@@ -57,6 +63,8 @@ export interface OrgAdminDeps {
   readonly renameOrg: (orgId: string, name: string) => Promise<HostedOrg>;
   /** The link an invitee opens, or null when the server has no public/web address. */
   readonly inviteLink: (code: string) => string | null;
+  /** One server-log line per appoint and revoke: the record an org admin cannot rewrite. Ids and the action only. */
+  readonly log?: (line: string) => void;
 }
 
 /** The invite fields, validated the same way whoever creates the invite. */
@@ -64,8 +72,8 @@ export function parseInviteInput(body: unknown): { ok: true; name: string; hours
   const fields = (body ?? {}) as { name?: unknown; email?: unknown; expiresInHours?: unknown };
   const name = typeof fields.name === "string" ? fields.name.trim() : "";
   const hours = fields.expiresInHours ?? DEFAULT_INVITE_HOURS;
-  if (name.length === 0 || typeof hours !== "number" || !Number.isInteger(hours) || hours <= 0 || hours > 24 * 365) {
-    return { ok: false, status: 400, code: "bad_request", message: "name is required; expiresInHours must be a whole number from 1 to 8760" };
+  if (name.length === 0 || name.length > MAX_INVITE_NAME_LENGTH || typeof hours !== "number" || !Number.isInteger(hours) || hours <= 0 || hours > 24 * 365) {
+    return { ok: false, status: 400, code: "bad_request", message: `name is required (at most ${MAX_INVITE_NAME_LENGTH} characters); expiresInHours must be a whole number from 1 to 8760` };
   }
   const rawEmail = fields.email;
   if (rawEmail !== undefined && rawEmail !== null && (typeof rawEmail !== "string" || !rawEmail.includes("@"))) {
@@ -100,6 +108,13 @@ export function refusalFor(error: unknown): OrgAdminRefusal | undefined {
 
 export class OrgAdmin {
   constructor(private readonly deps: OrgAdminDeps) {}
+
+  /** The server-log line for a grant or revoke that changed something. Ids and the action, never a name, email or token: the registry keeps only the latest entries per duo, so this is the durable record. */
+  private record(action: "grant" | "revoke", changed: boolean, orgId: string, duoId: string, actor: string): void {
+    if (changed) {
+      (this.deps.log ?? ((line) => console.error(line)))(`hosted: org admin ${action} org=${orgId} duo=${duoId} by=${actor}`);
+    }
+  }
 
   /** What each duo is called in the history: a duo's own name, or "Super admin". */
   private actorName(actor: string): string | null {
@@ -141,8 +156,8 @@ export class OrgAdmin {
   }
 
   /** Creates an invite into `orgId` and shows its code once. Throws `OrgNotFoundError`. */
-  mintInvite(orgId: string | undefined, input: { name: string; hours: number; email: string | null }) {
-    const { invite, code } = this.deps.registry.createInvite(input.name, new Date(Date.now() + input.hours * 3_600_000).toISOString(), input.email, orgId);
+  mintInvite(orgId: string | undefined, input: { name: string; hours: number; email: string | null }, options: { pruneExpired?: boolean } = {}) {
+    const { invite, code } = this.deps.registry.createInvite(input.name, new Date(Date.now() + input.hours * 3_600_000).toISOString(), input.email, orgId, options);
     return { id: invite.id, name: invite.name, email: invite.email ?? null, orgId: invite.orgId, expiresAt: invite.expiresAt, code, link: this.deps.inviteLink(code) };
   }
 
@@ -157,6 +172,7 @@ export class OrgAdmin {
         return { ok: false, status: 409, code: "super_admin_protected", message: "The super admin manages every org already and cannot be made an org admin." };
       }
       const { member, changed } = this.deps.registry.grantOrgAdmin(orgId, duoId, actor);
+      this.record("grant", changed, orgId, duoId, actor);
       return { ok: true, value: { member: this.view(member), changed } };
     } catch (error) {
       const refusal = refusalFor(error);
@@ -167,15 +183,16 @@ export class OrgAdmin {
     }
   }
 
-  /** Takes the role from `duoId`. Only the super admin (`actor === SUPER_ADMIN_ACTOR`) may revoke the last org admin, or touch a super admin's own duo. */
+  /** Takes the role from `duoId`. Only the super admin (`actor === SUPER_ADMIN_ACTOR`) may revoke the last org admin, or touch another super admin's duo (a duo that is both may always step down from the role itself). */
   revoke(orgId: string, duoId: string, actor: string): OrgAdminOutcome<{ member: OrgMemberView; changed: boolean }> {
     const superAdminActing = actor === SUPER_ADMIN_ACTOR;
     try {
       const target = this.deps.registry.listOrgMembers(orgId).find((member) => member.duoId === duoId);
-      if (!superAdminActing && target && !target.isRoot && this.deps.isAdminEmail(target.email ?? undefined)) {
+      if (!superAdminActing && duoId !== actor && target && !target.isRoot && this.deps.isAdminEmail(target.email ?? undefined)) {
         return { ok: false, status: 409, code: "super_admin_protected", message: "The super admin's access is not managed by an org admin." };
       }
       const { member, changed } = this.deps.registry.revokeOrgAdmin(orgId, duoId, actor, { allowLast: superAdminActing });
+      this.record("revoke", changed, orgId, duoId, actor);
       return { ok: true, value: { member: this.view(member), changed } };
     } catch (error) {
       const refusal = refusalFor(error);
@@ -186,12 +203,15 @@ export class OrgAdmin {
     }
   }
 
-  /** `renameOrg` for an org admin's own org, answering as a value. */
-  async renameAs(orgId: string, body: unknown): Promise<OrgAdminOutcome> {
+  /** `renameOrg` for an org admin's own org, answering as a value. `hideTakenNames`: an org admin sees no other org's name, so a taken name is a generic 409 `name_unavailable`, not `org_name_taken`. */
+  async renameAs(orgId: string, body: unknown, options: { hideTakenNames?: boolean } = {}): Promise<OrgAdminOutcome> {
     try {
       const renamed = await this.deps.renameOrg(orgId, (body as { name?: unknown } | null)?.name as string);
       return { ok: true, value: { org: { id: renamed.id, name: renamed.name } } };
     } catch (error) {
+      if (options.hideTakenNames && error instanceof OrgNameTakenError) {
+        return { ok: false, status: 409, code: "name_unavailable", message: "That name isn't available." };
+      }
       const refusal = refusalFor(error);
       if (refusal) {
         return refusal;
@@ -246,14 +266,18 @@ export class OrgAdmin {
         if (!input.ok) {
           return input;
         }
-        return { ok: true, status: 201, value: this.mintInvite(scope.orgId, input) };
+        // A cap on what an org admin leaves lying around: each invite rewrites the whole registry file for every duo on the server.
+        if (this.pendingInvites(scope.orgId).length >= MAX_PENDING_INVITES_PER_ORG) {
+          return { ok: false, status: 409, code: "too_many_invites", message: `This org already has ${MAX_PENDING_INVITES_PER_ORG} invites waiting. Wait for some to be used or to expire, then try again.` };
+        }
+        return { ok: true, status: 201, value: this.mintInvite(scope.orgId, input, { pruneExpired: true }) };
       },
       rename: async (body) => {
         const scope = asOrgAdmin();
         if (!("orgId" in scope)) {
           return scope;
         }
-        return namesOtherOrg(body, scope.orgId) ? FORBIDDEN : this.renameAs(scope.orgId, body);
+        return namesOtherOrg(body, scope.orgId) ? FORBIDDEN : this.renameAs(scope.orgId, body, { hideTakenNames: true });
       },
       grant: (target) => {
         const scope = asOrgAdmin();
