@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { notifyDraftWaiting } from "../src/push/notify.js";
 import { listSubscriptions, upsertSubscription, type QuietHours } from "../src/push/subscriptions.js";
@@ -106,6 +106,34 @@ describe("notifyDraftWaiting — the id-only push (digital-duo#251)", () => {
     sender.fail = () => new Error("network hiccup");
     await expect(notifyDraftWaiting(depsOf(storePath), "draft-1", sender)).resolves.toBeUndefined();
     expect(listSubscriptions(storePath, PASSPHRASE).map((s) => s.deviceId)).toEqual(["flaky-device"]);
+  });
+
+  it("logs an ordinary send failure — never retried, but not silent either, or push going wrong would have no trace at all (digital-duo#268 review)", async () => {
+    const storePath = initStore();
+    upsertSubscription(storePath, PASSPHRASE, "flaky-device", { endpoint: "https://push.example/flaky", keys: { p256dh: "k", auth: "a" }, quietHours: { manual: false, from: null, to: null, timezone: "UTC" } });
+    const sender = fakeSender();
+    sender.fail = () => new Error("network hiccup");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await notifyDraftWaiting(depsOf(storePath), "draft-1", sender);
+      expect(logged).toHaveBeenCalledWith(expect.stringContaining("push to a registered device failed"), expect.any(Error));
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("never logs anything for a gone subscription — that path already has its own outcome, dropping the row", async () => {
+    const storePath = initStore();
+    upsertSubscription(storePath, PASSPHRASE, "gone-device", { endpoint: "https://push.example/gone", keys: { p256dh: "k", auth: "a" }, quietHours: { manual: false, from: null, to: null, timezone: "UTC" } });
+    const sender = fakeSender();
+    sender.fail = () => new PushGoneError("410");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await notifyDraftWaiting(depsOf(storePath), "draft-1", sender);
+      expect(logged).not.toHaveBeenCalled();
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it("never throws even when the store read itself fails — a locked or corrupted store must cost nothing on the draft that already exists", async () => {

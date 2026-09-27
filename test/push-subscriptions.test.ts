@@ -2,12 +2,15 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import {
+  InvalidEndpointError,
   InvalidQuietHoursError,
   QUIET_HOURS_OFF,
   getOrCreateVapidKeys,
   isQuietNow,
   listSubscriptions,
   parseQuietHours,
+  parseSubscriptionEndpoint,
+  readPushState,
   removeSubscription,
   upsertSubscription,
   type QuietHours,
@@ -146,5 +149,60 @@ describe("getOrCreateVapidKeys — this duo's identity, generated once", () => {
     expect(first).toEqual({ publicKey: "pub-1", privateKey: "priv-1" });
     expect(second).toEqual(first);
     expect(calls).toBe(1);
+  });
+
+  it("defaults to the real generator when none is given — a production caller never has to import web-push just to pass it through", () => {
+    const storePath = initStore();
+    const keys = getOrCreateVapidKeys(storePath, PASSPHRASE);
+    // web-push's own VAPID keys are URL-safe base64: real, distinct, non-empty strings — not asserting an exact value (that's the library's own concern), only that this daemon's default actually reached it.
+    expect(keys.publicKey).toEqual(expect.any(String));
+    expect(keys.privateKey).toEqual(expect.any(String));
+    expect(keys.publicKey.length).toBeGreaterThan(20);
+    expect(keys.publicKey).not.toBe(keys.privateKey);
+  });
+});
+
+describe("parseSubscriptionEndpoint — refusing anywhere this daemon should not be pointed at (digital-duo#268 review: SSRF)", () => {
+  it("accepts a real https endpoint, unchanged", () => {
+    expect(parseSubscriptionEndpoint("https://fcm.googleapis.com/fcm/send/abc123")).toBe("https://fcm.googleapis.com/fcm/send/abc123");
+  });
+
+  it("refuses plain http — a real PushSubscription's endpoint is never anything but https", () => {
+    expect(() => parseSubscriptionEndpoint("http://push.example/a")).toThrow(InvalidEndpointError);
+  });
+
+  it("refuses a non-URL and a blank string", () => {
+    expect(() => parseSubscriptionEndpoint("not a url")).toThrow(InvalidEndpointError);
+    expect(() => parseSubscriptionEndpoint("")).toThrow(InvalidEndpointError);
+    expect(() => parseSubscriptionEndpoint(undefined)).toThrow(InvalidEndpointError);
+  });
+
+  it("refuses a scheme that isn't even a transport this daemon would ever post over — file:, javascript:", () => {
+    expect(() => parseSubscriptionEndpoint("file:///etc/passwd")).toThrow(InvalidEndpointError);
+    expect(() => parseSubscriptionEndpoint("javascript:alert(1)")).toThrow(InvalidEndpointError);
+  });
+
+  it("does not, on its own, exempt an internal-looking https host — this is a protocol check, no allowlist of push-service hosts (matches the scope of the codebase's own precedent, workspace/settings.ts's DUO_WORKSPACE_HOMESERVER check)", () => {
+    // Documenting the boundary of this fix rather than asserting a stronger
+    // guarantee than it makes: https to *anything* is accepted here, same
+    // as the existing DUO_WORKSPACE_HOMESERVER check accepts any https host.
+    expect(parseSubscriptionEndpoint("https://169.254.169.254/latest/meta-data/")).toBe("https://169.254.169.254/latest/meta-data/");
+  });
+});
+
+describe("readPushState — subscriptions and VAPID keys, read together (digital-duo#268 review: one store read, not two)", () => {
+  it("reads both in one call, and reports keys as undefined before anything has generated them", () => {
+    const storePath = initStore();
+    upsertSubscription(storePath, PASSPHRASE, "device-1", subscription());
+    const state = readPushState(storePath, PASSPHRASE);
+    expect(state.subscriptions).toHaveLength(1);
+    expect(state.vapidKeys).toBeUndefined();
+  });
+
+  it("reports the keys already generated, without generating new ones — this call never writes", () => {
+    const storePath = initStore();
+    const generated = getOrCreateVapidKeys(storePath, PASSPHRASE, () => ({ publicKey: "pub", privateKey: "priv" }));
+    const state = readPushState(storePath, PASSPHRASE);
+    expect(state.vapidKeys).toEqual(generated);
   });
 });

@@ -1,5 +1,4 @@
-import { generateVAPIDKeys } from "web-push";
-import { getOrCreateVapidKeys, isQuietNow, listSubscriptions, removeSubscription } from "./subscriptions.js";
+import { getOrCreateVapidKeys, isQuietNow, readPushState, removeSubscription } from "./subscriptions.js";
 import { PushGoneError, webPushSender, type PushSender } from "./sender.js";
 
 /**
@@ -33,11 +32,18 @@ export async function notifyDraftWaiting(
     if (!subject) {
       return;
     }
-    const subscriptions = listSubscriptions(deps.storePath, deps.passphrase);
+    // One store read for both, not two (the review's own finding on this
+    // PR): this runs synchronously, before the first `await`, in a
+    // function its callers fire without awaiting — every millisecond
+    // spent here still blocks the event loop, and the response the route
+    // already sent, until it yields.
+    const { subscriptions, vapidKeys } = readPushState(deps.storePath, deps.passphrase);
     if (subscriptions.length === 0) {
       return;
     }
-    const { publicKey, privateKey } = getOrCreateVapidKeys(deps.storePath, deps.passphrase, generateVAPIDKeys);
+    // The rare path: keys not generated yet (this duo's very first push,
+    // ever) is the one case that still needs a write.
+    const { publicKey, privateKey } = vapidKeys ?? getOrCreateVapidKeys(deps.storePath, deps.passphrase);
     const payload = JSON.stringify({ draftId });
     const now = new Date();
 
@@ -50,9 +56,13 @@ export async function notifyDraftWaiting(
           } catch (error) {
             if (error instanceof PushGoneError) {
               removeSubscription(deps.storePath, deps.passphrase, subscription.deviceId);
+              return;
             }
-            // Any other failure: #251's own "no retry queue for drafts" —
-            // this send simply did not happen, and nothing here retries it.
+            // #251's own "no retry queue for drafts": this send simply
+            // did not happen, and nothing here retries it — but an
+            // operator watching this daemon's own logs still needs to
+            // know push is failing, or it fails silently forever.
+            console.error(`notifyDraftWaiting: push to a registered device failed (not gone, not retried):`, error);
           }
         }),
     );

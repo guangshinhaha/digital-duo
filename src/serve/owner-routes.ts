@@ -1,11 +1,19 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { generateVAPIDKeys } from "web-push";
 import { appendActionAttempt, ensureActionAttemptLogSchema } from "../actions/attempt-log.js";
 import { readThreadMessages } from "../drafting/thread-history.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
-import { InvalidQuietHoursError, getOrCreateVapidKeys, parseQuietHours, removeSubscription, upsertSubscription, type QuietHours } from "../push/subscriptions.js";
+import {
+  InvalidEndpointError,
+  InvalidQuietHoursError,
+  getOrCreateVapidKeys,
+  parseQuietHours,
+  parseSubscriptionEndpoint,
+  removeSubscription,
+  upsertSubscription,
+  type QuietHours,
+} from "../push/subscriptions.js";
 import { withDatabase } from "../store/store.js";
 import { listRecentDemotions } from "../trust/demotion.js";
 import { grantAutonomy } from "../trust/grants.js";
@@ -275,7 +283,7 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
   // takes the public key as its `applicationServerKey`); the issue's own
   // "Ask" list does not name it, but nothing here is reachable without it.
   app.get("/push/vapid-public-key", async () => {
-    const { publicKey } = getOrCreateVapidKeys(deps.storePath, deps.passphrase, generateVAPIDKeys);
+    const { publicKey } = getOrCreateVapidKeys(deps.storePath, deps.passphrase);
     return { publicKey };
   });
 
@@ -287,10 +295,16 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
       sendError(reply, 401, "unauthorized", "Sign in to register push.");
       return;
     }
-    const { endpoint, keys } = request.body;
-    if (typeof endpoint !== "string" || endpoint.trim().length === 0) {
-      sendError(reply, 400, "bad_request", "endpoint is required: the browser's own PushSubscription.endpoint");
-      return;
+    const { keys } = request.body;
+    let endpoint: string;
+    try {
+      endpoint = parseSubscriptionEndpoint(request.body.endpoint);
+    } catch (error) {
+      if (error instanceof InvalidEndpointError) {
+        sendError(reply, 400, "bad_request", error.message);
+        return;
+      }
+      throw error;
     }
     if (typeof keys?.p256dh !== "string" || typeof keys.auth !== "string" || !keys.p256dh || !keys.auth) {
       sendError(reply, 400, "bad_request", "keys.p256dh and keys.auth are required: the browser's own PushSubscription.keys");

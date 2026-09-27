@@ -252,6 +252,19 @@ describe("push routes — registering, reading and removing this device's own su
     expect((await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: { endpoint: SUBSCRIBE_BODY.endpoint } })).statusCode).toBe(400);
   });
 
+  it("rejects a plain-http endpoint through the real route — refusing to be pointed at an internal address (digital-duo#268 review: SSRF)", async () => {
+    const { app, auth, storePath } = setup();
+    const response = await app.inject({
+      method: "POST",
+      url: "/push/subscriptions",
+      headers: auth,
+      payload: { ...SUBSCRIBE_BODY, endpoint: "http://169.254.169.254/latest/meta-data/" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("bad_request");
+    expect(listSubscriptions(storePath, PASSPHRASE)).toEqual([]);
+  });
+
   it("removes this device's own subscription, and a device with none is a no-op", async () => {
     const { app, auth } = setup();
     await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: SUBSCRIBE_BODY });
