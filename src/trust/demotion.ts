@@ -1,6 +1,7 @@
+import { readTopicsFile } from "../derivation/topics.js";
 import { withDatabase } from "../store/store.js";
 import { ensureTrustSchema, getCellRow, previousLevel, resolveAutonomy, upsertCellRow, type AutonomyLevel, type TrustCell, type TrustTier } from "./grid.js";
-import { appendLedgerEntry, ensureTrustLedgerSchema } from "./ledger.js";
+import { appendLedgerEntry, ensureTrustLedgerSchema, listLedgerEntries } from "./ledger.js";
 
 /**
  * "Demote fast — one correction drops the cell a level immediately, and
@@ -119,4 +120,64 @@ export function resolveAutonomyForAnswering(
     upsertCellRow(db, { ...existing, demotionAnnounced: true });
     return { level: resolved.level, stale: false, demotionNotice: DEMOTION_NOTICE };
   });
+}
+
+export interface DemotionNotice {
+  /** The ledger entry's own id — stable and unique, so a client can dedupe or mark one seen without inventing a key. */
+  readonly id: string;
+  readonly createdAt: string;
+  readonly topicId: string;
+  /** undefined when the topic has since been merged or removed — the notice is still real (the correction happened), just about a topic that no longer exists. */
+  readonly topicLabel: string | undefined;
+  readonly tier: TrustTier;
+  readonly fromLevel: AutonomyLevel;
+  readonly toLevel: AutonomyLevel;
+  readonly correctionRef: string;
+}
+
+interface DemotionDetail {
+  correctionRef: string;
+  fromLevel: AutonomyLevel;
+  toLevel: AutonomyLevel;
+  atFloor?: boolean;
+}
+
+/**
+ * digital-duo#246: the client's chat-first redesign has a notice card for
+ * exactly this ("I got that wrong, so I've gone back to asking you first.")
+ * but nothing to render it from — this is that route's read. The daemon
+ * supplies the topic and the two levels; the sentence itself is the
+ * client's to write (docs/trust-surface.md's split between what a route
+ * reports and what a surface says).
+ *
+ * A cell already at the floor when corrected (`atFloor`) is excluded: the
+ * ledger still records it as real evidence (`applyCorrection`'s own
+ * comment), but `fromLevel === toLevel` there — there is no drop to
+ * announce, and "gone back to asking" would be false for a cell that never
+ * left "ask". `since`, when given, keeps only entries strictly after it —
+ * an ISO timestamp, the `createdAt` of the newest notice the client already
+ * has — so a client can poll without re-reading history it has seen.
+ */
+export function listRecentDemotions(storePath: string, passphrase: string, duoDir: string, since?: string): DemotionNotice[] {
+  const labelById = new Map(readTopicsFile(duoDir).map((topic) => [topic.id, topic.label]));
+  return listLedgerEntries(storePath, passphrase)
+    .filter((entry) => entry.eventType === "demoted")
+    .filter((entry) => {
+      const detail = entry.detail as unknown as DemotionDetail;
+      return detail.atFloor !== true && detail.fromLevel !== detail.toLevel;
+    })
+    .filter((entry) => since === undefined || entry.createdAt > since)
+    .map((entry) => {
+      const detail = entry.detail as unknown as DemotionDetail;
+      return {
+        id: entry.id,
+        createdAt: entry.createdAt,
+        topicId: entry.topicId,
+        topicLabel: labelById.get(entry.topicId),
+        tier: entry.tier,
+        fromLevel: detail.fromLevel,
+        toLevel: detail.toLevel,
+        correctionRef: detail.correctionRef,
+      };
+    });
 }
