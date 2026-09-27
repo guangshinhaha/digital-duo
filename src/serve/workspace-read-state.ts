@@ -59,7 +59,16 @@ interface PendingMark {
  *   would re-decide identically (stale events re-skip; the rate window
  *   re-bounds), the same at-least-once stance read-state.ts states.
  */
-export function durableDuoReadState(storePath: string, passphrase: string, retentionMs: number): DuoReadState {
+export function durableDuoReadState(storePath: string, passphrase: string, retentionMs: number, log?: (line: string) => void): DuoReadState {
+  // A hosted daemon (#236) passes a logger that names the duo; `duo serve` leaves it out (console.error, as before).
+  const report = (what: string, detail: unknown): void => {
+    const message = detail instanceof Error ? detail.message : String(detail);
+    if (log) {
+      log(`workspace: ${what} ${message}`);
+    } else {
+      console.error(`workspace: ${what}`, detail instanceof Error ? detail.message : detail);
+    }
+  };
   // event id -> its homeserver timestamp, so the flush can prune the
   // snapshot with the table (below) and the map stays bounded by the same
   // retention the rows are.
@@ -71,14 +80,16 @@ export function durableDuoReadState(storePath: string, passphrase: string, reten
           origin_server_ts: number;
         }[]).map((row) => [row.event_id, row.origin_server_ts] as const);
       } catch (error) {
-        // Anything but a healthy read here (first boot before any write
-        // created the table, a store that cannot be read) degrades to
-        // "nothing handled" — the at-least-once re-answer — but never
-        // silently: this is the one load-time error surface.
-        console.error(
-          "workspace: loading durable read state failed, treating every event as unhandled:",
-          error instanceof Error ? error.message : error,
-        );
+        // Anything but a healthy read here (a store that cannot be read)
+        // degrades to "nothing handled" — the at-least-once re-answer — but
+        // never silently: this is the one load-time error surface. A missing
+        // table is not one: before the first answer is recorded there is no
+        // table yet, which every new duo (each hosted duo, at its first
+        // connect) passes through, so it reads as "nothing handled" quietly.
+        if (error instanceof Error && /no such table/i.test(error.message)) {
+          return [];
+        }
+        report("loading durable read state failed, treating every event as unhandled:", error);
         return [];
       }
     }),
@@ -122,10 +133,7 @@ export function durableDuoReadState(storePath: string, passphrase: string, reten
       // marks are dropped and the events stay unrecorded, which the replay
       // re-decides (stale events re-skip, the rate window re-bounds): the
       // same at-least-once stance a crash before the flush already has.
-      console.error(
-        `workspace: recording durable read state for ${batch.size} event(s) failed:`,
-        error instanceof Error ? error.message : error,
-      );
+      report(`recording durable read state for ${batch.size} event(s) failed:`, error);
     }
   };
 

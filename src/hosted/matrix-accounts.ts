@@ -78,7 +78,9 @@ export type ProvisionStatus =
   | "provisioned"
   /** Already provisioned earlier; nothing was called. */
   | "already"
-  /** Synapse could not do it right now; the duo is marked pending and will be retried. */
+  /** A duo that already had accounts was given a new token (`remintToken`); the connection follows the registry to it. */
+  | "reminted"
+  /** Synapse could not do it right now; the duo is marked pending and will be retried (for `remintToken`: nothing was changed, and the caller decides when to try again). */
   | "pending"
   /**
    * Something the daemon cannot fix by asking Synapse again: recorded accounts that do not fit the
@@ -91,7 +93,7 @@ export type ProvisionStatus =
 export interface ProvisionOutcome {
   readonly duoId: string;
   readonly status: ProvisionStatus;
-  /** Present for `provisioned` and `already`. Never a token. */
+  /** Present for `provisioned`, `reminted` and `already`. Never a token. */
   readonly accounts?: HostedMatrixAccountsView;
   /** Present for `pending` and `failed`: the scrubbed reason. */
   readonly error?: string;
@@ -146,6 +148,7 @@ function duoDisplayName(ownerName: string): string {
  */
 export class MatrixProvisioner {
   private readonly inflight = new Map<string, Promise<ProvisionOutcome>>();
+  private readonly reminting = new Map<string, Promise<ProvisionOutcome>>();
   private serverNameCache: string | undefined;
   private readonly log: (line: string) => void;
   private stopped = false;
@@ -172,6 +175,27 @@ export class MatrixProvisioner {
     }
     const attempt = this.run(duoId).finally(() => this.inflight.delete(duoId));
     this.inflight.set(duoId, attempt);
+    return attempt;
+  }
+
+  /**
+   * Gives a duo that already has accounts a new token, for one whose token Synapse no longer knows
+   * (its database was reset or restored from before the mint): `provision` returns `already` for it and
+   * nothing else would ever mint again. Both accounts are put again first (idempotent, and what brings
+   * them back after a reset), then a fresh never-expiring token is minted and stored through the
+   * registry's own write, which the duo's connection sees as a re-mint. A duo with no accounts is
+   * simply provisioned. Nothing is written when Synapse cannot be reached (`pending`, no failure
+   * mark: the duo has accounts, so a mark would never clear). Never revokes the old token: for a
+   * refused token that is moot, for a working one it stays valid on Synapse until it is ended there.
+   * One re-mint per duo at a time.
+   */
+  remintToken(duoId: string): Promise<ProvisionOutcome> {
+    const running = this.reminting.get(duoId);
+    if (running) {
+      return running;
+    }
+    const attempt = this.remint(duoId).finally(() => this.reminting.delete(duoId));
+    this.reminting.set(duoId, attempt);
     return attempt;
   }
 
@@ -258,13 +282,47 @@ export class MatrixProvisioner {
     return this.serverNameCache;
   }
 
-  private async run(duoId: string): Promise<ProvisionOutcome> {
-    const { registry, admin } = this.options;
+  private membership(duoId: string, what: string) {
+    const { registry } = this.options;
     const org = registry.orgOf(duoId);
     const member = org && registry.listOrgMembers(org.id).find((candidate) => candidate.duoId === duoId);
     if (!org || !member) {
-      throw new Error(`No hosted duo "${duoId}" to provision Matrix accounts for.`);
+      throw new Error(`No hosted duo "${duoId}" to ${what}.`);
     }
+    return { org, member };
+  }
+
+  private async remint(duoId: string): Promise<ProvisionOutcome> {
+    const { registry, admin } = this.options;
+    const { org, member } = this.membership(duoId, "mint a Matrix token for");
+    const existing = registry.matrixAccounts(duoId);
+    if (!existing) {
+      return this.provision(duoId);
+    }
+    const problem = accountProblem(duoId, org.id, existing, this.serverNameCache);
+    if (problem) {
+      this.log(`hosted: ${problem}; it needs an operator, nothing was changed`);
+      return { duoId, status: "failed", error: problem };
+    }
+    try {
+      await admin.putUser(existing.personUserId, { displayName: member.name });
+      await admin.putUser(existing.duoUserId, { displayName: duoDisplayName(member.name) });
+      const token = await admin.mintToken(existing.duoUserId, { neverExpires: true });
+      const accounts = this.storeToken(duoId, existing.personUserId, existing.duoUserId, token);
+      this.log(`hosted: minted a new Matrix token for duo ${duoId}`);
+      return { duoId, status: "reminted", accounts };
+    } catch (error) {
+      if (error instanceof SynapseAdminError) {
+        this.log(`hosted: could not mint a new Matrix token for duo ${duoId}: ${error.message}`);
+        return { duoId, status: "pending", error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  private async run(duoId: string): Promise<ProvisionOutcome> {
+    const { registry, admin } = this.options;
+    const { org, member } = this.membership(duoId, "provision Matrix accounts for");
 
     const existing = registry.matrixAccounts(duoId);
     if (existing) {

@@ -204,6 +204,7 @@ export class HostedRegistry {
   private data: RegistryFile;
   /** True while the file on disk is still a pre-orgs (v1) one, so the first write keeps a copy of it. */
   private backupBeforeWrite: boolean;
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(
     private readonly path: string,
@@ -225,6 +226,19 @@ export class HostedRegistry {
         draft.rootDuo = { name };
       });
     }
+  }
+
+  /**
+   * Calls `listener` after every write that lands (never for a write that fails), so something that
+   * follows the registry (a duo's workspace connection, #236) hears of a new duo, new accounts or a
+   * re-minted token without every writer knowing about it. The listener runs synchronously inside the
+   * write's caller, so it must be cheap and must not throw (one that does is ignored). Returns the unsubscribe.
+   */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
   }
 
   tenants(): readonly HostedTenant[] {
@@ -598,6 +612,13 @@ export class HostedRegistry {
     const result = change(draft);
     this.persist(draft);
     this.data = draft;
+    for (const listener of this.changeListeners) {
+      try {
+        listener();
+      } catch {
+        // A follower's trouble is never the writer's.
+      }
+    }
     return result;
   }
 

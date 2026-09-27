@@ -368,6 +368,33 @@ describe("WorkspaceService — the daemon dials out and holds the connection (#1
     await service.stop();
   });
 
+  it("sends its log lines to the injected logger when there is one, and to console.error as before when there is not (#236)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const lines: string[] = [];
+    const transport = new FakeWorkspaceTransport();
+    transport.failNextNConnects(1);
+    const service = new WorkspaceService({
+      settings: settings(),
+      transportFactory: () => transport as WorkspaceTransport,
+      answer: async () => answered("x"),
+      log: (line) => lines.push(line),
+    });
+    service.start();
+    await flush();
+    expect(lines).toEqual(["workspace: workspace connection failed: fake: homeserver unreachable"]);
+    expect(consoleError).not.toHaveBeenCalled();
+    await service.stop();
+
+    // No logger: the pre-#236 call shape, byte for byte.
+    const plainTransport = new FakeWorkspaceTransport();
+    plainTransport.failNextNConnects(1);
+    const plain = new WorkspaceService({ settings: settings(), transportFactory: () => plainTransport as WorkspaceTransport, answer: async () => answered("x") });
+    plain.start();
+    await flush();
+    expect(consoleError).toHaveBeenCalledWith("workspace: workspace connection failed:", "fake: homeserver unreachable");
+    await plain.stop();
+  });
+
   it("survives a failed send — logged, not thrown, the daemon lives on", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const { transport, service } = harness();

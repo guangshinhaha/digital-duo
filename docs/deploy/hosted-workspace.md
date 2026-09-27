@@ -565,9 +565,26 @@ room-state read per join, none for invites, publishes or directory hits; not mea
 - **A duo's connection** uses the token from the registry (§3), decrypted in the daemon, in
   place of `DUO_WORKSPACE_ACCESS_TOKEN`. The existing single-owner env variables
   (`DUO_WORKSPACE_HOMESERVER`, `DUO_WORKSPACE_ACCESS_TOKEN`, `DUO_WORKSPACE_USER_ID`) are read
-  by the personal-hardware path; hosted mode reads `DUO_WORKSPACE_HOMESERVER` (the private URL,
+  by the personal-hardware path; hosted mode reads `DUO_WORKSPACE_PRIVATE_URL` (the private URL,
   §5) and `DUO_WORKSPACE_PUBLIC_URL` (the https URL returned to clients) and ignores the other
   two.
+
+  > **Built 2026-09-26 (#236).** `src/hosted/duo-workspace.ts` (`DuoWorkspaceConnections`). The record
+  > above said `DUO_WORKSPACE_HOMESERVER` for the private URL; #232 named it `DUO_WORKSPACE_PRIVATE_URL`
+  > and that is what is read. One connection per provisioned duo, the root duo included, started when the
+  > registry says the duo has accounts (at boot, or later when provisioning completes) and restarted when
+  > its token is re-minted, stopped on `close()`. It only queues at boot: dialing, and building each duo's
+  > service (one decrypt of that duo's store), happen off a timer, capped and staggered
+  > (`DUO_HOSTED_WORKSPACE_MAX_DIALS`, `DUO_HOSTED_WORKSPACE_STAGGER_MS`, defaults 5 and 500 ms). Details
+  > and the variable list are in `hosted-mode.md`.
+  >
+  > Two things the record did not say. **The duo answers in a room it has joined**, and a duo joins a room
+  > only when its owner allows the invitation (#192, unchanged): a colleague's first direct message to
+  > `@duo-...` is an invitation the owner decides on, then questions in that room are answered. The Space
+  > and `#general` the admin API joins the duo to are group rooms, which the duo does not answer in without
+  > a recorded allow. **The duo's token is minted by the admin login API and has no device** (§5), so its
+  > `/sync` runs without a device id; the fake homeserver in the measurement below cannot show whether
+  > Synapse serves that the same way (**verify at the first real deploy**, see §12 #236).
 - **A duo's own `env` is built from an allowlist.** `tenantDeps` in `src/hosted/server.ts`
   (lines 117-118) currently spreads the whole process environment (`...shared.env`) into every
   duo's `deps.env`, so once #230 sets `DUO_WORKSPACE_ADMIN_TOKEN` (an acts-as-any-user token)
@@ -576,12 +593,79 @@ room-state read per join, none for invites, publishes or directory hits; not mea
   `DUO_WORKSPACE_ADMIN_TOKEN`, `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN`. Owned by
   #236 and #232. Not checked here: whether any per-duo route reads `deps.env` and returns or
   logs values, which the allowlist makes moot.
-- **Resource numbers** for N concurrent sync loops in one process belong in this record once
-  #236 measures them. Placeholder, to be filled by #236:
+- **matrix-js-sdk's logging is per client only in part.** Each duo's client is given its own logger, filtered by
+  `DUO_HOSTED_WORKSPACE_SDK_LOG` (silent by default) and routed through the duo's scrubbed log. matrix-js-sdk
+  42.4.0 still calls its **process-wide** logger directly from `models/room.js`, `models/event.js`,
+  `models/event-timeline-set.js` and `sync.js`. Those lines cannot name a duo, are not silenced by the
+  variable, and are not scrubbed of the duo's token (which the SDK sends in a header, not in those messages).
+  Read the daemon's stdout as sensitive; **verify at the first real deploy** which of them a busy Synapse
+  room produces.
+- **Resource numbers** for N concurrent sync loops in one process (#236, measured 2026-09-26):
 
-| Duos connected | Daemon memory | Daemon CPU | Measured on |
-|---|---|---|---|
-| _not measured yet_ | | | |
+| Duos connected | Daemon heap used | Timers / sockets held (daemon side) | CPU to connect all | CPU when idle | Event loop held, worst |
+|---|---|---|---|---|---|
+| 0 (baseline) | 24.2 MB | 0 / 0 | 0 | 0.6% of one core | 12 ms |
+| 1 | 26.0 MB | 6 / 1 | 0.20 s | 0.5% | 42 ms while connecting |
+| 5 | 27.1 MB | 30 / 5 | 0.77 s | 0.5% | 187 ms while connecting |
+| 20 | 28.7 MB | 120 / 20 | 2.7 s | 0.4% | 190 ms while connecting |
+| 50 | 33.1 MB | 300 / 50 | 6.2 s | 0.4% | 155 ms while connecting |
+| 100 | 40.8 MB | 640 / 100 | 11.6 s | 0.5% | 194 ms while connecting |
+
+  **These rows use empty stores.** Each duo's store had no records, so opening it cost the fixed key
+  derivation (scrypt) and little else. A store is opened whole (decrypted, read and re-encrypted) on
+  every read-state check and every answer, on the one thread that serves all hosted duos, so a real
+  corpus costs more than the rows say. Re-measured with each store seeded with 5,000 records (about
+  1.9 MB of text; `MEASURE_RECORDS=5000`, 2026-09-27, same machine, one run per row; the 20 and
+  larger populated runs were not completed):
+
+| Duos | Records per duo | One open of a store (median, max) | CPU to connect all | Event loop held while connecting, worst | Heap after connecting |
+|---|---|---|---|---|---|
+| 1 | 0 | 50 ms, 50 ms | 0.18 s | 11 ms | 26.0 MB |
+| 1 | 5,000 | 67 ms, 67 ms | 0.18 s | 19 ms | 29.1 MB |
+| 5 | 0 | 50 ms, 50 ms | 0.66 s | 112 ms | 26.4 MB |
+| 5 | 5,000 | 92 ms, 101 ms | 1.04 s | 123 ms | 28.6 MB |
+
+  A populated store adds roughly 20 to 40 ms per open at 5,000 records, on top of about 50 ms fixed, so
+  the "held for up to about 190 ms" figure below is for **empty stores** and is not a bound: it grows
+  with store size, and **store size is not measured beyond 5,000 records (about 1.9 MB)**. Size the
+  pilot's largest duo, seed a store to match, and read `eventLoopLagMaxMs.whileConnecting` and
+  `storeOpenMs` from the script before trusting these figures for it. The script reports one open of
+  each store separately (`storeOpenMs`), apart from client construction.
+
+  **Read as:** about **0.17 MB of heap per connected duo** (16.6 MB more than the baseline at 100), about
+  **6 timers and 1 socket per duo**, **about 0.12 CPU-seconds per duo once, to connect** (almost all of it
+  the synchronous decrypt of that duo's store, which is also why the event loop is held for up to about
+  190 ms at a time while duos connect, on empty stores; see above), and **an idle cost that does not grow with N**
+  (0.4 to 0.6% of a core with every sync held open). A first connection in the process also pays a one-off
+  of roughly 40 MB of resident memory for loading matrix-js-sdk. Resident memory (RSS) on this machine is
+  too noisy to give a per-duo figure (it read 78 to 169 MB across the runs above, with no trend against N):
+  macOS compresses idle pages, so heap is the number to trust, and the Railway service's own memory graph
+  is the check that counts.
+
+  **With the defaults (5 at a time, 500 ms apart) 100 duos take about 55 seconds to all be connected**
+  after boot, at most 2 new sessions per second, and every duo is answering as soon as it is in.
+
+  **Method.** `scripts/measure-hosted-workspace.ts <duos> [idleSeconds]` (run under `node --expose-gc`
+  through `tsx`, once per N, each in a fresh process). It builds N tenants in a real `HostedRegistry`,
+  each with its own encrypted store, records an account and token for each, and attaches them to the
+  daemon's real `DuoWorkspaceConnections` with the production defaults. Each connection is the real
+  `createMatrixTransport` over a real matrix-js-sdk 42.4.0 client, given the daemon's own `sdkLoggerFor` at its default (silent) level, syncing against a small fake homeserver
+  in the same process (it answers the calls a syncing client makes and holds each `/sync` open for the
+  client's own 30 s timeout, as Synapse does). Heap is `process.memoryUsage().heapUsed` after a forced GC,
+  30 seconds after every duo reported connected; CPU is `process.cpuUsage()` over the connect phase and
+  over that 30 s idle window; timers and sockets come from `process.getActiveResourcesInfo()` and are the
+  daemon's side: the fake server, in the same process, adds one socket and one hold timer per open `/sync`,
+  which are taken out (sockets halved, timers less N and the script's own tick). Machine: Apple
+  M1, 8 cores, 16 GB, Node 22.22.3, one run per N.
+
+  **What it does not measure.** Store size beyond what `MEASURE_RECORDS` seeds (see above). The fake homeserver is far lighter than Synapse, so this is the
+  **daemon's** side of N sync loops and says nothing about Synapse's own CPU, memory or Postgres load, nor
+  about real sync payloads (a duo in many busy rooms holds far more state than an empty room per duo).
+  Answers are not in it: drafting is LLM-bound and not a per-connection cost. The Railway container's CPU
+  allowance is different from an M1 core: check the deployed service's graphs after the first real deploy.
+  After `close()`, matrix-js-sdk leaves its own per-request abort timers (2 or 3 per duo, 80 to 110 s) to
+  expire on their own: they are the SDK's, they do not hold a connection, and the daemon exits on
+  SIGTERM without waiting for them.
 
 ## 9. Posture
 
@@ -703,6 +787,17 @@ comment on each child issue.
 - **#236** (hosted wiring) owns the resource measurement in §8. The hosted process does not
   open a workspace connection until #232 has stored a token for that duo. It also shares the
   `.railway.internal` https relaxation and the per-duo `env` allowlist with #232.
+
+  > **Built 2026-09-26 (#236).** Both shared items were already in place from #232 (`settings.ts`
+  > accepts http on `*.railway.internal`; `TENANT_ENV_ALLOWLIST`). What #236 added is in §8 and in
+  > `hosted-mode.md`. **Not verifiable without a real Synapse, and to check at the first deploy:**
+  > (1) that `/sync` works for a duo's admin-minted token, which has no device id (§5); (2) that the
+  > private `http://<service>.railway.internal:<port>` address is reachable from the daemon with matrix-js-sdk
+  > (Railway's private network is IPv6, so Synapse must listen on `::`); (3) that the admin API's
+  > invite-then-join of a duo into its org's Space and `#general` does not leave a held invitation for the
+  > owner to decide on (the client sees an `invite` membership, and the duo would hold it as pending); (4) the
+  > org module (#235) lets a colleague's direct-room invitation to a duo through and the duo's joins and sends
+  > in it; (5) that the duo's own token is not throttled by `rc_message` while answering.
 
 ## 13. Sources (checked 2026-09-26)
 

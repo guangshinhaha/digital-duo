@@ -449,3 +449,71 @@ describe("MatrixProvisioner — stop()", () => {
     await provisioner.whenIdle();
   });
 });
+
+
+describe("MatrixProvisioner.remintToken — a new token for a duo Synapse no longer knows", () => {
+  it("mints a fresh never-expiring token, keeps the accounts, stores it encrypted, and logs no token", async () => {
+    const { registry, fake, logs, provisioner } = setup();
+    const id = addDuo(registry, "Sam Tan");
+    await provisioner.provision(id);
+    const first = registry.duoMatrixToken(id)!;
+    const accounts = registry.matrixAccounts(id)!;
+
+    const outcome = await provisioner.remintToken(id);
+    expect(outcome.status).toBe("reminted");
+    expect(outcome.accounts).toMatchObject({ personUserId: accounts.personUserId, duoUserId: accounts.duoUserId });
+    expect(fake.minted).toHaveLength(2);
+    expect(fake.minted[1]).toMatchObject({ userId: accounts.duoUserId, validUntilMs: null });
+    const second = registry.duoMatrixToken(id)!;
+    expect(second).toBe(fake.minted[1]!.token);
+    expect(second).not.toBe(first);
+    expect(registry.matrixAccounts(id)!.duoTokenCipher).not.toBe(accounts.duoTokenCipher);
+    expect(JSON.stringify(outcome)).not.toContain(second);
+    expect(logs.join("\n")).not.toContain(second);
+    expect(logs.join("\n")).not.toContain(first);
+  });
+
+  it("brings the accounts back after Synapse's database was reset, where a bare mint would 404", async () => {
+    const { registry, fake, provisioner } = setup();
+    const id = addDuo(registry, "Sam Tan");
+    await provisioner.provision(id);
+    fake.users.clear();
+    // `provision` is content with recorded accounts; only a re-mint repairs them.
+    expect((await provisioner.provision(id)).status).toBe("already");
+    expect(fake.users.size).toBe(0);
+
+    expect((await provisioner.remintToken(id)).status).toBe("reminted");
+    expect(fake.users.has(registry.matrixAccounts(id)!.duoUserId)).toBe(true);
+    expect(fake.users.has(registry.matrixAccounts(id)!.personUserId)).toBe(true);
+    expect(fake.minted).toHaveLength(2);
+  });
+
+  it("changes nothing and marks nothing when Synapse cannot be reached", async () => {
+    const { registry, fake, provisioner } = setup();
+    const id = addDuo(registry, "Sam Tan");
+    await provisioner.provision(id);
+    const cipher = registry.matrixAccounts(id)!.duoTokenCipher;
+    fake.down = true;
+    const outcome = await provisioner.remintToken(id);
+    expect(outcome.status).toBe("pending");
+    expect(registry.matrixAccounts(id)!.duoTokenCipher).toBe(cipher);
+    expect(registry.matrixPending(id)).toBeUndefined();
+  });
+
+  it("provisions a duo that has no accounts, refuses recorded accounts that do not fit, and shares one mint between callers", async () => {
+    const { registry, fake, provisioner } = setup();
+    const fresh = addDuo(registry, "Fresh");
+    expect((await provisioner.remintToken(fresh)).status).toBe("provisioned");
+
+    const both = await Promise.all([provisioner.remintToken(fresh), provisioner.remintToken(fresh)]);
+    expect(both.map((outcome) => outcome.status)).toEqual(["reminted", "reminted"]);
+    expect(fake.minted).toHaveLength(2);
+
+    const other = addDuo(registry, "Other");
+    registry.setMatrixAccounts(other, { personUserId: "@wrongorg.someone:duo.test", duoUserId: "@duo-wrongorg.someone:duo.test" }, "syt_x");
+    const before = fake.minted.length;
+    expect((await provisioner.remintToken(other)).status).toBe("failed");
+    expect(fake.minted).toHaveLength(before);
+    await expect(provisioner.remintToken("nosuchduo")).rejects.toThrow(/No hosted duo/);
+  });
+});

@@ -16,8 +16,8 @@ import { ServePassphraseMismatchError, type ServeOptions } from "./serve.js";
  * A pre-existing single-owner store at DUO_STORE_PATH, with DUO_PASSPHRASE
  * set, keeps being served at the bare origin — the deployment this mode
  * replaced keeps its pairings and ask links. Matrix accounts are provisioned
- * when DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN are set (docs/deploy/hosted-workspace.md);
- * the duo's outbound workspace connection itself is #236.
+ * when DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN are set (docs/deploy/hosted-workspace.md),
+ * and each provisioned duo then holds its own outbound workspace connection (#236, src/hosted/duo-workspace.ts).
  */
 export async function runHostedServe(
   options: ServeOptions,
@@ -70,4 +70,4 @@ export async function runHostedServe(
   return { address, close: hosted.close };
 }
 
-export { runHostedInvite, runHostedProvision, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename } from "../hosted/invite.js";
+export { runHostedInvite, runHostedProvision, runHostedRemint, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename } from "../hosted/invite.js";
