@@ -19,7 +19,7 @@ export interface ScopeInfo {
 export const SCOPE_INFO: Readonly<Record<Scope, ScopeInfo>> = {
   "duo:read": {
     label: "Read",
-    description: "Search your duo, ask it questions, and see what it knows, its rules, its drafts and what is waiting for you.",
+    description: "Search your duo, and see what it knows, its rules, its voice, its drafts and what is waiting for you.",
     defaultOn: true,
   },
   "duo:save": {
@@ -29,12 +29,12 @@ export const SCOPE_INFO: Readonly<Record<Scope, ScopeInfo>> = {
   },
   "duo:operate": {
     label: "Operate",
-    description: "Have your duo embed and derive, draft replies, discard drafts and queue your answers as rule candidates. Nothing here sends a message.",
+    description: "Ask your duo questions and have it draft replies (each needs Read too, and leaves a record), embed and derive it (deriving rewrites its voice file), discard drafts, correct a public answer, and queue your answers as rule candidates. Nothing here sends a message.",
     defaultOn: true,
   },
   "duo:send": {
     label: "Send",
-    description: "Record a draft as sent or edited, and post a correction to a public answer. For a question that came from a channel this can deliver a message as you.",
+    description: "Record a draft as sent or edited. For a question that came from a channel this hands the text to that channel as you, once a channel is connected; today none is.",
     defaultOn: false,
   },
 };

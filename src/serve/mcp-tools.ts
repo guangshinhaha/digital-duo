@@ -27,6 +27,8 @@ export interface ToolContext {
 }
 
 const MAX_TEXT_CHARS = 700;
+/** The most a waiting-items list returns, newest first. */
+const MAX_LISTED = 25;
 
 function ok(value: unknown): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
@@ -44,17 +46,19 @@ function clip(text: string | null | undefined): string | null {
 }
 
 /**
- * Runs one tool call if the connection was given the scope it needs. The
- * refusal is the daemon's own and names the missing permission, so Claude can
+ * Runs one tool call if the connection was given every scope it needs. The
+ * refusal is the daemon's own and names each missing permission, so Claude can
  * tell the owner what to change; it does not depend on the tool having been
  * hidden in claude.ai. Any error a module raises reaches Claude as text: the
  * caller is the authenticated owner, so this is not an asker-facing surface.
  */
-async function guarded(ctx: ToolContext, scope: Scope, run: () => CallToolResult | Promise<CallToolResult>): Promise<CallToolResult> {
-  if (!ctx.scopes.has(scope)) {
+export async function guarded(ctx: ToolContext, needs: Scope | readonly Scope[], run: () => CallToolResult | Promise<CallToolResult>): Promise<CallToolResult> {
+  const missing = ([] as Scope[]).concat(needs).filter((scope) => !ctx.scopes.has(scope));
+  if (missing.length > 0) {
+    const named = missing.map((scope) => `${SCOPE_INFO[scope].label} (${scope})`).join(" and ");
     return fail(
-      `Not permitted: this connection was not given the ${SCOPE_INFO[scope].label} permission (${scope}). ` +
-        `Disconnect Claude in your duo's Settings, connect it again, and allow ${SCOPE_INFO[scope].label} on the sign-in page.`,
+      `Not permitted: this connection was not given the ${named} permission${missing.length > 1 ? "s" : ""}. ` +
+        `Disconnect Claude in your duo's Settings, connect it again, and allow ${missing.map((scope) => SCOPE_INFO[scope].label).join(" and ")} on the sign-in page.`,
     );
   }
   try {
@@ -84,7 +88,28 @@ function draftView(draft: NonNullable<ReturnType<typeof getDraft>>) {
     createdAt: draft.createdAt,
     outcome: draft.outcome,
     sentText: clip(draft.sentText),
+    origin: draft.provenance.origin,
+    askedBy: draft.provenance.origin === "channel" ? draft.provenance.askerRef : null,
+    delivery: draft.delivery,
   };
+}
+
+/** What actually happened to a settled draft's text, from the state recorded, not from what was hoped for. */
+function deliveryNote(outcome: "sent" | "edited" | "discarded", draft: NonNullable<ReturnType<typeof getDraft>> | undefined): string {
+  if (outcome === "discarded") {
+    return "Nothing was sent.";
+  }
+  if (!draft || draft.provenance.origin !== "channel") {
+    return "This question did not come from a channel, so nothing was delivered anywhere.";
+  }
+  const delivery = draft.delivery;
+  if (delivery === null) {
+    return "This question came from a channel, but no delivery was recorded.";
+  }
+  if (delivery.state === "failed") {
+    return `This question came from a channel, and delivery failed: ${delivery.reason}. The outcome is recorded; nothing reached the channel.`;
+  }
+  return delivery.state === "delivered" ? "The text was delivered to the channel it came from." : "The text was handed to the channel it came from; delivery is pending.";
 }
 
 /** Records how the owner settled a draft, refusing one that is already settled so nothing is delivered twice. */
@@ -102,12 +127,10 @@ async function settleDraft(ctx: ToolContext, id: string, outcome: "sent" | "edit
   const after = getDraft(deps.storePath, deps.passphrase, id);
   return ok({
     recorded: outcome,
-    draft: after ? draftView(after) : undefined,
-    ruleCandidateQueued: result !== undefined && "candidateId" in (result as object),
-    note:
-      outcome === "discarded"
-        ? "Nothing was sent."
-        : "If this question came from a channel it was handed to that channel; a question the owner asked directly delivers nothing.",
+    // Echoing the draft back shows what the duo wrote, so it is only done for a connection that may read.
+    draft: after && ctx.scopes.has("duo:read") ? draftView(after) : undefined,
+    ruleCandidatesQueued: result?.queuedKinds ?? [],
+    note: deliveryNote(outcome, after),
   });
 }
 
@@ -139,12 +162,12 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Ask my duo",
       description:
-        "Ask the user's Digital Duo a question and get the answer it would give, with how sure it is and what it drew on. A question it cannot answer comes back as passed on to the user, not as a guess. This is the duo's own answer, so relay it as the duo's, not as yours.",
+        "Ask the user's Digital Duo a question and get the answer it would give, with how sure it is and what it drew on. A question it cannot answer comes back as passed on to the user, not as a guess. This is the duo's own answer, so relay it as the duo's, not as yours. It leaves a record in the duo's answer log, and a passed-on question joins the user's queue.",
       inputSchema: { question: z.string().trim().min(1).describe("The question") },
       annotations: CHANGES_THE_DUO,
     },
     async ({ question }) =>
-      guarded(ctx, "duo:read", async () => {
+      guarded(ctx, ["duo:read", "duo:operate"], async () => {
         const outcome = await answerPublicly(
           deps.storePath,
           deps.passphrase,
@@ -164,6 +187,8 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
           evidenceAgeDays: outcome.kind === "answered" ? outcome.evidenceAgeDays : undefined,
           draftId: outcome.draftId,
           logEntryId: outcome.logEntryId,
+          ownerNotice: outcome.kind === "passed_on" ? outcome.ownerNotice : undefined,
+          note: "This is recorded in the duo's answer log; a question it passes on waits in the owner's queue.",
         });
       }),
   );
@@ -290,7 +315,10 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
     },
     async () =>
       guarded(ctx, "duo:read", () => {
-        const waiting = listDrafts(deps.storePath, deps.passphrase, { outcome: "pending" }).filter((draft) => draft.escalated);
+        const waiting = listDrafts(deps.storePath, deps.passphrase, { outcome: "pending" })
+          .filter((draft) => draft.escalated)
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .slice(0, MAX_LISTED);
         return ok(waiting.length === 0 ? { waiting: [], note: "Nothing is waiting." } : { waiting: waiting.map(draftView) });
       }),
   );
@@ -348,9 +376,9 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Derive my duo",
       description:
-        "Start building the user's Digital Duo's question-and-answer pairs, topics, rules and voice from what it holds. It takes minutes and is best run after embedding. Check duo_status for progress.",
+        "Start building the user's Digital Duo's question-and-answer pairs, topics, rules and voice from what it holds. It takes minutes and is best run after embedding. Check duo_status for progress. It rewrites the duo's voice description, so a hand-edited voice file is overwritten.",
       inputSchema: {},
-      annotations: CHANGES_THE_DUO,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async () =>
       guarded(ctx, "duo:operate", () => {
@@ -378,7 +406,7 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
       annotations: CHANGES_THE_DUO,
     },
     async ({ question, context }) =>
-      guarded(ctx, "duo:operate", async () => {
+      guarded(ctx, ["duo:read", "duo:operate"], async () => {
         const result = await draftReply(deps.storePath, deps.passphrase, deps.duoDir, question, context ?? null, deps.embeddingProvider, deps.inferenceProvider, deps.confidenceConfig);
         return ok({ ...result, note: "Nothing was sent. Open the draft with get_draft, or settle it with edit_draft, mark_draft_sent or discard_draft." });
       }),
@@ -422,7 +450,7 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Edit a draft (may send)",
       description:
-        "Record the user's edited version of a draft as what they sent. The difference teaches the duo, as a rule candidate awaiting the user's approval. IMPORTANT: for a question that came from a channel this may deliver the edited text to that channel as the user, so only call it when they have said to send it.",
+        "Record the user's edited version of a draft as what they sent. The difference teaches the duo, as a rule candidate awaiting the user's approval. IMPORTANT: for a question that came from a channel this hands the edited text to that channel as the user (once a channel is connected; today none is), so only call it when they have said to send it.",
       inputSchema: { id: z.string().trim().min(1).describe("The draft id"), text: z.string().trim().min(1).describe("The user's final text") },
       annotations: REACHES_OUTSIDE,
     },
@@ -434,7 +462,7 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Mark a draft sent (may send)",
       description:
-        "Record that the user sent a draft as written. IMPORTANT: for a question that came from a channel this may deliver the draft to that channel as the user, so only call it when they have said to send it.",
+        "Record that the user sent a draft as written. IMPORTANT: for a question that came from a channel this hands the draft to that channel as the user (once a channel is connected; today none is), so only call it when they have said to send it.",
       inputSchema: { id: z.string().trim().min(1).describe("The draft id") },
       annotations: REACHES_OUTSIDE,
     },
@@ -444,17 +472,25 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     "correct_public_answer",
     {
-      title: "Correct a public answer (posts a correction)",
+      title: "Correct a public answer",
       description:
-        "Correct an answer the user's duo already gave to someone. This posts the correction in the original thread, tells the people who asked, and lowers the duo's autonomy on that topic at once. Only call it when the user has said what the right answer is.",
+        "Record a correction to an answer the user's duo already gave to someone, and lower the duo's autonomy on that topic at once so it checks with them next time. Only call it when the user has said what the right answer is. This records and demotes; it does not post anything or tell anyone, because no channel is connected to post to.",
       inputSchema: {
-        entryId: z.string().trim().min(1).describe("The public answer's id, from list_public_answers"),
+        entryId: z.string().trim().min(1).describe("The public answer's id, from list_public_answers or ask_my_duo"),
         correctedText: z.string().trim().min(1).describe("The correct answer, in the user's own words"),
-        threadGone: z.boolean().optional().describe("True when the original thread no longer exists, so nothing can be posted there"),
       },
-      annotations: REACHES_OUTSIDE,
+      annotations: CHANGES_THE_DUO,
     },
-    async ({ entryId, correctedText, threadGone }) =>
-      guarded(ctx, "duo:send", () => ok(correctPublicAnswer(deps.storePath, deps.passphrase, deps.duoDir, entryId, correctedText, deps.ownerName, !threadGone))),
+    async ({ entryId, correctedText }) =>
+      guarded(ctx, "duo:operate", () => {
+        const result = correctPublicAnswer(deps.storePath, deps.passphrase, deps.duoDir, entryId, correctedText, deps.ownerName);
+        return ok({
+          correctionEntryId: result.correctionEntryId,
+          correctedTopicId: result.correctedTopicId,
+          demotion: result.demotion,
+          text: result.text,
+          note: "Recorded, and the topic's autonomy lowered. Nothing was posted and no one was notified: no channel is connected to post to.",
+        });
+      }),
   );
 }

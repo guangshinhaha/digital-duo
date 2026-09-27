@@ -5,12 +5,21 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
+import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
+import { putRule } from "../src/derivation/rules.js";
+import { writeTopicsFile } from "../src/derivation/topics.js";
+import { appendDraft } from "../src/drafting/draft-log.js";
+import { embedRecords } from "../src/ingest/embeddings.js";
+import { createRecord, type RecordInput } from "../src/ingest/record.js";
+import { writeRecords } from "../src/ingest/record-store.js";
+import { grantAutonomy } from "../src/trust/grants.js";
+import type { InferenceProvider } from "../src/provider/types.js";
 import { jobsFor } from "../src/serve/jobs.js";
 import { buildMcpServer, saveNotesToDuo } from "../src/serve/mcp.js";
 import { LEGACY_SCOPES, SCOPES, type Scope } from "../src/serve/scopes.js";
 import type { ServeDeps } from "../src/serve/server.js";
 import type { EmbeddingProvider } from "../src/provider/types.js";
-import { createEncryptedStore } from "../src/store/store.js";
+import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -82,12 +91,12 @@ describe("what a connection may do is what the owner granted (#256)", () => {
     ]) {
       expect(names).toContain(expected);
     }
-    for (const name of ["edit_draft", "mark_draft_sent", "correct_public_answer"]) {
+    for (const name of ["edit_draft", "mark_draft_sent"]) {
       const tool = tools.find((candidate) => candidate.name === name)!;
       expect(tool.annotations?.openWorldHint, `${name} is open-world`).toBe(true);
     }
-    expect(tools.find((tool) => tool.name === "edit_draft")!.description).toMatch(/deliver/i);
-    expect(tools.find((tool) => tool.name === "mark_draft_sent")!.description).toMatch(/deliver/i);
+    expect(tools.find((tool) => tool.name === "edit_draft")!.description).toMatch(/to that channel as the user/);
+    expect(tools.find((tool) => tool.name === "mark_draft_sent")!.description).toMatch(/to that channel as the user/);
     expect(tools.find((tool) => tool.name === "search_my_duo")!.annotations?.readOnlyHint).toBe(true);
   });
 
@@ -99,14 +108,14 @@ describe("what a connection may do is what the owner granted (#256)", () => {
 
     const save = await call(readOnly, "save_to_duo", { text: "A note." });
     expect(save.isError).toBe(true);
-    expect(save.text).toMatch(/Save permission \(duo:save\)/);
+    expect(save.text).toMatch(/Save \(duo:save\) permission/);
     const embed = await call(readOnly, "embed_my_duo");
     expect(embed.isError).toBe(true);
-    expect(embed.text).toMatch(/Operate permission \(duo:operate\)/);
+    expect(embed.text).toMatch(/Operate \(duo:operate\) permission/);
     expect(jobsFor(deps).embed.current().state).toBe("idle");
     const edit = await call(readOnly, "edit_draft", { id: draftId, text: "Different." });
     expect(edit.isError).toBe(true);
-    expect(edit.text).toMatch(/Send permission \(duo:send\)/);
+    expect(edit.text).toMatch(/Send \(duo:send\) permission/);
     expect((await call(readOnly, "get_draft", { id: draftId })).json.outcome).toBeNull();
   });
 
@@ -114,7 +123,7 @@ describe("what a connection may do is what the owner granted (#256)", () => {
     const claude = await connectWith(makeDeps(), LEGACY_SCOPES);
     expect((await call(claude, "save_to_duo", { text: "A note." })).isError).toBe(false);
     expect((await call(claude, "search_my_duo", { query: "note" })).isError).toBe(true);
-    expect((await call(claude, "what_my_duo_knows")).text).toMatch(/Read permission/);
+    expect((await call(claude, "what_my_duo_knows")).text).toMatch(/Read \(duo:read\) permission/);
   });
 });
 
@@ -152,7 +161,7 @@ describe("reading (#256)", () => {
   });
 
   it("answers as the duo would, passing on what it cannot answer instead of guessing", async () => {
-    const claude = await connectWith(makeDeps(), READ);
+    const claude = await connectWith(makeDeps(), ["duo:read", "duo:operate"]);
     const asked = await call(claude, "ask_my_duo", { question: NOT_A_QUESTION_ANYONE_HAS_ANSWERED });
     expect(asked.json.kind).toBe("passed_on");
     expect(asked.json.text).toMatch(/passed it on/);
@@ -231,7 +240,7 @@ describe("drafting (#257)", () => {
     const edited = await call(claude, "edit_draft", { id: draftId, text: "It is about 11 metres per second." });
     expect(edited.isError).toBe(false);
     expect(edited.json.recorded).toBe("edited");
-    expect(edited.json.note).toMatch(/directly delivers nothing/);
+    expect(edited.json.note).toMatch(/did not come from a channel, so nothing was delivered anywhere/);
     const after = (await call(claude, "get_draft", { id: draftId })).json;
     expect(after.outcome).toBe("edited");
     expect(after.sentText).toBe("It is about 11 metres per second.");
@@ -288,3 +297,153 @@ describe("what my duo passed to me (#258)", () => {
     expect(refused.isError).toBe(true);
   });
 });
+
+let recordCounter = 0;
+function record(overrides: Partial<RecordInput> & { text: string }) {
+  recordCounter += 1;
+  return createRecord({
+    source: "test",
+    sourceRef: null,
+    kind: "my_answer",
+    author: "me",
+    timestamp: `2026-01-01T00:00:${String(recordCounter).padStart(2, "0")}.000Z`,
+    threadId: `t${recordCounter}`,
+    audience: "channel",
+    ...overrides,
+  });
+}
+
+/** A duo that can answer "how much vacation leave do I get" with confidence, as the public-answer tests seed one. */
+async function seedAnswerableDuo(): Promise<ServeDeps> {
+  const agreeing: InferenceProvider = { name: "fake", async complete() { return "Five days per quarter, per policy."; } };
+  const deps = { ...makeDeps(), inferenceProvider: agreeing };
+  const question = record({ kind: "question_to_me", author: "other", text: "how much vacation leave do I get", threadId: "shared" });
+  const answer = record({ text: "OFFICIAL (OPEN)\nfive days per quarter, per the vacation policy", threadId: "shared" });
+  writeRecords(deps.storePath, PASSPHRASE, [question, answer]);
+  await embedRecords(deps.storePath, PASSPHRASE, deps.embeddingProvider);
+  const { pairs } = await extractQaPairs([question, answer]);
+  writeQaPairs(deps.storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+  withDatabase(deps.storePath, PASSPHRASE, true, (db) => {
+    putRule(
+      db,
+      {
+        id: "topic-leave",
+        topicId: "topic-leave",
+        text: "Standard leave is five days per quarter.",
+        status: "confirmed",
+        supportCount: 3,
+        consistency: 0.95,
+        createdAt: new Date().toISOString(),
+        lastConfirmedAt: new Date().toISOString(),
+        reviewStatus: "approved",
+        origin: "derived",
+        supersededByRuleId: null,
+        correctionDraftId: null,
+        correctionQuestion: null,
+      },
+      pairs.map((pair) => pair.id),
+    );
+  });
+  writeTopicsFile(deps.duoDir, [{ id: "topic-leave", label: "Vacation leave", createdAt: new Date().toISOString() }]);
+  grantAutonomy(deps.storePath, PASSPHRASE, deps.duoDir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+  return deps;
+}
+
+describe("permissions that need each other, and what a tool tells the truth about (#256 review)", () => {
+  it("needs Read as well as Operate to ask the duo or have it draft, and names whichever is missing", async () => {
+    const deps = makeDeps();
+    const readOnly = await connectWith(deps, READ);
+    const operateOnly = await connectWith(deps, ["duo:operate"]);
+    for (const [name, args] of [["ask_my_duo", { question: "Anything?" }], ["draft_reply", { question: "Anything?" }]] as [string, Record<string, unknown>][]) {
+      const noOperate = await call(readOnly, name, args);
+      expect(noOperate.isError).toBe(true);
+      expect(noOperate.text).toMatch(/Operate \(duo:operate\) permission/);
+      const noRead = await call(operateOnly, name, args);
+      expect(noRead.isError).toBe(true);
+      expect(noRead.text).toMatch(/Read \(duo:read\) permission/);
+    }
+    // Neither left a record behind.
+    expect((await call(await connectWith(deps, READ), "list_drafts")).json).toEqual([]);
+  });
+
+  it("does not read a settled draft back to a connection that may not read", async () => {
+    const deps = makeDeps();
+    const full = await connectWith(deps, SCOPES);
+    const draftId = await escalatedDraft(full);
+    const operateOnly = await connectWith(deps, ["duo:operate"]);
+    const discarded = await call(operateOnly, "discard_draft", { id: draftId });
+    expect(discarded.json.recorded).toBe("discarded");
+    expect(discarded.json.draft).toBeUndefined();
+
+    const another = await escalatedDraft(full);
+    const discardedWithRead = await call(full, "discard_draft", { id: another });
+    expect(discardedWithRead.json.draft.id).toBe(another);
+  });
+
+  it("lists what is waiting newest first", async () => {
+    const claude = await connectWith(makeDeps(), SCOPES);
+    const first = (await call(claude, "draft_reply", { question: "First unanswerable question?" })).json.draftId;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const second = (await call(claude, "draft_reply", { question: "Second unanswerable question?" })).json.draftId;
+    const waiting = (await call(claude, "list_escalations")).json.waiting;
+    expect(waiting.map((draft: { id: string }) => draft.id)).toEqual([second, first]);
+  });
+
+  it("reports a failed delivery as failed, not as handed over", async () => {
+    const deps = makeDeps();
+    const draftId = appendDraft(deps.storePath, PASSPHRASE, {
+      question: "Can you send me the report?",
+      threadContext: null,
+      draftText: "Here it is.",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "chat", askerRef: "colleague-1", threadId: "t1", permalink: null },
+    });
+    const claude = await connectWith(deps, SCOPES);
+    const sent = await call(claude, "mark_draft_sent", { id: draftId });
+    expect(sent.isError).toBe(false);
+    expect(sent.json.recorded).toBe("sent");
+    expect(sent.json.note).toMatch(/delivery failed: no connected adapter/);
+    expect(sent.json.note).not.toMatch(/handed to/);
+    expect(sent.json.draft.delivery.state).toBe("failed");
+    expect(sent.json.draft.askedBy).toBe("colleague-1");
+  });
+
+  it("marks the tool that rewrites the voice as destructive, and the ones that reach outside as open-world", async () => {
+    const claude = await connectWith(makeDeps(), SCOPES);
+    const tools = (await claude.listTools()).tools;
+    expect(tools.find((tool) => tool.name === "derive_my_duo")!.annotations?.destructiveHint).toBe(true);
+    expect(tools.find((tool) => tool.name === "derive_my_duo")!.description).toMatch(/voice/);
+    expect(tools.find((tool) => tool.name === "correct_public_answer")!.description).toMatch(/does not post/);
+  });
+});
+
+describe("an answerable question, and correcting the answer (#256, #258)", () => {
+  it("returns the answer with its confidence and sources, then records a correction that posts nothing", async () => {
+    const deps = await seedAnswerableDuo();
+    const claude = await connectWith(deps, ["duo:read", "duo:operate"]);
+
+    const asked = await call(claude, "ask_my_duo", { question: "how much vacation leave do I get" });
+    expect(asked.isError).toBe(false);
+    expect(asked.json.kind).toBe("answered");
+    expect(asked.json.text).toMatch(/Five days per quarter/);
+    expect(asked.json.sources.length).toBeGreaterThan(0);
+    expect(asked.json.confidence).toBeDefined();
+    expect(asked.json.logEntryId).toBeTruthy();
+    expect((await call(claude, "list_public_answers")).json[0].id).toBe(asked.json.logEntryId);
+
+    // Operate alone is enough to correct: it records and lowers autonomy, and nothing is sent.
+    const operateOnly = await connectWith(deps, ["duo:operate"]);
+    const corrected = await call(operateOnly, "correct_public_answer", { entryId: asked.json.logEntryId, correctedText: "It is four days per quarter." });
+    expect(corrected.isError).toBe(false);
+    expect(corrected.json.correctionEntryId).toBeTruthy();
+    expect(corrected.json.correctedTopicId).toBe("topic-leave");
+    expect(corrected.json.demotion).toBeDefined();
+    expect(corrected.json.note).toMatch(/Nothing was posted and no one was notified/);
+    expect(corrected.json).not.toHaveProperty("postedInThread");
+    expect(corrected.json).not.toHaveProperty("notifiedAskerRefs");
+  });
+});
+

@@ -10,8 +10,8 @@ import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
 import { withDatabase } from "../store/store.js";
 import type { ServeDeps } from "./server.js";
-import { registerDuoTools } from "./mcp-tools.js";
-import { LEGACY_SCOPES, SCOPE_INFO, type Scope } from "./scopes.js";
+import { guarded, registerDuoTools } from "./mcp-tools.js";
+import { LEGACY_SCOPES, type Scope } from "./scopes.js";
 import { verifyConnectorToken } from "./tokens.js";
 
 /** The record source every connector save carries — how the duplicate check below finds an earlier save of the same text. */
@@ -200,18 +200,7 @@ export function buildHistoryPrompt(classificationCeiling: string): string {
 export function buildMcpServer(deps: ServeDeps, scopes: readonly Scope[]): McpServer {
   const granted = new Set(scopes);
   const server = new McpServer({ name: "digital-duo", version: "1.0.0" });
-  const needsSave = <T>(run: () => Promise<T>): Promise<T | { isError: true; content: { type: "text"; text: string }[] }> =>
-    granted.has("duo:save")
-      ? run()
-      : Promise.resolve({
-          isError: true as const,
-          content: [
-            {
-              type: "text" as const,
-              text: `Not permitted: this connection was not given the ${SCOPE_INFO["duo:save"].label} permission (duo:save). Disconnect Claude in your duo's Settings, connect it again, and allow Save on the sign-in page.`,
-            },
-          ],
-        });
+  const ctx = { deps, scopes: granted };
   server.registerTool(
     "save_to_duo",
     {
@@ -221,7 +210,7 @@ export function buildMcpServer(deps: ServeDeps, scopes: readonly Scope[]): McpSe
       inputSchema: { text: z.string().trim().min(1).describe("The text to save, self-contained") },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ text }) => needsSave(async () => ({ content: [{ type: "text" as const, text: describeSaveOutcome(await saveToDuo(deps, text)) }] })),
+    async ({ text }) => guarded(ctx, "duo:save", async () => ({ content: [{ type: "text" as const, text: describeSaveOutcome(await saveToDuo(deps, text)) }] })),
   );
   server.registerTool(
     "save_notes_to_duo",
@@ -237,9 +226,9 @@ export function buildMcpServer(deps: ServeDeps, scopes: readonly Scope[]): McpSe
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ notes }) => needsSave(async () => ({ content: [{ type: "text" as const, text: describeBatchOutcome(await saveNotesToDuo(deps, notes)) }] })),
+    async ({ notes }) => guarded(ctx, "duo:save", async () => ({ content: [{ type: "text" as const, text: describeBatchOutcome(await saveNotesToDuo(deps, notes)) }] })),
   );
-  registerDuoTools(server, { deps, scopes: granted });
+  registerDuoTools(server, ctx);
   return server;
 }
 

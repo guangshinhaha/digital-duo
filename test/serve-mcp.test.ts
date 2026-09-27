@@ -246,7 +246,7 @@ describe("MCP connector (#227)", () => {
     try {
       const search = await client.callTool({ name: "search_my_duo", arguments: { query: "note" } });
       expect(search.isError).toBe(true);
-      expect((search.content as { text: string }[])[0].text).toMatch(/Read permission \(duo:read\)/);
+      expect((search.content as { text: string }[])[0].text).toMatch(/Read \(duo:read\) permission/);
       const embed = await client.callTool({ name: "embed_my_duo", arguments: {} });
       expect(embed.isError).toBe(true);
     } finally {

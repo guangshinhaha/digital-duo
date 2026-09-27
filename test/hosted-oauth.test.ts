@@ -11,6 +11,8 @@ import { IdentityError, type IdentityVerifier } from "../src/hosted/google.js";
 import { CLAUDE_REDIRECT_URIS, OAuthError, OAuthStore } from "../src/hosted/oauth.js";
 import { createHostedServer, tenantPaths, type HostedServer, type HostedSettings } from "../src/hosted/server.js";
 import { listRecords } from "../src/ingest/record-store.js";
+import { saveNotesToDuo } from "../src/serve/mcp.js";
+import type { ServeDeps } from "../src/serve/server.js";
 
 const tempDir = useTempDir();
 const ADMIN = "admin-token-for-tests";
@@ -130,6 +132,25 @@ async function saveAs(base: string, accessToken: string, text: string): Promise<
   } finally {
     await client.close();
   }
+}
+
+/** The deps a hosted duo is served with, rebuilt from its files, so a test can put a record straight into it. */
+async function tenantDepsFor(hostedRoot: string, hosted: HostedServer, tenantId: string): Promise<ServeDeps> {
+  const tenant = hosted.registry.tenants().find((candidate) => candidate.id === tenantId)!;
+  const paths = tenantPaths(hostedRoot, tenantId);
+  const config = loadConfig({});
+  return {
+    storePath: paths.storePath,
+    passphrase: hosted.registry.passphraseFor(tenant),
+    duoDir: paths.duoDir,
+    lifecycleLogPath: paths.lifecycleLogPath,
+    embeddingProvider: createFakeEmbeddingProvider(),
+    inferenceProvider: undefined,
+    confidenceConfig: config.confidence,
+    classificationCeiling: config.classificationCeiling,
+    ownerName: tenant.name,
+    env: {},
+  };
 }
 
 function connectorRecords(hosted: HostedServer, hostedRoot: string, tenantId: string) {
@@ -356,12 +377,22 @@ describe("what the owner allows at sign-in (#256)", () => {
     expect(Object.fromEntries(flow.info.scopes.map((scope) => [scope.id, scope.defaultOn]))).toEqual({ "duo:read": true, "duo:save": true, "duo:operate": true, "duo:send": false });
   });
 
-  it("grants read, save and operate, and never send, when the owner leaves the choices as they were", async () => {
+  it("grants save only when an approval names no permissions, as a sign-in page that predates them sends", async () => {
     const { base } = await start();
     await signUp(base, "sub-sam|sam@x.com|Sam");
     const tokens = await exchange(base, await connectScoped(base, {}));
+    expect(tokens.scope).toBe("duo:save");
+    const refused = await callTool(base, tokens.access_token, "search_my_duo", { query: "anything" });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/Read \(duo:read\) permission/);
+  });
+
+  it("grants exactly the three usual permissions, and never send, when the page sends its defaults", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const tokens = await exchange(base, await connectScoped(base, { scopes: ["duo:read", "duo:save", "duo:operate"] }));
     expect(tokens.scope).toBe("duo:read duo:save duo:operate");
-    expect((await callTool(base, tokens.access_token, "edit_draft", { id: "x", text: "y" })).text).toMatch(/Send permission \(duo:send\)/);
+    expect((await callTool(base, tokens.access_token, "edit_draft", { id: "x", text: "y" })).text).toMatch(/Send \(duo:send\) permission/);
   });
 
   it("grants send when the owner ticks it", async () => {
@@ -382,8 +413,28 @@ describe("what the owner allows at sign-in (#256)", () => {
     expect(tokens.scope).toBe("duo:read");
     const refused = await callTool(base, tokens.access_token, "save_to_duo", { text: "A note." });
     expect(refused.isError).toBe(true);
-    expect(refused.text).toMatch(/Save permission \(duo:save\)/);
+    expect(refused.text).toMatch(/Save \(duo:save\) permission/);
     expect((await callTool(base, tokens.access_token, "what_my_duo_knows", {})).isError).toBe(false);
+  });
+
+  it("searches only the signed-in owner's duo: what is in another duo is never returned", async () => {
+    const { base, hosted, hostedRoot } = await start();
+    const sam = await signUp(base, "sub-sam|sam@x.com|Sam");
+    const kim = await signUp(base, "sub-kim|kim@x.com|Kim");
+    // A record in Kim's duo, written directly, and one in Sam's.
+    for (const [duo, text] of [[kim, "Kim's secret: the printer budget code is 4471."], [sam, "Sam's note: the printer is on the second floor."]] as const) {
+      const tenant = hosted.registry.tenants().find((candidate) => candidate.id === duo.tenantId)!;
+      await saveNotesToDuo(
+        { ...(await tenantDepsFor(hostedRoot, hosted, tenant.id)) },
+        [text],
+      );
+    }
+    const tokens = await exchange(base, await connectScoped(base, { scopes: ["duo:read"] }));
+    const found = await callTool(base, tokens.access_token, "search_my_duo", { query: "printer" });
+    expect(found.isError).toBe(false);
+    expect(found.text).toContain("Sam's note");
+    expect(found.text).not.toContain("Kim's secret");
+    expect(found.text).not.toContain("4471");
   });
 
   it("refuses an owner who allows nothing, and keeps the request open", async () => {

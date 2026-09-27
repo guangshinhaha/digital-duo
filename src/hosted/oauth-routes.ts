@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { handleMcpRequest, MCP_METHOD_NOT_ALLOWED } from "../serve/mcp.js";
-import { DEFAULT_SCOPES, SCOPE_INFO, SCOPES, isScope, parseScopes, type Scope } from "../serve/scopes.js";
+import { LEGACY_SCOPES, SCOPE_INFO, SCOPES, isScope, parseScopes, type Scope } from "../serve/scopes.js";
 import type { ServeDeps } from "../serve/server.js";
 import type { VerifiedIdentity } from "./google.js";
 import { OAuthError, type OAuthStore } from "./oauth.js";
@@ -217,13 +217,14 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
       reply.code(404).send(errorBody("request_expired", "This connection request has expired. Start again from Claude."));
       return;
     }
-    // What the owner chose to allow. Left out, the defaults apply; either way it can never exceed what Claude asked for.
+    // What the owner chose to allow, and never more than Claude asked for. An approval that names none (a sign-in page that
+    // predates permissions, or any other client) grants save only: what an owner has not been shown is not granted.
     const chosen = request.body?.scopes;
     if (chosen !== undefined && (!Array.isArray(chosen) || !chosen.every(isScope))) {
       reply.code(400).send(errorBody("bad_request", "scopes must be a list of permission names."));
       return;
     }
-    const granted: Scope[] = SCOPES.filter((scope) => pending.requestedScopes.includes(scope) && (chosen === undefined ? DEFAULT_SCOPES.includes(scope) : (chosen as Scope[]).includes(scope)));
+    const granted: Scope[] = SCOPES.filter((scope) => pending.requestedScopes.includes(scope) && (chosen === undefined ? LEGACY_SCOPES.includes(scope) : (chosen as Scope[]).includes(scope)));
     if (granted.length === 0) {
       reply.code(400).send(errorBody("no_scopes", "Choose at least one thing Claude may do."));
       return;
