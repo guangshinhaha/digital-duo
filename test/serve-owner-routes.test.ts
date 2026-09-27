@@ -4,6 +4,9 @@ import { describe, expect, it } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { listActionAttempts } from "../src/actions/attempt-log.js";
+import { applyCorrection } from "../src/trust/demotion.js";
+import { recordCleanInstance, acceptPromotionOffer, PROMOTION_THRESHOLD } from "../src/trust/promotion.js";
+import { writeTopicsFile } from "../src/derivation/topics.js";
 import { loadConfig } from "../src/config.js";
 import { DeriveJob } from "../src/serve/derive-job.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
@@ -130,5 +133,40 @@ describe("owner routes — the terminal-only commands, from the app", () => {
     const response = await app.inject({ method: "GET", url: "/trust/promotions", headers: auth });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([]);
+  });
+
+  it("lists recent demotions for the client's notice card (digital-duo#246), none on a fresh duo", async () => {
+    const { app, auth } = setup();
+    const empty = await app.inject({ method: "GET", url: "/trust/notices", headers: auth });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json()).toEqual([]);
+  });
+
+  it("reports a real demotion with the topic and both levels, but not an at-floor no-op", async () => {
+    const { app, auth, storePath } = setup();
+    writeTopicsFile(join(tempDir(), "duo"), [{ id: "topic-a", label: "Topic A", createdAt: "2026-01-01T00:00:00.000Z" }]);
+    // Promote all the way to "auto" so there is somewhere for the correction to drop from.
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < PROMOTION_THRESHOLD; i++) {
+        recordCleanInstance(storePath, PASSPHRASE, "topic-a", "T0");
+      }
+      acceptPromotionOffer(storePath, PASSPHRASE, "topic-a", "T0");
+    }
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-a", tier: "T0", correctionRef: "audit-42" });
+    // A no-op correction on an untouched cell — excluded, nothing to announce.
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-b", tier: "T0", correctionRef: "audit-43" });
+
+    const response = await app.inject({ method: "GET", url: "/trust/notices", headers: auth });
+    expect(response.statusCode).toBe(200);
+    const notices = response.json();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ topicId: "topic-a", topicLabel: "Topic A", tier: "T0", fromLevel: "auto", toLevel: "approve" });
+  });
+
+  it("never lets an ask token reach /trust/notices either", async () => {
+    const { app, storePath } = setup();
+    const ask = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 3_600_000).toISOString());
+    const response = await app.inject({ method: "GET", url: "/trust/notices", headers: { authorization: `Bearer ${ask.token}` } });
+    expect(response.statusCode).toBe(401);
   });
 });

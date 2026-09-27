@@ -4,6 +4,7 @@ import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/clau
 import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
 import { withDatabase } from "../store/store.js";
+import { listRecentDemotions } from "../trust/demotion.js";
 import { grantAutonomy } from "../trust/grants.js";
 import { isTrustTier } from "../trust/grid.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers } from "../trust/promotion.js";
@@ -180,6 +181,19 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
   });
 
   app.get("/trust/promotions", async () => getPendingPromotionOffers(deps.storePath, deps.passphrase, deps.duoDir));
+
+  // digital-duo#246: the client's notice card ("I got that wrong, so I've
+  // gone back to asking you first.") has nothing to render without this —
+  // recent real demotions (a cell that actually dropped, never the
+  // at-floor no-op), oldest first, each carrying the id a client can use
+  // to dedupe or mark seen. Read-only: there is no write route, since a
+  // seen-marker is this device's own concern (owner-routes.ts's doc
+  // comment on why this file exists at all — nothing here adds
+  // behaviour beyond what the CLI's own command already does, and there
+  // is no `duo trust` command that marks a notice seen either).
+  app.get<{ Querystring: { since?: string } }>("/trust/notices", async (request) =>
+    listRecentDemotions(deps.storePath, deps.passphrase, deps.duoDir, request.query.since),
+  );
 
   app.post<{ Params: { topicId: string; tier: string }; Body: { decision?: unknown } }>(
     "/trust/promotions/:topicId/:tier",

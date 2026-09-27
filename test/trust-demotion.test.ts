@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { applyCorrection, resolveAutonomyForAnswering } from "../src/trust/demotion.js";
+import { applyCorrection, listRecentDemotions, resolveAutonomyForAnswering } from "../src/trust/demotion.js";
 import { getCellRow } from "../src/trust/grid.js";
 import { listLedgerEntries } from "../src/trust/ledger.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers, recordCleanInstance, PROMOTION_THRESHOLD } from "../src/trust/promotion.js";
@@ -154,5 +154,85 @@ describe("every demotion is recorded in the ledger with the correction that trig
       eventType: "demoted",
       detail: { correctionRef: "audit-entry-42", fromLevel: "auto", toLevel: "approve" },
     });
+  });
+});
+
+
+describe("listRecentDemotions — the client's notice card has something to read (digital-duo#246)", () => {
+  it("reports a real demotion with the topic's live label and both levels", () => {
+    const storePath = initStore();
+    seedTopic("topic-a", "Topic A");
+    promoteToAuto(storePath, "topic-a", "T0");
+
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-a", tier: "T0", correctionRef: "audit-42" });
+
+    const notices = listRecentDemotions(storePath, PASSPHRASE, duoDir());
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      topicId: "topic-a",
+      topicLabel: "Topic A",
+      tier: "T0",
+      fromLevel: "auto",
+      toLevel: "approve",
+      correctionRef: "audit-42",
+    });
+    expect(notices[0].id).toEqual(expect.any(String));
+    expect(notices[0].createdAt).toEqual(expect.any(String));
+  });
+
+  it("excludes a correction that was a no-op — the cell was already at the floor, so there is nothing to announce", () => {
+    const storePath = initStore();
+    seedTopic("topic-a", "Topic A");
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-a", tier: "T0", correctionRef: "audit-1" });
+
+    expect(listRecentDemotions(storePath, PASSPHRASE, duoDir())).toEqual([]);
+  });
+
+  it("says nothing about T4 — there is no T4 cell to demote in the first place", () => {
+    const storePath = initStore();
+    seedTopic("topic-a", "Topic A");
+    promoteToAuto(storePath, "topic-a", "T0");
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-a", tier: "T0", correctionRef: "audit-1" });
+
+    const notices = listRecentDemotions(storePath, PASSPHRASE, duoDir());
+    expect(notices.every((notice) => notice.tier !== "T4")).toBe(true);
+  });
+
+  it("carries topicLabel undefined for a demotion whose topic has since been merged or removed, rather than dropping the notice", () => {
+    const storePath = initStore();
+    seedTopic("topic-a", "Topic A");
+    promoteToAuto(storePath, "topic-a", "T0");
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-a", tier: "T0", correctionRef: "audit-1" });
+    writeTopicsFile(duoDir(), []); // merged/removed since
+
+    const notices = listRecentDemotions(storePath, PASSPHRASE, duoDir());
+    expect(notices).toHaveLength(1);
+    expect(notices[0].topicLabel).toBeUndefined();
+  });
+
+  it("keeps only entries strictly after `since`, so a client can poll without re-reading what it has already seen", async () => {
+    const storePath = initStore();
+    seedTopic("topic-a", "Topic A");
+    seedTopic("topic-b", "Topic B");
+    promoteToAuto(storePath, "topic-a", "T0");
+    promoteToAuto(storePath, "topic-b", "T0");
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-a", tier: "T0", correctionRef: "audit-1" });
+
+    const firstBatch = listRecentDemotions(storePath, PASSPHRASE, duoDir());
+    expect(firstBatch).toHaveLength(1);
+
+    // A real gap past ISO's millisecond resolution — `since` is a plain
+    // string comparison, so two corrections in the same millisecond would
+    // otherwise make this flake.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    applyCorrection(storePath, PASSPHRASE, { topicId: "topic-b", tier: "T0", correctionRef: "audit-2" });
+
+    const onlyNew = listRecentDemotions(storePath, PASSPHRASE, duoDir(), firstBatch[0].createdAt);
+    expect(onlyNew.map((notice) => notice.topicId)).toEqual(["topic-b"]);
+  });
+
+  it("reports none on a fresh duo", () => {
+    const storePath = initStore();
+    expect(listRecentDemotions(storePath, PASSPHRASE, duoDir())).toEqual([]);
   });
 });
