@@ -7,7 +7,7 @@ import { withDatabase } from "../store/store.js";
 import { grantAutonomy } from "../trust/grants.js";
 import { isTrustTier } from "../trust/grid.js";
 import { acceptPromotionOffer, declinePromotionOffer, getPendingPromotionOffers } from "../trust/promotion.js";
-import { DeriveJob } from "./derive-job.js";
+import { jobsFor } from "./jobs.js";
 import { buildHistoryPrompt } from "./mcp.js";
 import type { ServeDeps } from "./server.js";
 import {
@@ -46,7 +46,7 @@ function nonBlankString(value: unknown): string | undefined {
  * device's principal ever reaches these handlers.
  */
 export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void {
-  const deriveJob = new DeriveJob();
+  const deriveJob = jobsFor(deps).derive;
 
   app.post<{ Body: { export?: unknown } }>(
     "/corpus/import-claude",

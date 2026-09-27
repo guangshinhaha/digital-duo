@@ -10,6 +10,8 @@ import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
 import { withDatabase } from "../store/store.js";
 import type { ServeDeps } from "./server.js";
+import { registerDuoTools } from "./mcp-tools.js";
+import { LEGACY_SCOPES, SCOPE_INFO, type Scope } from "./scopes.js";
 import { verifyConnectorToken } from "./tokens.js";
 
 /** The record source every connector save carries — how the duplicate check below finds an earlier save of the same text. */
@@ -150,6 +152,8 @@ export interface ConnectorConnection {
   readonly clientName: string;
   readonly createdAt: string;
   readonly lastUsedAt: string | null;
+  /** What the owner allowed this Claude to do at sign-in (#256). */
+  readonly scopes: readonly Scope[];
 }
 
 /**
@@ -187,8 +191,27 @@ export function buildHistoryPrompt(classificationCeiling: string): string {
   ].join("\n");
 }
 
-function buildMcpServer(deps: ServeDeps): McpServer {
+/**
+ * A connection's MCP server: the save tools (#227), then every duo tool of
+ * #256. What the connection may do is the set of scopes it was granted at
+ * sign-in; a secret URL is always save-only. Exported so a test can serve a
+ * chosen set of scopes without going through sign-in.
+ */
+export function buildMcpServer(deps: ServeDeps, scopes: readonly Scope[]): McpServer {
+  const granted = new Set(scopes);
   const server = new McpServer({ name: "digital-duo", version: "1.0.0" });
+  const needsSave = <T>(run: () => Promise<T>): Promise<T | { isError: true; content: { type: "text"; text: string }[] }> =>
+    granted.has("duo:save")
+      ? run()
+      : Promise.resolve({
+          isError: true as const,
+          content: [
+            {
+              type: "text" as const,
+              text: `Not permitted: this connection was not given the ${SCOPE_INFO["duo:save"].label} permission (duo:save). Disconnect Claude in your duo's Settings, connect it again, and allow Save on the sign-in page.`,
+            },
+          ],
+        });
   server.registerTool(
     "save_to_duo",
     {
@@ -196,8 +219,9 @@ function buildMcpServer(deps: ServeDeps): McpServer {
       description:
         "Save text into the user's Digital Duo, their private work memory, when they ask to save, remember or send something to their duo. Pass the text to keep, written so it stands on its own without the rest of the chat.",
       inputSchema: { text: z.string().trim().min(1).describe("The text to save, self-contained") },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ text }) => ({ content: [{ type: "text", text: describeSaveOutcome(await saveToDuo(deps, text)) }] }),
+    async ({ text }) => needsSave(async () => ({ content: [{ type: "text" as const, text: describeSaveOutcome(await saveToDuo(deps, text)) }] })),
   );
   server.registerTool(
     "save_notes_to_duo",
@@ -211,9 +235,11 @@ function buildMcpServer(deps: ServeDeps): McpServer {
           .max(MAX_NOTES_PER_SAVE)
           .describe("The notes to save, each self-contained"),
       },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ notes }) => ({ content: [{ type: "text", text: describeBatchOutcome(await saveNotesToDuo(deps, notes)) }] }),
+    async ({ notes }) => needsSave(async () => ({ content: [{ type: "text" as const, text: describeBatchOutcome(await saveNotesToDuo(deps, notes)) }] })),
   );
+  registerDuoTools(server, { deps, scopes: granted });
   return server;
 }
 
@@ -222,8 +248,8 @@ function buildMcpServer(deps: ServeDeps): McpServer {
  * it is for. Stateless Streamable HTTP: a fresh server and transport per
  * request, no session to track.
  */
-export async function handleMcpRequest(deps: ServeDeps, request: FastifyRequest, reply: FastifyReply): Promise<void> {
-  const server = buildMcpServer(deps);
+export async function handleMcpRequest(deps: ServeDeps, request: FastifyRequest, reply: FastifyReply, scopes: readonly Scope[]): Promise<void> {
+  const server = buildMcpServer(deps, scopes);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   reply.hijack();
   reply.raw.on("close", () => {
@@ -262,7 +288,8 @@ export function registerMcpRoutes(app: FastifyInstance, deps: ServeDeps): void {
       reply.code(401).send({ jsonrpc: "2.0", error: { code: -32001, message: "This connector URL is not valid. Copy a new one from your duo." }, id: null });
       return;
     }
-    await handleMcpRequest(deps, request, reply);
+    // A secret URL is the #227 connector: it saves, as it always could, and nothing more, however it was minted.
+    await handleMcpRequest(deps, request, reply, LEGACY_SCOPES);
   });
 
   app.get("/mcp/:secret", async (_request, reply) => reply.code(405).header("Allow", "POST").send(MCP_METHOD_NOT_ALLOWED));

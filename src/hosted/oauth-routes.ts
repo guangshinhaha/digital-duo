@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { handleMcpRequest, MCP_METHOD_NOT_ALLOWED } from "../serve/mcp.js";
+import { DEFAULT_SCOPES, SCOPE_INFO, SCOPES, isScope, parseScopes, type Scope } from "../serve/scopes.js";
 import type { ServeDeps } from "../serve/server.js";
 import type { VerifiedIdentity } from "./google.js";
 import { OAuthError, type OAuthStore } from "./oauth.js";
@@ -19,7 +20,6 @@ export interface OAuthContext {
   depsFor(duoId: string): ServeDeps | undefined;
 }
 
-const SCOPE = "duo:save";
 /**
  * Claude's own servers make the registration and token calls, so many owners share a few source addresses and one
  * budget: registration is generous (the client cap and the unused-client grace are the real bound), and failed token
@@ -105,7 +105,7 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
     resource,
     authorization_servers: [ctx.publicUrl],
     bearer_methods_supported: ["header"],
-    scopes_supported: [SCOPE],
+    scopes_supported: [...SCOPES],
     resource_name: "Digital Duo",
   });
   control.get("/.well-known/oauth-protected-resource", protectedResource);
@@ -121,7 +121,7 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: [SCOPE],
+    scopes_supported: [...SCOPES],
   }));
 
   // RFC 7591: Claude registers itself. Open by design, so it is rate limited and only Claude's own callback addresses are accepted.
@@ -178,7 +178,13 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
       return back("invalid_target", "That resource is not served here.");
     }
     try {
-      const pending = ctx.store.beginAuthorization({ client, redirectUri, state, codeChallenge });
+      // What Claude asks for is the ceiling of what the owner can grant; asking for nothing (or nothing known) leaves it
+      // to the owner to choose from everything this server offers.
+      const requestedScopes = query.scope === undefined ? undefined : parseScopes(query.scope);
+      if (query.scope !== undefined && requestedScopes === undefined) {
+        return back("invalid_scope", "None of the requested scopes is one this server offers.");
+      }
+      const pending = ctx.store.beginAuthorization({ client, redirectUri, state, codeChallenge, requestedScopes });
       reply.redirect(`${ctx.webUrl}/#connect?host=${encodeURIComponent(ctx.publicUrl)}&request=${pending.id}`, 302);
     } catch (error) {
       if (error instanceof OAuthError) {
@@ -195,10 +201,13 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
       reply.code(404).send(errorBody("request_expired", "This connection request has expired. Start again from Claude."));
       return;
     }
-    return { clientName: pending.clientName };
+    return {
+      clientName: pending.clientName,
+      scopes: pending.requestedScopes.map((id) => ({ id, label: SCOPE_INFO[id].label, description: SCOPE_INFO[id].description, defaultOn: SCOPE_INFO[id].defaultOn })),
+    };
   });
 
-  control.post<{ Params: { id: string }; Body: { credential?: unknown } }>("/oauth/requests/:id/approve", async (request, reply) => {
+  control.post<{ Params: { id: string }; Body: { credential?: unknown; scopes?: unknown } }>("/oauth/requests/:id/approve", async (request, reply) => {
     if (ctx.signInBlocked(request.ip)) {
       reply.code(429).send(errorBody("rate_limited", "Too many failed sign-ins from this address; try again later."));
       return;
@@ -206,6 +215,17 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
     const pending = ctx.store.getAuthorization(request.params.id);
     if (!pending) {
       reply.code(404).send(errorBody("request_expired", "This connection request has expired. Start again from Claude."));
+      return;
+    }
+    // What the owner chose to allow. Left out, the defaults apply; either way it can never exceed what Claude asked for.
+    const chosen = request.body?.scopes;
+    if (chosen !== undefined && (!Array.isArray(chosen) || !chosen.every(isScope))) {
+      reply.code(400).send(errorBody("bad_request", "scopes must be a list of permission names."));
+      return;
+    }
+    const granted: Scope[] = SCOPES.filter((scope) => pending.requestedScopes.includes(scope) && (chosen === undefined ? DEFAULT_SCOPES.includes(scope) : (chosen as Scope[]).includes(scope)));
+    if (granted.length === 0) {
+      reply.code(400).send(errorBody("no_scopes", "Choose at least one thing Claude may do."));
       return;
     }
     const identity = await ctx.identify(request.body?.credential, request, reply);
@@ -223,7 +243,7 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
       reply.code(404).send(errorBody("request_expired", "This connection request has expired. Start again from Claude."));
       return;
     }
-    const code = ctx.store.issueCode(taken, duo.duoId);
+    const code = ctx.store.issueCode(taken, duo.duoId, granted);
     return { redirectTo: redirectWith(taken.redirectUri, { code, state: taken.state }), ownerName: duo.ownerName };
   });
 
@@ -273,7 +293,7 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
           reply.code(400).send({ error: "unsupported_grant_type", error_description: "grant_type must be authorization_code or refresh_token." });
           return;
         }
-        return { access_token: tokens.accessToken, token_type: "Bearer", expires_in: tokens.expiresInSeconds, refresh_token: tokens.refreshToken, scope: SCOPE };
+        return { access_token: tokens.accessToken, token_type: "Bearer", expires_in: tokens.expiresInSeconds, refresh_token: tokens.refreshToken, scope: tokens.scopes.join(" ") };
       } catch (error) {
         if (error instanceof OAuthError) {
           tokenFailures.record(failureKey);
@@ -303,7 +323,7 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
     if (!deps) {
       return challenge(reply, true);
     }
-    await handleMcpRequest(deps, request, reply);
+    await handleMcpRequest(deps, request, reply, verified?.scopes ?? []);
   });
   control.get("/mcp", async (_request, reply) => reply.code(405).header("Allow", "POST").send(MCP_METHOD_NOT_ALLOWED));
   control.delete("/mcp", async (_request, reply) => reply.code(405).header("Allow", "POST").send(MCP_METHOD_NOT_ALLOWED));

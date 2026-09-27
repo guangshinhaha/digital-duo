@@ -236,6 +236,24 @@ describe("MCP connector (#227)", () => {
     expect(connectorRecords(storePath)).toEqual([]);
   });
 
+  it("stays save-only over a secret URL: the duo's other tools are refused, and nothing is read", async () => {
+    const { base, storePath } = await startDuo("owner");
+    const { token } = createConnectorToken(storePath, PASSPHRASE);
+    await saveThroughConnector(`${base}/mcp/${token}`, "A note the secret URL can add but not read back.");
+
+    const client = new Client({ name: "test-claude", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp/${token}`)));
+    try {
+      const search = await client.callTool({ name: "search_my_duo", arguments: { query: "note" } });
+      expect(search.isError).toBe(true);
+      expect((search.content as { text: string }[])[0].text).toMatch(/Read permission \(duo:read\)/);
+      const embed = await client.callTool({ name: "embed_my_duo", arguments: {} });
+      expect(embed.isError).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
   it("mints the connector from the app: POST /connector returns the path once, GET reports it live", async () => {
     const { app, storePath } = await startDuo("owner");
     const device = createDeviceToken(storePath, PASSPHRASE, "laptop");

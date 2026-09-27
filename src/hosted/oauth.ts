@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { LEGACY_SCOPES, SCOPES, isScope, type Scope } from "../serve/scopes.js";
 
 /**
  * Issue #240: what the hosted daemon keeps to be a small OAuth 2.1
@@ -59,6 +60,8 @@ interface Grant {
   readonly clientName: string;
   readonly duoId: string;
   readonly createdAt: string;
+  /** What the owner allowed at sign-in. A grant made before scopes existed has none recorded and is save-only. */
+  readonly scopes?: readonly string[];
   lastUsedAt: string | null;
   accessHash: string;
   accessExpiresAt: number;
@@ -81,6 +84,8 @@ export interface PendingAuthorization {
   readonly redirectUri: string;
   readonly state: string | undefined;
   readonly codeChallenge: string;
+  /** What Claude asked for (or everything the server offers, when it named nothing): the most the owner can grant. */
+  readonly requestedScopes: readonly Scope[];
   readonly expiresAt: number;
 }
 
@@ -89,6 +94,7 @@ interface AuthorizationCode {
   readonly redirectUri: string;
   readonly codeChallenge: string;
   readonly duoId: string;
+  readonly scopes: readonly Scope[];
   readonly expiresAt: number;
 }
 
@@ -96,6 +102,7 @@ export interface IssuedTokens {
   readonly accessToken: string;
   readonly refreshToken: string;
   readonly expiresInSeconds: number;
+  readonly scopes: readonly Scope[];
 }
 
 /** What an owner sees of a connection: never a token, only that it exists and when it was last used. */
@@ -104,6 +111,13 @@ export interface Connection {
   readonly clientName: string;
   readonly createdAt: string;
   readonly lastUsedAt: string | null;
+  readonly scopes: readonly Scope[];
+}
+
+/** A grant's scopes as recorded, or save-only for one made before scopes existed. */
+function scopesOf(grant: Grant): Scope[] {
+  const recorded = grant.scopes?.filter(isScope);
+  return recorded === undefined ? [...LEGACY_SCOPES] : SCOPES.filter((scope) => recorded.includes(scope));
 }
 
 function hash(secret: string): string {
@@ -210,7 +224,13 @@ export class OAuthStore {
   }
 
   /** Remembers a validated authorization request; the owner is sent to sign in against the returned id. */
-  beginAuthorization(input: { client: OAuthClient; redirectUri: string; state: string | undefined; codeChallenge: string }): PendingAuthorization {
+  beginAuthorization(input: {
+    client: OAuthClient;
+    redirectUri: string;
+    state: string | undefined;
+    codeChallenge: string;
+    requestedScopes?: readonly Scope[];
+  }): PendingAuthorization {
     this.sweep();
     if (this.requests.size >= this.maxPendingRequests) {
       throw new OAuthError("temporarily_unavailable", "Too many sign-ins are waiting; try again shortly.");
@@ -222,6 +242,7 @@ export class OAuthStore {
       redirectUri: input.redirectUri,
       state: input.state,
       codeChallenge: input.codeChallenge,
+      requestedScopes: input.requestedScopes ?? SCOPES,
       expiresAt: this.now() + REQUEST_TTL_MS,
     };
     this.requests.set(pending.id, pending);
@@ -241,13 +262,14 @@ export class OAuthStore {
   }
 
   /** Issues the one-time code that Claude trades for tokens; it names the duo the signed-in owner owns. */
-  issueCode(pending: PendingAuthorization, duoId: string): string {
+  issueCode(pending: PendingAuthorization, duoId: string, granted: readonly Scope[]): string {
     const code = newSecret();
     this.codes.set(hash(code), {
       clientId: pending.clientId,
       redirectUri: pending.redirectUri,
       codeChallenge: pending.codeChallenge,
       duoId,
+      scopes: granted.filter((scope) => pending.requestedScopes.includes(scope)),
       expiresAt: this.now() + CODE_TTL_MS,
     });
     return code;
@@ -274,6 +296,7 @@ export class OAuthStore {
       clientName: client.name,
       duoId: record.duoId,
       createdAt: new Date(this.now()).toISOString(),
+      scopes: record.scopes,
       lastUsedAt: null,
       accessHash: "",
       accessExpiresAt: 0,
@@ -313,25 +336,25 @@ export class OAuthStore {
     grant.accessExpiresAt = this.now() + ACCESS_TTL_MS;
     grant.refreshHash = hash(refreshToken);
     grant.refreshExpiresAt = this.now() + REFRESH_TTL_MS;
-    return { accessToken, refreshToken, expiresInSeconds: ACCESS_TTL_MS / 1000 };
+    return { accessToken, refreshToken, expiresInSeconds: ACCESS_TTL_MS / 1000, scopes: scopesOf(grant) };
   }
 
   /** Which duo an access token is for, or undefined when it is unknown, expired or revoked. */
-  verifyAccess(accessToken: string): { duoId: string; connectionId: string } | undefined {
+  verifyAccess(accessToken: string): { duoId: string; connectionId: string; scopes: readonly Scope[] } | undefined {
     const presented = hash(accessToken);
     const grant = this.data.grants.find((candidate) => candidate.accessHash === presented);
     if (!grant || grant.accessExpiresAt <= this.now()) {
       return undefined;
     }
     grant.lastUsedAt = new Date(this.now()).toISOString();
-    return { duoId: grant.duoId, connectionId: grant.id };
+    return { duoId: grant.duoId, connectionId: grant.id, scopes: scopesOf(grant) };
   }
 
   connections(duoId: string): Connection[] {
     this.dropExpiredGrants();
     return this.data.grants
       .filter((grant) => grant.duoId === duoId)
-      .map((grant) => ({ id: grant.id, clientName: grant.clientName, createdAt: grant.createdAt, lastUsedAt: grant.lastUsedAt }));
+      .map((grant) => ({ id: grant.id, clientName: grant.clientName, createdAt: grant.createdAt, lastUsedAt: grant.lastUsedAt, scopes: scopesOf(grant) }));
   }
 
   /** Revokes one connection of this duo at once; false when the duo has no such connection. */
