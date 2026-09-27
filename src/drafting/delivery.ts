@@ -44,6 +44,27 @@ export interface ChannelAdapter {
    * is a network call.
    */
   deliver(request: ChannelDeliveryRequest): Promise<string | undefined | void>;
+  /**
+   * digital-duo#248: the messages of one thread on this channel, oldest
+   * first, so a bridged chat can fill in around the questions the client
+   * already has. Optional — an adapter that cannot or does not read its
+   * own history simply has no `history` at all, which `readThreadMessages`
+   * (`thread-history.ts`) reads as "nothing available," never an error.
+   * Whether a message was the owner's own reply is not this method's to
+   * say (it did not send it, this daemon's delivery seam did) — the
+   * caller works that out from its own delivered drafts.
+   */
+  history?(threadId: string): Promise<readonly RawThreadMessage[]>;
+}
+
+/** One message as a channel's own history read reports it — #248's `history()`, before this daemon has said anything about who it was. */
+export interface RawThreadMessage {
+  /** The channel's own reference for this message — opaque to the client, the same convention #247's `eventId` set. */
+  readonly id: string;
+  readonly at: string;
+  /** The channel's own sender reference, verbatim — #171's rule ("no surface ever has to recognise a product name") restated for reads: the client never keys behaviour on it. */
+  readonly senderRef: string;
+  readonly text: string;
 }
 
 /** A channel's connection state plus when it last carried anything — both reported by the adapter, which is the only side that can know (#171). */
