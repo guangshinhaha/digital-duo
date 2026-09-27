@@ -3,7 +3,12 @@ import { WebPushError } from "web-push";
 
 vi.mock("web-push", async (importOriginal) => {
   const actual = await importOriginal<typeof import("web-push")>();
-  return { ...actual, sendNotification: vi.fn() };
+  const mocked = { ...actual, sendNotification: vi.fn() };
+  // `src/push/sender.ts` reads `web-push` by its default export (a CJS
+  // module's ESM interop is not reliably named-export-safe under Node's
+  // real loader — see that file's own comment); mirror the same shape
+  // here, or the mock only replaces exports the source no longer reads.
+  return { ...mocked, default: mocked };
 });
 
 import { sendNotification } from "web-push";

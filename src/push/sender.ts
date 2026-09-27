@@ -1,4 +1,12 @@
-import { WebPushError, sendNotification } from "web-push";
+// `web-push` is CommonJS; a named import from it type-checks and even runs
+// under vitest's transform, but Node's own ESM loader (what actually runs
+// the compiled daemon, package.json's "type": "module") can fail to
+// synthesize a named export from a CJS module depending on how its own
+// `module.exports` is shaped — it did here, in production, though nothing
+// local caught it. The default import always works for any CJS module
+// under Node's ESM interop, since it is exactly `module.exports` itself.
+import webPush from "web-push";
+const { WebPushError, sendNotification } = webPush;
 
 /**
  * digital-duo#251: one push, sent. Transport-agnostic on purpose (the same
