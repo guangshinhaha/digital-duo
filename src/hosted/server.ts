@@ -176,10 +176,30 @@ function sdkLogLevelFrom(raw: string | undefined): SdkLogLevel | undefined {
   return level as SdkLogLevel;
 }
 
+const CONNECT_ON = ["", "1", "true", "on", "yes"];
+const CONNECT_OFF = ["0", "false", "off", "no"];
+
+/**
+ * The one off switch for the hosted duos' connections, so it fails closed on nonsense: a value that is
+ * neither plainly on nor plainly off (`disabled`, `none`, `n`, `false.`) is refused at boot, like the
+ * variables beside it, and not read as "on" while an operator believes the connections are off.
+ */
+function connectFrom(raw: string | undefined): boolean {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (CONNECT_ON.includes(value)) {
+    return true;
+  }
+  if (CONNECT_OFF.includes(value)) {
+    return false;
+  }
+  throw new WorkspaceConfigError(
+    `DUO_HOSTED_WORKSPACE_CONNECT must be one of ${[...CONNECT_ON.slice(1), ...CONNECT_OFF].join(", ")}, or empty for on (got ${JSON.stringify(raw)})`,
+  );
+}
+
 export function workspaceConnectionSettingsFrom(env: NodeJS.ProcessEnv): WorkspaceConnectionSettings {
-  const connect = env.DUO_HOSTED_WORKSPACE_CONNECT?.trim().toLowerCase();
   return {
-    enabled: !(connect === "0" || connect === "false" || connect === "off" || connect === "no"),
+    enabled: connectFrom(env.DUO_HOSTED_WORKSPACE_CONNECT),
     maxConcurrentDials: envInteger(env, "DUO_HOSTED_WORKSPACE_MAX_DIALS", 1),
     startStaggerMs: envInteger(env, "DUO_HOSTED_WORKSPACE_STAGGER_MS", 0),
     sdkLogLevel: sdkLogLevelFrom(env.DUO_HOSTED_WORKSPACE_SDK_LOG),
@@ -360,6 +380,9 @@ export interface HostedServerExtras {
   readonly synapseTimeoutMs?: number;
   /** How a duo's workspace transport is built (default: the matrix-js-sdk adapter). Tests hand in a fake. */
   readonly workspaceTransportFactory?: WorkspaceTransportFactory;
+  /** Tests: shorten the wait before a failed duo is retried or a refused duo re-minted (default one minute, capped at thirty). */
+  readonly workspaceRecoveryBaseMs?: number;
+  readonly workspaceRecoveryMaxMs?: number;
   /** The clock the workspace-session cache judges token age and expiry by (default: real time). */
   readonly sessionNow?: () => number;
   /** How often owed provisioning is retried (default 60s). */
@@ -430,6 +453,8 @@ export async function createHostedServer(
   // Each provisioned duo's own outbound workspace connection (#236), started from the registry's word
   // that the duo has accounts and following it (a re-minted token restarts it). It only queues here: the
   // dialing happens off a timer, so a Synapse that is down or slow never holds up boot or a sign-up.
+  // The provisioner is built below (it needs the admin client); the connections call it lazily, from timers, never during boot.
+  let remintable: MatrixProvisioner | undefined;
   const connections =
     settings.synapse && settings.workspaceConnections?.enabled !== false
       ? new DuoWorkspaceConnections({
@@ -440,6 +465,9 @@ export async function createHostedServer(
           maxConcurrentDials: settings.workspaceConnections?.maxConcurrentDials,
           startStaggerMs: settings.workspaceConnections?.startStaggerMs,
           sdkLogLevel: settings.workspaceConnections?.sdkLogLevel,
+          remint: (duoId) => (remintable ? remintable.remintToken(duoId) : Promise.resolve({ status: "pending", error: "the Matrix provisioner is not up yet" })),
+          recoveryBaseMs: extras.workspaceRecoveryBaseMs,
+          recoveryMaxMs: extras.workspaceRecoveryMaxMs,
           log: extras.log,
         })
       : undefined;
@@ -490,6 +518,7 @@ export async function createHostedServer(
         retryBaseMs: extras.provisionRetryMs ?? DEFAULT_PROVISION_RETRY_MS,
       })
     : undefined;
+  remintable = matrix;
   const settleWithin = async (attempt: Promise<unknown>): Promise<void> => {
     await Promise.race([attempt, new Promise<void>((resolve) => setTimeout(resolve, extras.signupProvisionWaitMs ?? DEFAULT_SIGNUP_PROVISION_WAIT_MS).unref())]);
   };
@@ -847,6 +876,30 @@ export async function createHostedServer(
     const summary = await matrix.provisionAll();
     const spaceSummary = await spaces!.syncAll();
     return { ...summary, outcomes: summary.outcomes.map(publicOutcome), spaces: publicSpaces(spaceSummary) };
+  });
+
+  // Gives one duo a new Matrix token (`duo hosted provision --remint <duoId>`): for a duo Synapse
+  // refuses (the daemon also does this itself, with a backoff and a cap). The token goes to the registry and the
+  // duo's connection restarts with it; the answer is the status and ids, never the token.
+  control.post("/hosted/matrix/remint", { preHandler: requireAdmin }, async (request, reply) => {
+    if (!matrix) {
+      sendError(reply, 400, "matrix_not_configured", "Set DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN to mint Matrix tokens.");
+      return;
+    }
+    const duoId = (request.body as { duoId?: unknown } | null)?.duoId;
+    if (typeof duoId !== "string" || duoId.length === 0) {
+      sendError(reply, 400, "invalid_request", "Send { duoId }.");
+      return;
+    }
+    if (duoId !== ROOT_DUO_ID && !registry.tenants().some((tenant) => tenant.id === duoId)) {
+      sendError(reply, 404, "duo_not_found", `No hosted duo "${duoId}".`);
+      return;
+    }
+    try {
+      return publicOutcome(await matrix.remintToken(duoId));
+    } catch {
+      sendError(reply, 500, "remint_failed", "Minting the token failed unexpectedly; see the daemon log.");
+    }
   });
 
   await control.ready();

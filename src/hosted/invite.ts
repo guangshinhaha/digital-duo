@@ -70,6 +70,15 @@ export function runHostedProvision(
   return callDaemon(env, "POST", "/hosted/matrix/provision", {}, timeoutMs);
 }
 
+/** Implements `duo hosted provision --remint <duoId>`: gives a duo Synapse no longer knows the token of a new one. The answer carries status and ids, never the token. */
+export function runHostedRemint(
+  duoId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  timeoutMs: number = PROVISION_CALL_TIMEOUT_MS,
+): Promise<{ duoId: string; status: string; error?: string; accounts?: { personUserId: string; duoUserId: string } }> {
+  return callDaemon(env, "POST", "/hosted/matrix/remint", { duoId }, timeoutMs);
+}
+
 /** Implements `duo hosted org create "<name>"`. */
 export function runHostedOrgCreate(name: string, env: NodeJS.ProcessEnv = process.env): Promise<HostedOrgSummary> {
   return callDaemon(env, "POST", "/hosted/orgs", { name });

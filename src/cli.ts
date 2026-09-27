@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedProvision, runHostedServe } from "./commands/hosted.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -168,8 +168,18 @@ hostedCommand
 hostedCommand
   .command("provision")
   .description("Create the Matrix accounts every hosted duo still lacks, then each org's Space and #general and put members in them (safe to re-run; talks to the running hosted daemon, which needs DUO_WORKSPACE_PRIVATE_URL and DUO_WORKSPACE_ADMIN_TOKEN)")
-  .action(async () => {
+  .option("--remint <duoId>", "instead, give this one duo a new Matrix token (for a duo whose token Synapse no longer knows, e.g. after its database was reset); the connection restarts with it")
+  .action(async (options: { remint?: string }) => {
     try {
+      if (options.remint !== undefined) {
+        const outcome = await runHostedRemint(options.remint);
+        console.log(
+          outcome.status === "reminted"
+            ? `Minted a new token for ${outcome.duoId}; its connection is restarting with it.`
+            : `${outcome.duoId}: ${outcome.status}${outcome.error ? ` (${outcome.error})` : ""}. Nothing was changed.`,
+        );
+        return;
+      }
       const summary = await runHostedProvision();
       console.log(`Provisioned ${summary.provisioned}, already done ${summary.already}, pending ${summary.pending}, needs attention ${summary.failed}.`);
       for (const outcome of summary.outcomes.filter((candidate) => candidate.status === "pending")) {

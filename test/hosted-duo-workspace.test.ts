@@ -1,6 +1,6 @@
 import { type AddressInfo } from "node:net";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { createFakeSynapse, FAKE_ADMIN_TOKEN, FAKE_SYNAPSE_URL, type FakeSynapse } from "./helpers/fake-synapse.js";
 import { FakeWorkspaceTransport } from "./helpers/fake-workspace-transport.js";
@@ -9,7 +9,7 @@ import { loadConfig } from "../src/config.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
-import { DuoWorkspaceConnections } from "../src/hosted/duo-workspace.js";
+import { DuoWorkspaceConnections, jitterFactor, sdkLoggerFor } from "../src/hosted/duo-workspace.js";
 import { HostedRegistry } from "../src/hosted/registry.js";
 import {
   createHostedServer,
@@ -30,6 +30,8 @@ import { grantAutonomy } from "../src/trust/grants.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
 import type { WorkspaceTransport } from "../src/workspace/transport.js";
 import { WorkspaceConfigError } from "../src/workspace/settings.js";
+import { WorkspaceTokenRevokedError } from "../src/workspace/transport.js";
+import { runHostedRemint } from "../src/hosted/invite.js";
 
 const tempDir = useTempDir();
 const ADMIN = "admin-token-for-tests";
@@ -208,6 +210,38 @@ const markerProvider: InferenceProvider = {
     return marker ? `${marker[1]}-FACT is the answer` : "I do not know";
   },
 };
+
+/** A duo the manager can attach: real encrypted store (its service reads its read state on start), registered in a real registry with accounts. */
+function seededDuos(count: number): { registry: HostedRegistry; ids: string[]; deps: (id: string) => Parameters<DuoWorkspaceConnections["attach"]>[1] } {
+  const registry = new HostedRegistry(join(tempDir(), "registry.json"), MASTER);
+  const ids: string[] = [];
+  const config = loadConfig({});
+  for (let index = 0; index < count; index += 1) {
+    const { invite } = registry.createInvite(`Duo ${index}`, new Date(Date.now() + 3_600_000).toISOString());
+    const tenant = registry.addTenant(invite.id, `Duo ${index}`, `pw-${index}`);
+    createEncryptedStore(join(tempDir(), "duos", tenant.id, "duo.db"), `pw-${index}`);
+    ids.push(tenant.id);
+  }
+  return {
+    registry,
+    ids,
+    deps: (id) => ({
+      storePath: join(tempDir(), "duos", id, "duo.db"),
+      passphrase: `pw-${ids.indexOf(id)}`,
+      duoDir: join(tempDir(), "duos", id, "duo"),
+      embeddingProvider: createFakeEmbeddingProvider(),
+      inferenceProvider: undefined,
+      confidenceConfig: config.confidence,
+      classificationCeiling: config.classificationCeiling,
+      ownerName: id,
+    }),
+  };
+}
+
+/** What `createHostedServer` does for the real manager: it hears of every registry write. */
+function follow(registry: HostedRegistry, manager: DuoWorkspaceConnections): void {
+  registry.onChange(() => manager.reconcile());
+}
 
 describe("each hosted duo connects to the workspace as itself and answers there (#236)", () => {
   it("connects with the duo's own token from the registry, to the private URL, and answers a passed-on question that lands in that owner's Escalations", async () => {
@@ -612,33 +646,6 @@ describe("the token never leaves the daemon", () => {
 });
 
 describe("no stampede: a cap and a stagger on first dials", () => {
-  /** A duo the manager can attach: real encrypted store (its service reads its read state on start), registered in a real registry with accounts. */
-  function seededDuos(count: number): { registry: HostedRegistry; ids: string[]; deps: (id: string) => Parameters<DuoWorkspaceConnections["attach"]>[1] } {
-    const registry = new HostedRegistry(join(tempDir(), "registry.json"), MASTER);
-    const ids: string[] = [];
-    const config = loadConfig({});
-    for (let index = 0; index < count; index += 1) {
-      const { invite } = registry.createInvite(`Duo ${index}`, new Date(Date.now() + 3_600_000).toISOString());
-      const tenant = registry.addTenant(invite.id, `Duo ${index}`, `pw-${index}`);
-      createEncryptedStore(join(tempDir(), "duos", tenant.id, "duo.db"), `pw-${index}`);
-      ids.push(tenant.id);
-    }
-    return {
-      registry,
-      ids,
-      deps: (id) => ({
-        storePath: join(tempDir(), "duos", id, "duo.db"),
-        passphrase: `pw-${ids.indexOf(id)}`,
-        duoDir: join(tempDir(), "duos", id, "duo"),
-        embeddingProvider: createFakeEmbeddingProvider(),
-        inferenceProvider: undefined,
-        confidenceConfig: config.confidence,
-        classificationCeiling: config.classificationCeiling,
-        ownerName: id,
-      }),
-    };
-  }
-
   it("never has more than the cap in their first dial, and starts them no closer than the stagger", async () => {
     const { registry, ids, deps } = seededDuos(6);
     const started: number[] = [];
@@ -755,5 +762,373 @@ describe("no stampede: a cap and a stagger on first dials", () => {
     expect(transports.latest(`@duo-default.${ids[1]!}:duo.test`).stopCalls).toBe(0);
     expect(manager.serviceFor(ids[0]!)).toBeUndefined();
     expect(manager.serviceFor(ids[1]!)).toBeDefined();
+  });
+});
+
+
+describe("DUO_HOSTED_WORKSPACE_CONNECT fails closed", () => {
+  const base = { DUO_HOSTED_MASTER_KEY: MASTER, DUO_HOSTED_ADMIN_TOKEN: ADMIN };
+  it.each(["1", "true", "ON", " yes ", ""])("%j leaves the connections on", (value) => {
+    expect(hostedSettingsFrom({ ...base, DUO_HOSTED_WORKSPACE_CONNECT: value }).workspaceConnections?.enabled).toBe(true);
+  });
+  it.each(["0", "false", "OFF", " No "])("%j turns them off", (value) => {
+    expect(hostedSettingsFrom({ ...base, DUO_HOSTED_WORKSPACE_CONNECT: value }).workspaceConnections?.enabled).toBe(false);
+  });
+  it.each(["disabled", "none", "n", "false.", "2"])("%j is refused at boot, not read as on", (value) => {
+    expect(() => hostedSettingsFrom({ ...base, DUO_HOSTED_WORKSPACE_CONNECT: value })).toThrow(WorkspaceConfigError);
+  });
+});
+
+describe("jitterFactor and the SDK logger", () => {
+  it("is fixed per duo, within 1.0 to 1.5, and spreads duos out", () => {
+    const factors = Array.from({ length: 200 }, (_, index) => jitterFactor(`duo${index}`));
+    expect(jitterFactor("abc")).toBe(jitterFactor("abc"));
+    for (const factor of factors) {
+      expect(factor).toBeGreaterThanOrEqual(1);
+      expect(factor).toBeLessThan(1.5);
+    }
+    expect(Math.min(...factors)).toBeLessThan(1.05);
+    expect(Math.max(...factors)).toBeGreaterThan(1.45);
+    expect(new Set(factors).size).toBeGreaterThan(100);
+  });
+
+  it("drops what is below its level and hands the rest to the duo's log", () => {
+    const lines: string[] = [];
+    const only = (level: Parameters<typeof sdkLoggerFor>[0]): string[] => {
+      lines.length = 0;
+      const logger = sdkLoggerFor(level, (line) => lines.push(line));
+      logger.error("e");
+      logger.warn("w");
+      logger.info("i");
+      logger.debug("d");
+      logger.trace("t");
+      logger.getChild("x").error("child");
+      return lines.slice();
+    };
+    expect(only("silent")).toEqual([]);
+    expect(only("error")).toEqual(["matrix sdk error: e", "matrix sdk error: child"]);
+    expect(only("warn")).toEqual(["matrix sdk error: e", "matrix sdk warn: w", "matrix sdk error: child"]);
+    expect(only("debug").map((line) => line.split(":")[0])).toHaveLength(5);
+    expect(only("trace")).toHaveLength(6);
+  });
+});
+
+describe("a duo that cannot be built is retried, and a failing step cannot lose a restart", () => {
+  it("brings a duo back on its own once its store opens, and says why it failed", async () => {
+    const fake = createFakeSynapse();
+    const transports = new Transports();
+    const { hosted, base, settings } = await start({ fake, transports });
+    const sam = await joinDuo(base, "Sam");
+    await connected(hosted, sam.tenantId);
+    await running.pop()!.close();
+
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const storePath = tenantPaths(settings.hostedRoot, sam.tenantId).storePath;
+    const original = readFileSync(storePath);
+    writeFileSync(storePath, "not a store");
+    const again = new Transports();
+    const restarted = await start({ fake, transports: again, settings: { hostedRoot: settings.hostedRoot }, extras: { workspaceRecoveryBaseMs: 30, workspaceRecoveryMaxMs: 60 } });
+    await expect.poll(() => restarted.hosted.workspace!.states().find((state) => state.duoId === sam.tenantId)?.phase, { timeout: 8_000 }).toBe("failed");
+    const failure = restarted.logs.find((line) => line.includes("could not be started"))!;
+    expect(failure).toContain(`duo ${sam.tenantId}`);
+    // The message, not only the class name; and never the token.
+    expect(failure).toMatch(/could not be started \(\w+: .+\)/);
+    expect(restarted.logs.join("\n")).not.toContain(restarted.hosted.registry.duoMatrixToken(sam.tenantId)!);
+
+    writeFileSync(storePath, original);
+    await connected(restarted.hosted, sam.tenantId);
+  });
+
+  it("queues the restart after a re-mint even when stopping the old connection throws", async () => {
+    const { registry, ids, deps } = seededDuos(1);
+    const id = ids[0]!;
+    const transports = new Transports();
+    const logs: string[] = [];
+    const manager = new DuoWorkspaceConnections({ registry, config: loadConfig({}), homeserverUrl: FAKE_SYNAPSE_URL, startStaggerMs: 0, log: (line) => logs.push(line), transportFactory: transports.factory });
+    managers.push(manager);
+    follow(registry, manager);
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: `@duo-default.${id}:duo.test` }, "syt_first");
+    manager.attach(id, deps(id));
+    await expect.poll(() => manager.states()[0]?.phase, { timeout: 8_000 }).toBe("connected");
+    transports.latest(`@duo-default.${id}:duo.test`).stop = async () => {
+      throw new Error("stop blew up");
+    };
+
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: `@duo-default.${id}:duo.test` }, "syt_second");
+    await expect.poll(() => transports.forUser(`@duo-default.${id}:duo.test`).length, { timeout: 8_000 }).toBe(2);
+    expect(transports.latest(`@duo-default.${id}:duo.test`).connectCalls).toBe(1);
+    expect(logs.some((line) => line.includes("step failed") && line.includes("stop blew up"))).toBe(true);
+  });
+
+  it("starts nothing from a fingerprint the registry has moved past", async () => {
+    const { registry, ids, deps } = seededDuos(1);
+    const id = ids[0]!;
+    const transports = new Transports();
+    const manager = new DuoWorkspaceConnections({ registry, config: loadConfig({}), homeserverUrl: FAKE_SYNAPSE_URL, startStaggerMs: 0, log: () => {}, transportFactory: transports.factory });
+    managers.push(manager);
+    // Not followed: the manager has not been told of the accounts, as when a re-mint lands between a duo's dispatch and its start.
+    manager.attach(id, deps(id));
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: `@duo-default.${id}:duo.test` }, "syt_new");
+    const entry = (manager as unknown as { entries: Map<string, unknown> }).entries.get(id);
+    const startService = (fingerprint: string, release: () => void) =>
+      (manager as unknown as { startService(entry: unknown, fingerprint: string, release: () => void): Promise<void> }).startService(entry, fingerprint, release);
+    let released = 0;
+    await startService("stale|fingerprint", () => {
+      released += 1;
+    });
+    expect(released).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(transports.created).toHaveLength(0);
+    expect(manager.serviceFor(id)).toBeUndefined();
+
+    // The current fingerprint does start it, so the guard above is what stopped the first call.
+    const accounts = registry.matrixAccounts(id)!;
+    await startService(`${accounts.duoUserId}|${accounts.duoTokenCipher}`, () => {});
+    await expect.poll(() => transports.created.length, { timeout: 8_000 }).toBe(1);
+  });
+});
+
+describe("a refused token is re-minted, boundedly", () => {
+  it("re-mints a revoked duo's token on its own, restarts it with the new one, and names the hosted remedy", async () => {
+    const fake = createFakeSynapse();
+    const transports = new Transports();
+    const { hosted, base, logs } = await start({ fake, transports, extras: { workspaceRecoveryBaseMs: 30, workspaceRecoveryMaxMs: 60 } });
+    const sam = await joinDuo(base, "Sam");
+    await connected(hosted, sam.tenantId);
+    const samUser = duoUserOf(hosted, sam.tenantId);
+    const oldToken = hosted.registry.duoMatrixToken(sam.tenantId)!;
+    const mintedBefore = fake.minted.length;
+
+    let builds = 0;
+    transports.behaviors.set(samUser, (settings) => {
+      const transport = transports.make(settings);
+      builds += 1;
+      if (builds === 1) {
+        transport.rejectNextConnectWith(new WorkspaceTokenRevokedError("M_UNKNOWN_TOKEN"));
+      }
+      return transport;
+    });
+    transports.latest(samUser).dropConnection();
+    await expect.poll(() => fake.minted.length, { timeout: 8_000 }).toBe(mintedBefore + 1);
+    await connected(hosted, sam.tenantId);
+
+    const newToken = hosted.registry.duoMatrixToken(sam.tenantId)!;
+    expect(newToken).not.toBe(oldToken);
+    expect(newToken).toBe(fake.minted[fake.minted.length - 1]!.token);
+    expect(fake.minted[fake.minted.length - 1]).toMatchObject({ userId: samUser, validUntilMs: null });
+    expect(transports.latest(samUser).settings_accessToken ?? transports.created[transports.created.length - 1]!.settings.accessToken).toBe(newToken);
+    const text = logs.join("\n");
+    expect(text).toContain("--remint");
+    expect(text).not.toContain("re-pair the duo on the owner's machine");
+    expect(text).toContain("minted a new token");
+    expect(text).not.toContain(oldToken);
+    expect(text).not.toContain(newToken);
+  });
+
+  it("stops after the cap when new tokens keep being refused, and never mints again until one connects", async () => {
+    const { registry, ids, deps } = seededDuos(1);
+    const id = ids[0]!;
+    const user = `@duo-default.${id}:duo.test`;
+    const logs: string[] = [];
+    let mints = 0;
+    const manager = new DuoWorkspaceConnections({
+      registry,
+      config: loadConfig({}),
+      homeserverUrl: FAKE_SYNAPSE_URL,
+      startStaggerMs: 0,
+      recoveryBaseMs: 10,
+      recoveryMaxMs: 20,
+      maxRemints: 3,
+      log: (line) => logs.push(line),
+      remint: async (duoId) => {
+        mints += 1;
+        registry.setMatrixAccounts(duoId, { personUserId: `@default.${duoId}:duo.test`, duoUserId: user }, `syt_minted_${mints}`);
+        return { status: "reminted" };
+      },
+      transportFactory: () => {
+        const transport = new FakeWorkspaceTransport();
+        transport.rejectNextConnectWith(new WorkspaceTokenRevokedError("M_UNKNOWN_TOKEN"));
+        return transport;
+      },
+    });
+    managers.push(manager);
+    follow(registry, manager);
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: user }, "syt_first");
+    manager.attach(id, deps(id));
+    await expect.poll(() => logs.some((line) => line.includes("gave up minting")), { timeout: 8_000 }).toBe(true);
+    expect(mints).toBe(3);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(mints).toBe(3);
+    expect(manager.states()[0]!.phase).toBe("revoked");
+    expect(logs.find((line) => line.includes("gave up"))).toContain(`--remint ${id}`);
+  });
+
+  it("waits and tries again when Synapse cannot mint, counting each try", async () => {
+    const { registry, ids, deps } = seededDuos(1);
+    const id = ids[0]!;
+    const user = `@duo-default.${id}:duo.test`;
+    let calls = 0;
+    const manager = new DuoWorkspaceConnections({
+      registry,
+      config: loadConfig({}),
+      homeserverUrl: FAKE_SYNAPSE_URL,
+      startStaggerMs: 0,
+      recoveryBaseMs: 10,
+      recoveryMaxMs: 20,
+      maxRemints: 4,
+      log: () => {},
+      remint: async (duoId) => {
+        calls += 1;
+        if (calls < 3) {
+          return { status: "pending", error: "Synapse is down" };
+        }
+        registry.setMatrixAccounts(duoId, { personUserId: `@default.${duoId}:duo.test`, duoUserId: user }, "syt_good");
+        return { status: "reminted" };
+      },
+      transportFactory: (settings) => {
+        const transport = new FakeWorkspaceTransport();
+        if (settings.accessToken !== "syt_good") {
+          transport.rejectNextConnectWith(new WorkspaceTokenRevokedError("M_UNKNOWN_TOKEN"));
+        }
+        return transport;
+      },
+    });
+    managers.push(manager);
+    follow(registry, manager);
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: user }, "syt_first");
+    manager.attach(id, deps(id));
+    await expect.poll(() => manager.states()[0]?.phase, { timeout: 8_000 }).toBe("connected");
+    expect(calls).toBe(3);
+  });
+
+  it("`POST /hosted/matrix/remint` (and `duo hosted provision --remint`) mints one duo a new token and restarts its connection, and answers no token", async () => {
+    const fake = createFakeSynapse();
+    const transports = new Transports();
+    const { hosted, base } = await start({ fake, transports });
+    const sam = await joinDuo(base, "Sam");
+    await connected(hosted, sam.tenantId);
+    const samUser = duoUserOf(hosted, sam.tenantId);
+    const oldToken = hosted.registry.duoMatrixToken(sam.tenantId)!;
+
+    const post = (body: unknown, headers: Record<string, string> = admin) =>
+      fetch(`${base}/hosted/matrix/remint`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+    expect((await post({ duoId: sam.tenantId }, {})).status).toBe(401);
+    expect((await post({})).status).toBe(400);
+    expect((await post({ duoId: "nosuchduo" })).status).toBe(404);
+
+    const before = transports.forUser(samUser).length;
+    const outcome = await runHostedRemint(sam.tenantId, { ...FAST_CLI_ENV(base), DUO_HOSTED_MASTER_KEY: MASTER, DUO_HOSTED_ADMIN_TOKEN: ADMIN } as NodeJS.ProcessEnv);
+    expect(outcome).toMatchObject({ duoId: sam.tenantId, status: "reminted" });
+    const newToken = hosted.registry.duoMatrixToken(sam.tenantId)!;
+    expect(newToken).not.toBe(oldToken);
+    expect(JSON.stringify(outcome)).not.toContain(newToken);
+    await expect.poll(() => transports.forUser(samUser).length, { timeout: 8_000 }).toBe(before + 1);
+    expect(transports.created[transports.created.length - 1]!.settings.accessToken).toBe(newToken);
+    await connected(hosted, sam.tenantId);
+  });
+});
+
+function FAST_CLI_ENV(base: string): NodeJS.ProcessEnv {
+  return { PORT: new URL(base).port };
+}
+
+describe("reconnects go through the same slots as first dials", () => {
+  it("spreads N duos dropped together across the stagger, and never holds more than the cap in a redial", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const { registry, ids, deps } = seededDuos(6);
+      const dialTimes: number[] = [];
+      let redialing = 0;
+      let peak = 0;
+      const heldRedials: Array<() => void> = [];
+      const transports: FakeWorkspaceTransport[] = [];
+      const builds = new Map<string, number>();
+      const manager = new DuoWorkspaceConnections({
+        registry,
+        config: loadConfig({ DUO_WORKSPACE_RECONNECT_INITIAL_MS: "1000", DUO_WORKSPACE_RECONNECT_MAX_MS: "1000" }),
+        homeserverUrl: FAKE_SYNAPSE_URL,
+        maxConcurrentDials: 2,
+        startStaggerMs: 100,
+        dialSlotMaxMs: 600_000,
+        log: () => {},
+        transportFactory: (settings) => {
+          const count = (builds.get(settings.userId) ?? 0) + 1;
+          builds.set(settings.userId, count);
+          const transport = new FakeWorkspaceTransport();
+          transports.push(transport);
+          if (count > 1) {
+            dialTimes.push(Date.now());
+            redialing += 1;
+            peak = Math.max(peak, redialing);
+            const connect = transport.connect.bind(transport);
+            transport.connect = () =>
+              new Promise<void>((resolve) => {
+                heldRedials.push(() => {
+                  redialing -= 1;
+                  void connect().then(resolve);
+                });
+              });
+          }
+          return transport;
+        },
+      });
+      managers.push(manager);
+    follow(registry, manager);
+      for (const id of ids) {
+        registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: `@duo-default.${id}:duo.test` }, `syt_${id}`);
+        manager.attach(id, deps(id));
+      }
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(manager.states().filter((state) => state.phase === "connected")).toHaveLength(6);
+
+      // A Synapse restart: every connection drops at once.
+      for (const transport of [...transports]) {
+        transport.dropConnection();
+      }
+      // The service's own backoff is 1.0 to 1.5 s; every duo is due within that window, but only two may be dialing.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(dialTimes).toHaveLength(2);
+      expect(peak).toBe(2);
+      // Each finished dial lets the next one start, no closer than the stagger.
+      while (dialTimes.length < 6) {
+        const before = dialTimes.length;
+        heldRedials.shift()!();
+        await vi.advanceTimersByTimeAsync(500);
+        expect(dialTimes.length).toBeGreaterThan(before);
+      }
+      expect(peak).toBe(2);
+      for (let index = 1; index < dialTimes.length; index += 1) {
+        expect(dialTimes[index]! - dialTimes[index - 1]!).toBeGreaterThanOrEqual(100);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("a duo detached and attached again", () => {
+  it("does not start the new connection until the old one has finished stopping", async () => {
+    const { registry, ids, deps } = seededDuos(1);
+    const id = ids[0]!;
+    const user = `@duo-default.${id}:duo.test`;
+    const transports = new Transports();
+    const manager = new DuoWorkspaceConnections({ registry, config: loadConfig({}), homeserverUrl: FAKE_SYNAPSE_URL, startStaggerMs: 0, log: () => {}, transportFactory: transports.factory });
+    managers.push(manager);
+    follow(registry, manager);
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: user }, "syt_x");
+    manager.attach(id, deps(id));
+    await expect.poll(() => manager.states()[0]?.phase, { timeout: 8_000 }).toBe("connected");
+
+    let finishStop: () => void = () => {};
+    transports.latest(user).stop = () => new Promise<void>((resolve) => (finishStop = resolve));
+    const detached = manager.detach(id);
+    manager.attach(id, deps(id));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(transports.forUser(user)).toHaveLength(1);
+
+    finishStop();
+    await detached;
+    await expect.poll(() => transports.forUser(user).length, { timeout: 8_000 }).toBe(2);
+    await expect.poll(() => manager.states()[0]?.phase, { timeout: 8_000 }).toBe("connected");
   });
 });

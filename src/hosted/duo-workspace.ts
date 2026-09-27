@@ -1,3 +1,4 @@
+import { format } from "node:util";
 import type { DuoConfig } from "../config.js";
 import { createDuoWorkspaceService, type DuoWorkspaceInputs } from "../serve/workspace-wiring.js";
 import type { WorkspaceService, WorkspacePhase } from "../workspace/service.js";
@@ -23,11 +24,17 @@ import type { HostedRegistry } from "./registry.js";
  * - **Never on the boot path.** `reconcile` only queues. Building a duo's service (it decrypts the
  *   duo's store once) and dialing happen later, one duo at a time off a timer, so a slow or absent
  *   Synapse costs the listener and invite redemption nothing.
- * - **No stampede.** At most `maxConcurrentDials` duos are in their first dial at once and dials
- *   start at least `startStaggerMs` apart. A slot is given back when a duo connects, fails its
- *   first attempt, is revoked, or has held it for `dialSlotMaxMs`. After a failure the service's
- *   own backoff takes over, with a per-duo jitter on the delays, so duos that failed together
- *   do not retry together.
+ * - **No stampede.** At most `maxConcurrentDials` duos are dialing at once and dials start at
+ *   least `startStaggerMs` apart. That holds for every dial, not only the first: a duo's service
+ *   rebuilds its client (and so a full initial sync) on each reconnect, so a Synapse restart that
+ *   drops all N duos sends N reconnects through the same slots. A slot is given back when a duo
+ *   connects, fails that attempt, is revoked, or has held it for `dialSlotMaxMs`. The service's own
+ *   backoff, with a per-duo jitter on its delays, spaces a duo's attempts.
+ * - **Failures heal.** A duo whose service cannot be built (a store that will not open, a full disk)
+ *   is retried after a capped, jittered backoff. A duo Synapse refuses (`M_UNKNOWN_TOKEN`: the
+ *   database was reset or restored from before the mint) is given a fresh token through `remint`,
+ *   after a backoff and at most `maxRemints` times until it connects; the new token is a registry
+ *   write, which restarts the connection like any re-mint.
  * - **Isolated.** Each duo has its own service, transport, backoff, read state and log context.
  *   All work on one duo is serialized on that duo's own chain, so one duo's hang or failure
  *   waits on nothing but itself.
@@ -58,6 +65,19 @@ export interface DuoWorkspaceConnectionsOptions {
    * instead, by duo id; what the SDK is let to say is prefixed with the duo's Matrix id. Raise it (`DUO_HOSTED_WORKSPACE_SDK_LOG`) to debug a real homeserver.
    */
   readonly sdkLogLevel?: SdkLogLevel;
+  /**
+   * Mints a duo a fresh token (`MatrixProvisioner.remintToken`) and stores it in the registry, where
+   * the connection notices it. Called on its own, with a backoff, for a duo whose token Synapse
+   * refused. Absent: a refused duo stays stopped until an admin re-mints it. It resolves with a
+   * status (`reminted` is success) and never throws for a Synapse problem.
+   */
+  readonly remint?: (duoId: string) => Promise<{ readonly status: string; readonly error?: string }>;
+  /** First wait before retrying a duo that failed to build, or before a re-mint; doubles per failure. Default one minute. */
+  readonly recoveryBaseMs?: number;
+  /** The wait never grows past this (before the per-duo jitter of up to 1.5x). Default thirty minutes. */
+  readonly recoveryMaxMs?: number;
+  /** A duo is re-minted at most this many times until one of its tokens connects; then it waits for an admin. Default 5. */
+  readonly maxRemints?: number;
 }
 
 export type SdkLogLevel = "silent" | "error" | "warn" | "info" | "debug" | "trace";
@@ -66,6 +86,9 @@ export const SDK_LOG_LEVELS: readonly SdkLogLevel[] = ["silent", "error", "warn"
 export const DEFAULT_MAX_CONCURRENT_DIALS = 5;
 export const DEFAULT_START_STAGGER_MS = 500;
 export const DEFAULT_DIAL_SLOT_MAX_MS = 30_000;
+export const DEFAULT_RECOVERY_BASE_MS = 60_000;
+export const DEFAULT_RECOVERY_MAX_MS = 30 * 60_000;
+export const DEFAULT_MAX_REMINTS = 5;
 
 /** What an admin may see of one duo's connection: ids and phase, never a token. */
 export interface DuoConnectionState {
@@ -79,7 +102,19 @@ export interface DuoConnectionState {
 interface Running {
   readonly fingerprint: string;
   readonly service: WorkspaceService;
-  releaseSlot: () => void;
+  /** Gives back whatever dial slot the duo holds now (first dial or reconnect). Idempotent. */
+  readonly releaseSlot: () => void;
+}
+
+/** Someone waiting for a dial slot: a duo's first dial, or a running service's reconnect. */
+interface Waiter {
+  readonly entry: Entry;
+  /** False once the wait no longer matters (the duo was torn down or replaced); the pump skips it. */
+  alive(): boolean;
+  /** Hands over the slot, with the function that gives it back. */
+  grant(release: () => void): void;
+  /** The wait is abandoned. */
+  cancel(): void;
 }
 
 interface Entry {
@@ -91,6 +126,13 @@ interface Entry {
   /** Set while the duo waits in the dial queue; cleared when it is dispatched or torn down. */
   queued: boolean;
   failed: boolean;
+  /** Consecutive builds that failed; sets the retry backoff. Zero once a service is built. */
+  failures: number;
+  retryTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Re-mints tried since a token last connected; capped by `maxRemints`. */
+  remints: number;
+  remintTimer: ReturnType<typeof setTimeout> | undefined;
+  remintGaveUp: boolean;
   /** Everything that changes this duo's connection runs here, one after another. */
   chain: Promise<void>;
 }
@@ -101,7 +143,7 @@ function fingerprintOf(accounts: { duoUserId: string; duoTokenCipher: string }):
 }
 
 /** 1.0 to 1.5, fixed per duo: spreads the duos' reconnect delays so ones that failed together do not retry together. */
-function jitterFactor(duoId: string): number {
+export function jitterFactor(duoId: string): number {
   let hash = 0;
   for (let index = 0; index < duoId.length; index += 1) {
     hash = (Math.imul(hash, 31) + duoId.charCodeAt(index)) >>> 0;
@@ -112,33 +154,52 @@ function jitterFactor(duoId: string): number {
 /**
  * matrix-js-sdk logs through one process-wide logger whose child loggers keep their own levels and
  * cannot be told which duo they belong to. So each duo's client is given its own logger, which drops
- * everything below `level` and prefixes what it keeps with that duo's Matrix id.
+ * everything below `level` and hands what it keeps to `log`: the duo's own scrubbed logger, so a line
+ * names the duo, has the token taken out, and goes where every other line for that duo goes.
+ *
+ * It covers what the client itself logs (its constructor's `logger` option, and what it passes to the
+ * things it builds). matrix-js-sdk 42.4.0 still calls the process-wide logger directly from
+ * `models/room.js`, `models/event.js`, `models/event-timeline-set.js` and `sync.js`; those lines cannot
+ * name a duo and are neither filtered nor scrubbed by this (docs/deploy/hosted-workspace.md §8).
  */
-function sdkLoggerFor(level: SdkLogLevel, userId: string): MatrixSdkLogger {
+export function sdkLoggerFor(level: SdkLogLevel, log: (line: string) => void): MatrixSdkLogger {
   const rank = SDK_LOG_LEVELS.indexOf(level);
   const emit = (method: "error" | "warn" | "info" | "debug" | "trace") => (...args: unknown[]): void => {
-    if (SDK_LOG_LEVELS.indexOf(method) <= rank && rank > 0) {
-      console[method](`hosted: matrix sdk ${userId}:`, ...args);
+    if (rank > 0 && SDK_LOG_LEVELS.indexOf(method) <= rank) {
+      try {
+        log(`matrix sdk ${method}: ${format(...args)}`);
+      } catch {
+        // A logger that cannot format its arguments must not break the client that called it.
+      }
     }
   };
   const logger: MatrixSdkLogger = { error: emit("error"), warn: emit("warn"), info: emit("info"), debug: emit("debug"), trace: emit("trace"), getChild: () => logger };
   return logger;
 }
 
-function matrixTransportFactory(sdkLogLevel: SdkLogLevel): WorkspaceTransportFactory {
+function matrixTransportFactory(sdkLogLevel: SdkLogLevel, log: (line: string) => void): WorkspaceTransportFactory {
   return async (settings) => {
     const { createMatrixTransport } = await import("../workspace/matrix-transport.js");
-    return createMatrixTransport(settings, { sdkLogger: sdkLoggerFor(sdkLogLevel, settings.userId) });
+    return createMatrixTransport(settings, { sdkLogger: sdkLoggerFor(sdkLogLevel, log) });
   };
+}
+
+/** `text` with the duo's token, and anything shaped like a Matrix access token, taken out. */
+function scrubToken(text: string, token: string | undefined): string {
+  return (token ? text.split(token).join("[redacted]") : text).replace(/syt_[A-Za-z0-9_-]+/g, "[redacted]");
 }
 
 export class DuoWorkspaceConnections {
   private readonly entries = new Map<string, Entry>();
-  private readonly queue: string[] = [];
+  private queue: Waiter[] = [];
+  /** A detached duo's last step, so a duo attached under the same id waits for its teardown. */
+  private readonly detaching = new Map<string, Promise<void>>();
   private readonly maxConcurrentDials: number;
   private readonly startStaggerMs: number;
   private readonly dialSlotMaxMs: number;
-  private readonly transportFactory: WorkspaceTransportFactory;
+  private readonly recoveryBaseMs: number;
+  private readonly recoveryMaxMs: number;
+  private readonly maxRemints: number;
   private readonly log: (line: string) => void;
   private activeDials = 0;
   private lastDispatchAt = 0;
@@ -149,13 +210,21 @@ export class DuoWorkspaceConnections {
     this.maxConcurrentDials = options.maxConcurrentDials ?? DEFAULT_MAX_CONCURRENT_DIALS;
     this.startStaggerMs = options.startStaggerMs ?? DEFAULT_START_STAGGER_MS;
     this.dialSlotMaxMs = options.dialSlotMaxMs ?? DEFAULT_DIAL_SLOT_MAX_MS;
-    this.transportFactory = options.transportFactory ?? matrixTransportFactory(options.sdkLogLevel ?? "silent");
+    this.recoveryBaseMs = options.recoveryBaseMs ?? DEFAULT_RECOVERY_BASE_MS;
+    this.recoveryMaxMs = options.recoveryMaxMs ?? DEFAULT_RECOVERY_MAX_MS;
+    this.maxRemints = options.maxRemints ?? DEFAULT_MAX_REMINTS;
     this.log = options.log ?? ((line) => console.error(line));
     if (!Number.isInteger(this.maxConcurrentDials) || this.maxConcurrentDials < 1) {
       throw new Error(`The workspace connection dial limit must be a whole number of at least 1 (got ${JSON.stringify(this.maxConcurrentDials)}).`);
     }
     if (!Number.isFinite(this.startStaggerMs) || this.startStaggerMs < 0) {
       throw new Error(`The workspace connection stagger must be a number of milliseconds, 0 or more (got ${JSON.stringify(this.startStaggerMs)}).`);
+    }
+    if (!Number.isFinite(this.recoveryBaseMs) || this.recoveryBaseMs < 0 || !Number.isFinite(this.recoveryMaxMs) || this.recoveryMaxMs < this.recoveryBaseMs) {
+      throw new Error("The workspace connection recovery backoff must be a base of 0 or more milliseconds and a maximum no smaller than it.");
+    }
+    if (!Number.isInteger(this.maxRemints) || this.maxRemints < 0) {
+      throw new Error(`The workspace connection re-mint limit must be a whole number, 0 or more (got ${JSON.stringify(this.maxRemints)}).`);
     }
     // Refuse a bad timing knob or homeserver URL at boot, once, with a placeholder credential: the
     // same all-or-nothing refusal `duo serve` gives, instead of one failed connection per duo later.
@@ -167,7 +236,21 @@ export class DuoWorkspaceConnections {
     if (this.stopped || this.entries.has(duoId)) {
       return;
     }
-    this.entries.set(duoId, { duoId, duo, wanted: undefined, running: undefined, queued: false, failed: false, chain: Promise.resolve() });
+    this.entries.set(duoId, {
+      duoId,
+      duo,
+      wanted: undefined,
+      running: undefined,
+      queued: false,
+      failed: false,
+      failures: 0,
+      retryTimer: undefined,
+      remints: 0,
+      remintTimer: undefined,
+      remintGaveUp: false,
+      // Behind the last teardown of a duo detached under this id, so two services for one duo can never overlap.
+      chain: this.detaching.get(duoId) ?? Promise.resolve(),
+    });
     this.reconcile();
   }
 
@@ -179,7 +262,15 @@ export class DuoWorkspaceConnections {
     }
     this.entries.delete(duoId);
     entry.wanted = undefined;
-    await this.enqueue(entry, () => this.teardown(entry));
+    const done = this.enqueue(entry, () => this.teardown(entry));
+    this.detaching.set(duoId, done);
+    try {
+      await done;
+    } finally {
+      if (this.detaching.get(duoId) === done) {
+        this.detaching.delete(duoId);
+      }
+    }
   }
 
   /**
@@ -232,7 +323,9 @@ export class DuoWorkspaceConnections {
       clearTimeout(this.pumpTimer);
       this.pumpTimer = undefined;
     }
-    this.queue.length = 0;
+    for (const waiter of this.queue.splice(0)) {
+      waiter.cancel();
+    }
     const entries = [...this.entries.values()];
     // In parallel, and settled not raced: one duo's stop hanging or throwing is that duo's, and the rest still stop.
     await Promise.allSettled(entries.map((entry) => this.enqueue(entry, () => this.teardown(entry))));
@@ -247,10 +340,15 @@ export class DuoWorkspaceConnections {
     }
     entry.wanted = wanted;
     entry.failed = false;
+    entry.failures = 0;
     void this.enqueue(entry, async () => {
-      await this.teardown(entry);
-      if (entry.wanted === wanted && wanted !== undefined && !this.stopped) {
-        this.queueDial(entry);
+      try {
+        await this.teardown(entry);
+      } finally {
+        // Even when stopping the old service threw: `wanted` is already the registry's word, and the restart must not be lost with the error.
+        if (entry.wanted === wanted && wanted !== undefined && !this.stopped) {
+          this.queueDial(entry);
+        }
       }
     });
   }
@@ -258,7 +356,7 @@ export class DuoWorkspaceConnections {
   /** Runs `work` on the duo's own chain. Never rejects: a duo's failure is logged by name and ends there. */
   private enqueue(entry: Entry, work: () => Promise<void>): Promise<void> {
     const next = entry.chain.then(work).catch((error: unknown) => {
-      this.say(entry.duoId, `workspace connection step failed (${error instanceof Error ? error.name : "error"})`);
+      this.say(entry.duoId, `workspace connection step failed (${this.describe(entry.duoId, error)})`);
     });
     entry.chain = next;
     return next;
@@ -266,13 +364,28 @@ export class DuoWorkspaceConnections {
 
   private async teardown(entry: Entry): Promise<void> {
     entry.queued = false;
+    for (const timer of [entry.retryTimer, entry.remintTimer]) {
+      clearTimeout(timer);
+    }
+    entry.retryTimer = undefined;
+    entry.remintTimer = undefined;
     const running = entry.running;
     entry.running = undefined;
+    // `stop()` has cleared the service's `running` flag by the time it returns its promise, so a reconnect
+    // still waiting for a slot fails quietly when it is cancelled below rather than being retried.
+    const stopping = running?.service.stop();
+    this.queue = this.queue.filter((waiter) => {
+      if (waiter.entry !== entry) {
+        return true;
+      }
+      waiter.cancel();
+      return false;
+    });
     if (!running) {
       return;
     }
     running.releaseSlot();
-    await running.service.stop();
+    await stopping;
   }
 
   private queueDial(entry: Entry): void {
@@ -280,8 +393,121 @@ export class DuoWorkspaceConnections {
       return;
     }
     entry.queued = true;
-    this.queue.push(entry.duoId);
+    this.queue.push({
+      entry,
+      alive: () => entry.queued && this.entries.get(entry.duoId) === entry,
+      cancel: () => {},
+      grant: (releaseSlot) => {
+        entry.queued = false;
+        const fingerprint = entry.wanted;
+        void this.enqueue(entry, async () => {
+          try {
+            await this.startService(entry, fingerprint, releaseSlot);
+          } catch (error) {
+            // Building the service failed (a store that will not open, a token that will not decrypt): this duo only, and not for good.
+            entry.failed = true;
+            entry.failures += 1;
+            releaseSlot();
+            this.say(entry.duoId, `workspace connection could not be started (${this.describe(entry.duoId, error)}); will try again`);
+            this.scheduleRetry(entry);
+          }
+        });
+      },
+    });
     this.schedulePump(0);
+  }
+
+  /** Waits for a dial slot, for a running service's reconnect. Rejects if the duo is torn down or the daemon stops first. */
+  private acquireSlot(entry: Entry): Promise<() => void> {
+    if (this.stopped) {
+      return Promise.reject(new Error("the workspace connections are stopping"));
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      let cancelled = false;
+      this.queue.push({
+        entry,
+        alive: () => !cancelled,
+        cancel: () => {
+          cancelled = true;
+          reject(new Error("the duo's workspace connection was stopped"));
+        },
+        grant: resolve,
+      });
+      this.schedulePump(0);
+    });
+  }
+
+  /** How long a duo that keeps failing waits: doubling, capped, then spread by the duo's own jitter so duos that failed together do not retry together. */
+  private recoveryDelayMs(duoId: string, failures: number): number {
+    const capped = Math.min(this.recoveryBaseMs * 2 ** Math.min(failures - 1, 30), this.recoveryMaxMs);
+    return Math.round(capped * jitterFactor(duoId));
+  }
+
+  /** A timer that never keeps the process alive: recovery is the daemon's business while it runs. */
+  private later(delayMs: number, run: () => void): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  /** A duo that failed to build is tried again after a backoff, unless its registry state changed meanwhile (`settle` then owns it). */
+  private scheduleRetry(entry: Entry): void {
+    if (this.stopped || entry.retryTimer !== undefined) {
+      return;
+    }
+    entry.retryTimer = this.later(this.recoveryDelayMs(entry.duoId, entry.failures), () => {
+      entry.retryTimer = undefined;
+      void this.enqueue(entry, async () => {
+        if (!this.stopped && entry.failed && entry.wanted !== undefined && this.entries.get(entry.duoId) === entry) {
+          entry.failed = false;
+          this.queueDial(entry);
+        }
+      });
+    });
+  }
+
+  /**
+   * A duo Synapse refused: ask for a new token after a backoff, at most `maxRemints` times until a token
+   * connects. Each success is a registry write, so `reconcile` restarts the duo with it; each failure
+   * (Synapse down) comes back here for a longer wait. The cap is what stops a token that Synapse
+   * accepts to mint but refuses to sync with from minting tokens for ever.
+   */
+  private scheduleRemint(entry: Entry): void {
+    if (!this.options.remint || this.stopped || entry.remintTimer !== undefined) {
+      return;
+    }
+    if (entry.remints >= this.maxRemints) {
+      if (!entry.remintGaveUp) {
+        entry.remintGaveUp = true;
+        this.say(entry.duoId, `gave up minting a new token after ${entry.remints} attempts; an admin must run \`duo hosted provision --remint ${entry.duoId}\``);
+      }
+      return;
+    }
+    const delay = this.recoveryDelayMs(entry.duoId, entry.remints + 1);
+    this.say(entry.duoId, `will mint a new token in about ${Math.max(1, Math.round(delay / 1000))} s (attempt ${entry.remints + 1} of ${this.maxRemints})`);
+    entry.remintTimer = this.later(delay, () => {
+      entry.remintTimer = undefined;
+      if (this.stopped || this.entries.get(entry.duoId) !== entry || entry.running?.service.state().phase !== "revoked") {
+        return;
+      }
+      entry.remints += 1;
+      void this.runRemint(entry);
+    });
+  }
+
+  /** Off the duo's chain: a hung Synapse must not hold up that duo's teardown. The registry write it ends in is what restarts the connection. */
+  private async runRemint(entry: Entry): Promise<void> {
+    try {
+      const outcome = await this.options.remint!(entry.duoId);
+      if (outcome.status === "reminted") {
+        this.say(entry.duoId, "minted a new token; reconnecting with it");
+        return;
+      }
+      this.say(entry.duoId, `could not mint a new token (${outcome.status}${outcome.error ? `: ${this.scrubText(entry.duoId, outcome.error)}` : ""})`);
+    } catch (error) {
+      this.say(entry.duoId, `could not mint a new token (${this.describe(entry.duoId, error)})`);
+    }
+    this.scheduleRemint(entry);
   }
 
   private schedulePump(delayMs: number): void {
@@ -302,11 +528,10 @@ export class DuoWorkspaceConnections {
         this.schedulePump(wait);
         return;
       }
-      const entry = this.entries.get(this.queue.shift()!);
-      if (!entry || !entry.queued) {
+      const waiter = this.queue.shift()!;
+      if (!waiter.alive()) {
         continue;
       }
-      entry.queued = false;
       this.lastDispatchAt = Date.now();
       this.activeDials += 1;
       let released = false;
@@ -320,17 +545,7 @@ export class DuoWorkspaceConnections {
         this.activeDials -= 1;
         this.schedulePump(0);
       };
-      const fingerprint = entry.wanted;
-      void this.enqueue(entry, async () => {
-        try {
-          await this.startService(entry, fingerprint, releaseSlot);
-        } catch (error) {
-          // Building the service failed (a store that will not open, a token that will not decrypt): this duo only.
-          entry.failed = true;
-          this.say(entry.duoId, `workspace connection could not be started (${error instanceof Error ? error.name : "error"})`);
-          releaseSlot();
-        }
-      });
+      waiter.grant(releaseSlot);
     }
   }
 
@@ -365,14 +580,41 @@ export class DuoWorkspaceConnections {
       releaseSlot();
       return;
     }
-    const scrub = (line: string): string => line.split(token).join("[redacted]").replace(/syt_[A-Za-z0-9_-]+/g, "[redacted]");
-    const log = (line: string): void => this.say(entry.duoId, scrub(line));
+    const log = (line: string): void => this.say(entry.duoId, scrubToken(line, token));
+
+    // The slot this duo holds now: the first dial's, then one per reconnect. It ends when the attempt does.
+    let held: { release: () => void; attempts: number } | undefined = { release: releaseSlot, attempts: 0 };
+    const releaseHeld = (): void => {
+      const current = held;
+      held = undefined;
+      current?.release();
+    };
+    const buildTransport = this.options.transportFactory ?? matrixTransportFactory(this.options.sdkLogLevel ?? "silent", log);
+    let dials = 0;
+    const transportFactory: WorkspaceTransportFactory = async (settings) => {
+      dials += 1;
+      if (dials > 1) {
+        // A reconnect rebuilds the client and syncs from scratch: it goes through the same gate as a first dial.
+        releaseHeld();
+        const release = await this.acquireSlot(entry);
+        if (entry.running?.service !== service) {
+          release();
+          throw new Error("the duo's workspace connection was stopped");
+        }
+        held = { release, attempts: service.state().attempts };
+      }
+      return buildTransport(settings);
+    };
     const service = createDuoWorkspaceService(entry.duo, {
       settings: this.settingsFor(entry.duoId, accounts.duoUserId, token),
-      transportFactory: this.transportFactory,
+      transportFactory,
       log,
+      revokedRemedy: this.options.remint
+        ? `the daemon will mint this duo a new token, or run \`duo hosted provision --remint ${entry.duoId}\` to do it now`
+        : `this duo needs a new token (\`duo hosted provision --remint ${entry.duoId}\`)`,
     });
-    entry.running = { fingerprint, service, releaseSlot };
+    entry.running = { fingerprint, service, releaseSlot: releaseHeld };
+    entry.failures = 0;
     let lastPhase: WorkspacePhase = "stopped";
     service.onState((state) => {
       // The transitions an operator wants, once each: the duo came up, or it dropped. Failures are logged by the service itself.
@@ -382,15 +624,41 @@ export class DuoWorkspaceConnections {
         log("workspace connection lost; reconnecting");
       }
       lastPhase = state.phase;
-      // The first dial is over once the duo is connected, has failed once (the service's backoff owns it from here), or ended.
-      if (state.phase === "connected" || state.phase === "stopped" || state.phase === "revoked" || (state.phase === "connecting" && state.attempts >= 1)) {
-        releaseSlot();
+      if (state.phase === "connected") {
+        // A token that works ends the count of re-mints against this duo.
+        entry.remints = 0;
+        entry.remintGaveUp = false;
+      }
+      // The attempt is over once the duo is connected, has failed (the service's backoff owns it from here), or ended.
+      if (state.phase === "connected" || state.phase === "stopped" || state.phase === "revoked" || (state.phase === "connecting" && state.attempts > (held?.attempts ?? 0))) {
+        releaseHeld();
       }
       if (state.phase === "revoked") {
         log("Synapse refused this duo's token; not retrying until its token is re-minted");
+        if (entry.running?.service === service) {
+          this.scheduleRemint(entry);
+        }
       }
     });
     service.start();
+  }
+
+  /** An error as a log fragment: its class and message, with the duo's token and anything token-shaped taken out, and no longer than a line should be. */
+  private describe(duoId: string, error: unknown): string {
+    return this.scrubText(duoId, error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+  }
+
+  private scrubText(duoId: string, text: string, token?: string): string {
+    let known = token;
+    if (known === undefined) {
+      try {
+        known = this.options.registry.duoMatrixToken(duoId);
+      } catch {
+        // A token that will not decrypt cannot be in the text either.
+      }
+    }
+    const scrubbed = scrubToken(text, known);
+    return scrubbed.length > 300 ? `${scrubbed.slice(0, 300)}...` : scrubbed;
   }
 
   private say(duoId: string, line: string): void {

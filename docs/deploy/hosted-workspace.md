@@ -407,6 +407,13 @@ Written plainly, because these are what a security reviewer will ask about.
   `DUO_WORKSPACE_ADMIN_TOKEN`, `DUO_HOSTED_MASTER_KEY` and `DUO_HOSTED_ADMIN_TOKEN`. Owned by
   #236 and #232. Not checked here: whether any per-duo route reads `deps.env` and returns or
   logs values, which the allowlist makes moot.
+- **matrix-js-sdk's logging is per client only in part.** Each duo's client is given its own logger, filtered by
+  `DUO_HOSTED_WORKSPACE_SDK_LOG` (silent by default) and routed through the duo's scrubbed log. matrix-js-sdk
+  42.4.0 still calls its **process-wide** logger directly from `models/room.js`, `models/event.js`,
+  `models/event-timeline-set.js` and `sync.js`. Those lines cannot name a duo, are not silenced by the
+  variable, and are not scrubbed of the duo's token (which the SDK sends in a header, not in those messages).
+  Read the daemon's stdout as sensitive; **verify at the first real deploy** which of them a busy Synapse
+  room produces.
 - **Resource numbers** for N concurrent sync loops in one process (#236, measured 2026-09-26):
 
 | Duos connected | Daemon heap used | Timers / sockets held (daemon side) | CPU to connect all | CPU when idle | Event loop held, worst |
@@ -418,10 +425,31 @@ Written plainly, because these are what a security reviewer will ask about.
 | 50 | 33.1 MB | 300 / 50 | 6.2 s | 0.4% | 155 ms while connecting |
 | 100 | 40.8 MB | 640 / 100 | 11.6 s | 0.5% | 194 ms while connecting |
 
+  **These rows use empty stores.** Each duo's store had no records, so opening it cost the fixed key
+  derivation (scrypt) and little else. A store is opened whole (decrypted, read and re-encrypted) on
+  every read-state check and every answer, on the one thread that serves all hosted duos, so a real
+  corpus costs more than the rows say. Re-measured with each store seeded with 5,000 records (about
+  1.9 MB of text; `MEASURE_RECORDS=5000`, 2026-09-27, same machine, one run per row; the 20 and
+  larger populated runs were not completed):
+
+| Duos | Records per duo | One open of a store (median, max) | CPU to connect all | Event loop held while connecting, worst | Heap after connecting |
+|---|---|---|---|---|---|
+| 1 | 0 | 50 ms, 50 ms | 0.18 s | 11 ms | 26.0 MB |
+| 1 | 5,000 | 67 ms, 67 ms | 0.18 s | 19 ms | 29.1 MB |
+| 5 | 0 | 50 ms, 50 ms | 0.66 s | 112 ms | 26.4 MB |
+| 5 | 5,000 | 92 ms, 101 ms | 1.04 s | 123 ms | 28.6 MB |
+
+  A populated store adds roughly 20 to 40 ms per open at 5,000 records, on top of about 50 ms fixed, so
+  the "held for up to about 190 ms" figure below is for **empty stores** and is not a bound: it grows
+  with store size, and **store size is not measured beyond 5,000 records (about 1.9 MB)**. Size the
+  pilot's largest duo, seed a store to match, and read `eventLoopLagMaxMs.whileConnecting` and
+  `storeOpenMs` from the script before trusting these figures for it. The script reports one open of
+  each store separately (`storeOpenMs`), apart from client construction.
+
   **Read as:** about **0.17 MB of heap per connected duo** (16.6 MB more than the baseline at 100), about
   **6 timers and 1 socket per duo**, **about 0.12 CPU-seconds per duo once, to connect** (almost all of it
   the synchronous decrypt of that duo's store, which is also why the event loop is held for up to about
-  190 ms at a time while duos connect, never more), and **an idle cost that does not grow with N**
+  190 ms at a time while duos connect, on empty stores; see above), and **an idle cost that does not grow with N**
   (0.4 to 0.6% of a core with every sync held open). A first connection in the process also pays a one-off
   of roughly 40 MB of resident memory for loading matrix-js-sdk. Resident memory (RSS) on this machine is
   too noisy to give a per-duo figure (it read 78 to 169 MB across the runs above, with no trend against N):
@@ -435,7 +463,7 @@ Written plainly, because these are what a security reviewer will ask about.
   through `tsx`, once per N, each in a fresh process). It builds N tenants in a real `HostedRegistry`,
   each with its own encrypted store, records an account and token for each, and attaches them to the
   daemon's real `DuoWorkspaceConnections` with the production defaults. Each connection is the real
-  `createMatrixTransport` over a real matrix-js-sdk 42.4.0 client, syncing against a small fake homeserver
+  `createMatrixTransport` over a real matrix-js-sdk 42.4.0 client, given the daemon's own `sdkLoggerFor` at its default (silent) level, syncing against a small fake homeserver
   in the same process (it answers the calls a syncing client makes and holds each `/sync` open for the
   client's own 30 s timeout, as Synapse does). Heap is `process.memoryUsage().heapUsed` after a forced GC,
   30 seconds after every duo reported connected; CPU is `process.cpuUsage()` over the connect phase and
@@ -444,7 +472,7 @@ Written plainly, because these are what a security reviewer will ask about.
   which are taken out (sockets halved, timers less N and the script's own tick). Machine: Apple
   M1, 8 cores, 16 GB, Node 22.22.3, one run per N.
 
-  **What it does not measure.** The fake homeserver is far lighter than Synapse, so this is the
+  **What it does not measure.** Store size beyond what `MEASURE_RECORDS` seeds (see above). The fake homeserver is far lighter than Synapse, so this is the
   **daemon's** side of N sync loops and says nothing about Synapse's own CPU, memory or Postgres load, nor
   about real sync payloads (a duo in many busy rooms holds far more state than an empty room per duo).
   Answers are not in it: drafting is LLM-bound and not a per-connection cost. The Railway container's CPU

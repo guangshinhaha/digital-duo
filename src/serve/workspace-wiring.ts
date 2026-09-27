@@ -19,6 +19,8 @@ export interface DuoWorkspaceServiceOptions {
   readonly transportFactory: WorkspaceTransportFactory;
   /** One line per event. A hosted duo's connection passes a logger that names the duo; `duo serve` leaves it out (console.error, as before). */
   readonly log?: (line: string) => void;
+  /** What to say when the homeserver refuses the token for good. Default: the single-owner remedy. */
+  readonly revokedRemedy?: string;
 }
 
 /**
@@ -37,6 +39,7 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
     settings,
     transportFactory: options.transportFactory,
     log: options.log,
+    revokedRemedy: options.revokedRemedy,
     // #189: durable read state in the same encrypted store the answers
     // themselves log to — which events previous processes handled, so a
     // restart no longer re-answers the sync window. The impl lives in

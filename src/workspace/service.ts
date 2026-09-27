@@ -112,6 +112,12 @@ export interface WorkspaceServiceOptions {
    * the line handed over is the same text, one string.
    */
   readonly log?: (line: string) => void;
+  /**
+   * #236: what to tell the operator when the homeserver refuses the token for good. Absent is the
+   * single-owner remedy (the owner re-pairs on their own machine); a hosted duo has no owner's
+   * machine, so the hosted daemon passes what actually fixes it there.
+   */
+  readonly revokedRemedy?: string;
 }
 
 /** Where the consent record lives — the owner's `duo/` directory (consent.ts states why a file and not the store). */
@@ -599,7 +605,7 @@ export class WorkspaceService {
         // explicit later start() may re-dial and re-discover the revocation;
         // nothing automatic does.
         this.consoleError(
-          "workspace access token rejected — not retrying; re-pair the duo on the owner's machine (DUO_WORKSPACE_ACCESS_TOKEN) and restart duo serve",
+          `workspace access token rejected — not retrying; ${this.options.revokedRemedy ?? "re-pair the duo on the owner's machine (DUO_WORKSPACE_ACCESS_TOKEN) and restart duo serve"}`,
           error,
         );
         this.running = false;

@@ -4,6 +4,12 @@
  * depend on the machine); the method and the numbers are recorded in docs/deploy/hosted-workspace.md §8.
  *
  *   npx tsx scripts/measure-hosted-workspace.ts <duos> [idleSeconds]
+ *   MEASURE_RECORDS=<n> ...   seed each duo's store with n records first (default 0: an empty store)
+ *
+ * With no records the store is empty and the cost of opening it is the fixed key derivation (scrypt) alone;
+ * a real duo's store also has to be decrypted, read and re-encrypted in proportion to its size on every
+ * open, so seed a corpus the size of your largest duo before reading anything off the connect numbers.
+ * The output reports how long one open of each store takes (`storeOpenMs`), apart from client construction.
  *
  * Run it once per N, each in a fresh process, so one run's heap does not leak into the next.
  *
@@ -22,10 +28,14 @@ import { loadConfig } from "../src/config.js";
 import { DuoWorkspaceConnections } from "../src/hosted/duo-workspace.js";
 import { HostedRegistry } from "../src/hosted/registry.js";
 import type { EmbeddingProvider } from "../src/provider/types.js";
-import { createEncryptedStore } from "../src/store/store.js";
+import { sdkLoggerFor } from "../src/hosted/duo-workspace.js";
+import { createRecord } from "../src/ingest/record.js";
+import { writeRecords } from "../src/ingest/record-store.js";
+import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 
 const duoCount = Number(process.argv[2] ?? "5");
 const idleSeconds = Number(process.argv[3] ?? "30");
+const recordsPerDuo = Number(process.env.MEASURE_RECORDS ?? "0");
 const embeddingProvider: EmbeddingProvider = { name: "fake", model: "fake", async embed() { return [0]; } };
 
 interface Stats {
@@ -139,14 +149,38 @@ async function main(): Promise<void> {
     const tenant = registry.addTenant(invite.id, `Duo ${index}`, `pw-${index}`);
     mkdirSync(join(dir, tenant.id), { recursive: true });
     createEncryptedStore(join(dir, tenant.id, "duo.db"), `pw-${index}`);
+    if (recordsPerDuo > 0) {
+      // Messages of a realistic length, in question/answer pairs, so the store has the size of a used one.
+      const records = Array.from({ length: recordsPerDuo }, (_, n) =>
+        createRecord({
+          source: "measure",
+          sourceRef: null,
+          kind: n % 2 === 0 ? "question_to_me" : "my_answer",
+          author: n % 2 === 0 ? "other" : "me",
+          text: `Record ${n} of duo ${index}: ${"the quick brown fox jumps over the lazy dog ".repeat(8)}`,
+          timestamp: new Date(Date.UTC(2026, 0, 1) + n * 60_000).toISOString(),
+          threadId: `t-${Math.floor(n / 2)}`,
+          audience: "channel",
+        }),
+      );
+      writeRecords(join(dir, tenant.id, "duo.db"), `pw-${index}`, records);
+    }
     ids.push(tenant.id);
   }
   const setupMs = Date.now() - setupStarted;
+  // One open of each store, on its own: what the daemon pays per duo on every read-state check or answer, apart from building a client.
+  const openMs = ids
+    .map((id, index) => {
+      const opened = Date.now();
+      withDatabase(join(dir, id, "duo.db"), `pw-${index}`, false, () => {});
+      return Date.now() - opened;
+    })
+    .sort((a, b) => a - b);
 
   // Baseline: everything imported and the homeserver up, no connections. The SDK is loaded now so its module cost is in the baseline, not the per-duo number.
   const { createMatrixTransport } = await import("../src/workspace/matrix-transport.js");
-  // What the daemon's default factory passes: an SDK logger that says nothing.
-  const silent = { error() {}, warn() {}, info() {}, debug() {}, trace() {}, getChild: () => silent };
+  // What the daemon's default factory passes: the production SDK logger at its default (silent) level.
+  const silent = sdkLoggerFor("silent", () => {});
   global.gc?.();
   const baseline = snapshot();
   const baselineHandles = handles();
@@ -208,8 +242,10 @@ async function main(): Promise<void> {
 
   const result = {
     duos: duoCount,
+    recordsPerDuo,
     connected,
     setupMs,
+    storeOpenMs: { median: openMs[Math.floor(openMs.length / 2)] ?? 0, max: openMs[openMs.length - 1] ?? 0 },
     connectAllMs: connectMs,
     baseline,
     steady,
