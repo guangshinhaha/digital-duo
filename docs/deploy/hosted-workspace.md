@@ -28,8 +28,10 @@
    (placement), and a Synapse module (enforcement). Only the module is a hard wall (§6).
 6. **The wall has stated limits.** It does not stop the operator, the daemon's admin account,
    or a misconfigured module, and it does not protect message content from Railway (§6.4).
-7. **One super admin role, no org admins in the POC.** The super admin is who
-   `DUO_HOSTED_ADMIN_EMAILS` names today. It is a registry role and is not a Synapse admin (§7).
+7. **Three roles: super admin, org admin, member.** The super admin is who
+   `DUO_HOSTED_ADMIN_EMAILS` names. An org admin (#254) manages one org, appointed by the super
+   admin or another org admin. Both are registry roles, neither is a Synapse admin, and neither
+   changes what anyone can do in the chat (§7).
 8. **Posture:** every org's messages sit on Railway. POC only, not for classified or sensitive
    government material. `workspace-platform.md` §5's forbidden-store list is unchanged (§9).
 9. **Homeserver: Synapse**, because it is the only candidate with the module API and the HTTP
@@ -531,19 +533,65 @@ module does no database work of its own; `get_room_state` is Synapse's). The two
 check on Railway is **not done** (#235 stays open until it is). Federation was not exercised (off in the config). Load: one
 room-state read per join, none for invites, publishes or directory hits; not measured.
 
-## 7. Super admin, and no org admins
+## 7. Super admin, org admin and member
+
+Three roles, all in the hosted registry and none of them in Synapse. The chat side never reads
+a role: Matrix accounts, Spaces, the org wall and the workspace session are the same for all
+three (a test greps the Matrix, Space and session code for the role, and another shows that
+changing a role makes no Matrix call).
+
+| | Member | Org admin (#254) | Super admin |
+|---|---|---|---|
+| See their org's name and their own role | yes | yes | yes |
+| List their org's members (person and duo), with role marks and the appoint/revoke history | no | yes, own org | yes, any org |
+| See their org's pending invites | no | yes, own org only | all invites, any org |
+| Invite someone (joins as a member, single-use link shown once) | no | yes, into their own org | into any org |
+| Rename the org (and its Space in the chat) | no | yes, own org | any org |
+| Appoint or revoke an org admin | no | yes, in their own org | any org |
+| Revoke the last org admin of an org | no | **no** (409 `last_org_admin`) | yes |
+| Create an org, list all orgs, list all duos, run provisioning | no | no | yes |
 
 - **Super admin** is exactly what exists today: a signed-in Google account whose email is in
-  `DUO_HOSTED_ADMIN_EMAILS` (`HostedTenant.isAdmin`), or the server-side `DUO_HOSTED_ADMIN_TOKEN`
-  on the box. It creates, renames and lists orgs, lists any org's members, and mints invites
-  into a named org.
-- **The super admin is a member of one org like everyone else.** In the workspace they see their
-  own org and no other. Being super admin is a registry power, and the account has no Synapse
-  admin rights. The only Synapse admin is `@workspace-admin`, held by the daemon.
-- **No org admins in the POC.** Nobody can invite into an org except the super admin. Deleting
-  an org is out of scope too. Both are recorded as follow-ups (#231's own out-of-scope list).
-  Adding org admins later means one registry flag and a per-org invite check in the same routes,
-  with no change to the Matrix side.
+  `DUO_HOSTED_ADMIN_EMAILS`, or the server-side `DUO_HOSTED_ADMIN_TOKEN` on the box. It is read
+  live from the env, so it is not stored as a role and cannot be appointed. The super admin is a
+  member of one org like everyone else (in the workspace they see their own org and no other),
+  with no Synapse admin rights: the only Synapse admin is `@workspace-admin`, held by the
+  daemon. In an org's member list they carry their own mark (`superAdmin`), apart from "Org
+  admin", and an org admin cannot appoint or revoke them.
+- **Org admin** is a stored role on a member of an org: `orgAdmin: { since, by }` on the tenant.
+  `by` is a stable actor id, `super-admin` or the appointing duo's id, never an email. It is not
+  `isAdmin` (that one records the super admin at sign-up and is not an authority). A new org
+  admin is invited as a member first, then appointed; the root duo and the super admin cannot be
+  appointed (409, `root_not_appointable` / `super_admin_protected`). An org admin is a normal
+  member in the chat: no invites across orgs, no room power, no chat server admin.
+- **Where an org admin's requests go.** Per duo, inside that duo's own app, behind its device
+  token and its 5 second auth cache: `<basePath>/org*` (`/t/<tenantId>/org*`, or `/org*` for the
+  root duo). The org is always the signed-in duo's own, never a request field, so nothing
+  scans other duos and no request can name another org. A body `orgId` naming any other org is
+  refused. Every "not for you" answer is one 403 `forbidden` "Only an admin can do this." with
+  one body: a member, an org admin using a super admin's route, another org's route, an org that
+  does not exist. It reveals nothing. An id that is not a member of the caller's org (unknown or
+  another org's) is one 404 `not_found`. The role is read from the registry on every request, so
+  an appointment or a revoke reaches a signed-in person on their next request, and `GET /org`
+  is how the app learns and refreshes it.
+- **The last-admin rule.** An org admin cannot revoke the last org admin of their org, themselves
+  included: 409 `last_org_admin`, nothing changes. Stepping down while another org admin remains
+  is allowed. The super admin (terminal or app) may revoke the last one, and an org with no org
+  admin works as before, managed by the super admin. Two org admins revoking each other at once
+  end with exactly one: registry writes are synchronous, so one revoke runs first and the other
+  finds itself either no longer an admin (403) or the last one (409); the org is never left with
+  none by an org admin.
+- **Appointments are recorded.** Each tenant keeps `orgAdminLog`, an append-only list of grants
+  and revocations (`{ at, action, by }`), capped at the latest 50 per duo. It survives a revoke.
+  The super admin and the org's org admins see it in the member list (`appointedBy`,
+  `appointedByName`, `appointedAt` and the `orgAdminLog` per member).
+- **Upgrade and restart.** `orgAdmin` and `orgAdminLog` are optional additions to a v2 registry:
+  no version bump, a registry from before has nobody as an org admin and nothing lost, an older
+  build that rewrites the file keeps the fields, and the role survives a restart.
+- **Still out of scope.** Removing or moving a member (when it exists it must revoke this role),
+  deleting an org, inviting someone directly as an org admin, and any role beyond these three.
+  If the super admin list changes so an existing org admin becomes a super admin, they hold both
+  and the super admin's rules win; revoke the org admin role from the terminal if it is unwanted.
 
 ## 8. Sessions and duo connections (context for #233 and #236)
 

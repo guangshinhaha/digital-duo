@@ -66,6 +66,34 @@ export interface HostedOrgSummary extends HostedOrg {
   readonly memberCount: number;
 }
 
+/**
+ * Who made an org-admin change, as a stable id and never an email (an email changes, and is personal data in an audit
+ * list): `SUPER_ADMIN_ACTOR` for the super admin (the server admin token or a super admin's own device), otherwise the
+ * appointing duo's id. It cannot collide with a duo id, which is lowercase letters and digits only.
+ */
+export const SUPER_ADMIN_ACTOR = "super-admin";
+
+/** A duo's role in its org. The super admin is not a role here: it is decided from `DUO_HOSTED_ADMIN_EMAILS`, above every org. */
+export type OrgRole = "member" | "org_admin";
+
+/** When and by whom a duo was appointed org admin (#254). Present on a tenant only while it holds the role. */
+export interface OrgAdminGrant {
+  readonly since: string;
+  /** `SUPER_ADMIN_ACTOR` or the appointing duo's id. */
+  readonly by: string;
+}
+
+/** One entry of a duo's append-only appoint/revoke history. */
+export interface OrgAdminLogEntry {
+  readonly at: string;
+  readonly action: "grant" | "revoke";
+  /** `SUPER_ADMIN_ACTOR` or the acting duo's id (the duo's own id when it stepped down). */
+  readonly by: string;
+}
+
+/** Each duo keeps its latest entries only, so the registry file cannot grow without bound. */
+export const ORG_ADMIN_LOG_CAP = 50;
+
 /** One duo in an org. `duoId` is the tenant id, or `ROOT_DUO_ID` for the pre-hosted root duo. */
 export interface OrgMember {
   readonly duoId: string;
@@ -73,12 +101,42 @@ export interface OrgMember {
   readonly email: string | null;
   readonly isRoot: boolean;
   readonly joinedAt: string | null;
+  /** `org_admin` while the duo holds the role (#254); the root duo is always a `member`. */
+  readonly orgRole: OrgRole;
+  /** Set with `orgRole: "org_admin"`: when and by whom. */
+  readonly orgAdmin: OrgAdminGrant | null;
+  /** The duo's appoint/revoke history, oldest first (bounded); empty for a duo never appointed. */
+  readonly orgAdminLog: readonly OrgAdminLogEntry[];
 }
 
 export class OrgNotFoundError extends Error {
   constructor(readonly orgId: string) {
     super(`There is no org "${orgId}".`);
     this.name = "OrgNotFoundError";
+  }
+}
+
+/** The duo is not a member of this org, or does not exist: one error for both, so an id from another org tells nothing. */
+export class OrgMemberNotFoundError extends Error {
+  constructor() {
+    super("There is no such member in this org.");
+    this.name = "OrgMemberNotFoundError";
+  }
+}
+
+/** The pre-hosted root duo is served for the super admin and cannot hold the org admin role. */
+export class RootNotAppointableError extends Error {
+  constructor() {
+    super("The root duo cannot be made an org admin.");
+    this.name = "RootNotAppointableError";
+  }
+}
+
+/** Revoking would leave an org with no org admin; only the super admin may do that. */
+export class LastOrgAdminError extends Error {
+  constructor() {
+    super("This is the last org admin of the org. Appoint another org admin first, or ask the super admin.");
+    this.name = "LastOrgAdminError";
   }
 }
 

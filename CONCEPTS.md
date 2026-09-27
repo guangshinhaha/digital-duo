@@ -30,4 +30,8 @@ A named group of duos on one hosted server, held in the hosted registry: every d
 
 ### Super admin
 Anyone whose Google email is listed in `DUO_HOSTED_ADMIN_EMAILS`, plus the server-side admin token: the only callers who may create, rename and list orgs, list any org's members, and invite into an org. Read live from the env on every request, so removing an email withdraws the privilege. A caller with no credential is refused 401, any other caller 403.
-*Avoid:* org admin (an admin scoped to one org does not exist yet)
+*Avoid:* org admin (a different role: it manages one org only)
+
+### Org admin
+A member of a hosted org who manages that org, appointed by the super admin or another org admin: they list its members and pending invites, invite people into it, rename it and appoint or revoke other org admins in it. Stored on the member's registry record as `orgAdmin` (who appointed them and when, by stable id), and read fresh on every request, so an appointment or a revoke reaches a signed-in person on their next request. The last org admin of an org can be revoked only by the super admin. In the chat an org admin has exactly a member's power.
+*Avoid:* admin (unqualified: ambiguous with the super admin), `isAdmin` (a record of the super admin at sign-up, not this role)

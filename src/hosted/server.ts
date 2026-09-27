@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
+import type { OrgAdminAccess } from "../serve/org-routes.js";
 import { createServer, type ServeDeps, type WorkspaceSessionAccess } from "../serve/server.js";
 import type { WorkspaceService } from "../workspace/service.js";
 import { WorkspaceConfigError } from "../workspace/settings.js";
@@ -19,8 +20,9 @@ import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type Veri
 import { OAuthStore, CLAUDE_REDIRECT_URIS } from "./oauth.js";
 import { registerOAuthRoutes } from "./oauth-routes.js";
 import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
+import { OrgAdmin, parseInviteInput } from "./org-admin.js";
 import { OrgSpaceProvisioner, type SpaceSummary } from "./org-spaces.js";
-import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID } from "./orgs.js";
+import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID, SUPER_ADMIN_ACTOR } from "./orgs.js";
 import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedTenant } from "./registry.js";
 import { assertSynapseBaseUrl, SynapseAdmin, SynapseConfigError } from "./synapse-admin.js";
 import { WorkspaceSessions } from "./workspace-session.js";
@@ -298,6 +300,7 @@ export function tenantDeps(
   passphrase: string,
   workspaceSession?: WorkspaceSessionAccess,
   workspace?: () => WorkspaceService | undefined,
+  orgAdmin?: OrgAdminAccess,
 ): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
   const deps: ServeDeps = {
@@ -324,6 +327,7 @@ export function tenantDeps(
     },
     trustProxy: shared.trustProxy,
     ...(workspaceSession ? { workspaceSession } : {}),
+    ...(orgAdmin ? { orgAdmin } : {}),
   };
   return workspace ? withLiveWorkspace(deps, workspace) : deps;
 }
@@ -369,7 +373,6 @@ function constantTimeEquals(a: string, b: string): boolean {
 
 const SIGNUP_FAILURE_WINDOW_MS = 15 * 60_000;
 const SIGNUP_MAX_FAILURES = 10;
-const DEFAULT_INVITE_HOURS = 7 * 24;
 const MAX_NAME_LENGTH = 80;
 
 /** Test seams for `createHostedServer`; production passes none. */
@@ -439,6 +442,16 @@ export async function createHostedServer(
           ...(shared.env.DUO_OAUTH_REDIRECT_URIS ?? "").split(",").map((uri) => uri.trim()).filter((uri) => uri.length > 0),
         ])
       : undefined;
+  const isAdminEmail = (email: string | undefined) => email !== undefined && settings.adminEmails.includes(email.toLowerCase());
+  // #254: org admins. Each duo's app is given a handle bound to its own id (below, like the workspace session), so the
+  // org and the role always come from the signed-in duo. The rename and the link are closures over what is built later; they run per request.
+  const orgAdmin = new OrgAdmin({
+    registry,
+    isAdminEmail,
+    renameOrg: (orgId, name) => renameOrgAndSpace(orgId, name),
+    inviteLink: (code) =>
+      settings.webUrl && settings.publicUrl ? `${settings.webUrl}/#join?host=${encodeURIComponent(settings.publicUrl)}&invite=${encodeURIComponent(code)}` : null,
+  });
   const withConnector = (deps: ServeDeps, duoId: string): ServeDeps =>
     oauth && settings.publicUrl
       ? { ...deps, connectorAccess: { url: `${settings.publicUrl}/mcp`, connections: () => oauth.connections(duoId), revoke: (id) => oauth.revoke(duoId, id) } }
@@ -492,7 +505,7 @@ export async function createHostedServer(
   const stopFollowingRegistry = connections ? registry.onChange(() => connections.reconcile()) : undefined;
   const liveWorkspace = (duoId: string) => connections && (() => connections.serviceFor(duoId));
   const mountTenant = async (tenant: HostedTenant, passphrase: string): Promise<MountedDuo> => {
-    const deps = withConnector(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), liveWorkspace(tenant.id)), tenant.id);
+    const deps = withConnector(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), liveWorkspace(tenant.id), orgAdmin.forDuo(tenant.id)), tenant.id);
     const mounted = await mountDuo(deps);
     connections?.attach(tenant.id, deps);
     return mounted;
@@ -503,7 +516,7 @@ export async function createHostedServer(
   }
   const rootAccess = sessionAccess(ROOT_DUO_ID);
   const rootLive = liveWorkspace(ROOT_DUO_ID);
-  const rootServed = root && withConnector({ ...root, ...(rootAccess ? { workspaceSession: rootAccess } : {}) }, ROOT_DUO_ID);
+  const rootServed = root && withConnector({ ...root, ...(rootAccess ? { workspaceSession: rootAccess } : {}), orgAdmin: orgAdmin.forDuo(ROOT_DUO_ID) }, ROOT_DUO_ID);
   const rootDuo = rootServed ? await mountDuo(rootLive ? withLiveWorkspace(rootServed, rootLive) : rootServed) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
@@ -543,6 +556,14 @@ export async function createHostedServer(
   // An unexpected failure is logged by name only (a message could quote something it should not), and never stops the server.
   const logUnexpected = (error: unknown): void => {
     (extras.log ?? ((line) => console.error(line)))(`hosted: Matrix provisioning failed unexpectedly (${error instanceof Error ? error.name : "error"})`);
+  };
+  /** Renames an org and pushes the name to its Space: the super admin's rename and an org admin's are this one path. The org is renamed whatever Synapse does. */
+  const renameOrgAndSpace = async (orgId: string, name: string) => {
+    const renamed = registry.renameOrg(orgId, name);
+    if (spaces) {
+      await settleWithin(spaces.ensureOrg(renamed.id).catch(logUnexpected));
+    }
+    return registry.org(renamed.id) ?? renamed;
   };
   // One sweep at a time: a tick that finds the last sweep still running (a slow Synapse) skips itself
   // instead of piling a second sweep onto it. The provisioner's own backoff spaces out each failed duo.
@@ -592,8 +613,6 @@ export async function createHostedServer(
     allowedHeaders: [...CORS_ALLOWED_HEADERS],
     methods: ["GET", "POST", "OPTIONS"],
   });
-
-  const isAdminEmail = (email: string | undefined) => email !== undefined && settings.adminEmails.includes(email.toLowerCase());
 
   /**
    * Super admin is decided per request from `settings.adminEmails` (live from DUO_HOSTED_ADMIN_EMAILS when the settings come from
@@ -687,7 +706,7 @@ export async function createHostedServer(
     const tenant = found && registry.refreshTenantEmail(found.id, identity.email);
     if (tenant) {
       const device = mintDevice(tenantPaths(settings.hostedRoot, tenant.id).storePath, registry.passphraseFor(tenant));
-      return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
+      return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId, orgRole: registry.orgRoleOf(tenant.id) };
     }
     // The root duo belongs to whichever admin signs in first; after that,
     // only that same Google account opens it.
@@ -697,7 +716,7 @@ export async function createHostedServer(
         registry.claimRoot(identity.subject, identity.email);
       }
       const device = mintDevice(root.storePath, root.passphrase);
-      return { tenantId: null, basePath: "", token: device.token, ownerName: root.ownerName, isAdmin: true, orgId: registry.orgOf(ROOT_DUO_ID)?.id ?? null };
+      return { tenantId: null, basePath: "", token: device.token, ownerName: root.ownerName, isAdmin: true, orgId: registry.orgOf(ROOT_DUO_ID)?.id ?? null, orgRole: "member" };
     }
     sendError(reply, 404, "no_duo", "There's no duo for this Google account yet. Ask for an invite link.");
   });
@@ -774,47 +793,34 @@ export async function createHostedServer(
       await settleWithin(attempt);
     }
     reply.code(201);
-    return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId };
+    return { tenantId: tenant.id, basePath: `/t/${tenant.id}`, token: device.token, ownerName: tenant.name, isAdmin: isSuperAdminTenant(tenant), orgId: tenant.orgId, orgRole: registry.orgRoleOf(tenant.id) };
   });
 
   control.post<{ Body: { name?: unknown; email?: unknown; expiresInHours?: unknown; orgId?: unknown } }>(
     "/hosted/invites",
     { preHandler: requireAdmin },
     async (request, reply) => {
-      const name = typeof request.body?.name === "string" ? request.body.name.trim() : "";
-      const hours = request.body?.expiresInHours ?? DEFAULT_INVITE_HOURS;
-      if (name.length === 0 || typeof hours !== "number" || !Number.isInteger(hours) || hours <= 0 || hours > 24 * 365) {
-        sendError(reply, 400, "bad_request", "name is required; expiresInHours must be a whole number from 1 to 8760");
+      const input = parseInviteInput(request.body);
+      if (!input.ok) {
+        sendError(reply, input.status, input.code, input.message);
         return;
       }
-      const rawEmail = request.body?.email;
-      if (rawEmail !== undefined && rawEmail !== null && (typeof rawEmail !== "string" || !rawEmail.includes("@"))) {
-        sendError(reply, 400, "bad_request", "email, when given, must be an email address");
-        return;
-      }
-      const email = typeof rawEmail === "string" && rawEmail.trim() ? rawEmail.trim().toLowerCase() : null;
       const rawOrgId = request.body?.orgId;
       if (rawOrgId !== undefined && rawOrgId !== null && (typeof rawOrgId !== "string" || rawOrgId.length === 0)) {
         sendError(reply, 400, "bad_request", "orgId, when given, must be an org id");
         return;
       }
-      let created;
       try {
         // No org named means the default org, so an invite made the old way still works.
-        created = registry.createInvite(name, new Date(Date.now() + hours * 3_600_000).toISOString(), email, typeof rawOrgId === "string" ? rawOrgId : undefined);
+        const created = orgAdmin.mintInvite(typeof rawOrgId === "string" ? rawOrgId : undefined, input);
+        reply.code(201);
+        return created;
       } catch (error) {
         if (sendOrgError(reply, error)) {
           return;
         }
         throw error;
       }
-      const { invite, code } = created;
-      const link =
-        settings.webUrl && settings.publicUrl
-          ? `${settings.webUrl}/#join?host=${encodeURIComponent(settings.publicUrl)}&invite=${encodeURIComponent(code)}`
-          : null;
-      reply.code(201);
-      return { id: invite.id, name: invite.name, email: invite.email ?? null, orgId: invite.orgId, expiresAt: invite.expiresAt, code, link };
     },
   );
 
@@ -846,11 +852,8 @@ export async function createHostedServer(
 
   control.post<{ Params: { orgId: string }; Body: { name?: unknown } }>("/hosted/orgs/:orgId/rename", { preHandler: requireAdmin }, async (request, reply) => {
     try {
-      const renamed = registry.renameOrg(request.params.orgId, request.body?.name as string);
-      if (spaces) {
-        await settleWithin(spaces.ensureOrg(renamed.id).catch(logUnexpected));
-      }
-      return { ...(registry.org(renamed.id) ?? renamed), memberCount: registry.listOrgMembers(renamed.id).length };
+      const renamed = await renameOrgAndSpace(request.params.orgId, request.body?.name as string);
+      return { ...renamed, memberCount: registry.listOrgMembers(renamed.id).length };
     } catch (error) {
       if (sendOrgError(reply, error)) {
         return;
@@ -861,12 +864,31 @@ export async function createHostedServer(
 
   control.get<{ Params: { orgId: string } }>("/hosted/orgs/:orgId/members", { preHandler: requireAdmin }, async (request, reply) => {
     try {
-      return registry.listOrgMembers(request.params.orgId).map((member) => ({ ...member, isAdmin: isAdminEmail(member.email ?? undefined) }));
+      return orgAdmin.membersOf(request.params.orgId);
     } catch (error) {
       if (sendOrgError(reply, error)) {
         return;
       }
       throw error;
+    }
+  });
+
+  // #254: the super admin appoints and revokes org admins in any org, and is the only one who may revoke the last one.
+  // Same handlers an org admin's own app reaches per duo (`<basePath>/org/admins/<duoId>/...`), acting as `super-admin`.
+  // They take no body, so they sit in a scope that ignores one: a client that sends `Content-Type: application/json` with none must not get Fastify's empty-body 400.
+  control.register(async (scope) => {
+    scope.removeAllContentTypeParsers();
+    scope.addContentTypeParser("*", (_request, _payload, done) => done(null, undefined));
+    for (const action of ["grant", "revoke"] as const) {
+      scope.post<{ Params: { orgId: string; duoId: string } }>(`/hosted/orgs/:orgId/admins/:duoId/${action}`, { preHandler: requireAdmin }, async (request, reply) => {
+        const { orgId, duoId } = request.params;
+        const outcome = orgAdmin[action](orgId, duoId, SUPER_ADMIN_ACTOR);
+        if (!outcome.ok) {
+          sendError(reply, outcome.status, outcome.code, outcome.message);
+          return;
+        }
+        return outcome.value;
+      });
     }
   });
 

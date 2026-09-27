@@ -35,6 +35,7 @@ import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
 import { EmbedJob } from "./embed-job.js";
 import { registerMcpRoutes, type ConnectorAccess } from "./mcp.js";
+import { registerOrgRoutes, type OrgAdminAccess } from "./org-routes.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
@@ -116,6 +117,8 @@ export interface ServeDeps {
   readonly connectorAccess?: ConnectorAccess;
   /** #233: set by hosted mode when a workspace is configured; absent, `/workspace/session` answers 404 `workspace_not_configured`. */
   readonly workspaceSession?: WorkspaceSessionAccess;
+  /** #254: set by hosted mode, bound to this duo; absent (a personal duo), the `/org*` routes do not exist. */
+  readonly orgAdmin?: OrgAdminAccess;
 }
 
 function errorBody(code: string, message: string) {
@@ -997,6 +1000,9 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   registerRoutes(app, deps, draftReady, auth, embedJob);
   registerOwnerRoutes(app, deps);
   registerWorkspaceSessionRoutes(app, deps);
+  if (deps.orgAdmin) {
+    registerOrgRoutes(app, deps.orgAdmin);
+  }
   registerMcpRoutes(app, deps);
   return app;
 }
