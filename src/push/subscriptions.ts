@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { generateVAPIDKeys } from "web-push";
+// `web-push` is CommonJS — a named import from it type-checks and runs
+// under vitest, but fails at runtime under Node's own ESM loader depending
+// on how the package's own `module.exports` is shaped (`push/sender.ts`
+// has the full account). The default import is always safe.
+import webPush from "web-push";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
 
@@ -287,7 +291,7 @@ function readVapidKeys(db: Database): VapidKeys | undefined {
  * keep a test deterministic, never to reach the real one; every production
  * caller can simply omit it.
  */
-export function getOrCreateVapidKeys(storePath: string, passphrase: string, generate: () => VapidKeys = generateVAPIDKeys): VapidKeys {
+export function getOrCreateVapidKeys(storePath: string, passphrase: string, generate: () => VapidKeys = webPush.generateVAPIDKeys): VapidKeys {
   // Read-only first (`verifyDeviceToken`'s own discipline): this is called
   // on every push send, and a write transaction re-encrypts and rewrites
   // the whole store file — worth paying only on the one call, ever, that
