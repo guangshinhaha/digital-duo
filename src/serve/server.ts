@@ -25,6 +25,8 @@ import { listAuditEntries } from "../permissions/audit.js";
 import { hasRefusalsDecision, readRefusalsFile } from "../trust/refusals.js";
 import { resolveAskerRef } from "../permissions/directory.js";
 import { answerPublicly, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { notifyDraftWaiting } from "../push/notify.js";
+import type { PushSender } from "../push/sender.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
 import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
@@ -120,6 +122,16 @@ export interface ServeDeps {
   readonly workspaceSession?: WorkspaceSessionAccess;
   /** #254: set by hosted mode, bound to this duo; absent (a personal duo), the `/org*` routes do not exist. */
   readonly orgAdmin?: OrgAdminAccess;
+  /**
+   * digital-duo#251: how a push notification actually reaches a device.
+   * Optional — omitted, `notifyDraftWaiting`'s own default (`webPushSender`,
+   * the real `web-push`-backed one) is used, the same optionality
+   * `channelAdapters` above already has. Injected here, rather than only
+   * as `notifyDraftWaiting`'s own parameter, so every call site in this
+   * file shares one sender per daemon process instead of each reaching for
+   * the real one individually.
+   */
+  readonly pushSender?: PushSender;
 }
 
 function errorBody(code: string, message: string) {
@@ -454,6 +466,13 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     // the owner can act on, so both are announced.
     reply.code(201);
     draftReady.publish(result.draftId);
+    // digital-duo#251: every self-asked draft is something the owner
+    // decides (Keep/Edit/Dismiss), unlike a public answer that may resolve
+    // on its own (see the `answerPublicly` call sites below, which push
+    // only its escalations) — so this one always fires. Never awaited,
+    // exactly like `draftReady.publish` above: a push failing must not
+    // slow or cost the response this route already has.
+    void notifyDraftWaiting(deps, result.draftId, deps.pushSender);
     return result;
   });
 
@@ -547,6 +566,10 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
         deps.inferenceProvider,
         deps.confidenceConfig,
         deps.ownerName,
+        undefined, // no attachments on this path
+        // digital-duo#251: someone asked through an ask link while the
+        // owner was away — exactly the "a draft is waiting" push exists for.
+        (draftId) => void notifyDraftWaiting(deps, draftId, deps.pushSender),
       );
       // The CLI's three-outcome shape (R7), not a new HTTP vocabulary:
       // asker-visible fields for everyone, the owner-facing fields the

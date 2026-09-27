@@ -5,6 +5,7 @@ import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.
 import { useTempDir } from "./helpers/temp-dir.js";
 import { listActionAttempts } from "../src/actions/attempt-log.js";
 import type { ChannelAdapter } from "../src/drafting/delivery.js";
+import { listSubscriptions } from "../src/push/subscriptions.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { recordCleanInstance, acceptPromotionOffer, PROMOTION_THRESHOLD } from "../src/trust/promotion.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
@@ -202,5 +203,87 @@ describe("owner routes — the terminal-only commands, from the app", () => {
     const ask = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 3_600_000).toISOString());
     const response = await app.inject({ method: "GET", url: "/threads/slack/t1/messages", headers: { authorization: `Bearer ${ask.token}` } });
     expect(response.statusCode).toBe(401);
+  });
+});
+
+describe("push routes — registering, reading and removing this device's own subscription (digital-duo#251)", () => {
+  const SUBSCRIBE_BODY = { endpoint: "https://push.example/a", keys: { p256dh: "p256dh-key", auth: "auth-key" } };
+
+  it("hands out this duo's VAPID public key, the same one on every call", async () => {
+    const { app, auth } = setup();
+    const first = await app.inject({ method: "GET", url: "/push/vapid-public-key", headers: auth });
+    const second = await app.inject({ method: "GET", url: "/push/vapid-public-key", headers: auth });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().publicKey).toEqual(expect.any(String));
+    expect(second.json().publicKey).toBe(first.json().publicKey);
+  });
+
+  it("registers this device's subscription, defaulting quiet hours to off", async () => {
+    const { app, auth } = setup();
+    const response = await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: SUBSCRIBE_BODY });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ endpoint: SUBSCRIBE_BODY.endpoint, quietHours: { manual: false, from: null, to: null, timezone: "UTC" } });
+  });
+
+  it("registers with quiet hours, and a malformed one is refused with a 400 naming the problem", async () => {
+    const { app, auth } = setup();
+    const good = await app.inject({
+      method: "POST",
+      url: "/push/subscriptions",
+      headers: auth,
+      payload: { ...SUBSCRIBE_BODY, quietHours: { from: "22:00", to: "07:00", timezone: "Asia/Singapore" } },
+    });
+    expect(good.statusCode).toBe(200);
+    expect(good.json().quietHours).toEqual({ manual: false, from: "22:00", to: "07:00", timezone: "Asia/Singapore" });
+
+    const bad = await app.inject({
+      method: "POST",
+      url: "/push/subscriptions",
+      headers: auth,
+      payload: { ...SUBSCRIBE_BODY, quietHours: { from: "22:00" } }, // half-set window
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error.code).toBe("bad_request");
+  });
+
+  it("rejects a subscription missing endpoint or keys", async () => {
+    const { app, auth } = setup();
+    expect((await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: { keys: SUBSCRIBE_BODY.keys } })).statusCode).toBe(400);
+    expect((await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: { endpoint: SUBSCRIBE_BODY.endpoint } })).statusCode).toBe(400);
+  });
+
+  it("removes this device's own subscription, and a device with none is a no-op", async () => {
+    const { app, auth } = setup();
+    await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: SUBSCRIBE_BODY });
+    const removed = await app.inject({ method: "DELETE", url: "/push/subscriptions", headers: auth });
+    expect(removed.statusCode).toBe(204);
+    const again = await app.inject({ method: "DELETE", url: "/push/subscriptions", headers: auth });
+    expect(again.statusCode).toBe(204);
+  });
+
+  it("registering again from the same device replaces its subscription, never adds a second one", async () => {
+    const { app, auth, storePath } = setup();
+    await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: SUBSCRIBE_BODY });
+    await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: { ...SUBSCRIBE_BODY, endpoint: "https://push.example/rotated" } });
+    expect(listSubscriptions(storePath, PASSPHRASE)).toHaveLength(1);
+    expect(listSubscriptions(storePath, PASSPHRASE)[0].endpoint).toBe("https://push.example/rotated");
+  });
+
+  it("revoking a device removes its push subscription — the acceptance criterion, exercised through the real route", async () => {
+    const { app, auth, storePath } = setup();
+    await app.inject({ method: "POST", url: "/push/subscriptions", headers: auth, payload: SUBSCRIBE_BODY });
+    const device = listDeviceTokens(storePath, PASSPHRASE)[0];
+    expect(listSubscriptions(storePath, PASSPHRASE)).toHaveLength(1);
+
+    await app.inject({ method: "POST", url: `/devices/${device.id}/revoke`, headers: auth });
+    expect(listSubscriptions(storePath, PASSPHRASE)).toEqual([]);
+  });
+
+  it("never lets an ask token reach any push route", async () => {
+    const { app, storePath } = setup();
+    const ask = { authorization: `Bearer ${createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 3_600_000).toISOString()).token}` };
+    expect((await app.inject({ method: "GET", url: "/push/vapid-public-key", headers: ask })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/push/subscriptions", headers: ask, payload: SUBSCRIBE_BODY })).statusCode).toBe(401);
+    expect((await app.inject({ method: "DELETE", url: "/push/subscriptions", headers: ask })).statusCode).toBe(401);
   });
 });

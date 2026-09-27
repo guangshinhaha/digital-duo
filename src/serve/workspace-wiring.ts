@@ -1,6 +1,7 @@
 import { attachmentGroundingDoor } from "../drafting/attachment-grounding.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
 import { answerPublicly } from "../permissions/public-answer.js";
+import { notifyDraftWaiting } from "../push/notify.js";
 import { askerContextForSender } from "../workspace/asker.js";
 import type { WorkspaceSettings } from "../workspace/settings.js";
 import { WorkspaceService } from "../workspace/service.js";
@@ -11,7 +12,19 @@ import type { ServeDeps } from "./server.js";
 /** What one duo's workspace connection needs of the duo itself: its own store, folder, providers and owner. */
 export type DuoWorkspaceInputs = Pick<
   ServeDeps,
-  "storePath" | "passphrase" | "duoDir" | "embeddingProvider" | "inferenceProvider" | "confidenceConfig" | "classificationCeiling" | "ownerName"
+  | "storePath"
+  | "passphrase"
+  | "duoDir"
+  | "embeddingProvider"
+  | "inferenceProvider"
+  | "confidenceConfig"
+  | "classificationCeiling"
+  | "ownerName"
+  // digital-duo#251: env carries DUO_PUSH_VAPID_SUBJECT, pushSender is the
+  // injectable transport — both already required/optional on ServeDeps, so
+  // every existing caller that builds one already has them.
+  | "env"
+  | "pushSender"
 >;
 
 export interface DuoWorkspaceServiceOptions {
@@ -90,6 +103,9 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
         // door refused, or the question rode with nothing, and this is
         // undefined — the pre-#190 call shape, byte-identical.
         question.grounding,
+        // digital-duo#251: a workspace message arrived while the owner
+        // was away — the epic's own headline case for a push.
+        (draftId) => void notifyDraftWaiting(duo, draftId, duo.pushSender),
       ),
   });
   return workspace;

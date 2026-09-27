@@ -1,9 +1,11 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
+import { generateVAPIDKeys } from "web-push";
 import { appendActionAttempt, ensureActionAttemptLogSchema } from "../actions/attempt-log.js";
 import { readThreadMessages } from "../drafting/thread-history.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
+import { InvalidQuietHoursError, getOrCreateVapidKeys, parseQuietHours, removeSubscription, upsertSubscription, type QuietHours } from "../push/subscriptions.js";
 import { withDatabase } from "../store/store.js";
 import { listRecentDemotions } from "../trust/demotion.js";
 import { grantAutonomy } from "../trust/grants.js";
@@ -261,5 +263,60 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
       return;
     }
     return grantAutonomy(deps.storePath, deps.passphrase, deps.duoDir, { scopeText, tier, topicId });
+  });
+
+  // digital-duo#251: push registration. `request.principal!.tokenId` is
+  // this call's own device id, never one a caller could name — every route
+  // in this file only ever reaches a device principal (this file's own
+  // doc comment), so a device can register or remove only its own
+  // subscription, structurally, not by a check this route has to get
+  // right. `GET /push/vapid-public-key` is the one thing a device needs
+  // before it can even construct a subscription (`PushManager.subscribe`
+  // takes the public key as its `applicationServerKey`); the issue's own
+  // "Ask" list does not name it, but nothing here is reachable without it.
+  app.get("/push/vapid-public-key", async () => {
+    const { publicKey } = getOrCreateVapidKeys(deps.storePath, deps.passphrase, generateVAPIDKeys);
+    return { publicKey };
+  });
+
+  app.post<{
+    Body: { endpoint?: unknown; keys?: { p256dh?: unknown; auth?: unknown }; quietHours?: { manual?: unknown; from?: unknown; to?: unknown; timezone?: unknown } };
+  }>("/push/subscriptions", async (request, reply) => {
+    const deviceId = request.principal?.tokenId;
+    if (!deviceId) {
+      sendError(reply, 401, "unauthorized", "Sign in to register push.");
+      return;
+    }
+    const { endpoint, keys } = request.body;
+    if (typeof endpoint !== "string" || endpoint.trim().length === 0) {
+      sendError(reply, 400, "bad_request", "endpoint is required: the browser's own PushSubscription.endpoint");
+      return;
+    }
+    if (typeof keys?.p256dh !== "string" || typeof keys.auth !== "string" || !keys.p256dh || !keys.auth) {
+      sendError(reply, 400, "bad_request", "keys.p256dh and keys.auth are required: the browser's own PushSubscription.keys");
+      return;
+    }
+    let quietHours: QuietHours;
+    try {
+      quietHours = parseQuietHours(request.body.quietHours ?? {});
+    } catch (error) {
+      if (error instanceof InvalidQuietHoursError) {
+        sendError(reply, 400, "bad_request", error.message);
+        return;
+      }
+      throw error;
+    }
+    upsertSubscription(deps.storePath, deps.passphrase, deviceId, { endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth }, quietHours });
+    return { deviceId, endpoint, quietHours };
+  });
+
+  app.delete("/push/subscriptions", async (request, reply) => {
+    const deviceId = request.principal?.tokenId;
+    if (!deviceId) {
+      sendError(reply, 401, "unauthorized", "Sign in to remove push.");
+      return;
+    }
+    removeSubscription(deps.storePath, deps.passphrase, deviceId);
+    reply.code(204).send();
   });
 }

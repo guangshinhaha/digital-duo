@@ -100,6 +100,7 @@ export async function runServe(
     confidenceConfig: config.confidence,
     classificationCeiling: config.classificationCeiling,
     ownerName: config.ownerName,
+    env,
   };
   const workspace = workspaceSettings ? createDuoWorkspaceService(duo, { settings: workspaceSettings, transportFactory: workspaceTransportFactory }) : undefined;
 
