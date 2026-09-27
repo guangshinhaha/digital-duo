@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD } from "../src/config.js";
-import { appendDraft, DraftNotFoundError, ensureDraftLogSchema, getDraft, listDrafts, recordDraftOutcome } from "../src/drafting/draft-log.js";
+import { appendDraft, DraftNotFoundError, ensureDraftLogSchema, getDraft, listDrafts, recordDeliveryOutcome, recordDraftOutcome } from "../src/drafting/draft-log.js";
 import { createEncryptedStore, withDatabase, type Database } from "../src/store/store.js";
 
 const tempDir = useTempDir();
@@ -591,5 +591,62 @@ describe("draft provenance (#169) — where a draft came from, structured", () =
     const listed = listDrafts(storePath, PASSPHRASE);
     expect(listed).toHaveLength(1);
     expect(listed[0].provenance).toMatchObject({ origin: "channel", channelKind: "slack", askerRef: "directory.json#sam" });
+  });
+});
+
+describe("recordDeliveryOutcome — the delivered event id (digital-duo#247)", () => {
+  function appendPlainDraft(storePath: string): string {
+    return appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "slack", askerRef: "directory.json#sam", threadId: null, permalink: null },
+    });
+  }
+
+  it("carries the eventId through delivered", () => {
+    const storePath = initStore();
+    const id = appendPlainDraft(storePath);
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "delivered", eventId: "$abc:example.org" });
+    expect(getDraft(storePath, PASSPHRASE, id)?.delivery).toEqual({ state: "delivered", eventId: "$abc:example.org" });
+  });
+
+  it("a delivered record with no eventId carries no eventId key at all, both freshly and once re-read from storage", () => {
+    const storePath = initStore();
+    const id = appendPlainDraft(storePath);
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "delivered" });
+    const delivery = getDraft(storePath, PASSPHRASE, id)?.delivery;
+    expect(delivery).toEqual({ state: "delivered" });
+    expect(delivery && "eventId" in delivery).toBe(false);
+  });
+
+  it("a later delivery record overwrites an earlier eventId — the same overwrite-on-every-write contract pending/delivered/failed already have", () => {
+    const storePath = initStore();
+    const id = appendPlainDraft(storePath);
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "pending" });
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "delivered", eventId: "$first:example.org" });
+    expect(getDraft(storePath, PASSPHRASE, id)?.delivery).toEqual({ state: "delivered", eventId: "$first:example.org" });
+
+    // A later record with no eventId clears the earlier one rather than leaving it stale.
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "delivered" });
+    const delivery = getDraft(storePath, PASSPHRASE, id)?.delivery;
+    expect(delivery).toEqual({ state: "delivered" });
+    expect(delivery && "eventId" in delivery).toBe(false);
+  });
+
+  it("a pending or failed delivery never carries an eventId, even if an earlier attempt on the same draft had one", () => {
+    const storePath = initStore();
+    const id = appendPlainDraft(storePath);
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "delivered", eventId: "$first:example.org" });
+
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "pending" });
+    expect(getDraft(storePath, PASSPHRASE, id)?.delivery).toEqual({ state: "pending" });
+
+    recordDeliveryOutcome(storePath, PASSPHRASE, id, { state: "failed", reason: "timed out" });
+    expect(getDraft(storePath, PASSPHRASE, id)?.delivery).toEqual({ state: "failed", reason: "timed out" });
   });
 });
