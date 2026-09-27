@@ -11,6 +11,8 @@ import { IdentityError, type IdentityVerifier } from "../src/hosted/google.js";
 import { CLAUDE_REDIRECT_URIS, OAuthError, OAuthStore } from "../src/hosted/oauth.js";
 import { createHostedServer, tenantPaths, type HostedServer, type HostedSettings } from "../src/hosted/server.js";
 import { listRecords } from "../src/ingest/record-store.js";
+import { saveNotesToDuo } from "../src/serve/mcp.js";
+import type { ServeDeps } from "../src/serve/server.js";
 
 const tempDir = useTempDir();
 const ADMIN = "admin-token-for-tests";
@@ -130,6 +132,25 @@ async function saveAs(base: string, accessToken: string, text: string): Promise<
   } finally {
     await client.close();
   }
+}
+
+/** The deps a hosted duo is served with, rebuilt from its files, so a test can put a record straight into it. */
+async function tenantDepsFor(hostedRoot: string, hosted: HostedServer, tenantId: string): Promise<ServeDeps> {
+  const tenant = hosted.registry.tenants().find((candidate) => candidate.id === tenantId)!;
+  const paths = tenantPaths(hostedRoot, tenantId);
+  const config = loadConfig({});
+  return {
+    storePath: paths.storePath,
+    passphrase: hosted.registry.passphraseFor(tenant),
+    duoDir: paths.duoDir,
+    lifecycleLogPath: paths.lifecycleLogPath,
+    embeddingProvider: createFakeEmbeddingProvider(),
+    inferenceProvider: undefined,
+    confidenceConfig: config.confidence,
+    classificationCeiling: config.classificationCeiling,
+    ownerName: tenant.name,
+    env: {},
+  };
 }
 
 function connectorRecords(hosted: HostedServer, hostedRoot: string, tenantId: string) {
@@ -319,6 +340,141 @@ describe("claude.ai connector by sign-in (#240)", () => {
   });
 });
 
+describe("what the owner allows at sign-in (#256)", () => {
+  /** The whole flow with a requested scope and an owner's choice, returning the token answer. */
+  async function connectScoped(base: string, opts: { scope?: string; scopes?: string[] }) {
+    const clientId = await registerClient(base);
+    const { verifier, challenge } = pkce();
+    const requestId = requestIdFrom(await authorize(base, clientId, challenge, opts.scope === undefined ? {} : { scope: opts.scope }));
+    const info = (await (await fetch(`${base}/oauth/requests/${requestId}`)).json()) as { scopes: { id: string; defaultOn: boolean; label: string }[] };
+    const approved = await json(base, `/oauth/requests/${requestId}/approve`, { credential: "sub-sam|sam@x.com|Sam", ...(opts.scopes === undefined ? {} : { scopes: opts.scopes }) });
+    return { info, approved, clientId, verifier, requestId };
+  }
+
+  async function exchange(base: string, flow: { approved: Response; clientId: string; verifier: string }) {
+    const { redirectTo } = (await flow.approved.json()) as { redirectTo: string };
+    const response = await token(base, { grant_type: "authorization_code", code: codeFrom(redirectTo), redirect_uri: REDIRECT, client_id: flow.clientId, code_verifier: flow.verifier });
+    expect(response.status).toBe(200);
+    return (await response.json()) as { access_token: string; refresh_token: string; scope: string };
+  }
+
+  async function callTool(base: string, accessToken: string, name: string, args: Record<string, unknown>): Promise<{ isError: boolean; text: string }> {
+    const client = new Client({ name: "test-claude", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { authorization: `Bearer ${accessToken}` } } }));
+    try {
+      const result = await client.callTool({ name, arguments: args });
+      return { isError: result.isError === true, text: (result.content as { text: string }[])[0].text };
+    } finally {
+      await client.close();
+    }
+  }
+
+  it("lists every permission Claude could be given, with sending off to start with, when Claude names none", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const flow = await connectScoped(base, {});
+    expect(flow.info.scopes.map((scope) => scope.id)).toEqual(["duo:read", "duo:save", "duo:operate", "duo:send"]);
+    expect(Object.fromEntries(flow.info.scopes.map((scope) => [scope.id, scope.defaultOn]))).toEqual({ "duo:read": true, "duo:save": true, "duo:operate": true, "duo:send": false });
+  });
+
+  it("grants save only when an approval names no permissions, as a sign-in page that predates them sends", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const tokens = await exchange(base, await connectScoped(base, {}));
+    expect(tokens.scope).toBe("duo:save");
+    const refused = await callTool(base, tokens.access_token, "search_my_duo", { query: "anything" });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/Read \(duo:read\) permission/);
+  });
+
+  it("grants exactly the three usual permissions, and never send, when the page sends its defaults", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const tokens = await exchange(base, await connectScoped(base, { scopes: ["duo:read", "duo:save", "duo:operate"] }));
+    expect(tokens.scope).toBe("duo:read duo:save duo:operate");
+    expect((await callTool(base, tokens.access_token, "edit_draft", { id: "x", text: "y" })).text).toMatch(/Send \(duo:send\) permission/);
+  });
+
+  it("grants send when the owner ticks it", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const tokens = await exchange(base, await connectScoped(base, { scopes: ["duo:read", "duo:send"] }));
+    expect(tokens.scope).toBe("duo:read duo:send");
+    // Allowed to try: the refusal is now about the draft, not the permission.
+    expect((await callTool(base, tokens.access_token, "mark_draft_sent", { id: "nope" })).text).toMatch(/No draft with id/);
+  });
+
+  it("shows only what Claude asked for, and grants no more than that whatever the owner sends", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const flow = await connectScoped(base, { scope: "duo:read", scopes: ["duo:read", "duo:send", "duo:operate"] });
+    expect(flow.info.scopes.map((scope) => scope.id)).toEqual(["duo:read"]);
+    const tokens = await exchange(base, flow);
+    expect(tokens.scope).toBe("duo:read");
+    const refused = await callTool(base, tokens.access_token, "save_to_duo", { text: "A note." });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/Save \(duo:save\) permission/);
+    expect((await callTool(base, tokens.access_token, "what_my_duo_knows", {})).isError).toBe(false);
+  });
+
+  it("searches only the signed-in owner's duo: what is in another duo is never returned", async () => {
+    const { base, hosted, hostedRoot } = await start();
+    const sam = await signUp(base, "sub-sam|sam@x.com|Sam");
+    const kim = await signUp(base, "sub-kim|kim@x.com|Kim");
+    // A record in Kim's duo, written directly, and one in Sam's.
+    for (const [duo, text] of [[kim, "Kim's secret: the printer budget code is 4471."], [sam, "Sam's note: the printer is on the second floor."]] as const) {
+      const tenant = hosted.registry.tenants().find((candidate) => candidate.id === duo.tenantId)!;
+      await saveNotesToDuo(
+        { ...(await tenantDepsFor(hostedRoot, hosted, tenant.id)) },
+        [text],
+      );
+    }
+    const tokens = await exchange(base, await connectScoped(base, { scopes: ["duo:read"] }));
+    const found = await callTool(base, tokens.access_token, "search_my_duo", { query: "printer" });
+    expect(found.isError).toBe(false);
+    expect(found.text).toContain("Sam's note");
+    expect(found.text).not.toContain("Kim's secret");
+    expect(found.text).not.toContain("4471");
+  });
+
+  it("refuses an owner who allows nothing, and keeps the request open", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const flow = await connectScoped(base, { scopes: [] });
+    expect(flow.approved.status).toBe(400);
+    expect(((await flow.approved.json()) as { error: { code: string } }).error.code).toBe("no_scopes");
+    const retry = await approve(base, flow.requestId, "sub-sam|sam@x.com|Sam");
+    expect(retry.status).toBe(200);
+  });
+
+  it("refuses a choice that names something that is not a permission", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const flow = await connectScoped(base, { scopes: ["duo:read", "duo:everything"] });
+    expect(flow.approved.status).toBe(400);
+  });
+
+  it("sends Claude back with invalid_scope when it asks only for permissions this server does not offer", async () => {
+    const { base } = await start();
+    const clientId = await registerClient(base);
+    const response = await authorize(base, clientId, pkce().challenge, { scope: "admin everything" });
+    expect(response.status).toBe(302);
+    expect(new URL(response.headers.get("location") ?? "").searchParams.get("error")).toBe("invalid_scope");
+  });
+
+  it("keeps the granted permissions through a refresh, and shows the owner what each connection may do", async () => {
+    const { base } = await start();
+    const sam = await signUp(base, "sub-sam|sam@x.com|Sam");
+    const flow = await connectScoped(base, { scopes: ["duo:read", "duo:operate"] });
+    const tokens = await exchange(base, flow);
+    const refreshed = await token(base, { grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: flow.clientId });
+    expect(((await refreshed.json()) as { scope: string }).scope).toBe("duo:read duo:operate");
+
+    const status = (await (await fetch(`${base}${sam.basePath}/connector`, { headers: { authorization: `Bearer ${sam.token}` } })).json()) as { connections: { scopes: string[] }[] };
+    expect(status.connections[0].scopes).toEqual(["duo:read", "duo:operate"]);
+  });
+});
+
 describe("claude.ai connector by sign-in: hardening (#240 review)", () => {
   it("answers a repeated or malformed PKCE challenge by sending Claude back with an error, not a crash", async () => {
     const { base } = await start();
@@ -383,7 +539,7 @@ describe("OAuthStore", () => {
     const client = oauth.registerClient({ clientName: "Claude", redirectUris: [REDIRECT] });
     const { verifier, challenge } = pkce();
     const pending = oauth.beginAuthorization({ client, redirectUri: REDIRECT, state: undefined, codeChallenge: challenge });
-    const code = oauth.issueCode(pending, duoId);
+    const code = oauth.issueCode(pending, duoId, ["duo:save"]);
     return { client, tokens: oauth.exchangeCode({ code, clientId: client.id, redirectUri: REDIRECT, codeVerifier: verifier }) };
   }
 
@@ -407,7 +563,7 @@ describe("OAuthStore", () => {
     const { store: oauth } = store(clock);
     const client = oauth.registerClient({ clientName: "Claude", redirectUris: [REDIRECT] });
     const { verifier, challenge } = pkce();
-    const code = oauth.issueCode(oauth.beginAuthorization({ client, redirectUri: REDIRECT, state: undefined, codeChallenge: challenge }), "duo-a");
+    const code = oauth.issueCode(oauth.beginAuthorization({ client, redirectUri: REDIRECT, state: undefined, codeChallenge: challenge }), "duo-a", ["duo:save"]);
     clock.now += 6 * 60_000;
     expect(() => oauth.exchangeCode({ code, clientId: client.id, redirectUri: REDIRECT, codeVerifier: verifier })).toThrow(/expired/);
   });
@@ -471,6 +627,24 @@ describe("OAuthStore", () => {
     expect(begin).toThrow(/Too many sign-ins/);
     clock.now += 11 * 60_000;
     expect(begin).not.toThrow();
+  });
+
+  it("treats a grant made before permissions existed as save-only", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const path = join(tempDir(), "oauth.json");
+    const clock = { now: 1_000_000 };
+    const written = new OAuthStore(path, CLAUDE_REDIRECT_URIS, () => clock.now);
+    const { tokens } = grantFor(written, "duo-a");
+    // Strip the scopes the way a file written by the earlier version would lack them.
+    const { readFileSync } = await import("node:fs");
+    const file = JSON.parse(readFileSync(path, "utf8")) as { grants: { scopes?: string[] }[] };
+    for (const grant of file.grants) {
+      delete grant.scopes;
+    }
+    writeFileSync(path, JSON.stringify(file));
+    const restarted = new OAuthStore(path, CLAUDE_REDIRECT_URIS, () => clock.now);
+    expect(restarted.verifyAccess(tokens.accessToken)?.scopes).toEqual(["duo:save"]);
+    expect(restarted.connections("duo-a")[0].scopes).toEqual(["duo:save"]);
   });
 
   it("sets a damaged file aside and starts empty rather than stopping the daemon", async () => {

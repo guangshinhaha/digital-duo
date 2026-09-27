@@ -33,7 +33,8 @@ import type { WorkspaceService } from "../workspace/service.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
-import { EmbedJob } from "./embed-job.js";
+import type { EmbedJob } from "./embed-job.js";
+import { jobsFor } from "./jobs.js";
 import { registerMcpRoutes, type ConnectorAccess } from "./mcp.js";
 import { registerOrgRoutes, type OrgAdminAccess } from "./org-routes.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
@@ -996,7 +997,7 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   });
   const auth = registerAuth(app, deps.storePath, deps.passphrase);
   const draftReady = registerDraftReadySocket(app, deps);
-  const embedJob = new EmbedJob();
+  const embedJob = jobsFor(deps).embed;
   registerRoutes(app, deps, draftReady, auth, embedJob);
   registerOwnerRoutes(app, deps);
   registerWorkspaceSessionRoutes(app, deps);

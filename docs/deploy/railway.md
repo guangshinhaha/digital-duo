@@ -75,6 +75,16 @@ signing in and the secret URLs below are turned off. Settings, "Connect to Claud
 URL plus `/mcp`); paste it into claude.ai under Settings, Connectors, Add custom connector. Claude registers itself, sends
 you to the web app's `#connect` page to sign in with Google, and is given tokens for the duo that Google account owns.
 
+- **What Claude may do is what you allow at sign-in** (#256). The `#connect` page lists four permissions and you choose
+  which to grant: **Read** (search, ask, see what the duo knows, its drafts and what is waiting for you), **Save** (add
+  notes), **Operate** (embed, derive, draft replies, discard drafts, queue your answers as rule candidates; nothing here
+  sends a message) and **Send** (record a draft as sent or edited, and post a correction to a public answer, which for a
+  question that came from a channel can deliver a message as you). Read, Save and Operate start ticked; Send never does.
+  The daemon checks the granted set on every tool call and refuses one outside it, naming the missing permission, so
+  hiding a tool in claude.ai is not the only guard. To change what a connection may do, disconnect it and connect again.
+  Never a tool, however it is connected: granting trust, confirming irreversible actions, approving a rule candidate,
+  minting or revoking any credential, room consent, ending or purging a duo. Those stay in the app.
+- A connection made before permissions existed, and any secret-URL connection, is Save-only.
 - One address serves every duo: the token names the duo, so Kim's sign-in can only ever reach Kim's duo.
 - Access tokens last an hour and refresh tokens 30 days (rotated on use; a reused one revokes the connection). Revoke a
   connection from Settings, Connect to Claude; the next save is refused.
