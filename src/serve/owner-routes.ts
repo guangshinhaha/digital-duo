@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { appendActionAttempt, ensureActionAttemptLogSchema } from "../actions/attempt-log.js";
+import { readThreadMessages } from "../drafting/thread-history.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
@@ -193,6 +194,19 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
   // is no `duo trust` command that marks a notice seen either).
   app.get<{ Querystring: { since?: string } }>("/trust/notices", async (request) =>
     listRecentDemotions(deps.storePath, deps.passphrase, deps.duoDir, request.query.since),
+  );
+
+  // digital-duo#248: a bridged chat's surrounding messages, so the client
+  // can fill in around the questions it already has from GET /drafts. No
+  // adapter for this channel, or one that cannot read its own history, or
+  // a thread it simply cannot read — every one of those is the same
+  // "nothing available" empty array; the route never distinguishes them,
+  // because the client's fallback (today's questions-only view) is the
+  // same for all three.
+  app.get<{ Params: { channelKind: string; threadId: string } }>(
+    "/threads/:channelKind/:threadId/messages",
+    async (request) =>
+      readThreadMessages(deps.storePath, deps.passphrase, deps.channelAdapters ?? [], request.params.channelKind, request.params.threadId),
   );
 
   app.post<{ Params: { topicId: string; tier: string }; Body: { decision?: unknown } }>(

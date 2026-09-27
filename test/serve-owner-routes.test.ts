@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { listActionAttempts } from "../src/actions/attempt-log.js";
+import type { ChannelAdapter } from "../src/drafting/delivery.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { recordCleanInstance, acceptPromotionOffer, PROMOTION_THRESHOLD } from "../src/trust/promotion.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
@@ -16,7 +17,7 @@ import { createEncryptedStore } from "../src/store/store.js";
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
 
-function setup() {
+function setup(overrides: Partial<ServeDeps> = {}) {
   const storePath = join(tempDir(), "data", "duo.db");
   createEncryptedStore(storePath, PASSPHRASE);
   const config = loadConfig();
@@ -31,6 +32,7 @@ function setup() {
     classificationCeiling: config.classificationCeiling,
     ownerName: "Owner",
     env: {},
+    ...overrides,
   };
   const device = createDeviceToken(storePath, PASSPHRASE, "laptop");
   const app = createServer(deps);
@@ -167,6 +169,38 @@ describe("owner routes — the terminal-only commands, from the app", () => {
     const { app, storePath } = setup();
     const ask = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 3_600_000).toISOString());
     const response = await app.inject({ method: "GET", url: "/trust/notices", headers: { authorization: `Bearer ${ask.token}` } });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it("reads a bridged thread's messages when a registered adapter can read its own history (digital-duo#248)", async () => {
+    const slack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver() {},
+      async history() {
+        return [{ id: "m1", at: "2026-01-01T00:00:01.000Z", senderRef: "U_sam", text: "hi" }];
+      },
+    };
+    const { app, auth } = setup({ channelAdapters: [slack] });
+    const response = await app.inject({ method: "GET", url: "/threads/slack/t1/messages", headers: auth });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([{ id: "m1", at: "2026-01-01T00:00:01.000Z", senderRef: "U_sam", text: "hi", fromOwner: false }]);
+  });
+
+  it("answers a channel with no adapter registered with a clear empty result, not an error", async () => {
+    const { app, auth } = setup();
+    const response = await app.inject({ method: "GET", url: "/threads/slack/t1/messages", headers: auth });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([]);
+  });
+
+  it("never lets an ask token read a bridged thread either", async () => {
+    const { app, storePath } = setup();
+    const ask = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 3_600_000).toISOString());
+    const response = await app.inject({ method: "GET", url: "/threads/slack/t1/messages", headers: { authorization: `Bearer ${ask.token}` } });
     expect(response.statusCode).toBe(401);
   });
 });
