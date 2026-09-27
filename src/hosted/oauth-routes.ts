@@ -20,7 +20,12 @@ export interface OAuthContext {
 }
 
 const SCOPE = "duo:save";
-const REGISTER_MAX_PER_HOUR = 20;
+/**
+ * Claude's own servers make the registration and token calls, so many owners share a few source addresses and one
+ * budget: registration is generous (the client cap and the unused-client grace are the real bound), and failed token
+ * calls are counted per client as well as per address.
+ */
+const REGISTER_MAX_PER_HOUR = 300;
 const TOKEN_MAX_FAILURES_PER_WINDOW = 30;
 const TOKEN_FAILURE_WINDOW_MS = 15 * 60_000;
 
@@ -31,12 +36,20 @@ function errorBody(code: string, message: string) {
 /** A small per-address counter: `blocked` says whether the address is over its budget, `record` spends one. */
 function limiter(max: number, windowMs: number) {
   const windows = new Map<string, { start: number; count: number }>();
+  const prune = () => {
+    for (const [key, window] of windows) {
+      if (Date.now() - window.start > windowMs) {
+        windows.delete(key);
+      }
+    }
+  };
   return {
     blocked(ip: string): boolean {
       const window = windows.get(ip);
       return window !== undefined && Date.now() - window.start <= windowMs && window.count >= max;
     },
     record(ip: string): void {
+      prune();
       const window = windows.get(ip);
       if (!window || Date.now() - window.start > windowMs) {
         windows.set(ip, { start: Date.now(), count: 1 });
@@ -57,6 +70,13 @@ function redirectWith(base: string, params: Record<string, string | undefined>):
   return url.toString();
 }
 
+/** A query parameter as one string: a repeated parameter arrives as an array and is not a value. */
+function single(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -76,10 +96,6 @@ function asString(value: unknown): string | undefined {
 export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext): void {
   const resource = `${ctx.publicUrl}/mcp`;
   const metadataUrl = `${ctx.publicUrl}/.well-known/oauth-protected-resource`;
-
-  control.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, body, done) => {
-    done(null, Object.fromEntries(new URLSearchParams(body as string)));
-  });
 
   const registrations = limiter(REGISTER_MAX_PER_HOUR, 60 * 60_000);
   const tokenFailures = limiter(TOKEN_MAX_FAILURES_PER_WINDOW, TOKEN_FAILURE_WINDOW_MS);
@@ -138,27 +154,38 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
 
   // The owner arrives here from Claude. A request that names no known client or address is answered with an error page and
   // never redirected (a redirect could send someone to an address an attacker chose); every other problem goes back to Claude.
-  control.get<{ Querystring: Record<string, string | undefined> }>("/oauth/authorize", async (request, reply) => {
+  control.get<{ Querystring: Record<string, unknown> }>("/oauth/authorize", async (request, reply) => {
     const query = request.query;
-    const client = ctx.store.getClient(query.client_id ?? "");
-    const redirectUri = query.redirect_uri;
+    const client = ctx.store.getClient(single(query.client_id) ?? "");
+    const redirectUri = single(query.redirect_uri);
     if (!client || !redirectUri || !client.redirectUris.includes(redirectUri)) {
       reply.code(400).send(errorBody("invalid_request", "This connection request is not valid. Start again from Claude."));
       return;
     }
-    const back = (error: string, description: string) =>
-      reply.redirect(redirectWith(redirectUri, { error, error_description: description, state: query.state }), 302);
+    const state = single(query.state);
+    const back = (error: string, description: string) => reply.redirect(redirectWith(redirectUri, { error, error_description: description, state }), 302);
+    if (query.state !== undefined && state === undefined) {
+      return back("invalid_request", "state must be a single value.");
+    }
     if (query.response_type !== "code") {
       return back("unsupported_response_type", "Only the authorization code flow is supported.");
     }
-    if (!query.code_challenge || query.code_challenge_method !== "S256") {
-      return back("invalid_request", "A PKCE code challenge with method S256 is required.");
+    const codeChallenge = single(query.code_challenge);
+    if (!codeChallenge || !PKCE_CHALLENGE.test(codeChallenge) || query.code_challenge_method !== "S256") {
+      return back("invalid_request", "A PKCE code challenge (S256) is required.");
     }
     if (query.resource !== undefined && query.resource !== resource) {
       return back("invalid_target", "That resource is not served here.");
     }
-    const pending = ctx.store.beginAuthorization({ client, redirectUri, state: query.state, codeChallenge: query.code_challenge });
-    reply.redirect(`${ctx.webUrl}/#connect?host=${encodeURIComponent(ctx.publicUrl)}&request=${pending.id}`, 302);
+    try {
+      const pending = ctx.store.beginAuthorization({ client, redirectUri, state, codeChallenge });
+      reply.redirect(`${ctx.webUrl}/#connect?host=${encodeURIComponent(ctx.publicUrl)}&request=${pending.id}`, 302);
+    } catch (error) {
+      if (error instanceof OAuthError) {
+        return back(error.code, error.message);
+      }
+      throw error;
+    }
   });
 
   // What the web app's sign-in page shows before the owner decides.
@@ -190,9 +217,14 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
       reply.code(404).send(errorBody("no_duo", "There's no duo for this Google account, so nothing was connected."));
       return;
     }
-    ctx.store.takeAuthorization(pending.id);
-    const code = ctx.store.issueCode(pending, duo.duoId);
-    return { redirectTo: redirectWith(pending.redirectUri, { code, state: pending.state }), ownerName: duo.ownerName };
+    // Two approvals of one request can both get past the sign-in check above; only the one that takes it is given a code.
+    const taken = ctx.store.takeAuthorization(pending.id);
+    if (!taken) {
+      reply.code(404).send(errorBody("request_expired", "This connection request has expired. Start again from Claude."));
+      return;
+    }
+    const code = ctx.store.issueCode(taken, duo.duoId);
+    return { redirectTo: redirectWith(taken.redirectUri, { code, state: taken.state }), ownerName: duo.ownerName };
   });
 
   control.post<{ Params: { id: string } }>("/oauth/requests/:id/deny", async (request, reply) => {
@@ -204,44 +236,53 @@ export function registerOAuthRoutes(control: FastifyInstance, ctx: OAuthContext)
     return { redirectTo: redirectWith(pending.redirectUri, { error: "access_denied", error_description: "The owner declined.", state: pending.state }) };
   });
 
-  // RFC 6749 §3.2: trade a code (with its PKCE verifier) or a refresh token for tokens.
-  control.post<{ Body: Record<string, unknown> }>("/oauth/token", async (request, reply) => {
-    reply.header("Cache-Control", "no-store").header("Pragma", "no-cache");
-    if (tokenFailures.blocked(request.ip)) {
-      reply.code(429).send({ error: "invalid_request", error_description: "Too many failed attempts from this address; try again later." });
-      return;
-    }
-    const body = request.body ?? {};
-    const clientId = asString(body.client_id);
-    try {
-      let tokens;
-      if (body.grant_type === "authorization_code") {
-        const code = asString(body.code);
-        const redirectUri = asString(body.redirect_uri);
-        const codeVerifier = asString(body.code_verifier);
-        if (!clientId || !code || !redirectUri || !codeVerifier) {
-          throw new OAuthError("invalid_request", "client_id, code, redirect_uri and code_verifier are required.");
-        }
-        tokens = ctx.store.exchangeCode({ code, clientId, redirectUri, codeVerifier });
-      } else if (body.grant_type === "refresh_token") {
-        const refreshToken = asString(body.refresh_token);
-        if (!clientId || !refreshToken) {
-          throw new OAuthError("invalid_request", "client_id and refresh_token are required.");
-        }
-        tokens = ctx.store.refresh({ refreshToken, clientId });
-      } else {
-        reply.code(400).send({ error: "unsupported_grant_type", error_description: "grant_type must be authorization_code or refresh_token." });
+  // RFC 6749 §3.2: trade a code (with its PKCE verifier) or a refresh token for tokens. Registered as its own plugin so
+  // the form body type this endpoint needs is accepted here and nowhere else on the control app.
+  control.register(async (scope) => {
+    scope.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, raw, done) => {
+      done(null, Object.fromEntries(new URLSearchParams(raw as string)));
+    });
+
+    scope.post<{ Body: Record<string, unknown> }>("/oauth/token", async (request, reply) => {
+      reply.header("Cache-Control", "no-store").header("Pragma", "no-cache");
+      const body = request.body ?? {};
+      const clientId = asString(body.client_id);
+      // Claude's servers share addresses across owners, so failures are counted per client as well as per address.
+      const failureKey = `${request.ip}|${clientId ?? ""}`;
+      if (tokenFailures.blocked(failureKey)) {
+        reply.code(429).send({ error: "invalid_request", error_description: "Too many failed attempts; try again later." });
         return;
       }
-      return { access_token: tokens.accessToken, token_type: "Bearer", expires_in: tokens.expiresInSeconds, refresh_token: tokens.refreshToken, scope: SCOPE };
-    } catch (error) {
-      if (error instanceof OAuthError) {
-        tokenFailures.record(request.ip);
-        reply.code(400).send({ error: error.code, error_description: error.message });
-        return;
+      try {
+        let tokens;
+        if (body.grant_type === "authorization_code") {
+          const code = asString(body.code);
+          const redirectUri = asString(body.redirect_uri);
+          const codeVerifier = asString(body.code_verifier);
+          if (!clientId || !code || !redirectUri || !codeVerifier) {
+            throw new OAuthError("invalid_request", "client_id, code, redirect_uri and code_verifier are required.");
+          }
+          tokens = ctx.store.exchangeCode({ code, clientId, redirectUri, codeVerifier });
+        } else if (body.grant_type === "refresh_token") {
+          const refreshToken = asString(body.refresh_token);
+          if (!clientId || !refreshToken) {
+            throw new OAuthError("invalid_request", "client_id and refresh_token are required.");
+          }
+          tokens = ctx.store.refresh({ refreshToken, clientId });
+        } else {
+          reply.code(400).send({ error: "unsupported_grant_type", error_description: "grant_type must be authorization_code or refresh_token." });
+          return;
+        }
+        return { access_token: tokens.accessToken, token_type: "Bearer", expires_in: tokens.expiresInSeconds, refresh_token: tokens.refreshToken, scope: SCOPE };
+      } catch (error) {
+        if (error instanceof OAuthError) {
+          tokenFailures.record(failureKey);
+          reply.code(400).send({ error: error.code, error_description: error.message });
+          return;
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   });
 
   // The MCP address itself. The token names the duo; without a valid one Claude is pointed at the metadata and starts the sign-in.

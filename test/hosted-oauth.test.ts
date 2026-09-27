@@ -319,6 +319,62 @@ describe("claude.ai connector by sign-in (#240)", () => {
   });
 });
 
+describe("claude.ai connector by sign-in: hardening (#240 review)", () => {
+  it("answers a repeated or malformed PKCE challenge by sending Claude back with an error, not a crash", async () => {
+    const { base } = await start();
+    const clientId = await registerClient(base);
+    const good = pkce().challenge;
+
+    const repeated = await fetch(
+      `${base}/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(REDIRECT)}&code_challenge=${good}&code_challenge=${good}&code_challenge_method=S256`,
+      { redirect: "manual" },
+    );
+    expect(repeated.status).toBe(302);
+    expect(new URL(repeated.headers.get("location") ?? "").searchParams.get("error")).toBe("invalid_request");
+
+    const malformed = await authorize(base, clientId, "short");
+    expect(malformed.status).toBe(302);
+    expect(new URL(malformed.headers.get("location") ?? "").searchParams.get("error")).toBe("invalid_request");
+
+    const repeatedState = await fetch(
+      `${base}/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(REDIRECT)}&code_challenge=${good}&code_challenge_method=S256&state=a&state=b`,
+      { redirect: "manual" },
+    );
+    expect(new URL(repeatedState.headers.get("location") ?? "").searchParams.get("error")).toBe("invalid_request");
+  });
+
+  it("accepts the token endpoint's form body type there and nowhere else on the control app", async () => {
+    const { base } = await start();
+    const form = { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ credential: "x|y@z.com|Y" }) };
+    expect((await fetch(`${base}/hosted/login`, form)).status).toBe(415);
+    expect((await token(base, { grant_type: "nope" })).status).toBe(400);
+  });
+
+  it("gives a code to only one of two overlapping approvals of the same request", async () => {
+    const { base } = await start();
+    await signUp(base, "sub-sam|sam@x.com|Sam");
+    const clientId = await registerClient(base);
+    const requestId = requestIdFrom(await authorize(base, clientId, pkce().challenge));
+
+    const [first, second] = await Promise.all([approve(base, requestId, "sub-sam|sam@x.com|Sam"), approve(base, requestId, "sub-sam|sam@x.com|Sam")]);
+    expect([first.status, second.status].sort()).toEqual([200, 404]);
+  });
+
+  it("counts failed token attempts per client, so one client's failures do not lock out another sharing its address", async () => {
+    const { base } = await start();
+    const noisy = await registerClient(base);
+    const quiet = await registerClient(base);
+    const bad = { grant_type: "refresh_token", refresh_token: "nope" };
+
+    let last = 0;
+    for (let i = 0; i < 31; i += 1) {
+      last = (await token(base, { ...bad, client_id: noisy })).status;
+    }
+    expect(last).toBe(429);
+    expect((await token(base, { ...bad, client_id: quiet })).status).toBe(400);
+  });
+});
+
 describe("OAuthStore", () => {
   function store(clock: { now: number }, path = join(tempDir(), "oauth.json")) {
     return { path, store: new OAuthStore(path, CLAUDE_REDIRECT_URIS, () => clock.now) };
@@ -370,10 +426,60 @@ describe("OAuthStore", () => {
 
   it("refuses to register more clients than it will remember when all are in use", () => {
     const clock = { now: 1_000_000 };
-    const { store: oauth } = store(clock);
-    for (let i = 0; i < 100; i += 1) {
+    const oauth = new OAuthStore(join(tempDir(), "oauth.json"), CLAUDE_REDIRECT_URIS, () => clock.now, { maxClients: 5 });
+    for (let i = 0; i < 5; i += 1) {
       grantFor(oauth, "duo-a");
     }
     expect(() => oauth.registerClient({ clientName: "One more", redirectUris: [REDIRECT] })).toThrow(/Too many/);
+  });
+
+  it("forgets grants whose refresh token has lapsed, so their clients stop blocking new ones", () => {
+    const clock = { now: 1_000_000 };
+    const oauth = new OAuthStore(join(tempDir(), "oauth.json"), CLAUDE_REDIRECT_URIS, () => clock.now, { maxClients: 3 });
+    for (let i = 0; i < 3; i += 1) {
+      grantFor(oauth, "duo-a");
+    }
+    expect(oauth.connections("duo-a")).toHaveLength(3);
+    expect(() => oauth.registerClient({ clientName: "Blocked", redirectUris: [REDIRECT] })).toThrow(/Too many/);
+
+    clock.now += 31 * 24 * 60 * 60_000;
+    expect(() => oauth.registerClient({ clientName: "Fits now", redirectUris: [REDIRECT] })).not.toThrow();
+    expect(oauth.connections("duo-a")).toEqual([]);
+  });
+
+  it("does not forget a client that has only just registered to make room for another", () => {
+    const clock = { now: 1_000_000 };
+    const oauth = new OAuthStore(join(tempDir(), "oauth.json"), CLAUDE_REDIRECT_URIS, () => clock.now, { maxClients: 2 });
+    const first = oauth.registerClient({ clientName: "First", redirectUris: [REDIRECT] });
+    oauth.registerClient({ clientName: "Second", redirectUris: [REDIRECT] });
+    expect(() => oauth.registerClient({ clientName: "Third", redirectUris: [REDIRECT] })).toThrow(/Too many/);
+    expect(oauth.getClient(first.id)).toBeDefined();
+
+    clock.now += 61 * 60_000;
+    oauth.registerClient({ clientName: "Third", redirectUris: [REDIRECT] });
+    expect(oauth.getClient(first.id)).toBeUndefined();
+  });
+
+  it("caps sign-ins waiting on an owner", () => {
+    const clock = { now: 1_000_000 };
+    const oauth = new OAuthStore(join(tempDir(), "oauth.json"), CLAUDE_REDIRECT_URIS, () => clock.now, { maxPendingRequests: 3 });
+    const client = oauth.registerClient({ clientName: "Claude", redirectUris: [REDIRECT] });
+    const begin = () => oauth.beginAuthorization({ client, redirectUri: REDIRECT, state: undefined, codeChallenge: pkce().challenge });
+    begin();
+    begin();
+    begin();
+    expect(begin).toThrow(/Too many sign-ins/);
+    clock.now += 11 * 60_000;
+    expect(begin).not.toThrow();
+  });
+
+  it("sets a damaged file aside and starts empty rather than stopping the daemon", async () => {
+    const { writeFileSync, existsSync } = await import("node:fs");
+    const path = join(tempDir(), "oauth.json");
+    writeFileSync(path, "{ this is not json");
+    const oauth = new OAuthStore(path, CLAUDE_REDIRECT_URIS);
+    expect(oauth.connections("duo-a")).toEqual([]);
+    expect(existsSync(`${path}.corrupt`)).toBe(true);
+    expect(() => oauth.registerClient({ clientName: "Claude", redirectUris: [REDIRECT] })).not.toThrow();
   });
 });

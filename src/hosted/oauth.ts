@@ -20,7 +20,7 @@ import { dirname } from "node:path";
 export class OAuthError extends Error {
   constructor(
     /** The RFC 6749 error code the token and registration endpoints answer with. */
-    readonly code: "invalid_request" | "invalid_client" | "invalid_grant" | "invalid_redirect_uri" | "invalid_client_metadata",
+    readonly code: "invalid_request" | "invalid_client" | "invalid_grant" | "invalid_redirect_uri" | "invalid_client_metadata" | "temporarily_unavailable",
     message: string,
   ) {
     super(message);
@@ -36,7 +36,11 @@ const REQUEST_TTL_MS = 10 * 60_000;
 const ACCESS_TTL_MS = 60 * 60_000;
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60_000;
 /** Registration is open to anyone (that is how Claude connects), so the number of remembered clients is capped. */
-const MAX_CLIENTS = 100;
+const MAX_CLIENTS = 1000;
+/** A client is only ever forgotten to make room once it has sat unused this long: Claude registers and then authorizes within moments. */
+const UNUSED_CLIENT_GRACE_MS = 60 * 60_000;
+/** Sign-ins waiting on an owner are held in memory, and starting one needs no sign-in, so they are capped. */
+const MAX_PENDING_REQUESTS = 1000;
 const MAX_REDIRECT_URIS_PER_CLIENT = 5;
 const MAX_CLIENT_NAME_LENGTH = 80;
 const PKCE_VERIFIER = /^[A-Za-z0-9\-._~]{43,128}$/;
@@ -121,12 +125,45 @@ export class OAuthStore {
   private readonly requests = new Map<string, PendingAuthorization>();
   private readonly codes = new Map<string, AuthorizationCode>();
 
+  private readonly maxClients: number;
+  private readonly maxPendingRequests: number;
+
   constructor(
     private readonly path: string,
     private readonly allowedRedirectUris: readonly string[] = CLAUDE_REDIRECT_URIS,
     private readonly now: () => number = Date.now,
+    limits: { maxClients?: number; maxPendingRequests?: number } = {},
   ) {
-    this.data = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as OAuthFile) : { clients: [], grants: [] };
+    this.maxClients = limits.maxClients ?? MAX_CLIENTS;
+    this.maxPendingRequests = limits.maxPendingRequests ?? MAX_PENDING_REQUESTS;
+    this.data = this.load();
+  }
+
+  /**
+   * A damaged file must not stop the hosted daemon at boot, and everything in it can be recovered by connecting
+   * again: it is set aside as `.corrupt` and the store starts empty, which signs connectors out and nothing else.
+   */
+  private load(): OAuthFile {
+    if (!existsSync(this.path)) {
+      return { clients: [], grants: [] };
+    }
+    try {
+      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as Partial<OAuthFile>;
+      return { clients: Array.isArray(parsed.clients) ? parsed.clients : [], grants: Array.isArray(parsed.grants) ? parsed.grants : [] };
+    } catch {
+      renameSync(this.path, `${this.path}.corrupt`);
+      return { clients: [], grants: [] };
+    }
+  }
+
+  /** Forgets grants whose refresh token has lapsed: they can never be used again, and would otherwise pin their client forever. */
+  private dropExpiredGrants(): void {
+    const now = this.now();
+    const live = this.data.grants.filter((grant) => grant.refreshExpiresAt > now);
+    if (live.length !== this.data.grants.length) {
+      this.data.grants = live;
+      this.persist();
+    }
   }
 
   private persist(): void {
@@ -146,9 +183,11 @@ export class OAuthStore {
     if (refused !== undefined) {
       throw new OAuthError("invalid_redirect_uri", "That redirect address isn't one this server sends people back to.");
     }
-    if (this.data.clients.length >= MAX_CLIENTS) {
+    this.dropExpiredGrants();
+    if (this.data.clients.length >= this.maxClients) {
       const inUse = new Set(this.data.grants.map((grant) => grant.clientId));
-      const oldestUnused = this.data.clients.find((existing) => !inUse.has(existing.id));
+      const settled = this.now() - UNUSED_CLIENT_GRACE_MS;
+      const oldestUnused = this.data.clients.find((existing) => !inUse.has(existing.id) && Date.parse(existing.createdAt) <= settled);
       if (!oldestUnused) {
         throw new OAuthError("invalid_client_metadata", "Too many clients are registered on this server.");
       }
@@ -173,6 +212,9 @@ export class OAuthStore {
   /** Remembers a validated authorization request; the owner is sent to sign in against the returned id. */
   beginAuthorization(input: { client: OAuthClient; redirectUri: string; state: string | undefined; codeChallenge: string }): PendingAuthorization {
     this.sweep();
+    if (this.requests.size >= this.maxPendingRequests) {
+      throw new OAuthError("temporarily_unavailable", "Too many sign-ins are waiting; try again shortly.");
+    }
     const pending: PendingAuthorization = {
       id: newSecret(),
       clientId: input.client.id,
@@ -286,6 +328,7 @@ export class OAuthStore {
   }
 
   connections(duoId: string): Connection[] {
+    this.dropExpiredGrants();
     return this.data.grants
       .filter((grant) => grant.duoId === duoId)
       .map((grant) => ({ id: grant.id, clientName: grant.clientName, createdAt: grant.createdAt, lastUsedAt: grant.lastUsedAt }));
