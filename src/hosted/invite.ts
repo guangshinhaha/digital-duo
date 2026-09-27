@@ -1,4 +1,5 @@
-import type { HostedOrgSummary, OrgMember } from "./orgs.js";
+import type { OrgMemberView } from "./org-admin.js";
+import type { HostedOrgSummary } from "./orgs.js";
 import { hostedSettingsFrom } from "./server.js";
 
 /**
@@ -95,6 +96,34 @@ export function runHostedOrgRename(orgId: string, name: string, env: NodeJS.Proc
 }
 
 /** Implements `duo hosted org members <id>`. */
-export function runHostedOrgMembers(orgId: string, env: NodeJS.ProcessEnv = process.env): Promise<Array<OrgMember & { isAdmin: boolean }>> {
+export function runHostedOrgMembers(orgId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgMemberView[]> {
   return callDaemon(env, "GET", `/hosted/orgs/${encodeURIComponent(orgId)}/members`);
+}
+
+/** One line of `duo hosted org members`: id, name, email, then the role marks (`super admin`, or `org admin` with who appointed them and when). */
+export function formatOrgMemberLine(member: OrgMemberView): string {
+  const marks: string[] = [];
+  if (member.superAdmin) {
+    marks.push("super admin");
+  }
+  if (member.orgRole === "org_admin") {
+    marks.push(`org admin (appointed by ${member.appointedByName ?? member.appointedBy ?? "unknown"}${member.appointedAt ? ` on ${member.appointedAt.slice(0, 10)}` : ""})`);
+  }
+  return [member.duoId, member.name, member.email ?? "-", ...marks].join("\t");
+}
+
+export interface OrgAdminChange {
+  member: OrgMemberView;
+  /** False when the duo already had (grant) or already lacked (revoke) the role: nothing was written. */
+  changed: boolean;
+}
+
+/** Implements `duo hosted org admin grant <orgId> <duoId>`: appoints a member as their org's admin, as the super admin. */
+export function runHostedOrgAdminGrant(orgId: string, duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgAdminChange> {
+  return callDaemon(env, "POST", `/hosted/orgs/${encodeURIComponent(orgId)}/admins/${encodeURIComponent(duoId)}/grant`, {});
+}
+
+/** Implements `duo hosted org admin revoke <orgId> <duoId>`: as the super admin, so it may revoke an org's last org admin. */
+export function runHostedOrgAdminRevoke(orgId: string, duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgAdminChange> {
+  return callDaemon(env, "POST", `/hosted/orgs/${encodeURIComponent(orgId)}/admins/${encodeURIComponent(duoId)}/revoke`, {});
 }

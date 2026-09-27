@@ -82,9 +82,12 @@
   duo, and every `POST /hosted/login` refreshes that email from the verified Google identity.
   The privilege still follows an address, not a person: if an admin address is reassigned to
   someone else, revoke the old account's devices (its duo's device list) as well as editing the
-  list. Org-admin routes answer 401 with no credential and 403 for any other caller (a garbage
-  or revoked token is a 403 too). Org admins who are not the super admin, and deleting an org,
-  are out of scope (follow-ups).
+  list. The super admin routes (`/hosted/orgs*` and the rest of `/hosted/*`) answer 401 with no
+  credential and 403 for any other caller (a garbage or revoked token is a 403 too, on `/hosted/*`
+  only). Every `/hosted/*` route stays super admin only: an org admin's device gets the same 403 as
+  a member's. Org admins (#254, below) use the own-org routes inside their duo instead (`<basePath>/org*`),
+  which are per-duo device-token routes: a missing, bad or revoked token there is a 401.
+  Deleting an org is out of scope (a follow-up).
 - **Org ids are lowercase letters and digits only.** They are embedded in Matrix account names
   (`@<orgId>.<handle>:<server>`, split on the first dot), which are permanent. The registry
   refuses to load a file with any other org id, and never generates one. Org names are
@@ -108,11 +111,42 @@ Routes (all super admin only; POST for rename because CORS allows only GET and P
 |---|---|
 | `GET /hosted/orgs` | `[{ id, name, createdAt, memberCount }]` |
 | `POST /hosted/orgs` `{ name }` | create; 201, 400 on a bad name, 409 if the name is taken |
-| `POST /hosted/orgs/:orgId/rename` `{ name }` | rename; 404 for an unknown org |
-| `GET /hosted/orgs/:orgId/members` | `[{ duoId, name, email, isRoot, joinedAt, isAdmin }]` |
+| `POST /hosted/orgs/:orgId/rename` `{ name }` | rename; 404 for an unknown org, 409 `org_name_taken` if another org has the name |
+| `GET /hosted/orgs/:orgId/members` | `[{ duoId, name, email, isRoot, joinedAt, isAdmin, superAdmin, orgRole, appointedBy, appointedByName, appointedAt, orgAdminLog }]` |
+| `POST /hosted/orgs/:orgId/admins/:duoId/grant` | appoint a member as org admin, as `super-admin`; `{ member, changed }` |
+| `POST /hosted/orgs/:orgId/admins/:duoId/revoke` | revoke the role, and may revoke the org's last org admin; `{ member, changed }`. Revoking a member who holds no role is 200 `changed: false`; revoking `root` is 409 `root_not_appointable`, as granting it is |
 | `POST /hosted/invites` `{ name, orgId?, email?, expiresInHours? }` | as before, plus the org |
 
-`duoId` is the tenant id, or `root` for the pre-hosted root duo.
+`duoId` is the tenant id, or `root` for the pre-hosted root duo. `isAdmin` and `superAdmin` are the same
+fact (the super admin, from the env); `orgRole` is `member` or `org_admin`.
+
+### Org admins (#254)
+
+A member can be made org admin of their own org by the super admin or another org admin
+(`docs/deploy/hosted-workspace.md` §7 has the model: roles, the last-admin rule, the audit list).
+`POST /hosted/login` and `/hosted/signup` keep `isAdmin` (the super admin) and gain
+`orgRole: "member" | "org_admin"`. An org admin's app calls routes inside its own duo, under the
+duo's `basePath` (`/t/<id>`, or empty for the root duo), with the duo's device token:
+
+| Route (under `<basePath>`) | Who | What |
+|---|---|---|
+| `GET /org` | any signed-in member | `{ org: { id, name }, role, superAdmin }`: how the app learns and refreshes its role |
+| `GET /org/members` | org admin | the org's members, as the super admin's list above |
+| `GET /org/invites` | org admin | `[{ id, name, email, orgId, createdAt, expiresAt }]`, this org's pending invites only |
+| `POST /org/invites` `{ name, email?, expiresInHours? }` | org admin | 201 `{ id, name, email, orgId, expiresAt, code, link }`; always this org. `name` at most 80 characters (400 beyond); 409 `too_many_invites` when the org already has 50 unused, unexpired invites (expired ones are dropped as a new one is made) |
+| `POST /org/rename` `{ name }` | org admin | `{ org: { id, name } }`; also renames the org's Space. A name another org has is the generic 409 `name_unavailable` |
+| `POST /org/admins/:duoId/grant` | org admin | `{ member, changed }`; idempotent |
+| `POST /org/admins/:duoId/revoke` | org admin | `{ member, changed }`; 409 `last_org_admin` for the last one |
+
+Errors: 401 no or bad device token (also an ask link or a connector token: these routes take a
+device token only); 403 `forbidden` for everything that is not the caller's to do (one body); 404
+`not_found` for a `:duoId` that is not in the caller's org; 409 `last_org_admin`,
+`root_not_appointable` (granting or revoking `root`), `super_admin_protected` (an org admin acting on
+another super admin), `name_unavailable`, `too_many_invites`; 400 `bad_request`. The super admin's own
+routes above keep the specific `org_name_taken` and have no invite cap. `org_name_taken` is never sent
+to an org admin, who sees no other org's name.
+The routes exist only in hosted mode (`ServeDeps.orgAdmin`, bound to one duo in
+`src/hosted/server.ts`; the logic is `src/hosted/org-admin.ts`).
 
 Code that needs org membership imports from `src/hosted/registry.ts` (`HostedRegistry`, reachable
 as `hosted.registry`) and `src/hosted/orgs.ts` (types and constants):
@@ -436,7 +470,9 @@ Sam opens the link, types his name, and lands in onboarding with his own duo.
 duo hosted org create "Platform team"          # prints the new org's id
 duo hosted org list                            # id, name, member count
 duo hosted org rename <id> "Platform"
-duo hosted org members <id>
+duo hosted org members <id>                    # role marks: super admin, org admin (who appointed, when)
+duo hosted org admin grant <orgId> <duoId>     # appoint an org admin (super admin power)
+duo hosted org admin revoke <orgId> <duoId>    # revoke one, even an org's last
 duo hosted invite "Kim" --org <id>             # without --org: the default org
 ```
 

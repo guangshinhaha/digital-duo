@@ -6,15 +6,22 @@ import {
   assertOrgId,
   DEFAULT_ORG_ID,
   DEFAULT_ORG_NAME,
+  LastOrgAdminError,
   normalizeOrgName,
+  ORG_ADMIN_LOG_CAP,
+  OrgMemberNotFoundError,
   OrgNameTakenError,
   OrgNotFoundError,
   REGISTRY_VERSION,
   RegistryVersionError,
   ROOT_DUO_ID,
+  RootNotAppointableError,
   type HostedOrg,
   type HostedOrgSummary,
+  type OrgAdminGrant,
+  type OrgAdminLogEntry,
   type OrgMember,
+  type OrgRole,
 } from "./orgs.js";
 
 /**
@@ -93,6 +100,14 @@ export interface HostedTenant {
   readonly isAdmin?: boolean;
   /** The one org this duo belongs to. */
   readonly orgId: string;
+  /**
+   * Set while this duo is an org admin of `orgId` (#254): when and by whom. Absent means a plain member. Not `isAdmin`,
+   * which records the super admin at sign-up; this is a role inside one org. An optional addition to a v2 registry with no
+   * version bump: an older build reads the file, ignores the field and writes it back untouched (it spreads tenants).
+   */
+  readonly orgAdmin?: OrgAdminGrant;
+  /** Every appoint and revoke of this duo, oldest first, capped at `ORG_ADMIN_LOG_CAP`. Survives a revoke, so the history does. */
+  readonly orgAdminLog?: readonly OrgAdminLogEntry[];
   /** Set once the duo's Matrix accounts exist (#232). Absent means not provisioned yet. */
   readonly matrix?: HostedMatrixAccounts;
   /** Set while provisioning is owed and failing, so an outage is visible and retried. */
@@ -180,6 +195,11 @@ export function migrateRegistryFile(raw: unknown, now = new Date().toISOString()
       rootOrgId: file.rootOrgId ?? DEFAULT_ORG_ID,
     },
   };
+}
+
+/** Appends to a duo's history and keeps the latest `ORG_ADMIN_LOG_CAP`. */
+function appendLog(log: readonly OrgAdminLogEntry[] | undefined, entry: OrgAdminLogEntry): OrgAdminLogEntry[] {
+  return [...(log ?? []), entry].slice(-ORG_ADMIN_LOG_CAP);
 }
 
 export class InviteInvalidError extends Error {
@@ -343,14 +363,121 @@ export class HostedRegistry {
     }
     const members: OrgMember[] = [];
     if (this.data.rootDuo && this.data.rootOrgId === orgId) {
-      members.push({ duoId: ROOT_DUO_ID, name: this.data.rootDuo.name, email: this.data.root?.email ?? null, isRoot: true, joinedAt: null });
+      members.push({
+        duoId: ROOT_DUO_ID,
+        name: this.data.rootDuo.name,
+        email: this.data.root?.email ?? null,
+        isRoot: true,
+        joinedAt: null,
+        orgRole: "member",
+        orgAdmin: null,
+        orgAdminLog: [],
+      });
     }
     for (const tenant of this.data.tenants) {
       if (tenant.orgId === orgId) {
-        members.push({ duoId: tenant.id, name: tenant.name, email: tenant.email ?? null, isRoot: false, joinedAt: tenant.createdAt });
+        members.push({
+          duoId: tenant.id,
+          name: tenant.name,
+          email: tenant.email ?? null,
+          isRoot: false,
+          joinedAt: tenant.createdAt,
+          orgRole: tenant.orgAdmin ? "org_admin" : "member",
+          orgAdmin: tenant.orgAdmin ?? null,
+          orgAdminLog: tenant.orgAdminLog ?? [],
+        });
       }
     }
     return members;
+  }
+
+  /** A duo's role in its org. Unknown ids and the root duo are plain members. */
+  orgRoleOf(duoId: string): OrgRole {
+    return this.data.tenants.find((tenant) => tenant.id === duoId)?.orgAdmin ? "org_admin" : "member";
+  }
+
+  /** How many duos hold the org admin role in an org. */
+  orgAdminCount(orgId: string): number {
+    return this.data.tenants.filter((tenant) => tenant.orgId === orgId && tenant.orgAdmin).length;
+  }
+
+  /**
+   * Appoints a member of `orgId` as its org admin, recording who (`by`: `SUPER_ADMIN_ACTOR` or the appointing duo's id) and when.
+   * Idempotent: appointing an org admin changes nothing (the first appointment and its date stand) and writes nothing.
+   * A duo that is not in this org, or does not exist, is `OrgMemberNotFoundError` either way; the root duo cannot be appointed.
+   * Whether the target is the super admin is decided from the emails in force, which only the server knows, so it checks that first.
+   */
+  grantOrgAdmin(orgId: string, duoId: string, by: string): { member: OrgMember; changed: boolean } {
+    const tenant = this.tenantInOrg(orgId, duoId);
+    if (tenant.orgAdmin) {
+      return { member: this.memberOf(orgId, duoId), changed: false };
+    }
+    const at = new Date().toISOString();
+    this.commit((draft) => {
+      draft.tenants = draft.tenants.map((candidate) =>
+        candidate.id === duoId ? { ...candidate, orgAdmin: { since: at, by }, orgAdminLog: appendLog(candidate.orgAdminLog, { at, action: "grant", by }) } : candidate,
+      );
+    });
+    return { member: this.memberOf(orgId, duoId), changed: true };
+  }
+
+  /**
+   * Takes the org admin role from a member of `orgId` and keeps them as a member, recording who did it and when. Revoking a duo that
+   * holds no role changes nothing; the root duo is refused (`RootNotAppointableError`) as it is when appointed. Unless `allowLast` (only the super admin's routes pass it), the last org admin of an org cannot be
+   * revoked: `LastOrgAdminError`, and nothing changes. The whole check-and-write is synchronous, so two admins revoking each other
+   * at once run one after the other and the second finds itself the last.
+   */
+  revokeOrgAdmin(orgId: string, duoId: string, by: string, options: { allowLast: boolean }): { member: OrgMember; changed: boolean } {
+    // The root duo never holds the role, so revoking it is refused exactly as appointing it is (`RootNotAppointableError`, from `tenantInOrg`).
+    const tenant = this.tenantInOrg(orgId, duoId);
+    if (!tenant.orgAdmin) {
+      return { member: this.memberOf(orgId, duoId), changed: false };
+    }
+    if (!options.allowLast && this.orgAdminCount(orgId) <= 1) {
+      throw new LastOrgAdminError();
+    }
+    const at = new Date().toISOString();
+    this.commit((draft) => {
+      draft.tenants = draft.tenants.map((candidate) => {
+        if (candidate.id !== duoId) {
+          return candidate;
+        }
+        const { orgAdmin: _revoked, ...rest } = candidate;
+        return { ...rest, orgAdminLog: appendLog(candidate.orgAdminLog, { at, action: "revoke", by }) };
+      });
+    });
+    return { member: this.memberOf(orgId, duoId), changed: true };
+  }
+
+  private rootIn(orgId: string): boolean {
+    return this.data.rootDuo != null && this.data.rootOrgId === orgId;
+  }
+
+  private requireOrg(orgId: string): void {
+    if (!this.org(orgId)) {
+      throw new OrgNotFoundError(orgId);
+    }
+  }
+
+  /** The tenant `duoId` if it is in `orgId`; the root duo, an unknown id and another org's duo are all the same refusal. */
+  private tenantInOrg(orgId: string, duoId: string): HostedTenant {
+    this.requireOrg(orgId);
+    if (duoId === ROOT_DUO_ID && this.rootIn(orgId)) {
+      throw new RootNotAppointableError();
+    }
+    const tenant = this.data.tenants.find((candidate) => candidate.id === duoId && candidate.orgId === orgId);
+    if (!tenant) {
+      throw new OrgMemberNotFoundError();
+    }
+    return tenant;
+  }
+
+  private memberOf(orgId: string, duoId: string): OrgMember {
+    const member = this.listOrgMembers(orgId).find((candidate) => candidate.duoId === duoId);
+    if (!member) {
+      throw new OrgMemberNotFoundError();
+    }
+    return member;
   }
 
   private assertOrgNameFree(name: string, exceptOrgId?: string): void {
@@ -533,6 +660,7 @@ export class HostedRegistry {
     expiresAt: string,
     email: string | null = null,
     orgId: string = DEFAULT_ORG_ID,
+    options: { pruneExpired?: boolean } = {},
   ): { invite: HostedInvite; code: string } {
     if (!this.org(orgId)) {
       throw new OrgNotFoundError(orgId);
@@ -550,6 +678,11 @@ export class HostedRegistry {
       orgId,
     };
     this.commit((draft) => {
+      if (options.pruneExpired) {
+        // In the same write: this org's unused invites that have lapsed can no longer be redeemed, so they are dead weight.
+        const now = Date.now();
+        draft.invites = draft.invites.filter((candidate) => candidate.orgId !== orgId || candidate.usedAt !== null || Date.parse(candidate.expiresAt) > now);
+      }
       draft.invites.push(invite);
     });
     return { invite, code };

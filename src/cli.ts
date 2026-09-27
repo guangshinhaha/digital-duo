@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedOrgAdminGrant, runHostedOrgAdminRevoke, formatOrgMemberLine, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runConnectorNew, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -245,12 +245,38 @@ hostedOrgCommand
 
 hostedOrgCommand
   .command("members <id>")
-  .description("List the duos in an org")
+  .description("List the duos in an org, with their role: super admin, org admin (and who appointed them) or member")
   .action(async (id: string) => {
     try {
       for (const member of await runHostedOrgMembers(id)) {
-        console.log(`${member.duoId}\t${member.name}\t${member.email ?? "-"}${member.isAdmin ? "\tadmin" : ""}`);
+        console.log(formatOrgMemberLine(member));
       }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const hostedOrgAdminCommand = hostedOrgCommand.command("admin").description("Org admins: members who manage their own org (appointed by the super admin or another org admin)");
+
+hostedOrgAdminCommand
+  .command("grant <orgId> <duoId>")
+  .description("Appoint a member of the org as its org admin (find duo ids with `duo hosted org members <orgId>`)")
+  .action(async (orgId: string, duoId: string) => {
+    try {
+      const { member, changed } = await runHostedOrgAdminGrant(orgId, duoId);
+      console.log(changed ? `${member.name} (${member.duoId}) is now an org admin of ${orgId}.` : `${member.name} (${member.duoId}) was already an org admin of ${orgId}; nothing changed.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedOrgAdminCommand
+  .command("revoke <orgId> <duoId>")
+  .description("Take the org admin role from a member (they stay a member). As the super admin this may revoke an org's last org admin")
+  .action(async (orgId: string, duoId: string) => {
+    try {
+      const { member, changed } = await runHostedOrgAdminRevoke(orgId, duoId);
+      console.log(changed ? `${member.name} (${member.duoId}) is no longer an org admin of ${orgId}.` : `${member.name} (${member.duoId}) was not an org admin of ${orgId}; nothing changed.`);
     } catch (error) {
       reportError(error);
     }
