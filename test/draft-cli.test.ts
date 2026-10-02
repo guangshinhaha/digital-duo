@@ -94,6 +94,21 @@ describe("duo draft-outcome — the outcome of a draft is recorded (#32 AC3)", (
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toMatch(/not-a-real-id/);
   });
+
+  it("refuses to record a second outcome on an already-settled draft, naming what it has (#262)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    await initStore(storePath, tempDir());
+    const draftResult = await runCli(["draft", "what is the meaning of life"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    const idMatch = /draft id ([\w-]+)/.exec(draftResult.stderr);
+    const draftId = idMatch![1];
+
+    const first = await runCli(["draft-outcome", draftId, "discarded"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(first.exitCode).toBe(0);
+
+    const second = await runCli(["draft-outcome", draftId, "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath } });
+    expect(second.exitCode).not.toBe(0);
+    expect(second.stderr).toMatch(/already recorded as "discarded"/);
+  });
 });
 
 describe("duo draft-outcome sent — the CLI reaches the same delivery seam as the daemon (#170)", () => {
@@ -122,6 +137,32 @@ describe("duo draft-outcome sent — the CLI reaches the same delivery seam as t
     if (draft?.delivery?.state === "failed") {
       expect(draft.delivery.reason).toContain("slack");
     }
+  });
+
+  it("running `duo draft-outcome sent` again after a failed delivery is a retry, not a second disposition — it is not refused (#262)", async () => {
+    const storePath = join(tempDir(), "data", "duo.db");
+    createEncryptedStore(storePath, PASSPHRASE);
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I get deploy access?",
+      threadContext: null,
+      draftText: "point them at the runbook",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "slack", askerRef: "directory.json#sam", threadId: null, permalink: null },
+    });
+
+    const first = await runCli(["draft-outcome", draftId, "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } });
+    expect(first.exitCode).toBe(0);
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toMatchObject({ state: "failed" });
+
+    // The CLI process never has a connected adapter, so this retry fails to
+    // deliver again too — the point is only that it is *allowed to try*,
+    // rather than refused as an already-settled draft.
+    const retry = await runCli(["draft-outcome", draftId, "sent"], { cwd: tempDir(), env: { DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE } });
+    expect(retry.exitCode).toBe(0);
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toMatchObject({ state: "failed" });
   });
 
   it("an owner draft sent from the CLI records no delivery at all", async () => {

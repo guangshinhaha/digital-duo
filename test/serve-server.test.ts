@@ -1368,6 +1368,81 @@ describe("POST /drafts/:id/outcome — delivery through the origin channel (#170
     expect(body.delivery).toEqual({ state: "failed", reason: "Slack API returned 500" });
   });
 
+  it("refuses a second outcome on an already-settled draft with 409, naming the existing outcome, and delivers nothing a second time (#262)", async () => {
+    const draftId = appendChannelDraft();
+    const first = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent" },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(requests).toHaveLength(1);
+
+    const second = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "edited", sentText: "a different answer entirely" },
+    });
+    expect(second.statusCode).toBe(409);
+    expect(second.json().error.message).toMatch(/already recorded as "sent"/);
+
+    // Nothing changed and nothing was delivered a second time.
+    expect(requests).toHaveLength(1);
+    const fetched = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    const body = fetched.json();
+    expect(body.outcome).toBe("sent");
+    expect(body.sentText).toBeNull();
+  });
+
+  it("a retry after a FAILED delivery is not blocked by the settled-draft guard, and can still deliver (#262)", async () => {
+    const draftId = appendChannelDraft();
+    adapters[0] = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver() {
+        throw new Error("Slack API returned 500");
+      },
+    };
+
+    const first = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent" },
+    });
+    expect(first.statusCode).toBe(200);
+    const afterFirst = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(afterFirst.json().delivery).toEqual({ state: "failed", reason: "Slack API returned 500" });
+
+    // The adapter is fixed and the same outcome is recorded again — a retry,
+    // not a second disposition — and it is not refused as already settled.
+    adapters[0] = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver(request) {
+        requests.push(request);
+      },
+    };
+    const retry = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent" },
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(requests).toHaveLength(1);
+    const afterRetry = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(afterRetry.json().delivery).toEqual({ state: "delivered" });
+  });
+
   it("an owner-asked draft records no delivery — nothing was handed off, and the route says nothing about channels", async () => {
     const draftId = appendDraft(storePath, PASSPHRASE, {
       question: "what do I think about X?",
