@@ -286,6 +286,30 @@ export class DraftNotFoundError extends Error {
 }
 
 /**
+ * Thrown by `recordOutcomeAndDeliver` (`drafting/delivery.ts`) for a draft
+ * that already has an outcome (#262). Recording a second outcome on a
+ * settled draft would also hand `sent`/`edited` text to the draft's origin
+ * channel a second time — `POST /drafts/:id/outcome` and `duo draft-outcome`
+ * both route through `recordOutcomeAndDeliver`, so refusing there, before
+ * anything is written or delivered, protects both surfaces at once. Named
+ * the same way the MCP tools' own settled-draft guard (#260,
+ * `serve/mcp-tools.ts`'s `settleDraft`) already reads it, for a consistent
+ * message across every surface that can record an outcome.
+ *
+ * Deliberately not thrown from `recordDraftOutcome` itself: that function is
+ * also how the calibration eval (`derivation/calibration.ts`) re-judges an
+ * item, which is expected to overwrite a prior judgement's outcome freely
+ * and never goes near a channel — guarding it there would break that
+ * legitimate re-judging flow for a case delivery can never reach.
+ */
+export class DraftAlreadySettledError extends Error {
+  constructor(draftId: string, outcome: DraftOutcome) {
+    super(`Draft "${draftId}" was already recorded as "${outcome}" — refusing to record a second outcome, so nothing was delivered again.`);
+    this.name = "DraftAlreadySettledError";
+  }
+}
+
+/**
  * Records the owner's disposition of a draft — sent, edited, or discarded
  * (#32 AC3) — against its own row, for the correction loop and the eval to
  * both read later. `sentText` is optional (existing callers that only

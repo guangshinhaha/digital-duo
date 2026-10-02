@@ -183,6 +183,69 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     expect(draft?.delivery).toEqual({ state: "failed", reason: "Slack API returned 500" });
   });
 
+  it("refuses a second outcome on an already-settled draft, naming the outcome it has, and delivers nothing again (#262)", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+    const requests: ChannelDeliveryRequest[] = [];
+    const slack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver(request) {
+        requests.push(request);
+      },
+    };
+
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { channelAdapters: [slack] });
+    expect(requests).toHaveLength(1);
+
+    await expect(
+      recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "edited", "a different answer entirely", { channelAdapters: [slack] }),
+    ).rejects.toThrow(/already recorded as "sent"/);
+
+    // Nothing was changed and nothing was delivered a second time.
+    expect(requests).toHaveLength(1);
+    const draft = getDraft(storePath, PASSPHRASE, draftId);
+    expect(draft?.outcome).toBe("sent");
+    expect(draft?.sentText).toBeNull();
+  });
+
+  it("a retry after a FAILED delivery is not refused as already settled, and can still deliver (#262)", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+    const requests: ChannelDeliveryRequest[] = [];
+    const failingSlack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver() {
+        throw new Error("Slack API returned 500");
+      },
+    };
+
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { channelAdapters: [failingSlack] });
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toEqual({ state: "failed", reason: "Slack API returned 500" });
+
+    const workingSlack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver(request) {
+        requests.push(request);
+      },
+    };
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { channelAdapters: [workingSlack] });
+
+    expect(requests).toHaveLength(1);
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toEqual({ state: "delivered" });
+  });
+
   it("a failed delivery costs nothing on the correction side either: the candidate queued before delivery still stands", async () => {
     const storePath = initStore();
     const draftId = appendChannelDraft(storePath, "alpha beta gamma delta");

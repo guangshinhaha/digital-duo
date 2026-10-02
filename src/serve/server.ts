@@ -245,6 +245,11 @@ function statusForError(error: Error): number {
     // rule is a conflict the caller must resolve (supersedesRuleId), not a
     // server error.
     case "CandidateConflictError":
+    // #262: a second outcome recorded against a draft that already has
+    // one — refused by recordOutcomeAndDeliver before anything is written
+    // or delivered again, the same "already finalized" conflict as the
+    // rest of this family.
+    case "DraftAlreadySettledError":
       return 409;
     case "BlankEditError":
     // #172: a channel/thread mute key containing the "/" separator — the

@@ -1,7 +1,7 @@
 import type { EditClassifier, ClassifyAndQueueResult } from "../corrections/classify.js";
 import { recordDraftOutcomeAndClassify } from "../corrections/classify.js";
 import { isChannelMuted } from "./channel-mutes.js";
-import { getDraft, recordDeliveryOutcome, type DraftRecord, type SettableDraftOutcome } from "./draft-log.js";
+import { DraftAlreadySettledError, DraftNotFoundError, getDraft, recordDeliveryOutcome, type DraftRecord, type SettableDraftOutcome } from "./draft-log.js";
 
 /**
  * The delivery seam (#170): one channel-agnostic interface. Recording
@@ -96,8 +96,17 @@ export interface ChannelDeliveryRequest {
  * Delivery failures are recorded against the draft and never raised:
  * this function resolves with the classification result whatever
  * happened on the wire. Only the outcome-recording errors propagate
- * (unknown draft id, blank edit) — those mean nothing was recorded at
- * all, which the caller must see.
+ * (unknown draft id, blank edit, already settled) — those mean nothing was
+ * recorded at all, which the caller must see.
+ *
+ * A draft that already has an outcome is refused with `DraftAlreadySettledError`
+ * before anything is recorded or delivered (#262) — both `POST
+ * /drafts/:id/outcome` and `duo draft-outcome` call this function, so
+ * neither surface has to guard this itself, the same reasoning that already
+ * keeps delivery and the blank-edit check centralized here. The one
+ * exception is a retry after a FAILED delivery: `recordDeliveryOutcome`'s
+ * own doc comment already treats a re-sent draft as recording its latest
+ * attempt, so that retry is let through rather than blocked by this check.
  */
 export async function recordOutcomeAndDeliver(
   storePath: string,
@@ -107,6 +116,14 @@ export async function recordOutcomeAndDeliver(
   sentText: string | undefined,
   options: { readonly classifier?: EditClassifier; readonly channelAdapters?: readonly ChannelAdapter[] } = {},
 ): Promise<ClassifyAndQueueResult | undefined> {
+  const existing = getDraft(storePath, passphrase, draftId);
+  if (!existing) {
+    throw new DraftNotFoundError(draftId);
+  }
+  if (existing.outcome !== null && existing.delivery?.state !== "failed") {
+    throw new DraftAlreadySettledError(draftId, existing.outcome);
+  }
+
   const result = await recordDraftOutcomeAndClassify(storePath, passphrase, draftId, outcome, sentText, options.classifier);
 
   // Only sent/edited deliver — "discarded" means nothing was sent, and an
