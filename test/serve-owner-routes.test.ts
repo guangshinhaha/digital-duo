@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { strToU8, zipSync } from "fflate";
 import { describe, expect, it } from "vitest";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
@@ -12,6 +13,7 @@ import { writeTopicsFile } from "../src/derivation/topics.js";
 import { loadConfig } from "../src/config.js";
 import { DeriveJob } from "../src/serve/derive-job.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
+import { CLAUDE_EXPORT_ZIP_BODY_LIMIT } from "../src/serve/owner-routes.js";
 import { createAskToken, createDeviceToken, listDeviceTokens } from "../src/serve/tokens.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
@@ -57,6 +59,127 @@ describe("owner routes — the terminal-only commands, from the app", () => {
     const response = await app.inject({ method: "POST", url: "/corpus/import-claude", headers: auth, payload: { export: "not json" } });
     expect(response.statusCode).toBe(400);
     expect(response.json().error.code).toBe("malformed_export");
+  });
+
+  describe("POST /corpus/import-claude-zip (#239)", () => {
+    function zipOf(entries: Record<string, string>): Buffer {
+      const files: Record<string, Uint8Array> = {};
+      for (const [name, contents] of Object.entries(entries)) {
+        files[name] = strToU8(contents);
+      }
+      return Buffer.from(zipSync(files, { level: 0 }));
+    }
+
+    function conversationsExportJson(): string {
+      return readFileSync(join(__dirname, "fixtures", "claude-export-mixed.json"), "utf8");
+    }
+
+    it("imports the zip's conversations.json and reports the same summary shape `/corpus/import-claude` gives for the identical text", async () => {
+      const { app, auth } = setup();
+      const raw = conversationsExportJson();
+      const zip = zipOf({ "conversations.json": raw, "users.json": "{}" });
+
+      const zipResponse = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude-zip",
+        headers: { ...auth, "content-type": "application/zip" },
+        payload: zip,
+      });
+
+      expect(zipResponse.statusCode).toBe(200);
+      const zipBody = zipResponse.json();
+
+      // Cross-checked against the paste/JSON-body route's own parse of the
+      // identical conversations.json text, on the same fresh store: the zip
+      // route is only supposed to add unzipping in front of the same
+      // parse-and-ingest tail, so the two must land on the same numbers.
+      const pasteResponse = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude",
+        headers: auth,
+        payload: { export: raw },
+      });
+      const pasteBody = pasteResponse.json();
+
+      expect(zipBody.conversationCount).toBe(pasteBody.conversationCount);
+      expect(zipBody.workRelevantConversationCount).toBe(pasteBody.workRelevantConversationCount);
+      expect(zipBody.written).toBeGreaterThan(0);
+      // The zip import ran first, so the paste import of the same text sees
+      // every record already present.
+      expect(pasteBody.written).toBe(0);
+      expect(pasteBody.skipped).toBe(zipBody.written);
+    });
+
+    it("refuses a file that isn't a zip at all", async () => {
+      const { app, auth } = setup();
+      const response = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude-zip",
+        headers: { ...auth, "content-type": "application/zip" },
+        payload: Buffer.from("not a zip file, just plain bytes"),
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe("malformed_export");
+    });
+
+    it("refuses a zip with no conversations.json inside", async () => {
+      const { app, auth } = setup();
+      const zip = zipOf({ "users.json": "{}", "projects.json": "[]" });
+      const response = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude-zip",
+        headers: { ...auth, "content-type": "application/zip" },
+        payload: zip,
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe("malformed_export");
+      expect(response.json().error.message).toMatch(/conversations\.json/);
+    });
+
+    it("uploading the same zip again adds nothing", async () => {
+      const { app, auth } = setup();
+      const zip = zipOf({ "conversations.json": conversationsExportJson() });
+
+      const first = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude-zip",
+        headers: { ...auth, "content-type": "application/zip" },
+        payload: zip,
+      });
+      expect(first.statusCode).toBe(200);
+      const firstBody = first.json();
+      expect(firstBody.written).toBeGreaterThan(0);
+
+      const second = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude-zip",
+        headers: { ...auth, "content-type": "application/zip" },
+        payload: zip,
+      });
+      expect(second.statusCode).toBe(200);
+      const secondBody = second.json();
+      expect(secondBody.written).toBe(0);
+      expect(secondBody.skipped).toBe(firstBody.written);
+    });
+
+    it("refuses a zip over the size limit before parsing it, stating the limit", async () => {
+      const { app, auth } = setup();
+      // No valid zip needs to be constructed — the limit is enforced by
+      // Content-Length/streamed size before the body is ever parsed, so an
+      // oversized body of any bytes is refused the same way.
+      const oversized = Buffer.alloc(CLAUDE_EXPORT_ZIP_BODY_LIMIT + 1024);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/corpus/import-claude-zip",
+        headers: { ...auth, "content-type": "application/zip" },
+        payload: oversized,
+      });
+
+      expect(response.statusCode).toBe(413);
+      expect(response.json().error.code).toBe("zip_too_large");
+      expect(response.json().error.message).toMatch(/100MB/);
+    });
   });
 
   it("refuses a second derive while one is running", () => {
