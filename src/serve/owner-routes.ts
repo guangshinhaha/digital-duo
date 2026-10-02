@@ -1,6 +1,7 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyError, FastifyInstance, FastifyReply } from "fastify";
 import { appendActionAttempt, ensureActionAttemptLogSchema } from "../actions/attempt-log.js";
 import { readThreadMessages } from "../drafting/thread-history.js";
+import { extractConversationsJson } from "../ingest/adapters/claude-export-zip.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
 import { ingestRecords } from "../ingest/two-phase.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
@@ -34,6 +35,15 @@ import {
 
 /** A Claude export's conversations.json is routinely tens of MB — far past Fastify's 1 MiB default. */
 const CLAUDE_EXPORT_BODY_LIMIT = 200 * 1024 * 1024;
+/**
+ * #239: the zip an owner downloads straight from claude.ai. Smaller than
+ * {@link CLAUDE_EXPORT_BODY_LIMIT} (that one bounds the already-decompressed
+ * `conversations.json` text posted by the paste path) because a zip is
+ * compressed text plus a few sibling JSON files — the issue's own estimate
+ * ("tens of MB") leaves 100MB a comfortable ceiling without inviting an
+ * upload that ties up the daemon decompressing it.
+ */
+export const CLAUDE_EXPORT_ZIP_BODY_LIMIT = 100 * 1024 * 1024;
 const DEFAULT_ASK_LINK_HOURS = 72;
 /** ECMAScript Dates top out at ±8.64e15 ms — the same overflow guard `duo ask-link new` applies. */
 const MAX_DATE_MS = 8.64e15;
@@ -44,6 +54,40 @@ function sendError(reply: FastifyReply, status: number, code: string, message: s
 
 function nonBlankString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** `Math.floor` — the limit is a round number of bytes; this only ever prints the whole-MB value it was declared with. */
+function asMb(bytes: number): string {
+  return `${Math.floor(bytes / (1024 * 1024))}MB`;
+}
+
+interface ClaudeImportOutcome {
+  conversationCount: number;
+  workRelevantConversationCount: number;
+  written: number;
+  skipped: number;
+  discardedAboveCeiling: number;
+}
+
+/**
+ * The tail both `/corpus/import-claude` (conversations.json pasted as text)
+ * and `/corpus/import-claude-zip` (#239: the export zip, unzipped first)
+ * share once they each have `conversations.json`'s text in hand — parsing,
+ * ingest, and the summary shape, identical either way. Neither route adds
+ * behaviour beyond getting to this same text.
+ */
+function importClaudeExportText(raw: string, deps: ServeDeps): ClaudeImportOutcome {
+  const { records, conversationCount, workRelevantConversationCount } = parseClaudeExport(raw);
+  const outcome = ingestRecords(deps.storePath, deps.passphrase, records, {
+    ceiling: parseClassificationCeiling(deps.classificationCeiling),
+  });
+  return {
+    conversationCount,
+    workRelevantConversationCount,
+    written: outcome.written,
+    skipped: outcome.alreadyPresent,
+    discardedAboveCeiling: outcome.discardedAboveCeiling,
+  };
 }
 
 /**
@@ -70,17 +114,7 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
         return;
       }
       try {
-        const { records, conversationCount, workRelevantConversationCount } = parseClaudeExport(raw);
-        const outcome = ingestRecords(deps.storePath, deps.passphrase, records, {
-          ceiling: parseClassificationCeiling(deps.classificationCeiling),
-        });
-        return {
-          conversationCount,
-          workRelevantConversationCount,
-          written: outcome.written,
-          skipped: outcome.alreadyPresent,
-          discardedAboveCeiling: outcome.discardedAboveCeiling,
-        };
+        return importClaudeExportText(raw, deps);
       } catch (error) {
         if (error instanceof MalformedExportError) {
           sendError(reply, 400, "malformed_export", error.message);
@@ -90,6 +124,55 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
       }
     },
   );
+
+  // #239: the zip an owner downloads straight from claude.ai, uploaded
+  // whole — no unzipping or pasting conversations.json by hand. Scoped in
+  // its own child context so the zip content-type parsers and the
+  // too-large error message below apply to this one route only, never to
+  // the rest of the app (same encapsulation idiom server.ts's
+  // registerWorkspaceSessionRoutes uses for its own route-local parser).
+  app.register(async (scope) => {
+    for (const contentType of ["application/zip", "application/x-zip-compressed", "application/octet-stream"]) {
+      scope.addContentTypeParser(contentType, { parseAs: "buffer" }, (_request, body, done) => done(null, body));
+    }
+
+    scope.setErrorHandler((error: FastifyError, _request, reply) => {
+      if (error.code === "FST_ERR_CTP_BODY_TOO_LARGE") {
+        sendError(reply, 413, "zip_too_large", `This zip is too large: the limit is ${asMb(CLAUDE_EXPORT_ZIP_BODY_LIMIT)}.`);
+        return;
+      }
+      reply.send(error);
+    });
+
+    // The `bodyLimit` option is what makes "too large" refused before it's
+    // read, not just checked after: Fastify compares a Content-Length
+    // header against it before the stream is ever consumed (the request
+    // never reaches this handler at all — `scope.setErrorHandler` above
+    // sends the 413 instead), and for a chunked request with no
+    // Content-Length, aborts the stream the instant the running total
+    // crosses the limit rather than buffering the whole body first.
+    scope.post<{ Body: Buffer }>(
+      "/corpus/import-claude-zip",
+      { bodyLimit: CLAUDE_EXPORT_ZIP_BODY_LIMIT },
+      async (request, reply) => {
+        const body = request.body;
+        if (!Buffer.isBuffer(body) || body.length === 0) {
+          sendError(reply, 400, "bad_request", "A zip file body is required (Content-Type: application/zip).");
+          return;
+        }
+        try {
+          const conversationsJson = extractConversationsJson(body);
+          return importClaudeExportText(conversationsJson, deps);
+        } catch (error) {
+          if (error instanceof MalformedExportError) {
+            sendError(reply, 400, "malformed_export", error.message);
+            return;
+          }
+          throw error;
+        }
+      },
+    );
+  });
 
   app.post("/corpus/derive", async (_request, reply) => {
     const started = deriveJob.start({
