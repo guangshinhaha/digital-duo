@@ -1,5 +1,5 @@
 import { OrgNotFoundError, type HostedOrg } from "./orgs.js";
-import { orgIdOfUserId } from "./matrix-accounts.js";
+import { orgIdOfUserId, SERVICE_ACCOUNT_LOCALPART } from "./matrix-accounts.js";
 import type { HostedRegistry, MatrixPending } from "./registry.js";
 import { SynapseAdminError, type SynapseAdmin } from "./synapse-admin.js";
 
@@ -67,7 +67,7 @@ export interface SpaceSummary {
 
 export interface OrgSpaceProvisionerOptions {
   readonly registry: HostedRegistry;
-  readonly admin: Pick<SynapseAdmin, "createPrivateRoom" | "addSpaceChild" | "setRoomName" | "joinUser" | "whoAmI">;
+  readonly admin: Pick<SynapseAdmin, "createPrivateRoom" | "addSpaceChild" | "setRoomName" | "setFunctionalMembers" | "joinUser" | "whoAmI">;
   /** Synapse's `server_name` (the `via` of the Space's child link). Otherwise read once from the admin token's user id. */
   readonly serverName?: string;
   /** One line per event: org and duo ids, room ids and scrubbed reasons only. Defaults to stderr. */
@@ -83,9 +83,15 @@ const DEFAULT_RETRY_MAX_MS = 30 * 60_000;
 /** A rename that lands while a run is finishing is picked up by another pass; bound the passes so a flapping name cannot spin. */
 const MAX_PASSES = 3;
 
-/** An org's rooms exist, are linked, and carry its current name. */
+/** An org's rooms exist, are linked, carry its current name, and hide the service account from a generated name or a member list. */
 export function orgSpaceComplete(org: HostedOrg): boolean {
-  return org.spaceRoomId !== undefined && org.generalRoomId !== undefined && org.generalLinked === true && org.spaceSyncedName === org.name;
+  return (
+    org.spaceRoomId !== undefined &&
+    org.generalRoomId !== undefined &&
+    org.generalLinked === true &&
+    org.spaceSyncedName === org.name &&
+    org.functionalMembersSet === true
+  );
 }
 
 export class OrgSpaceProvisioner {
@@ -331,6 +337,13 @@ export class OrgSpaceProvisioner {
           await admin.setRoomName(org.spaceRoomId!, org.name);
           org = this.record(orgId, { spaceSyncedName: org.name });
           this.log(`hosted: renamed the Space for org ${orgId}`);
+        }
+        if (!org.functionalMembersSet) {
+          const serviceAccountId = `@${SERVICE_ACCOUNT_LOCALPART}:${serverName}`;
+          await admin.setFunctionalMembers(org.spaceRoomId!, [serviceAccountId]);
+          await admin.setFunctionalMembers(org.generalRoomId!, [serviceAccountId]);
+          org = this.record(orgId, { functionalMembersSet: true });
+          this.log(`hosted: hid the service account from the Space and #general's names for org ${orgId}`);
         }
         // A rename that landed while this pass ran leaves the org out of step; go round again.
         org = registry.org(orgId) ?? org;

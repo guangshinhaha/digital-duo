@@ -57,6 +57,13 @@ export interface HostedMatrixAccounts {
   /** base64 of encrypt(duoAccessToken, masterKey), like `passphraseCipher`. Never leaves the daemon. */
   readonly duoTokenCipher: string;
   readonly provisionedAt: string;
+  /**
+   * The registry name last pushed to Matrix as the person's display name (#272), so a reconcile sweep
+   * can tell a stale or never-set name from a correct one without asking Synapse, and costs no call for
+   * an account that is already right. Absent on an account provisioned before this existed, or recorded
+   * by a build that predates it; either way that reads as "never synced" and is corrected on the next sweep.
+   */
+  readonly displayName?: string;
 }
 
 /** What is safe to show an admin about a duo's accounts: no token, not even its ciphertext. */
@@ -512,7 +519,7 @@ export class HostedRegistry {
   }
 
   /** Records a duo's provisioned accounts and encrypts its token in the same write; clears any pending mark. */
-  setMatrixAccounts(duoId: string, ids: { personUserId: string; duoUserId: string }, duoAccessToken: string): HostedMatrixAccountsView {
+  setMatrixAccounts(duoId: string, ids: { personUserId: string; duoUserId: string; displayName?: string }, duoAccessToken: string): HostedMatrixAccountsView {
     const accounts: HostedMatrixAccounts = {
       ...ids,
       duoTokenCipher: encrypt(Buffer.from(duoAccessToken, "utf8"), this.masterKey).toString("base64"),
@@ -533,6 +540,25 @@ export class HostedRegistry {
       });
     });
     return matrixAccountsView(accounts);
+  }
+
+  /**
+   * Updates only the name recorded as last pushed to Matrix for a duo's accounts (#272), after the
+   * reconcile sweep has itself called Synapse to put it there. Never touches the ids, the token or
+   * `provisionedAt`. Throws if the duo has no recorded accounts yet (`setMatrixAccounts` is for that).
+   */
+  setMatrixDisplayName(duoId: string, displayName: string): HostedMatrixAccountsView {
+    if (!this.matrixAccounts(duoId)) {
+      throw new Error(`No duo "${duoId}" with recorded Matrix accounts to set a display name for.`);
+    }
+    return this.commit((draft) => {
+      if (duoId === ROOT_DUO_ID) {
+        draft.rootMatrix = { ...draft.rootMatrix!, displayName };
+        return matrixAccountsView(draft.rootMatrix);
+      }
+      draft.tenants = draft.tenants.map((candidate) => (candidate.id === duoId && candidate.matrix ? { ...candidate, matrix: { ...candidate.matrix, displayName } } : candidate));
+      return matrixAccountsView(draft.tenants.find((candidate) => candidate.id === duoId)!.matrix!);
+    });
   }
 
   /** Marks a duo as owed accounts and failing, keeping when it started and counting attempts. */
@@ -606,7 +632,7 @@ export class HostedRegistry {
    */
   updateOrgSpace(
     orgId: string,
-    patch: { spaceRoomId?: string; generalRoomId?: string; spaceSyncedName?: string; generalLinked?: boolean },
+    patch: { spaceRoomId?: string; generalRoomId?: string; spaceSyncedName?: string; generalLinked?: boolean; functionalMembersSet?: boolean },
   ): HostedOrg {
     return this.commit((draft) => {
       const org = draft.orgs.find((candidate) => candidate.id === orgId);

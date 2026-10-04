@@ -203,6 +203,45 @@ describe("OrgSpaceProvisioner: an org's Space and #general", () => {
     expect(fake.rooms.get(registry.org(org.id)!.spaceRoomId!)!.name).toBe("Platform");
   });
 
+  it("hides the service account from the Space and #general's generated names and member lists (#272)", async () => {
+    const { registry, fake, spaces } = setup();
+    const org = registry.createOrg("Platform team");
+    await spaces.ensureOrg(org.id);
+    const stored = registry.org(org.id)!;
+    const admin = "@workspace-admin:duo.test";
+
+    expect(fake.rooms.get(stored.spaceRoomId!)!.functionalMembers).toEqual([admin]);
+    expect(fake.rooms.get(stored.generalRoomId!)!.functionalMembers).toEqual([admin]);
+    expect(stored.functionalMembersSet).toBe(true);
+    expect(orgSpaceComplete(stored)).toBe(true);
+
+    // A second run costs no call: it is already set.
+    const calls = fake.requests.length;
+    expect((await spaces.ensureOrg(org.id)).status).toBe("already");
+    expect(fake.requests).toHaveLength(calls);
+  });
+
+  it("an org whose rooms were made before this existed gets the state on the next sweep, with no manual step", async () => {
+    const { registry, fake, spaces, path } = setup();
+    const org = registry.createOrg("Platform team");
+    await spaces.ensureOrg(org.id);
+    const stored = registry.org(org.id)!;
+
+    // Simulate rooms created by a build that predates #272: no `functionalMembersSet` recorded.
+    const tampered = JSON.parse(readFileSync(path, "utf8")) as { orgs: Array<Record<string, unknown>> };
+    const entry = tampered.orgs.find((candidate) => candidate.id === org.id)!;
+    delete entry.functionalMembersSet;
+    writeFileSync(path, JSON.stringify(tampered));
+    const reopened = new HostedRegistry(path, MASTER);
+    expect(orgSpaceComplete(reopened.org(org.id)!)).toBe(false);
+
+    const sweeper = new OrgSpaceProvisioner({ registry: reopened, admin: new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch }), serverName: "duo.test", log: () => {} });
+    expect((await sweeper.ensureOrg(org.id)).status).toBe("provisioned");
+    expect(orgSpaceComplete(reopened.org(org.id)!)).toBe(true);
+    expect(fake.rooms.get(stored.spaceRoomId!)!.functionalMembers).toEqual(["@workspace-admin:duo.test"]);
+    expect(fake.rooms.get(stored.generalRoomId!)!.functionalMembers).toEqual(["@workspace-admin:duo.test"]);
+  });
+
   it("never sends a token anywhere but the Authorization header, and logs none", async () => {
     const { registry, fake, logs, spaces } = setup();
     const org = registry.createOrg("Platform team");
@@ -591,6 +630,16 @@ describe("SynapseAdmin room calls (endpoint shapes per the Synapse and Matrix do
     expect(fake.rooms.get(space)!.name).toBe("New name");
     expect(fake.rooms.get(space)!.children.get(general)).toEqual({ via: ["duo.test"], suggested: true });
     expect(fake.rooms.get(space)!.members.has("@a.b:duo.test")).toBe(true);
+  });
+
+  it("setFunctionalMembers hits the documented endpoint with the documented body", async () => {
+    const fake = createFakeSynapse();
+    const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
+    const space = await admin.createPrivateRoom({ name: "Org", space: true, txnId: "s" });
+    await admin.setFunctionalMembers(space, ["@workspace-admin:duo.test"]);
+    const request = fake.requests.find((candidate) => candidate.path === `/_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/io.element.functional_members`);
+    expect(request).toMatchObject({ method: "PUT", body: { service_members: ["@workspace-admin:duo.test"] } });
+    expect(fake.rooms.get(space)!.functionalMembers).toEqual(["@workspace-admin:duo.test"]);
   });
 
   it("the fake answers as Synapse does: a repeat admin join of an invite-only room is 403, and an unknown room's members 404", async () => {

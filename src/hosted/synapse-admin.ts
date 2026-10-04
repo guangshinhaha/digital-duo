@@ -202,6 +202,19 @@ export class SynapseAdmin {
   }
 
   /**
+   * Names a room's purely-functional members (`PUT .../state/io.element.functional_members`), the
+   * `service_members` convention matrix-js-sdk's room-name generation and several Element-family clients
+   * already honor. The daemon's service account creates and stays in every org room (#272) but is not a
+   * person to show in a member list or let an auto-generated room name pick; listing it here is how a
+   * client is told to leave it out. Safe to repeat: it rewrites the same state.
+   */
+  async setFunctionalMembers(roomId: string, serviceMemberIds: readonly string[]): Promise<void> {
+    await this.call("PUT", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/io.element.functional_members`, {
+      service_members: serviceMemberIds,
+    });
+  }
+
+  /**
    * Who is joined to the room (`GET /_synapse/admin/v1/rooms/<room>/members`): `{members: [user ids], total}`,
    * joined users only, in one unpaginated answer (Synapse v1.161.0 `RoomMembersRestServlet`). 404 for an
    * unknown room. An invited or left user is not listed.

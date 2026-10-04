@@ -1,6 +1,6 @@
 import { duoUserIdFor } from "../workspace/directory.js";
 import { assertOrgId, ROOT_DUO_ID } from "./orgs.js";
-import { matrixAccountsView, type HostedMatrixAccountsView, type HostedRegistry } from "./registry.js";
+import { matrixAccountsView, type HostedMatrixAccounts, type HostedMatrixAccountsView, type HostedRegistry } from "./registry.js";
 import { SynapseAdminError, type SynapseAdmin } from "./synapse-admin.js";
 
 /**
@@ -308,7 +308,7 @@ export class MatrixProvisioner {
       await admin.putUser(existing.personUserId, { displayName: member.name });
       await admin.putUser(existing.duoUserId, { displayName: duoDisplayName(member.name) });
       const token = await admin.mintToken(existing.duoUserId, { neverExpires: true });
-      const accounts = this.storeToken(duoId, existing.personUserId, existing.duoUserId, token);
+      const accounts = this.storeToken(duoId, existing.personUserId, existing.duoUserId, token, member.name);
       this.log(`hosted: minted a new Matrix token for duo ${duoId}`);
       return { duoId, status: "reminted", accounts };
     } catch (error) {
@@ -334,7 +334,7 @@ export class MatrixProvisioner {
         this.log(`hosted: ${problem}; it needs an operator, nothing was changed`);
         return { duoId, status: "failed", error: problem };
       }
-      return { duoId, status: "already", accounts: matrixAccountsView(existing) };
+      return { duoId, status: "already", accounts: await this.syncDisplayName(duoId, existing, member.name) };
     }
 
     try {
@@ -345,7 +345,7 @@ export class MatrixProvisioner {
       await admin.putUser(duoUserId, { displayName: duoDisplayName(member.name) });
       // The duo's token never expires (§5): the daemon holds it for good and the registry keeps it encrypted.
       const token = await admin.mintToken(duoUserId, { neverExpires: true });
-      const accounts = this.storeToken(duoId, personUserId, duoUserId, token);
+      const accounts = this.storeToken(duoId, personUserId, duoUserId, token, member.name);
       this.log(`hosted: provisioned Matrix accounts for duo ${duoId}`);
       return { duoId, status: "provisioned", accounts };
     } catch (error) {
@@ -363,16 +363,44 @@ export class MatrixProvisioner {
    * immediate retry covers a transient write error and cannot double-mint (the token is already
    * in hand); a second failure is logged, without the token, and rethrown.
    */
-  private storeToken(duoId: string, personUserId: string, duoUserId: string, token: string): HostedMatrixAccountsView {
+  private storeToken(duoId: string, personUserId: string, duoUserId: string, token: string, displayName: string): HostedMatrixAccountsView {
     const { registry } = this.options;
     try {
       try {
-        return registry.setMatrixAccounts(duoId, { personUserId, duoUserId }, token);
+        return registry.setMatrixAccounts(duoId, { personUserId, duoUserId, displayName }, token);
       } catch {
-        return registry.setMatrixAccounts(duoId, { personUserId, duoUserId }, token);
+        return registry.setMatrixAccounts(duoId, { personUserId, duoUserId, displayName }, token);
       }
     } catch (error) {
       this.log(`hosted: minted a Matrix token for duo ${duoId} but could not store it (${error instanceof Error ? error.name : "error"}); an unrecorded token now exists on ${duoUserId}`);
+      throw error;
+    }
+  }
+
+  /**
+   * The `already` path (#272): recorded accounts are left alone by every other path, so a name that was
+   * never set, or changed in the registry since, would otherwise never reach Matrix again. `existing.displayName`
+   * is the name last pushed, kept with the accounts so this compares against the registry's own write and never
+   * asks Synapse: an account already named right costs no call, matching every other idempotent step here.
+   * A Synapse problem is logged and left for the next sweep, never thrown and never turned into `pending` or
+   * `failed` (the duo already has working accounts).
+   */
+  private async syncDisplayName(duoId: string, existing: HostedMatrixAccounts, name: string): Promise<HostedMatrixAccountsView> {
+    if (existing.displayName === name) {
+      return matrixAccountsView(existing);
+    }
+    const { registry, admin } = this.options;
+    try {
+      await admin.putUser(existing.personUserId, { displayName: name });
+      await admin.putUser(existing.duoUserId, { displayName: duoDisplayName(name) });
+      const updated = registry.setMatrixDisplayName(duoId, name);
+      this.log(`hosted: re-synced the Matrix display name for duo ${duoId}`);
+      return updated;
+    } catch (error) {
+      if (error instanceof SynapseAdminError) {
+        this.log(`hosted: could not re-sync the Matrix display name for duo ${duoId}: ${error.message}`);
+        return matrixAccountsView(existing);
+      }
       throw error;
     }
   }

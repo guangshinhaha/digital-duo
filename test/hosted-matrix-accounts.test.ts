@@ -171,6 +171,60 @@ describe("MatrixProvisioner — accounts for a person and their duo", () => {
   });
 });
 
+describe("MatrixProvisioner — re-syncing display names on the already path (#272)", () => {
+  it("an account recorded before display names were cached is named on the next sweep, and a further sweep costs no call", async () => {
+    const { registry, fake, provisioner } = setup();
+    const id = addDuo(registry, "Sam Tan");
+    // Accounts recorded with no cached display name, as a pre-#272 build (or Synapse itself) would have left them.
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: `@duo-default.${id}:duo.test` }, "syt_old");
+
+    const outcome = await provisioner.provision(id);
+    expect(outcome.status).toBe("already");
+    expect(outcome.accounts!.displayName).toBe("Sam Tan");
+    expect(fake.users.get(`@default.${id}:duo.test`)).toMatchObject({ displayname: "Sam Tan" });
+    expect(fake.users.get(`@duo-default.${id}:duo.test`)).toMatchObject({ displayname: "Sam Tan's duo" });
+    expect(registry.matrixAccounts(id)!.displayName).toBe("Sam Tan");
+
+    // Named right now: the next sweep makes no call at all for it.
+    const calls = fake.requests.length;
+    expect((await provisioner.provision(id)).status).toBe("already");
+    expect(fake.requests).toHaveLength(calls);
+  });
+
+  it("a recorded name that has drifted from the registry is corrected", async () => {
+    const { registry, fake, provisioner, path } = setup();
+    const id = addDuo(registry, "Sam Tan");
+    await provisioner.provision(id);
+    expect(registry.matrixAccounts(id)!.displayName).toBe("Sam Tan");
+
+    const tampered = JSON.parse(readFileSync(path, "utf8"));
+    tampered.tenants[0].matrix.displayName = "Stale Name";
+    writeFileSync(path, JSON.stringify(tampered));
+    const reopened = new HostedRegistry(path, MASTER);
+    const sweeper = new MatrixProvisioner({ registry: reopened, admin: new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch }), serverName: FAKE_SERVER_NAME, log: () => {} });
+
+    expect((await sweeper.provision(id)).status).toBe("already");
+    expect(fake.users.get(`@default.${id}:duo.test`)!.displayname).toBe("Sam Tan");
+    expect(reopened.matrixAccounts(id)!.displayName).toBe("Sam Tan");
+  });
+
+  it("a Synapse problem during the resync is logged and left for the next sweep, and never turns `already` into `pending` or `failed`", async () => {
+    const { registry, fake, provisioner, logs } = setup();
+    const id = addDuo(registry, "Sam Tan");
+    registry.setMatrixAccounts(id, { personUserId: `@default.${id}:duo.test`, duoUserId: `@duo-default.${id}:duo.test` }, "syt_old");
+    fake.down = true;
+
+    const outcome = await provisioner.provision(id);
+    expect(outcome.status).toBe("already");
+    expect(registry.matrixAccounts(id)!.displayName).toBeUndefined();
+    expect(logs.some((line) => line.includes("could not re-sync the Matrix display name"))).toBe(true);
+
+    fake.down = false;
+    expect((await provisioner.provision(id)).status).toBe("already");
+    expect(registry.matrixAccounts(id)!.displayName).toBe("Sam Tan");
+  });
+});
+
 describe("MatrixProvisioner — Synapse is down", () => {
   it("marks the duo pending, does not throw, and finishes the job on the next run", async () => {
     const { registry, fake, provisioner } = setup();

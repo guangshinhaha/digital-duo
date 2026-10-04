@@ -57,6 +57,14 @@ export interface HostedOrg {
   readonly spaceSyncedName?: string;
   /** True once `#general` is a child of the Space. */
   readonly generalLinked?: boolean;
+  /**
+   * True once the Space and `#general` both carry `io.element.functional_members` naming the service
+   * account (#272): it created and stays in both rooms, and without this it can pollute matrix-js-sdk's
+   * auto-generated room name and shows up in `#general`'s member list. An optional addition to a v2
+   * registry with no version bump, like `generalLinked`: absent means not set yet, including on a room
+   * made before this existed, so the backfill (`orgSpaceComplete`) picks it up on the next sweep.
+   */
+  readonly functionalMembersSet?: boolean;
   /** Set while the org's rooms are owed and failing; cleared when they are complete and named right. */
   readonly spacePending?: MatrixPending;
 }
