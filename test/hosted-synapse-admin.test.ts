@@ -114,6 +114,54 @@ describe("SynapseAdmin — the admin API client", () => {
     expect(error).toMatchObject({ status: 404, retryable: false });
   });
 
+  it("deactivates an account with erase, clearing its profile and parting it from its rooms (#275)", async () => {
+    const { fake, admin } = client();
+    await admin.putUser("@a.b:duo.test", { displayName: "Sam" });
+    const roomId = await admin.createPrivateRoom({ name: "general", txnId: "t1" });
+    await admin.joinUser(roomId, "@a.b:duo.test");
+    expect(fake.rooms.get(roomId)!.members.has("@a.b:duo.test")).toBe(true);
+
+    await admin.deactivateUser("@a.b:duo.test", { erase: true });
+
+    expect(fake.deactivated.get("@a.b:duo.test")).toEqual({ erased: true });
+    expect(fake.users.get("@a.b:duo.test")!.displayname).toBeUndefined();
+    expect(fake.rooms.get(roomId)!.members.has("@a.b:duo.test")).toBe(false);
+    const request = fake.requests.at(-1)!;
+    expect(request.method).toBe("POST");
+    expect(request.path).toBe("/_synapse/admin/v1/deactivate/%40a.b%3Aduo.test");
+    expect(request.body).toEqual({ erase: true });
+  });
+
+  it("deactivating without erase leaves the profile and room membership alone", async () => {
+    const { fake, admin } = client();
+    await admin.putUser("@a.b:duo.test", { displayName: "Sam" });
+    await admin.deactivateUser("@a.b:duo.test", { erase: false });
+    expect(fake.deactivated.get("@a.b:duo.test")).toEqual({ erased: false });
+    expect(fake.users.get("@a.b:duo.test")!.displayname).toBe("Sam");
+  });
+
+  it("revokes every token the account held", async () => {
+    const { fake, admin } = client();
+    await admin.putUser("@duo-a.b:duo.test", { displayName: "x" });
+    const token = await admin.mintToken("@duo-a.b:duo.test", { neverExpires: true });
+    await admin.deactivateUser("@duo-a.b:duo.test", { erase: true });
+    const probe = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: token, fetch: fake.fetch });
+    await failureOf(probe.whoAmI());
+  });
+
+  it("deactivating a user Synapse has never heard of is a permanent 404 (read by `endDuo` as already gone)", async () => {
+    const { admin } = client();
+    const error = await failureOf(admin.deactivateUser("@nobody.x:duo.test", { erase: true }));
+    expect(error).toMatchObject({ status: 404, retryable: false });
+  });
+
+  it("the deactivated user id never appears in an error's label", async () => {
+    const { fake, admin } = client();
+    fake.failNext(1, 500, "M_UNKNOWN");
+    const error = await failureOf(admin.deactivateUser("@secret-name.x:duo.test", { erase: true }));
+    expect(error.message).toBe("Synapse admin API POST /_synapse/admin/v1/deactivate/<id> failed: HTTP 500 M_UNKNOWN");
+  });
+
   it("a login answer with no access token is an error, not an empty token", async () => {
     const admin = new SynapseAdmin({
       baseUrl: FAKE_SYNAPSE_URL,

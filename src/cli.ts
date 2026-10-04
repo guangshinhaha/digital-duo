@@ -29,7 +29,7 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedOrgAdminGrant, runHostedOrgAdminRevoke, formatOrgMemberLine, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
+import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedOrgAdminGrant, runHostedOrgAdminRevoke, runHostedEnd, formatOrgMemberLine, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runConnectorNew, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -198,6 +198,26 @@ hostedCommand
       }
       for (const outcome of summary.spaces.memberOutcomes.filter((candidate) => candidate.status === "pending" || candidate.status === "failed")) {
         console.log(`  ${outcome.duoId}: space join ${outcome.status} (${outcome.error ?? "unknown"})`);
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedCommand
+  .command("end <duoId>")
+  .description("End a hosted duo for good, as the super admin: deactivates both its Matrix accounts (and so removes it from its org's Space and rooms), drops any live workspace connection, and removes its registry entry and token. Refuses the root duo. Ending an already-gone duo is a no-op, not an error")
+  .action(async (duoId: string) => {
+    try {
+      const outcome = await runHostedEnd(duoId);
+      if (!outcome.found) {
+        console.log(`${duoId}: no such duo (already ended, or never existed). Nothing to do.`);
+        return;
+      }
+      const { person, duo } = outcome.deactivated;
+      console.log(`Ended duo ${duoId}. Matrix accounts deactivated: person ${person ? "yes" : "already gone"}, duo ${duo ? "yes" : "already gone"}.`);
+      for (const error of outcome.errors) {
+        console.log(`  could not deactivate its ${error}`);
       }
     } catch (error) {
       reportError(error);

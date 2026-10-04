@@ -752,6 +752,25 @@ export class HostedRegistry {
     });
   }
 
+  /**
+   * Removes a tenant's whole entry — its encrypted passphrase and token, its Matrix account records, and
+   * its place in `listOrgMembers` of its org — in one write (#275, `endDuo`). Its invites are left alone:
+   * a redeemed one keeps `tenantId` pointing at an id nothing now answers to, the same as any other
+   * historical record here, and an unused one simply cannot be redeemed into this duo again.
+   *
+   * Idempotent: removing a duo already gone (or never here) finds nothing to remove and writes nothing.
+   * Returns whether a tenant was actually removed, so a caller can tell "ended now" from "was already gone".
+   */
+  removeTenant(duoId: string): boolean {
+    if (!this.data.tenants.some((tenant) => tenant.id === duoId)) {
+      return false;
+    }
+    this.commit((draft) => {
+      draft.tenants = draft.tenants.filter((tenant) => tenant.id !== duoId);
+    });
+    return true;
+  }
+
   newTenantId(): string {
     let id = newShortId(10);
     while (this.data.tenants.some((tenant) => tenant.id === id)) {
