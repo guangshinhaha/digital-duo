@@ -15,7 +15,10 @@ import { randomBytes } from "node:crypto";
  *   starts `invite` at 0 and the caller's `power_level_content_override` replaces keys whole (shallow update);
  *   the admin join API on an invite-only room first invites, so a user already joined gets 403 `M_FORBIDDEN`;
  *   `GET /_synapse/admin/v1/rooms/<room>/members` lists joined users only (no pagination, 404 for an unknown room);
- *   state events need the sender's level to reach `state_default`.
+ *   state events need the sender's level to reach `state_default`;
+ * - `POST /_synapse/admin/v1/deactivate/<user>` (#275): 404 for a user the fake has never heard of; otherwise
+ *   200, and `erase: true` clears the display name and parts the user from every room it was in, the same
+ *   as Synapse's own GDPR-style erasure.
  */
 export const FAKE_SYNAPSE_URL = "http://synapse.railway.internal:8008";
 export const FAKE_SERVER_NAME = "duo.test";
@@ -57,6 +60,10 @@ export interface FakeSynapse {
   expireTransactions(): void;
   /** Whether `userId` may invite in the room: their power level (default 0) reaches the room's `invite` level. */
   mayInvite(roomId: string, userId: string): boolean;
+
+  // --- deactivation (#275) ---
+  /** Every user id ever deactivated, with whether that call erased it. */
+  readonly deactivated: Map<string, { erased: boolean }>;
 }
 
 /** A room as the fake keeps it (#234). `joinRule` is "public" only for a `public_chat` preset, so tests can prove no room is ever public. */
@@ -101,6 +108,7 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
   const loggedOut = new Set<string>(); // #233
   const rooms = new Map<string, FakeRoom>();
   const transactions = new Map<string, string>();
+  const deactivated = new Map<string, { erased: boolean }>();
 
   const json = (status: number, body: unknown) =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -108,6 +116,7 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
   const fake: FakeSynapse = {
     users,
     rooms,
+    deactivated,
     expireTransactions() {
       transactions.clear();
     },
@@ -315,6 +324,30 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
         }
         room.members.add(userId);
         return json(200, { room_id: roomId });
+      }
+      // --- deactivation (#275) ---
+      const deactivate = method === "POST" ? /^\/_synapse\/admin\/v1\/deactivate\/([^/]+)$/.exec(url.pathname) : null;
+      if (deactivate) {
+        const userId = decodeURIComponent(deactivate[1]!);
+        if (!users.has(userId)) {
+          return json(404, { errcode: "M_NOT_FOUND", error: "User not found" });
+        }
+        const body = JSON.parse(rawBody ?? "{}") as { erase?: boolean };
+        const erase = body.erase === true;
+        deactivated.set(userId, { erased: erase });
+        if (erase) {
+          users.set(userId, { ...users.get(userId)!, displayname: undefined });
+          for (const room of rooms.values()) {
+            room.members.delete(userId);
+          }
+        }
+        // Every access token this user held is revoked, as Synapse's own deactivation does.
+        for (const entry of minted) {
+          if (entry.userId === userId) {
+            loggedOut.add(entry.token);
+          }
+        }
+        return json(200, { id_server_unbind_result: "success" });
       }
       return json(404, { errcode: "M_UNRECOGNIZED", error: "Unrecognized request" });
     },

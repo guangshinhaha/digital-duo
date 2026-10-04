@@ -127,3 +127,20 @@ export function runHostedOrgAdminGrant(orgId: string, duoId: string, env: NodeJS
 export function runHostedOrgAdminRevoke(orgId: string, duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgAdminChange> {
   return callDaemon(env, "POST", `/hosted/orgs/${encodeURIComponent(orgId)}/admins/${encodeURIComponent(duoId)}/revoke`, {});
 }
+
+/** What `duo hosted end <duoId>` answers: whether the duo was found, which Matrix accounts were just deactivated, and any Synapse trouble (never a token). */
+export interface EndDuoResult {
+  readonly duoId: string;
+  readonly found: boolean;
+  readonly deactivated: { readonly person: boolean; readonly duo: boolean };
+  readonly errors: readonly string[];
+}
+
+/**
+ * Implements `duo hosted end <duoId>` (#275): ends a hosted duo for good, as the super admin. Refused for
+ * the root duo by the daemon; ending an already-gone duo answers `found: false` rather than failing, so
+ * the command is safe to re-run.
+ */
+export function runHostedEnd(duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<EndDuoResult> {
+  return callDaemon(env, "POST", `/hosted/duos/${encodeURIComponent(duoId)}/end`, {});
+}

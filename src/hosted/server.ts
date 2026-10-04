@@ -19,6 +19,7 @@ import { DuoWorkspaceConnections, SDK_LOG_LEVELS, type SdkLogLevel } from "./duo
 import { googleIdentityVerifier, IdentityError, type IdentityVerifier, type VerifiedIdentity } from "./google.js";
 import { OAuthStore, CLAUDE_REDIRECT_URIS } from "./oauth.js";
 import { registerOAuthRoutes } from "./oauth-routes.js";
+import { endDuo, EndDuoRootRefusedError } from "./end-duo.js";
 import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
 import { OrgAdmin, parseInviteInput } from "./org-admin.js";
 import { OrgSpaceProvisioner, type SpaceSummary } from "./org-spaces.js";
@@ -946,6 +947,30 @@ export async function createHostedServer(
       return publicOutcome(await matrix.remintToken(duoId));
     } catch {
       sendError(reply, 500, "remint_failed", "Minting the token failed unexpectedly; see the daemon log.");
+    }
+  });
+
+  // Ends a hosted duo for good (#275, `duo hosted end <duoId>`): deactivates both Matrix accounts (which
+  // also parts them from the org's Space and rooms), drops any live workspace connection, and removes the
+  // registry entry. Refuses the root duo; ending an already-gone duo is a 200 with `found: false`, not an
+  // error, so the CLI is safe to re-run.
+  control.post<{ Params: { duoId: string } }>("/hosted/duos/:duoId/end", { preHandler: requireAdmin }, async (request, reply) => {
+    try {
+      const outcome = await endDuo(request.params.duoId, { registry, admin: synapseAdmin, connections, log: extras.log });
+      // The per-duo app, if one is mounted, is unmounted too: its routes must stop answering now, not
+      // only once the registry's own listener next reconciles a workspace connection.
+      const mounted = duos.get(outcome.duoId);
+      if (outcome.found && mounted) {
+        duos.delete(outcome.duoId);
+        await mounted.app.close();
+      }
+      return outcome;
+    } catch (error) {
+      if (error instanceof EndDuoRootRefusedError) {
+        sendError(reply, 400, "root_not_endable", error.message);
+        return;
+      }
+      throw error;
     }
   });
 

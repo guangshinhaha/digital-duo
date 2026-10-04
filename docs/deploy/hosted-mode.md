@@ -434,6 +434,48 @@ registry.onChange(listener): () => void                   // called after every 
 
 Resource numbers for N connections in one process are in `hosted-workspace.md` §8.
 
+## Ending a duo (#275)
+
+`duo hosted end <duoId>` removes a hosted duo for good — a test tenant left over from verification, or any
+duo an operator has decided to remove. Super admin only (`requireAdmin`, like every other `duo hosted ...`
+command): the server-side admin token or a super admin's own signed-in device.
+
+```sh
+duo hosted end <duoId>     # find duoId with `duo hosted org members <orgId>` (`duo hosted org list` for the org ids)
+```
+
+In order:
+
+1. **Both Matrix accounts are deactivated** (`SynapseAdmin.deactivateUser`, `POST
+   /_synapse/admin/v1/deactivate/<user_id>`) with `erase: true` — a hosted duo is always a throwaway/managed
+   account, never one a person could want reinstated later, so this is the right call every time, not a
+   suspension. Deactivation revokes every access token the account held and parts it from every room it was
+   in, which is how it disappears from its org's Space, `#general`, and any other room, with no separate
+   call. An account Synapse has never heard of (404) is read as already gone, not a failure.
+2. **Its live workspace connection, if any, is dropped** (`DuoWorkspaceConnections.detach`) right away,
+   rather than left for the next registry-change sweep to notice.
+3. **Its registry entry is removed** (`HostedRegistry.removeTenant`): the encrypted passphrase, the Matrix
+   account records and the token cipher, and so its row in `duo hosted org members <orgId>`. Its redeemed
+   invite, if any, is left as historical record (same as every other append-only log here) — it just points
+   at an id nothing answers to any more.
+4. **Its mounted app is unmounted**: `/t/<duoId>/...` answers 404 immediately, not only after a restart.
+
+**Never blocked by Synapse.** A deactivation Synapse refuses for a reason other than 404 (an outage, a
+wrong admin token) is reported back (`errors: [...]`) but does not stop the registry entry from being
+removed — a duo that cannot be reached must not become impossible to remove from the roster. Run `duo
+hosted end <duoId>` again once Synapse is reachable to retry the Matrix side; the registry half is already
+done and is itself idempotent.
+
+**Refuses the root duo** with a clear `root_not_endable` error: it is not a tenant and is never disposable.
+
+**Idempotent.** Ending a duo already ended, or one that never existed, answers `{ found: false, ... }` —
+not an error — so the command is safe to re-run.
+
+```ts
+POST /hosted/duos/:duoId/end   // admin token or a super admin's device; 400 for the root duo
+// -> { duoId, found, deactivated: { person, duo }, errors: string[] }  — never a token
+```
+
 ## Variables (in addition to `railway.md`'s)
 
 | Variable | What |
@@ -478,6 +520,10 @@ duo hosted invite "Kim" --org <id>             # without --org: the default org
 
 ```sh
 duo hosted provision                           # create any Matrix accounts, org Spaces and member joins still missing; safe to repeat
+```
+
+```sh
+duo hosted end <duoId>                         # end a duo for good: deactivates its Matrix accounts, drops its registry entry; see "Ending a duo" above
 ```
 
 Like `invite`, these talk to the running daemon with `DUO_HOSTED_ADMIN_TOKEN`.

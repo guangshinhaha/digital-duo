@@ -137,6 +137,22 @@ export class SynapseAdmin {
   }
 
   /**
+   * Deactivates an account for good (`POST /_synapse/admin/v1/deactivate/<user_id>`): it can never log in
+   * or be reused, Synapse revokes every access token it holds, and it is parted from every room it was
+   * in (#275). `erase: true` additionally scrubs its profile and message content — a GDPR-style erasure
+   * that cannot be undone, so it is only for an account truly being thrown away (a test duo, a duo an
+   * admin has ended), never a reversible suspension.
+   *
+   * Idempotent in the sense this caller needs: deactivating an account Synapse has never heard of is
+   * `SynapseAdminError` with `status` 404, which `endDuo` (the only caller) reads as "already gone" and
+   * not a failure. Deactivating an already-deactivated account succeeds (Synapse answers 200) and is
+   * simply a repeat of the same effect.
+   */
+  async deactivateUser(userId: string, options: { erase: boolean }): Promise<void> {
+    await this.call("POST", `/_synapse/admin/v1/deactivate/${encodeURIComponent(userId)}`, { erase: options.erase });
+  }
+
+  /**
    * Ends a person's OWN access token (`POST /_matrix/client/v3/logout`, with that token as the bearer).
    * Used when a device of the duo is revoked, so a session the daemon handed out stops working now and
    * not at its expiry (#233). A token Synapse already refuses (401) is already ended, so that is not an
@@ -247,7 +263,7 @@ export class SynapseAdmin {
   }
 
   private async call(method: "GET" | "PUT" | "POST", path: string, body?: unknown, bearer: string = this.adminToken): Promise<{ status: number; json: unknown }> {
-    const label = `${method} ${path.replace(/\/users\/[^/]+/, "/users/<id>")}`;
+    const label = `${method} ${path.replace(/\/(users|deactivate)\/[^/]+/, (_match, kind: string) => `/${kind}/<id>`)}`;
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, {
