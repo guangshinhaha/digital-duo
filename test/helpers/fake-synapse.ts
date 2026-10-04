@@ -71,6 +71,8 @@ export interface FakeRoom {
   members: Set<string>;
   /** m.space.child state: child room id -> content (`via`, `suggested`). */
   children: Map<string, { via?: string[]; suggested?: boolean }>;
+  /** `io.element.functional_members` state's `service_members`, once set (#272); undefined means never set. */
+  functionalMembers: string[] | undefined;
   powerLevelOverride: unknown;
   /** The room's effective power levels: Synapse's defaults, the preset's, then the caller's override on top (shallow). */
   powerLevels: { invite: number; events_default: number; state_default: number; users_default: number; users: Record<string, number> };
@@ -233,6 +235,7 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
           joinRule: body.preset === "public_chat" || body.visibility === "public" ? "public" : "invite",
           members: new Set([adminUserId]),
           children: new Map(),
+          functionalMembers: undefined,
           powerLevelOverride: body.power_level_content_override,
           // The creator holds 100; private_chat sets invite 0; the caller's override replaces whole keys.
           powerLevels: {
@@ -258,7 +261,7 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
         const members = [...room.members];
         return json(200, { members, total: members.length });
       }
-      const state = method === "PUT" ? /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/(m\.space\.child|m\.room\.name)(?:\/([^/]+))?$/.exec(url.pathname) : null;
+      const state = method === "PUT" ? /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/(m\.space\.child|m\.room\.name|io\.element\.functional_members)(?:\/([^/]+))?$/.exec(url.pathname) : null;
       if (state) {
         const room = rooms.get(decodeURIComponent(state[1]!));
         if (!room) {
@@ -270,9 +273,11 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
         if ((room.powerLevels.users[adminUserId] ?? room.powerLevels.users_default) < room.powerLevels.state_default) {
           return json(403, { errcode: "M_FORBIDDEN", error: "not enough power to send this state event" });
         }
-        const body = JSON.parse(rawBody ?? "{}") as { name?: string; via?: string[]; suggested?: boolean };
+        const body = JSON.parse(rawBody ?? "{}") as { name?: string; via?: string[]; suggested?: boolean; service_members?: string[] };
         if (state[2] === "m.room.name") {
           room.name = body.name;
+        } else if (state[2] === "io.element.functional_members") {
+          room.functionalMembers = body.service_members ?? [];
         } else {
           room.children.set(decodeURIComponent(state[3] ?? ""), { via: body.via, suggested: body.suggested });
         }
