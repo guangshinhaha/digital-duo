@@ -42,6 +42,7 @@ JOIN_RULES_EVENT = "m.room.join_rules"
 HISTORY_EVENT = "m.room.history_visibility"
 GUEST_EVENT = "m.room.guest_access"
 MEMBER_EVENT = "m.room.member"
+SPACE_CHILD_EVENT = "m.space.child"
 READABILITY_EVENTS = (HISTORY_EVENT, GUEST_EVENT)
 
 ERR_INVITE = "Invites across organisations are not allowed."
@@ -51,6 +52,8 @@ ERR_PUBLIC = "Public rooms are not allowed on this server."
 ERR_3PID = "Invites by email or phone number are not allowed."
 ERR_PUBLISH = "Publishing rooms to the room directory is not allowed."
 ERR_CREATE = "This room cannot be created."
+ERR_LINK = "Only a room open to your own organisation, and that you are in, can be listed here."
+ERR_UNLINK = "Only the person who listed a room here can change or remove that listing."
 
 
 def parse_config(config: object) -> tuple[str, frozenset[str]]:
@@ -235,6 +238,60 @@ class OrgWall:
             return ERR_NO_ORG
         check = self.history_problem if event_type == HISTORY_EVENT else self.guest_problem
         return check(as_mapping(content))
+
+    def may_link_child(
+        self,
+        user_id: str,
+        parent_room_id: object,
+        content: object,
+        existing_link: Optional[tuple[object, object]],
+        child_join_rules: object,
+        child_history: object,
+        child_members: Mapping[str, str],
+        restricted_orgs: Mapping[str, frozenset],
+    ) -> Optional[str]:
+        """A client-sent m.space.child event (#274): how a room becomes findable within one org.
+
+        A room is findable by colleagues when it is a child of the org's Space: Synapse's /hierarchy and
+        room summary then show it, but only to someone who is in the room or in a room its `restricted`
+        rule names (synapse/handlers/room_summary.py `_is_local_room_accessible`), and the org Space holds
+        one org. So the link is allowed only for a room that is already open to exactly the sender's org
+        through this very parent: join rule `restricted`, the parent among its allow entries, every allow
+        entry a room of the sender's org (the same strict reading as rule 3), every joined or invited member
+        in the sender's org, the sender joined, and history not world-readable. Joins into it are still each
+        judged by `may_join`; this check is what keeps a listing honest, not the only wall.
+
+        `existing_link` is (sender, content) of the parent's current m.space.child for this child, or None.
+        A link nobody holds yet (none, or one already removed), or the sender's own, may be written; a live
+        one written by anyone else (the service account's link to `#general`, a colleague's channel) may not
+        be changed or removed by a member. A removal (no `via`, which is how Synapse reads a link as gone)
+        of the sender's own link is always allowed.
+        """
+        if self.is_service(user_id):
+            return None
+        org = self.org_of(user_id)
+        if org is None:
+            return ERR_NO_ORG
+        if existing_link is not None:
+            link_sender, link_content = existing_link
+            if as_mapping(link_content).get("via") and link_sender != user_id:
+                return ERR_UNLINK
+        if not as_mapping(content).get("via"):
+            return None
+        if not isinstance(parent_room_id, str):
+            return ERR_LINK
+        if child_members.get(user_id) != "join":
+            return ERR_LINK
+        if self.orgs_in_room(child_members) != frozenset({org}):
+            return ERR_LINK
+        join_rules = as_mapping(child_join_rules)
+        if join_rules.get("join_rule") != "restricted" or parent_room_id not in allowed_room_ids(join_rules):
+            return ERR_LINK
+        if self.join_rule_problem(org, join_rules, restricted_orgs) is not None:
+            return ERR_LINK
+        if self.history_problem(as_mapping(child_history)) is not None:
+            return ERR_LINK
+        return None
 
     def may_publish(self, user_id: str) -> Optional[str]:
         return None if self.is_service(user_id) else ERR_PUBLISH

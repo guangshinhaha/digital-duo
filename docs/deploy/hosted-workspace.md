@@ -262,6 +262,19 @@ a single public room makes everyone in it findable by every org. So the module m
 creating, publishing or making a room public (§6.3), and the Space and `#general` are private
 (invite-only, or restricted to the Space's members), never `public`.
 
+**Findable within one org (#274).** A "channel" a colleague can find and join without an invite is
+not a public room and is never in the room directory. It is a room whose join rule is `restricted`
+to the org's Space, listed as a child of that Space (`m.space.child`). Synapse's `/hierarchy` and
+room-summary endpoints show such a child only to someone already in it or in a room its rule names
+(`_is_local_room_accessible` in `synapse/handlers/room_summary.py`), the Space holds one org, and a
+`restricted` room is not a "public room" for the user directory (only `join_rule: public` or
+`world_readable` history is), so it does not spring the trap above. The room directory
+(`/publicRooms`) stays closed to members: it is one list for the whole server, and Synapse
+v1.161.0 has no module callback that could filter it per requester, so it cannot be scoped to an
+org. Members can list rooms in their Space because the daemon sets `m.space.child` to power level 0
+there (`SynapseAdmin.allowMemberSpaceLinks`, done for every org Space by `OrgSpaceProvisioner`,
+existing ones on the next sweep), and the module judges every link (§6.3 rule 6).
+
 ### 6.2 Module callbacks, as verified
 
 | Callback | Signature (Synapse docs, `develop`) | What we use it for | Notes verified on 2026-09-26 |
@@ -272,7 +285,7 @@ creating, publishing or making a room public (§6.3), and the Space and `#genera
 | `user_may_publish_room` | `async (user_id: str, room_id: str)` | Always refuse for non-service accounts | |
 | `user_may_send_3pid_invite` | `async (inviter, medium, address, room_id)` | Always refuse (no email or phone invites) | Local only. |
 | `check_username_for_spam` | `async (user_profile: UserProfile, requester_id: str) -> bool` | Directory filter: return `True` (hide) when `org_of(profile.user_id) != org_of(requester_id)`, and always for the service account | Returns `True` to **exclude**. `requester_id` was added in Synapse **v1.122.0** (changelog); pin at or above it. **A filter, not a scope:** Synapse applies the search `limit` before this callback (see §6.4), so `search_all_users: false` (shipped) is the real control and this is the second lock. |
-| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting a join rule other than `invite` (or `restricted` to a room of the sender's org), a `m.room.history_visibility` other than `invited`/`joined`/`shared`, and a `m.room.guest_access` other than `forbidden`, so a private room cannot be flipped public or world-readable later | Called for events from clients. **Verified 2026-09-26 (#235)** on v1.161.0: it sees a `PUT /rooms/<id>/state/m.room.join_rules` from a local client, and the `(Codes, dict)` answer reaches the client with our sentence. It does not see room creation, so `user_may_create_room` reads `initial_state` (rule 3), also verified. **Not `user_may_send_state_event`:** it is documented as experimental, it runs before `check_event_for_spam`, and on v1.161.0 it accepts only `NOT_SPAM` or a bare `Codes` (a `(Codes, dict)` pair is logged as an invalid value and answered with a fixed sentence), so it is not registered. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
+| `check_event_for_spam` | `async (event: EventBase)` | Refuse a `m.room.join_rules` state event setting a join rule other than `invite` (or `restricted` to a room of the sender's org), a `m.room.history_visibility` other than `invited`/`joined`/`shared`, and a `m.room.guest_access` other than `forbidden`, so a private room cannot be flipped public or world-readable later; and judge every `m.space.child` (listing a room in a Space, §6.3 rule 6, #274) | Called for events from clients. **Verified 2026-09-26 (#235)** on v1.161.0: it sees a `PUT /rooms/<id>/state/m.room.join_rules` from a local client, and the `(Codes, dict)` answer reaches the client with our sentence. It does not see room creation, so `user_may_create_room` reads `initial_state` (rule 3), also verified. **Not `user_may_send_state_event`:** it is documented as experimental, it runs before `check_event_for_spam`, and on v1.161.0 it accepts only `NOT_SPAM` or a bare `Codes` (a `(Codes, dict)` pair is logged as an invalid value and answered with a fixed sentence), so it is not registered. The third-party-rules `check_event_allowed` is documented as "very experimental" and points at `check_event_for_spam` instead. |
 
 Return values. **Return only `NOT_SPAM` or `Codes.FORBIDDEN`, never a boolean.** The docs and the
 code disagree on booleans: the docs say a deprecated `True` means `FORBIDDEN`, while
@@ -344,6 +357,23 @@ For any actor that is not the service account:
    allowed only when every `allow` entry names a room whose joined and invited members are all in
    the actor's org (the service account skipped) and that has at least one; `knock`, `public`,
    the legacy `private`, and anything unrecognised are refused, in rules 3 and 5 alike.
+6. **Listing a room in a Space (#274).** A client-sent `m.space.child` state event that adds or
+   changes a link (a truthy `via`) is allowed only when the child room is open to exactly the
+   sender's org through this very parent: its join rule is `restricted`, the parent is one of its
+   `allow` entries, every `allow` entry passes rule 5's strict reading, every joined or invited member
+   is in the sender's org, the sender is joined to it, and its history is not `world_readable`. A
+   live link written by anyone else (the service account's `#general` link, a colleague's channel)
+   cannot be changed or removed by a member; a member may remove their own. The module reads the
+   parent's existing link and the child's join rules, history visibility and members fresh, like a
+   join. Not judged in `createRoom`'s `initial_state`: a brand-new room holds only its creator's org,
+   and a link there shows nobody anything they could not already join. This is what keeps a
+   listing honest; the wall itself is still rule 2 (every join into the child is judged) and
+   Synapse's own rule that a hierarchy or summary shows a child only to someone who may join it.
+   The room directory stays refused (rule 3 and `user_may_publish_room`), and so do `public_chat`
+   and `visibility: public`: org scoping is the Space, never publishing. A room made before #274 is
+   invite-only (Synapse's `private_chat` preset) and is unaffected: it cannot be listed until a
+   member explicitly sets its join rule to `restricted` to the org's Space (rule 5 allows that) and
+   then lists it.
 
 The service account is exempt (it is a server admin, so Synapse already skips 1 and 2 for it).
 Synapse also never calls `user_may_create_room` for a server admin (`synapse/handlers/room.py`
@@ -442,7 +472,8 @@ Written plainly, because these are what a security reviewer will ask about.
 The module (`deploy/synapse/modules/duo_org_wall/`) was run inside `matrix-synapse==1.161.0`
 from PyPI (Python 3.13), configured by `render_config.py`'s own output (only the database, port
 and paths swapped: SQLite, loopback, a temp dir), with `@workspace-admin` created by
-`create_admin.py` and two orgs' people and duos created through the admin API. 101 checks over
+`create_admin.py` and two orgs' people and duos created through the admin API. 101 checks (128
+since #274) over
 HTTP (`tests/real_synapse.py`) plus the daemon's TypeScript provisioning (`MatrixProvisioner`,
 `OrgSpaceProvisioner`) against the same server. Both are opt-in; how to run them:
 `docs/deploy/railway.md`. What was **observed**:
@@ -494,6 +525,24 @@ HTTP (`tests/real_synapse.py`) plus the daemon's TypeScript provisioning (`Matri
   `sendToDevice` is delivered, `/keys/query` returns another org's device keys and display name,
   and with `search_all_users: true` a limit-1 search answers `limited: true`. If Synapse changes
   one of these the check fails, which is the point: read what it does now and update §6.4.
+
+- **Findable within one org (#274, 2026-10-06, same Synapse and harness, 128 checks).** With the
+  Space's `m.space.child` lowered exactly as `allowMemberSpaceLinks` does it: alice creates a room
+  restricted to her org's Space and lists it; bob (never invited) finds it in the Space's
+  `/hierarchy` and joins; carol (org B) gets `403` on org A's hierarchy, `404` on all three
+  room-summary endpoints (which answer bob `200`), cannot join it (nor can her duo), and it is in
+  nobody's `/publicRooms`. Publishing it and making it `public` stay refused. A member cannot list
+  a room they are not in, an invite-only room (listable only after its join rule is explicitly
+  opened to the Space), or a Space-restricted room holding an admin-invited org B member; cannot
+  remove a colleague's listing or `#general`'s. In a Space the daemon has not changed, Synapse's own
+  power levels refuse a member's link before the module is asked. A control run with no module lets
+  alice list an invite-only room, and five new mutations (`event-link-off` 5, `link-join-rule-off`
+  1, `link-not-in-room-ok` 3, `link-mixed-org-ok` 1, `unlink-others-ok` 2) each fail checks; every
+  earlier mutation still does. `test/synapse-org-wall-daemon.test.ts` runs the same flow on Spaces the
+  daemon's `OrgSpaceProvisioner` made. **One finding:** an org Space holding another org's pending
+  invite (left by a refused admin-API join, below) can no longer be the target of a `restricted`
+  rule, so nobody in that org can make a channel until the invite is gone. That fails closed, and the
+  daemon never asks for a cross-org join.
 
 Findings the record did not have, which the next reader should know:
 

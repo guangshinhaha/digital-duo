@@ -632,7 +632,7 @@ export class HostedRegistry {
    */
   updateOrgSpace(
     orgId: string,
-    patch: { spaceRoomId?: string; generalRoomId?: string; spaceSyncedName?: string; generalLinked?: boolean; functionalMembersSet?: boolean },
+    patch: { spaceRoomId?: string; generalRoomId?: string; spaceSyncedName?: string; generalLinked?: boolean; functionalMembersSet?: boolean; memberLinksAllowed?: boolean },
   ): HostedOrg {
     return this.commit((draft) => {
       const org = draft.orgs.find((candidate) => candidate.id === orgId);

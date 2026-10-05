@@ -130,10 +130,48 @@ class DuoOrgWall:
         needed = rules.allowed_room_ids(rules.as_mapping(content))
         return self._verdict(callback, self._wall.may_send_join_rules(sender, content, await self._restricted_orgs(needed)))
 
+    async def _space_child_verdict(self, event):
+        """An m.space.child state event (#274): listing a room in a Space, which is how it becomes findable in the org."""
+        sender = event.sender
+        if self._wall.is_service(sender):
+            return NOT_SPAM
+        child_id = event.get_state_key()
+        if child_id is None:
+            # Not a state event: a timeline event of this type links nothing.
+            return NOT_SPAM
+        existing = await self._api.get_room_state(event.room_id, [(rules.SPACE_CHILD_EVENT, child_id)])
+        link = existing.get((rules.SPACE_CHILD_EVENT, child_id))
+        child = await self._api.get_room_state(
+            child_id, [(rules.JOIN_RULES_EVENT, ""), (rules.HISTORY_EVENT, ""), (rules.MEMBER_EVENT, None)]
+        )
+        join_rules = child.get((rules.JOIN_RULES_EVENT, ""))
+        history = child.get((rules.HISTORY_EVENT, ""))
+        members = {
+            key[1]: str(state.content.get("membership")) for key, state in child.items() if key[0] == rules.MEMBER_EVENT
+        }
+        join_rules_content = join_rules.content if join_rules is not None else {}
+        # No history-visibility event reads as `shared` (the spec's default, and Synapse's).
+        history_content = history.content if history is not None else {"history_visibility": "shared"}
+        needed = rules.allowed_room_ids(rules.as_mapping(join_rules_content))
+        return self._verdict(
+            "check_event_for_spam",
+            self._wall.may_link_child(
+                sender,
+                event.room_id,
+                event.content,
+                (link.sender, link.content) if link is not None else None,
+                join_rules_content,
+                history_content,
+                members,
+                await self._restricted_orgs(needed),
+            ),
+        )
+
     async def check_event_for_spam(self, event):
         # Runs for every event a local client sends: answer at once unless it is
         # a join-rules, history-visibility or guest-access event (the state that can
-        # open a room to people outside it). Room creation never comes through here,
+        # open a room to people outside it), or an m.space.child event (listing a room
+        # in a Space, which makes it findable there, #274). Room creation never comes through here,
         # which is why user_may_create_room reads initial_state. Not user_may_send_state_event:
         # experimental, and on v1.161.0 it drops the (Codes, dict) pair, so the person
         # would get Synapse's fixed sentence instead of ours.
@@ -142,6 +180,8 @@ class DuoOrgWall:
                 return await self._join_rules_verdict("check_event_for_spam", event.sender, event.content)
             if event.type in rules.READABILITY_EVENTS:
                 return self._verdict("check_event_for_spam", self._wall.may_send_readability(event.sender, event.type, event.content))
+            if event.type == rules.SPACE_CHILD_EVENT:
+                return await self._space_child_verdict(event)
             return NOT_SPAM
         except Exception as error:
             return self._failed("check_event_for_spam", error)

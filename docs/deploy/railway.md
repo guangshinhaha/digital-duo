@@ -226,7 +226,7 @@ under `umask 077` cannot stop Synapse starting) and sets `PYTHONPATH=/modules`;
 
   ```
   python3.13 -m venv /tmp/wall-venv && /tmp/wall-venv/bin/pip install matrix-synapse==1.161.0
-  /tmp/wall-venv/bin/python deploy/synapse/modules/duo_org_wall/tests/real_synapse.py       # 101 checks
+  /tmp/wall-venv/bin/python deploy/synapse/modules/duo_org_wall/tests/real_synapse.py       # 128 checks
   /tmp/wall-venv/bin/python deploy/synapse/modules/duo_org_wall/tests/real_synapse.py --mutate-all   # each weakened wall must fail a check
   DUO_TEST_SYNAPSE_PYTHON=/tmp/wall-venv/bin/python npx vitest run test/synapse-org-wall.test.ts test/synapse-org-wall-daemon.test.ts
   ```

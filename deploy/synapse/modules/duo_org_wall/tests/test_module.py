@@ -46,9 +46,16 @@ class Event:
         self.content, self.state_key = {"membership": membership}, key
 
 
+class StateEvent:
+    def __init__(self, sender, content):
+        self.sender, self.content = sender, content
+
+
 class FakeApi:
-    def __init__(self, rooms=None, error=None):
-        self.callbacks, self.rooms, self.error, self.asked = {}, rooms or {}, error, []
+    """`rooms`: room id -> {user: membership}. `state`: room id -> {(type, state_key): (sender, content)} for other state."""
+
+    def __init__(self, rooms=None, error=None, state=None):
+        self.callbacks, self.rooms, self.error, self.asked, self.state = {}, rooms or {}, error, [], state or {}
 
     def register_spam_checker_callbacks(self, **callbacks):
         self.callbacks = callbacks
@@ -57,11 +64,14 @@ class FakeApi:
         self.asked.append((room_id, list(event_filter)))
         if self.error:
             raise self.error
-        return {("m.room.member", user): Event(membership, user) for user, membership in self.rooms.get(room_id, {}).items()}
+        everything = {("m.room.member", user): Event(membership, user) for user, membership in self.rooms.get(room_id, {}).items()}
+        everything.update({key: StateEvent(*value) for key, value in self.state.get(room_id, {}).items()})
+        # As Synapse filters: a None state key is every event of that type.
+        return {key: event for key, event in everything.items() if any(key[0] == t and (k is None or key[1] == k) for t, k in event_filter)}
 
 
-def build(rooms=None, error=None):
-    api = FakeApi(rooms, error)
+def build(rooms=None, error=None, state=None):
+    api = FakeApi(rooms, error, state)
     module.DuoOrgWall(module.DuoOrgWall.parse_config({"server_name": "duo", "service_accounts": [ADMIN]}), api)
     return api
 
@@ -164,6 +174,58 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(run(cb["check_event_for_spam"](Ev("m.room.guest_access", A1, {"guest_access": "forbidden"}))), "NOT_SPAM")
         self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev("m.room.guest_access", A1, {"guest_access": "can_join"}))), "Public rooms"))
 
+    def test_space_child_links_read_the_child_and_the_existing_link(self):
+        space, channel, group = "!space:duo", "!channel:duo", "!group:duo"
+        open_to_space = {"join_rule": "restricted", "allow": [{"type": "m.room_membership", "room_id": space}]}
+        api = build(
+            rooms={space: {ADMIN: "join", A1: "join", A2: "join"}, channel: {A1: "join"}, group: {A1: "join", A2: "join"}, "!general:duo": {ADMIN: "join", A1: "join"}},
+            state={
+                space: {("m.space.child", "!general:duo"): (ADMIN, {"via": ["duo"]})},
+                channel: {("m.room.join_rules", ""): (A1, open_to_space), ("m.room.history_visibility", ""): (A1, {"history_visibility": "shared"})},
+                group: {("m.room.join_rules", ""): (A1, {"join_rule": "invite"})},
+            },
+        )
+        cb = api.callbacks
+
+        class Ev:
+            def __init__(self, sender, key, content, room_id=space):
+                self.type, self.sender, self.content, self.room_id, self._key = "m.space.child", sender, content, room_id, key
+
+            def get_state_key(self):
+                return self._key
+
+        link = {"via": ["duo"]}
+        self.assertEqual(run(cb["check_event_for_spam"](Ev(A1, channel, link))), "NOT_SPAM")
+        self.assertIn((space, [("m.space.child", channel)]), api.asked)
+        self.assertIn((channel, [("m.room.join_rules", ""), ("m.room.history_visibility", ""), ("m.room.member", None)]), api.asked)
+        self.assertIn((space, [("m.room.member", None)]), api.asked)  # the allow entry's orgs
+        # An invite-only room (every room made before #274) is not listed; nor is a room the sender is not in.
+        self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev(A1, group, link))), "can be listed"))
+        self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev(A2, channel, link))), "can be listed"))
+        # Another org's account cannot list it, nor can a member touch the service account's #general link.
+        self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev(B1, channel, link))), "can be listed"))
+        self.assertTrue(refusal(run(cb["check_event_for_spam"](Ev(A1, "!general:duo", {}))), "Only the person who listed"))
+        # Removing your own (or a never-made) link is fine whatever the room is; the service account is never judged (nor read for).
+        self.assertEqual(run(cb["check_event_for_spam"](Ev(A1, group, {}))), "NOT_SPAM")
+        before = len(api.asked)
+        self.assertEqual(run(cb["check_event_for_spam"](Ev(ADMIN, group, link))), "NOT_SPAM")
+        self.assertEqual(len(api.asked), before)
+        # A timeline (non-state) event of this type links nothing.
+        self.assertEqual(run(cb["check_event_for_spam"](Ev(A1, None, link))), "NOT_SPAM")
+
+    def test_a_room_with_no_history_event_reads_as_shared(self):
+        space, channel = "!space:duo", "!channel:duo"
+        open_to_space = {"join_rule": "restricted", "allow": [{"type": "m.room_membership", "room_id": space}]}
+        api = build(rooms={space: {A1: "join"}, channel: {A1: "join"}}, state={channel: {("m.room.join_rules", ""): (A1, open_to_space)}})
+
+        class Ev:
+            type, sender, content, room_id = "m.space.child", A1, {"via": ["duo"]}, space
+
+            def get_state_key(self):
+                return channel
+
+        self.assertEqual(run(api.callbacks["check_event_for_spam"](Ev())), "NOT_SPAM")
+
     def test_directory_returns_a_boolean_true_to_hide(self):
         cb = build().callbacks
         self.assertIs(run(cb["check_username_for_spam"]({"user_id": A2, "display_name": "x", "avatar_url": None}, A1)), False)
@@ -186,6 +248,16 @@ class FailsClosed(unittest.TestCase):
         config = {"initial_state": [{"type": "m.room.join_rules", "state_key": "", "content": {"join_rule": "restricted", "allow": [{"room_id": "!x:duo"}]}}]}
         with self.assertLogs("duo_org_wall.module", level="ERROR"):
             self.assertTrue(refusal(run(cb["user_may_create_room"](A1, config)), "cannot be checked"))
+
+        class Link:
+            type, sender, content, room_id = "m.space.child", A1, {"via": ["duo"]}, "!space:duo"
+
+            def get_state_key(self):
+                return "!x:duo"
+
+        with self.assertLogs("duo_org_wall.module", level="ERROR") as logged:
+            self.assertTrue(refusal(run(cb["check_event_for_spam"](Link())), "cannot be checked"))
+        self.assertNotIn(SECRET, "\n".join(logged.output))
 
     def test_a_failing_decision_refuses_or_hides(self):
         api = build()
