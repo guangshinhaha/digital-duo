@@ -75,7 +75,12 @@ MUTATIONS = {
     "event-history-off": ("a client-sent history-visibility / guest-access event is not checked", [("module.py", "if event.type in rules.READABILITY_EVENTS:", "if False:")]),
     "publish-off": ("publishing to the room directory allowed", [("rules.py", "return None if self.is_service(user_id) else ERR_PUBLISH", "return None")]),
     "3pid-off": ("3pid invites on an existing room allowed", [("rules.py", "return None if self.is_service(user_id) else ERR_3PID", "return None")]),
-    "directory-off": ("the directory filter shows everyone", [("module.py", 'return self._wall.hide_from_directory(user_profile.get("user_id"), requester_id)', "return False")]),
+    "event-link-off": ("a client-sent m.space.child (listing a room in a Space) is not checked", [("module.py", "if event.type == rules.SPACE_CHILD_EVENT:", "if False:")]),
+    "link-join-rule-off": ("a room that is not restricted to the Space can be listed in it", [("rules.py", 'if join_rules.get("join_rule") != "restricted" or parent_room_id not in allowed_room_ids(join_rules):', "if False:")]),
+    "link-not-in-room-ok": ("a member can list a room they are not in", [("rules.py", 'if child_members.get(user_id) != "join":', "if False:")]),
+    "link-mixed-org-ok": ("a room with another org's member can be listed", [("rules.py", "if self.orgs_in_room(child_members) != frozenset({org}):", "if False:")]),
+    "unlink-others-ok": ("a member can change or remove someone else's listing", [("rules.py", 'if as_mapping(link_content).get("via") and link_sender != user_id:', "if False:")]),
+    "directory-off":("the directory filter shows everyone", [("module.py", 'return self._wall.hide_from_directory(user_profile.get("user_id"), requester_id)', "return False")]),
     "fails-open": ("an error inside the module allows instead of refusing", [("module.py", 'return Codes.FORBIDDEN, {"error": "This request cannot be checked right now."}', "return NOT_SPAM")]),
 }
 # Mutations no check in this file can see (only the unit tests): not reachable through Synapse's HTTP API.
@@ -340,6 +345,8 @@ def phase_main(server, admin, actors, ctx):
     check("restricted to another org's Space is refused", refused(result), result)
     result = make_room(ALICE, {"initial_state": restricted("!nosuchroom:" + SERVER)})
     check("restricted to a room that does not exist is refused (fails closed)", refused(result), result)
+    phase_channels(server, admin, actors, ctx, make_room, restricted)
+
     result = make_room(ALICE, {"initial_state": ["not-an-object"]})
     check("a malformed initial_state entry does not create a room (Synapse's own validation 500s before the module is asked; rules.py is unit-tested on it)", result[0] >= 400, result)
 
@@ -446,6 +453,115 @@ def phase_main(server, admin, actors, ctx):
     check("Synapse never asks the module about a server admin's room creation (a public room by the admin is allowed: never promote a person)", status == 200, out)
 
 
+def phase_channels(server, admin, actors, ctx, make_room, restricted):
+    """#274: a room findable by its own org (a child of the org's Space, restricted to it) and by no one else."""
+    A = lambda user_id: actors.tokens[user_id]  # noqa: E731
+    space_a, space_b, general_a = ctx["space_a"], ctx["space_b"], ctx["general_a"]
+    print("\n  #274: rooms findable within one org")
+    link = lambda who, parent, child, content: call(server, "PUT", "/_matrix/client/v3/rooms/%s/state/m.space.child/%s" % (q(parent), q(child)), A(who), content)  # noqa: E731
+    via = {"via": [SERVER]}
+
+    # The daemon's step, exactly as src/hosted/synapse-admin.ts allowMemberSpaceLinks does it: read, lower m.space.child, write back.
+    path = "/_matrix/client/v3/rooms/%s/state/m.room.power_levels" % q(space_a)
+    status, levels = call(server, "GET", path, admin)
+    levels["events"] = {**levels.get("events", {}), "m.space.child": 0}
+    result = call(server, "PUT", path, admin, levels)
+    check("(setup) the service account lets org A's Space members list rooms in it (the daemon's allowMemberSpaceLinks)", status == 200 and result[0] == 200, result)
+    result = call(server, "PUT", "/_matrix/client/v3/rooms/%s/state/m.space.child/%s" % (q(space_a), q(general_a)), admin, {"via": [SERVER], "suggested": True})
+    check("(setup) the service account links #general into org A's Space, as the daemon does", result[0] == 200, result)
+
+    status, channel = make_room(ALICE, {"name": "a-channel", "initial_state": restricted(space_a)})
+    channel_id = channel.get("room_id")
+    check("alice creates a channel: a room restricted to her org's Space", status == 200, channel)
+    result = link(BOB, space_a, channel_id, via)
+    check("bob cannot list a room he is not in, even one open to his own org", refused(result, "can be listed"), result)
+    result = link(ALICE, space_a, channel_id, via)
+    check("alice lists her channel in her org's Space (m.space.child, judged by the module)", result[0] == 200, result)
+
+    def hierarchy(who, space):
+        status, body = call(server, "GET", "/_matrix/client/v1/rooms/%s/hierarchy" % q(space), A(who))
+        return status, {room.get("room_id") for room in body.get("rooms", [])}
+
+    status, found = hierarchy(BOB, space_a)
+    check("bob, a colleague who was never invited, finds the channel in his org's Space hierarchy", status == 200 and channel_id in found, (status, found))
+    status, found = hierarchy(ALICE_DUO, space_a)
+    check("alice's duo (same org) finds it too", status == 200 and channel_id in found, (status, found))
+    result = call(server, "POST", "/_matrix/client/v3/join/" + q(channel_id), A(BOB), {})
+    check("bob joins the channel with no invite (restricted to the Space he is in)", result[0] == 200, result)
+
+    status, found = hierarchy(CAROL, space_a)
+    check("carol (org B) cannot read org A's Space hierarchy at all", status == 403 and channel_id not in found, (status, found))
+    status, found = hierarchy(CAROL, space_b)
+    check("org A's channel is not in org B's own Space hierarchy", status == 200 and channel_id not in found, (status, found))
+    summaries = {}
+    for summary_path in ("/_matrix/client/v1/room_summary/%s", "/_matrix/client/unstable/im.nheko.summary/rooms/%s/summary", "/_matrix/client/unstable/im.nheko.summary/summary/%s"):
+        summaries[summary_path] = (call(server, "GET", summary_path % q(channel_id), A(BOB))[0], call(server, "GET", summary_path % q(channel_id), A(CAROL)))
+    served = [summary_path for summary_path, (bob_status, _) in summaries.items() if bob_status == 200]
+    ctx["summary_served"] = {summary_path: [bob_status, carol[0]] for summary_path, (bob_status, carol) in summaries.items()}
+    check(
+        "carol gets no summary of the channel by id on any room-summary endpoint, including one that answers bob (%d served)" % len(served),
+        all(carol[0] != 200 and "a-channel" not in json.dumps(carol[1]) for _, carol in summaries.values()),
+        summaries,
+    )
+    result = call(server, "POST", "/_matrix/client/v3/join/" + q(channel_id), A(CAROL), {})
+    check("carol cannot join the channel by id", refused(result), result)
+    result = call(server, "POST", "/_matrix/client/v3/join/" + q(channel_id), A(CAROL_DUO), {})
+    check("carol's duo cannot join it either", refused(result), result)
+    status, listed = call(server, "GET", "/_matrix/client/v3/publicRooms", A(CAROL))
+    check("the channel is not in the server's public room directory (as carol)", status == 200 and channel_id not in {room.get("room_id") for room in listed.get("chunk", [])}, (status, listed))
+    status, listed = call(server, "GET", "/_matrix/client/v3/publicRooms", A(BOB))
+    check("... nor as bob: org scoping is the Space, never the directory", status == 200 and channel_id not in {room.get("room_id") for room in listed.get("chunk", [])}, (status, listed))
+    result = call(server, "PUT", "/_matrix/client/v3/directory/list/room/" + q(channel_id), A(ALICE), {"visibility": "public"})
+    check("publishing the channel to the room directory is still refused", refused(result, "directory"), result)
+    result = call(server, "PUT", "/_matrix/client/v3/rooms/%s/state/m.room.join_rules" % q(channel_id), A(ALICE), {"join_rule": "public"})
+    check("the channel cannot be made public afterwards", refused(result, "Public rooms"), result)
+
+    # A link is never someone else's to change, and #general's stays.
+    result = link(BOB, space_a, channel_id, {})
+    check("bob cannot remove alice's listing", refused(result, "Only the person who listed"), result)
+    result = link(BOB, space_a, general_a, {})
+    check("a member cannot remove #general from the org's Space", refused(result, "Only the person who listed"), result)
+
+    # Rooms made before this change: an invite-only room is unaffected, and not listable until it is explicitly opened to the org.
+    status, older = make_room(ALICE, {"name": "older-group"})
+    older_id = older.get("room_id")
+    result = link(ALICE, space_a, older_id, via)
+    check("an invite-only room (every room made before #274) cannot be listed as it is", refused(result, "can be listed"), result)
+    result = call(server, "POST", "/_matrix/client/v3/join/" + q(older_id), A(BOB), {})
+    check("... and stays invite-only: a colleague cannot join it uninvited", result[0] == 403, result)
+    result = call(server, "PUT", "/_matrix/client/v3/rooms/%s/state/m.room.join_rules" % q(older_id), A(ALICE), restricted(space_a)[0]["content"])
+    check("the explicit change: alice opens it to her org's Space", result[0] == 200, result)
+    result = link(ALICE, space_a, older_id, via)
+    check("... after which she can list it", result[0] == 200, result)
+
+    # A room restricted to the Space but holding another org's invitee (only the service account can put one there) is never listed.
+    status, mixed = make_room(ALICE, {"name": "mixed-channel", "initial_state": restricted(space_a)})
+    mixed_id = mixed.get("room_id")
+    # The service account is in org A's Space, so the restricted rule lets it join itself (and an admin's join is not judged).
+    admin_joined = call(server, "POST", "/_matrix/client/v3/join/" + q(mixed_id), admin, {})
+    invited = call(server, "POST", "/_matrix/client/v3/rooms/%s/invite" % q(mixed_id), A(ALICE), {"user_id": CAROL})
+    check("(setup) carol cannot be invited into it by alice", refused(invited), invited)
+    admin_invited = call(server, "POST", "/_matrix/client/v3/rooms/%s/invite" % q(mixed_id), admin, {"user_id": CAROL}) if admin_joined[0] == 200 else admin_joined
+    result = link(ALICE, space_a, mixed_id, via)
+    check("a room with another org's (admin-invited) member is never listed, even restricted to the Space", admin_invited[0] == 200 and refused(result, "can be listed"), (admin_joined, admin_invited, result))
+
+    # A Space the daemon has not changed (as every Space was before #274): a member lists nothing there, even a room the module
+    # would accept, because Synapse's own power levels say no. A fresh org B Space (org B's main one holds the pending invite
+    # an earlier refused join left behind, so nothing can be restricted to it).
+    status, fresh = call(server, "POST", "/_matrix/client/v3/createRoom", admin, {"name": "Org B unchanged", "visibility": "private", "preset": "private_chat", "creation_content": {"type": "m.space"}, "power_level_content_override": {"invite": 100, "events_default": 100}})
+    space_b2 = fresh.get("room_id")
+    joined = call(server, "POST", "/_synapse/admin/v1/join/" + q(space_b2), admin, {"user_id": CAROL})
+    status, b_room = make_room(CAROL, {"name": "b-channel", "initial_state": restricted(space_b2)})
+    result = link(CAROL, space_b2, b_room.get("room_id"), via)
+    ours = ("can be listed", "Only the person", "does not belong", "cannot be checked")
+    check(
+        "in a Space the daemon has not changed, a member still cannot list a room the module would accept (Synapse's power levels refuse it, not the module)",
+        joined[0] == 200 and status == 200 and result[0] == 403 and not any(sentence in result[1].get("error", "") for sentence in ours),
+        (joined, status, result),
+    )
+    ctx["channel"] = channel_id
+
+
 def login_with_device(server, admin, user_id, display_name):
     """A real password login (the admin-API token has no device, and to-device and key calls need one). Returns (token, device id)."""
     password = secrets.token_hex(24)
@@ -508,6 +624,9 @@ def phase_control_no_module(server, admin, actors, ctx):
     status, resolved = call(server, "GET", "/_matrix/client/v3/directory/room/" + q("#controlpeek:" + SERVER), actors.tokens[CAROL])
     status, body = call(server, "GET", "/_matrix/client/v3/rooms/%s/messages?dir=b&limit=10" % q(peek), actors.tokens[CAROL])
     check("control: without the module a world_readable private room is readable by another org through its alias (the attack the checks above stop)", result[0] == 200 and status == 200 and "control words" in json.dumps(body), (sent, result, status, body))
+    status, room = call(server, "POST", "/_matrix/client/v3/createRoom", actors.tokens[ALICE], {"preset": "private_chat", "name": "control-unlisted"})
+    result = call(server, "PUT", "/_matrix/client/v3/rooms/%s/state/m.space.child/%s" % (q(ctx["space_a"]), q(room["room_id"])), actors.tokens[ALICE], {"via": [SERVER]})
+    check("control: without the module a member lists an invite-only room in the org Space (the #274 link check is the module's)", status == 200 and result[0] == 200, (status, result))
 
 
 def phase_module_search_all(server, admin, actors, ctx):
@@ -673,7 +792,7 @@ def main():
         server.stop()
     failed = [name for name, ok, _ in results if not ok]
     print("\n%d checks, %d failed" % (len(results), len(failed)))
-    print("observed: " + json.dumps({key: ctx[key] for key in ("join_rules_callbacks", "raising_create", "raising_invite", "raising_join", "raising_search", "invite_state_types") if key in ctx}))
+    print("observed: " + json.dumps({key: ctx[key] for key in ("join_rules_callbacks", "summary_served", "raising_create", "raising_invite", "raising_join", "raising_search", "invite_state_types") if key in ctx}))
     for name in failed:
         print("FAILED: " + name)
     if mutation:

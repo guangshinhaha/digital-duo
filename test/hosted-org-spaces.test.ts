@@ -242,6 +242,47 @@ describe("OrgSpaceProvisioner: an org's Space and #general", () => {
     expect(fake.rooms.get(stored.generalRoomId!)!.functionalMembers).toEqual(["@workspace-admin:duo.test"]);
   });
 
+  it("lets the Space's members list a room in it, and changes nothing else about who may do what (#274)", async () => {
+    const { registry, fake, spaces } = setup();
+    const org = registry.createOrg("Platform team");
+    await spaces.ensureOrg(org.id);
+    const stored = registry.org(org.id)!;
+    const space = fake.rooms.get(stored.spaceRoomId!)!;
+    const general = fake.rooms.get(stored.generalRoomId!)!;
+
+    expect(stored.memberLinksAllowed).toBe(true);
+    expect(orgSpaceComplete(stored)).toBe(true);
+    // Only m.space.child is lowered, and only in the Space; the rest of the Space's levels are written back as they were.
+    expect(space.powerLevels).toMatchObject({ invite: 100, events_default: 100, state_default: 50, users_default: 0, users: { "@workspace-admin:duo.test": 100 }, events: { "m.space.child": 0 } });
+    expect(general.powerLevels.events).toBeUndefined();
+    expect(fake.mayInvite(space.roomId, "@workspace-admin:duo.test")).toBe(true);
+
+    const calls = fake.requests.length;
+    expect((await spaces.ensureOrg(org.id)).status).toBe("already");
+    expect(fake.requests).toHaveLength(calls);
+  });
+
+  it("a Space made before #274 gets member links on the next sweep, with no manual step", async () => {
+    const { registry, fake, spaces, path } = setup();
+    const org = registry.createOrg("Platform team");
+    await spaces.ensureOrg(org.id);
+    const stored = registry.org(org.id)!;
+    // As a pre-#274 build left it: no flag, and the Space's levels without the m.space.child entry.
+    delete fake.rooms.get(stored.spaceRoomId!)!.powerLevels.events;
+    const tampered = JSON.parse(readFileSync(path, "utf8")) as { orgs: Array<Record<string, unknown>> };
+    delete tampered.orgs.find((candidate) => candidate.id === org.id)!.memberLinksAllowed;
+    writeFileSync(path, JSON.stringify(tampered));
+    const reopened = new HostedRegistry(path, MASTER);
+    expect(orgSpaceComplete(reopened.org(org.id)!)).toBe(false);
+
+    const sweeper = new OrgSpaceProvisioner({ registry: reopened, admin: new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch }), serverName: "duo.test", log: () => {} });
+    expect((await sweeper.ensureOrg(org.id)).status).toBe("provisioned");
+    expect(orgSpaceComplete(reopened.org(org.id)!)).toBe(true);
+    expect(fake.rooms.get(stored.spaceRoomId!)!.powerLevels).toMatchObject({ invite: 100, events_default: 100, events: { "m.space.child": 0 } });
+    // Nothing was recreated: still one Space and one #general for this org.
+    expect([...fake.rooms.values()].filter((room) => room.name === "Platform team")).toHaveLength(1);
+  });
+
   it("never sends a token anywhere but the Authorization header, and logs none", async () => {
     const { registry, fake, logs, spaces } = setup();
     const org = registry.createOrg("Platform team");
@@ -640,6 +681,22 @@ describe("SynapseAdmin room calls (endpoint shapes per the Synapse and Matrix do
     const request = fake.requests.find((candidate) => candidate.path === `/_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/io.element.functional_members`);
     expect(request).toMatchObject({ method: "PUT", body: { service_members: ["@workspace-admin:duo.test"] } });
     expect(fake.rooms.get(space)!.functionalMembers).toEqual(["@workspace-admin:duo.test"]);
+  });
+
+  it("allowMemberSpaceLinks reads the power levels and writes them back whole with only m.space.child changed", async () => {
+    const fake = createFakeSynapse();
+    const admin = new SynapseAdmin({ baseUrl: FAKE_SYNAPSE_URL, adminToken: FAKE_ADMIN_TOKEN, fetch: fake.fetch });
+    const space = await admin.createPrivateRoom({ name: "Org", space: true, txnId: "s" });
+    fake.rooms.get(space)!.powerLevels.events = { "m.room.name": 50, "m.room.power_levels": 100 };
+    await admin.allowMemberSpaceLinks(space);
+    const path = `/_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/m.room.power_levels`;
+    expect(fake.requests.filter((candidate) => candidate.path === path).map((candidate) => candidate.method)).toEqual(["GET", "PUT"]);
+    expect(fake.requests.find((candidate) => candidate.path === path && candidate.method === "PUT")!.body).toMatchObject({
+      invite: 100,
+      events_default: 100,
+      users: { "@workspace-admin:duo.test": 100 },
+      events: { "m.room.name": 50, "m.room.power_levels": 100, "m.space.child": 0 },
+    });
   });
 
   it("the fake answers as Synapse does: a repeat admin join of an invite-only room is 403, and an unknown room's members 404", async () => {

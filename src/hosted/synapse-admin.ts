@@ -175,7 +175,8 @@ export class SynapseAdmin {
    * §6, §12). **Always private**: `visibility: "private"` and the `private_chat` preset (invite-only) are
    * fixed here and not options, so no caller can make a public room, which would put everyone in it in
    * every org's directory. A Space is the same room with `creation_content.type = "m.space"`, and only
-   * the service account may post in it (`events_default: 100`, the spec's recommendation).
+   * the service account may post in it (`events_default: 100`, the spec's recommendation). The one exception,
+   * added after creation by `allowMemberSpaceLinks` (#274), is `m.space.child`, judged by the org wall.
    *
    * **Only the service account may invite** (`invite: 100` in both rooms). The `private_chat` preset
    * sets `invite: 0`, so without this override any member could invite any user id, another org's
@@ -210,6 +211,27 @@ export class SynapseAdmin {
       via,
       suggested: true,
     });
+  }
+
+  /**
+   * Lets the Space's members list a room in it (#274): sets `events["m.space.child"]` to 0 in the Space's
+   * `m.room.power_levels`, by reading the current content and writing it back with only that key changed (a
+   * state PUT replaces the whole content, so nothing else may be dropped). This is how a member's room
+   * becomes findable by their org: a child of the org's Space shows in its hierarchy, and Synapse shows a
+   * child only to someone who may join it. **The org wall judges every such link** (`duo_org_wall`
+   * `may_link_child`: only a room restricted to this Space, holding only the sender's org, that the sender
+   * is in; and nobody but its author may change or remove a link, so `#general`'s stays). Everything
+   * else in the Space stays at 100. Safe to repeat: it rewrites the same level.
+   */
+  async allowMemberSpaceLinks(spaceRoomId: string): Promise<void> {
+    const path = `/_matrix/client/v3/rooms/${encodeURIComponent(spaceRoomId)}/state/m.room.power_levels`;
+    const { json } = await this.call("GET", path);
+    if (json === null || typeof json !== "object" || Array.isArray(json)) {
+      throw new SynapseAdminError("Synapse returned no power levels for the Space", 200, null, false);
+    }
+    const current = json as Record<string, unknown>;
+    const events = current.events !== null && typeof current.events === "object" && !Array.isArray(current.events) ? (current.events as Record<string, unknown>) : {};
+    await this.call("PUT", path, { ...current, events: { ...events, "m.space.child": 0 } });
   }
 
   /** Sets a room's name (`PUT .../state/m.room.name`), as the service account, which is in the room and its creator. */

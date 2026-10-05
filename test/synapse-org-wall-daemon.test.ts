@@ -85,6 +85,49 @@ describe.skipIf(!synapsePython)("daemon provisioning against a real Synapse with
       expect((await admin.roomMembers(room)).sort()).toEqual(["@workspace-admin:duo", ...idsOf(lee)].sort());
     }
 
+    // #274: in a Space the daemon provisioned, a member lists a room open to the org; a colleague finds and joins it
+    // uninvited; the other org neither sees nor joins it; and #general's listing is not a member's to remove. Done before
+    // the cross-org joins below: a refused admin-API join leaves the admin's invite pending in the room, and an org Space
+    // holding another org's invitee is, rightly (fails closed), no longer a room anything can be restricted to.
+    const matrix = async (method: string, path: string, token: string, body?: unknown) => {
+      const response = await fetch(`${base}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: response.status, json: (await response.json()) as Record<string, unknown> };
+    };
+    const tokenOf = async (userId: string) =>
+      (await matrix("POST", `/_synapse/admin/v1/users/${encodeURIComponent(userId)}/login`, adminToken, {})).json.access_token as string;
+    const [samPerson] = idsOf(sam);
+    const [kimPerson] = idsOf(kim);
+    const [leePerson] = idsOf(lee);
+    const samToken = await tokenOf(samPerson!);
+    const kimToken = await tokenOf(kimPerson!);
+    const leeToken = await tokenOf(leePerson!);
+    const space = alphaRooms.spaceRoomId!;
+    const created = await matrix("POST", "/_matrix/client/v3/createRoom", samToken, {
+      preset: "private_chat",
+      name: "alpha channel",
+      initial_state: [{ type: "m.room.join_rules", state_key: "", content: { join_rule: "restricted", allow: [{ type: "m.room_membership", room_id: space }] } }],
+    });
+    expect(created.status, JSON.stringify(created.json)).toBe(200);
+    const channel = created.json.room_id as string;
+    const linked = await matrix("PUT", `/_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/m.space.child/${encodeURIComponent(channel)}`, samToken, { via: ["duo"] });
+    expect(linked.status, JSON.stringify(linked.json)).toBe(200);
+    const hierarchy = async (token: string) => matrix("GET", `/_matrix/client/v1/rooms/${encodeURIComponent(space)}/hierarchy`, token);
+    const seenByKim = await hierarchy(kimToken);
+    expect(seenByKim.status).toBe(200);
+    expect((seenByKim.json.rooms as Array<{ room_id: string }>).map((room) => room.room_id)).toContain(channel);
+    expect((await matrix("POST", `/_matrix/client/v3/join/${encodeURIComponent(channel)}`, kimToken, {})).status).toBe(200);
+    expect((await hierarchy(leeToken)).status).toBe(403);
+    expect((await matrix("POST", `/_matrix/client/v3/join/${encodeURIComponent(channel)}`, leeToken, {})).status).toBe(403);
+    const unlinkGeneral = await matrix("PUT", `/_matrix/client/v3/rooms/${encodeURIComponent(space)}/state/m.space.child/${encodeURIComponent(alphaRooms.generalRoomId!)}`, samToken, {});
+    expect(unlinkGeneral.status).toBe(403);
+    // Beta's Space was provisioned the same way, but holds none of it.
+    const betaHierarchy = await matrix("GET", `/_matrix/client/v1/rooms/${encodeURIComponent(betaRooms.spaceRoomId!)}/hierarchy`, leeToken);
+    expect((betaHierarchy.json.rooms as Array<{ room_id: string }>).map((room) => room.room_id)).not.toContain(channel);
+
     // The wall: the real module refuses an org B account in an org A room, person or duo, Space or #general.
     for (const target of idsOf(lee)) {
       for (const room of [alphaRooms.spaceRoomId!, alphaRooms.generalRoomId!]) {

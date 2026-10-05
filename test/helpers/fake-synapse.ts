@@ -82,7 +82,7 @@ export interface FakeRoom {
   functionalMembers: string[] | undefined;
   powerLevelOverride: unknown;
   /** The room's effective power levels: Synapse's defaults, the preset's, then the caller's override on top (shallow). */
-  powerLevels: { invite: number; events_default: number; state_default: number; users_default: number; users: Record<string, number> };
+  powerLevels: { invite: number; events_default: number; state_default: number; users_default: number; users: Record<string, number>; events?: Record<string, number> };
 }
 
 export interface FakeSynapseOptions {
@@ -269,6 +269,22 @@ export function createFakeSynapse(options: FakeSynapseOptions = {}): FakeSynapse
         }
         const members = [...room.members];
         return json(200, { members, total: members.length });
+      }
+      // #274: a room's power levels, read and written whole by `allowMemberSpaceLinks`.
+      const levels = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/m\.room\.power_levels\/?$/.exec(url.pathname);
+      if (levels && (method === "GET" || method === "PUT")) {
+        const room = rooms.get(decodeURIComponent(levels[1]!));
+        if (!room) {
+          return json(404, { errcode: "M_NOT_FOUND", error: "Unknown room" });
+        }
+        if (method === "GET") {
+          return json(200, room.powerLevels);
+        }
+        if ((room.powerLevels.users[adminUserId] ?? room.powerLevels.users_default) < 100) {
+          return json(403, { errcode: "M_FORBIDDEN", error: "not enough power to change power levels" });
+        }
+        room.powerLevels = JSON.parse(rawBody ?? "{}") as FakeRoom["powerLevels"];
+        return json(200, { event_id: `$${randomBytes(6).toString("hex")}` });
       }
       const state = method === "PUT" ? /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/(m\.space\.child|m\.room\.name|io\.element\.functional_members)(?:\/([^/]+))?$/.exec(url.pathname) : null;
       if (state) {

@@ -262,6 +262,139 @@ class ReadabilityEvents(unittest.TestCase):
         self.assertIsNone(wall.may_send_readability(A1, "m.room.message", {"body": "x"}))
 
 
+SPACE_A, SPACE_B = "!spacea:duo", "!spaceb:duo"
+LINK = {"via": ["duo"], "suggested": False}
+OPEN_TO_A = {"join_rule": "restricted", "allow": ALLOW(SPACE_A)}
+ROOMS_OF = {SPACE_A: frozenset({"orga1111"}), SPACE_B: frozenset({"orgb2222"})}
+
+
+class SpaceChildLinks(unittest.TestCase):
+    """#274: a room is findable within one org by being a child of the org's Space, and only then."""
+
+    def link(self, sender=A1, parent=SPACE_A, content=LINK, existing=None, rules_content=OPEN_TO_A, history_content=None, members=None, restricted=None):
+        return wall.may_link_child(
+            sender,
+            parent,
+            content,
+            existing,
+            rules_content,
+            {"history_visibility": "shared"} if history_content is None else history_content,
+            {A1: "join", A2: "join"} if members is None else members,
+            ROOMS_OF if restricted is None else restricted,
+        )
+
+    def test_a_member_lists_a_room_open_to_their_own_org_in_its_space(self):
+        self.assertIsNone(self.link())
+        self.assertIsNone(self.link(members={A1: "join"}))
+        self.assertIsNone(self.link(members={A1: "join", A1_DUO: "invite", ADMIN: "join", B1: "leave"}))
+        self.assertIsNone(self.link(sender=A1_DUO, members={A1_DUO: "join"}))
+        for value in ("invited", "joined", "shared"):
+            self.assertIsNone(self.link(history_content={"history_visibility": value}), value)
+
+    def test_a_room_with_another_orgs_member_is_never_listed(self):
+        self.assertEqual(self.link(members={A1: "join", B1: "join"}), rules.ERR_LINK)
+        self.assertEqual(self.link(members={A1: "join", B1_DUO: "invite"}), rules.ERR_LINK)
+        self.assertEqual(self.link(members={A1: "join", "@mallory:duo": "join"}), rules.ERR_LINK)
+
+    def test_only_a_room_restricted_to_this_parent_and_only_rooms_of_the_senders_org(self):
+        # A room created before #274 is invite-only (Synapse's private_chat preset): unaffected, and unlistable until changed.
+        self.assertEqual(self.link(rules_content={"join_rule": "invite"}), rules.ERR_LINK)
+        for content in [
+            {},
+            {"join_rule": "public"},
+            {"join_rule": "knock"},
+            {"join_rule": "knock_restricted", "allow": ALLOW(SPACE_A)},
+            {"join_rule": "restricted"},
+            {"join_rule": "restricted", "allow": []},
+            {"join_rule": "restricted", "allow": ALLOW(SPACE_B)},  # another org's Space
+            {"join_rule": "restricted", "allow": ALLOW("!elsewhere:duo")},  # not this parent
+            {"join_rule": "restricted", "allow": ALLOW(SPACE_A) + ALLOW(SPACE_B)},  # this parent and another org's
+            {"join_rule": "restricted", "allow": ALLOW(SPACE_A) + [{"type": "m.room_membership"}]},
+            None,
+            "restricted",
+        ]:
+            self.assertEqual(self.link(rules_content=content), rules.ERR_LINK, content)
+        # The parent itself must hold only the sender's org (an org B Space cannot be the target of an org A link).
+        self.assertEqual(self.link(parent=SPACE_B, rules_content={"join_rule": "restricted", "allow": ALLOW(SPACE_B)}), rules.ERR_LINK)
+        self.assertEqual(self.link(restricted={SPACE_A: frozenset({"orga1111", "orgb2222"})}), rules.ERR_LINK)
+        self.assertEqual(self.link(restricted={SPACE_A: frozenset()}), rules.ERR_LINK)
+        self.assertEqual(self.link(restricted={}), rules.ERR_LINK)
+        self.assertEqual(self.link(parent=None), rules.ERR_LINK)
+
+    def test_the_sender_must_be_joined_to_the_room_they_list(self):
+        self.assertEqual(self.link(members={A2: "join"}), rules.ERR_LINK)
+        self.assertEqual(self.link(members={A1: "invite", A2: "join"}), rules.ERR_LINK)
+        self.assertEqual(self.link(members={A1: "leave", A2: "join"}), rules.ERR_LINK)
+        self.assertEqual(self.link(members={}), rules.ERR_LINK)  # also how an unknown room id reads
+
+    def test_a_world_readable_room_is_never_listed(self):
+        for content in [{"history_visibility": "world_readable"}, {}, {"history_visibility": None}]:
+            self.assertEqual(self.link(history_content=content), rules.ERR_LINK, content)
+
+    def test_any_truthy_via_is_judged_as_a_link(self):
+        # Synapse reads only a list of strings as a live link, but a stranger shape is judged, never waved through.
+        for via in (["duo"], "duo", {"x": 1}, [3]):
+            self.assertEqual(self.link(content={"via": via}, rules_content={"join_rule": "invite"}), rules.ERR_LINK, via)
+
+    def test_removing_your_own_link_or_writing_a_removed_one_needs_nothing_else(self):
+        for content in ({}, {"via": []}, {"via": None}, None):
+            self.assertIsNone(self.link(content=content, rules_content={"join_rule": "invite"}, members={}), content)
+            self.assertIsNone(self.link(content=content, existing=(A1, LINK), rules_content={"join_rule": "invite"}, members={}), content)
+
+    def test_someone_elses_live_link_cannot_be_changed_or_removed(self):
+        for existing in [(ADMIN, LINK), (A2, LINK)]:  # the service account's #general link; a colleague's channel
+            self.assertEqual(self.link(existing=existing), rules.ERR_UNLINK, existing)
+            self.assertEqual(self.link(content={}, existing=existing), rules.ERR_UNLINK, existing)
+        self.assertIsNone(self.link(existing=(A1, LINK)))
+        # A link already removed (no via) is nobody's: it may be listed again.
+        self.assertIsNone(self.link(existing=(A2, {})))
+        self.assertIsNone(self.link(existing=(ADMIN, {"via": []})))
+
+    def test_no_org_and_the_service_account(self):
+        self.assertEqual(self.link(sender="@mallory:duo", members={"@mallory:duo": "join"}), rules.ERR_NO_ORG)
+        self.assertEqual(self.link(sender="@mallory:duo", content={}), rules.ERR_NO_ORG)
+        self.assertIsNone(self.link(sender=ADMIN, rules_content={"join_rule": "invite"}, members={B1: "join"}, existing=(A2, LINK)))
+
+
+class OrgScopedChannels(unittest.TestCase):
+    """#274 end to end, in the wall's own terms: what a findable-in-the-org room is, and what it is not."""
+
+    def test_a_channel_open_to_the_org_space_is_creatable_listable_and_joinable_by_a_colleague(self):
+        create = {"preset": "private_chat", "name": "channel", "initial_state": [state("restricted", allow=ALLOW(SPACE_A))]}
+        self.assertIsNone(wall.may_create_room(A1, create, ROOMS_OF))
+        self.assertIsNone(wall.may_link_child(A1, SPACE_A, LINK, None, OPEN_TO_A, {"history_visibility": "shared"}, {A1: "join"}, ROOMS_OF))
+        # A colleague joins it with no invite: Synapse's restricted rule lets in members of the Space, and the wall agrees.
+        self.assertIsNone(wall.may_join(A2, {A1: "join"}))
+        self.assertIsNone(wall.may_join(A1_DUO, {A1: "join", A2: "join"}))
+
+    def test_another_org_can_neither_join_it_nor_point_its_own_room_at_it(self):
+        self.assertEqual(wall.may_join(B1, {A1: "join", A2: "join"}), rules.ERR_JOIN)
+        self.assertEqual(wall.may_join(B1_DUO, {A1: "join"}), rules.ERR_JOIN)
+        # Nor open its own room to org A's Space, nor list org A's room in its own Space.
+        self.assertEqual(wall.may_create_room(B1, {"initial_state": [state("restricted", allow=ALLOW(SPACE_A))]}, ROOMS_OF), rules.ERR_PUBLIC)
+        self.assertEqual(wall.may_link_child(B1, SPACE_B, LINK, None, OPEN_TO_A, {"history_visibility": "shared"}, {A1: "join", B1: "join"}, ROOMS_OF), rules.ERR_LINK)
+
+    def test_public_and_directory_publishing_stay_refused(self):
+        # The room directory (/publicRooms) is one list for the whole server, with no per-requester module filter in
+        # Synapse 1.161.0: org scoping is the Space, never publishing.
+        self.assertEqual(wall.may_create_room(A1, {"preset": "public_chat"}, ROOMS_OF), rules.ERR_PUBLIC)
+        self.assertEqual(wall.may_create_room(A1, {"visibility": "public", "initial_state": [state("restricted", allow=ALLOW(SPACE_A))]}, ROOMS_OF), rules.ERR_PUBLIC)
+        self.assertEqual(wall.may_publish(A1), rules.ERR_PUBLISH)
+
+    def test_a_room_made_before_this_change_is_unaffected_until_explicitly_changed(self):
+        # Invite-only, as #214's private groups are: still fine to use, not listable as it is.
+        members = {A1: "join", A2: "join"}
+        invite_only = {"join_rule": "invite"}
+        self.assertEqual(wall.may_link_child(A1, SPACE_A, LINK, None, invite_only, {"history_visibility": "shared"}, members, ROOMS_OF), rules.ERR_LINK)
+        # The explicit change: open it to the org's Space (rule 5 already allows this), then list it.
+        self.assertIsNone(wall.may_send_join_rules(A1, OPEN_TO_A, ROOMS_OF))
+        self.assertIsNone(wall.may_link_child(A1, SPACE_A, LINK, None, OPEN_TO_A, {"history_visibility": "shared"}, members, ROOMS_OF))
+        # Private groups and DMs keep working exactly as before.
+        self.assertIsNone(wall.may_create_room(A1, {"preset": "private_chat", "name": "group"}, {}))
+        self.assertIsNone(wall.may_create_room(A1, {"preset": "trusted_private_chat", "is_direct": True, "invite": [A2]}, {}))
+        self.assertEqual(wall.may_create_room(A1, {"is_direct": True, "invite": [B1]}, {}), rules.ERR_INVITE)
+
+
 class PublishAnd3pid(unittest.TestCase):
     def test_always_refused_except_for_the_service_account(self):
         self.assertEqual(wall.may_publish(A1), rules.ERR_PUBLISH)

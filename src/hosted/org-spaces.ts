@@ -67,7 +67,7 @@ export interface SpaceSummary {
 
 export interface OrgSpaceProvisionerOptions {
   readonly registry: HostedRegistry;
-  readonly admin: Pick<SynapseAdmin, "createPrivateRoom" | "addSpaceChild" | "setRoomName" | "setFunctionalMembers" | "joinUser" | "whoAmI">;
+  readonly admin: Pick<SynapseAdmin, "createPrivateRoom" | "addSpaceChild" | "setRoomName" | "setFunctionalMembers" | "allowMemberSpaceLinks" | "joinUser" | "whoAmI">;
   /** Synapse's `server_name` (the `via` of the Space's child link). Otherwise read once from the admin token's user id. */
   readonly serverName?: string;
   /** One line per event: org and duo ids, room ids and scrubbed reasons only. Defaults to stderr. */
@@ -83,14 +83,18 @@ const DEFAULT_RETRY_MAX_MS = 30 * 60_000;
 /** A rename that lands while a run is finishing is picked up by another pass; bound the passes so a flapping name cannot spin. */
 const MAX_PASSES = 3;
 
-/** An org's rooms exist, are linked, carry its current name, and hide the service account from a generated name or a member list. */
+/**
+ * An org's rooms exist, are linked, carry its current name, hide the service account from a generated name or a
+ * member list, and the Space lets members list a room open to the org in it (#274).
+ */
 export function orgSpaceComplete(org: HostedOrg): boolean {
   return (
     org.spaceRoomId !== undefined &&
     org.generalRoomId !== undefined &&
     org.generalLinked === true &&
     org.spaceSyncedName === org.name &&
-    org.functionalMembersSet === true
+    org.functionalMembersSet === true &&
+    org.memberLinksAllowed === true
   );
 }
 
@@ -344,6 +348,12 @@ export class OrgSpaceProvisioner {
           await admin.setFunctionalMembers(org.generalRoomId!, [serviceAccountId]);
           org = this.record(orgId, { functionalMembersSet: true });
           this.log(`hosted: hid the service account from the Space and #general's names for org ${orgId}`);
+        }
+        if (!org.memberLinksAllowed) {
+          // #274: members may list a room in the Space (the org wall judges each link), so a room open to the org is findable by it.
+          await admin.allowMemberSpaceLinks(org.spaceRoomId!);
+          org = this.record(orgId, { memberLinksAllowed: true });
+          this.log(`hosted: let members list rooms open to the org in the Space for org ${orgId}`);
         }
         // A rename that landed while this pass ran leaves the org out of step; go round again.
         org = registry.org(orgId) ?? org;

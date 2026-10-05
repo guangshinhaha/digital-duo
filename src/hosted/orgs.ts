@@ -65,6 +65,13 @@ export interface HostedOrg {
    * made before this existed, so the backfill (`orgSpaceComplete`) picks it up on the next sweep.
    */
   readonly functionalMembersSet?: boolean;
+  /**
+   * True once the Space lets its members list a room in it (`m.space.child` at power level 0, #274), which is
+   * how a member's room becomes findable by the org; the org wall judges each link. Optional with no version
+   * bump, like `functionalMembersSet`: absent (including on a Space made before this existed) means not done
+   * yet, and the backfill (`orgSpaceComplete`) does it on the next sweep.
+   */
+  readonly memberLinksAllowed?: boolean;
   /** Set while the org's rooms are owed and failing; cleared when they are complete and named right. */
   readonly spacePending?: MatrixPending;
 }
