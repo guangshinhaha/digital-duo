@@ -1,5 +1,6 @@
 import type { FastifyError, FastifyInstance, FastifyReply } from "fastify";
 import { appendActionAttempt, ensureActionAttemptLogSchema } from "../actions/attempt-log.js";
+import { describeRecipientVoice, resetRecipientVoice } from "../drafting/recipient-voice.js";
 import { readThreadMessages } from "../drafting/thread-history.js";
 import { extractConversationsJson } from "../ingest/adapters/claude-export-zip.js";
 import { MalformedExportError, parseClaudeExport } from "../ingest/adapters/claude-export.js";
@@ -415,5 +416,30 @@ export function registerOwnerRoutes(app: FastifyInstance, deps: ServeDeps): void
     }
     removeSubscription(deps.storePath, deps.passphrase, deviceId);
     reply.code(204).send();
+  });
+
+  // guangshinhaha/duo#262: how drafts to one person are tuned. `:id` is the
+  // same recipient id POST /drafts was given (URL-encoded — a Matrix id's
+  // "@" and ":" survive). GET reports whether adaptation is active and on
+  // what; DELETE starts the relationship's learned tone over, so the general
+  // voice applies again until enough new sends accumulate. Both read and
+  // write this duo's own store only — a hosted daemon's per-duo deps make
+  // another duo's relationships unreachable from here.
+  app.get<{ Params: { id: string } }>("/people/:id/voice-adaptation", async (request, reply) => {
+    const id = nonBlankString(request.params.id);
+    if (id === undefined) {
+      sendError(reply, 400, "bad_request", "a person id is required");
+      return;
+    }
+    return describeRecipientVoice(deps.storePath, deps.passphrase, id);
+  });
+
+  app.delete<{ Params: { id: string } }>("/people/:id/voice-adaptation", async (request, reply) => {
+    const id = nonBlankString(request.params.id);
+    if (id === undefined) {
+      sendError(reply, 400, "bad_request", "a person id is required");
+      return;
+    }
+    return resetRecipientVoice(deps.storePath, deps.passphrase, id);
   });
 }

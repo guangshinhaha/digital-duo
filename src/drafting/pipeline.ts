@@ -12,7 +12,8 @@ import {
   type ConfidenceResult,
 } from "./confidence.js";
 import { gatherDraftContext, type DraftContext } from "./context.js";
-import { appendDraft, type DraftSource } from "./draft-log.js";
+import { appendDraft, type DraftRecipient, type DraftSource } from "./draft-log.js";
+import { deriveRecipientVoice, type RecipientRegister } from "./recipient-voice.js";
 import { explainEscalation, noEvidenceEscalationReason, refusedSubjectEscalationReason } from "./escalation.js";
 import { buildDraftPrompt, extractiveDraft, pickRepresentativeSample } from "./generate.js";
 import { matchesRefusedSubject } from "./relevance-gate.js";
@@ -30,6 +31,18 @@ export interface DraftAnswer {
   readonly evidenceAgeDays: number | null;
   /** The freshest supporting evidence's own timestamp (see DraftContext.freshestEvidenceTimestamp) — null exactly when `evidenceAgeDays` is null. A predecessor-duo consultation (#61) states this as the date its answer is "as of". */
   readonly evidenceTimestamp: string | null;
+  /** True when this draft was generated with the recipient's learned style in its prompt (duo#262) — what a Why panel reads to say "Tuned for how you write to Wei". Also persisted on the draft row. */
+  readonly adaptedForRecipient: boolean;
+  /** The detail behind `adaptedForRecipient`, null exactly when it is false. */
+  readonly recipientAdaptation: RecipientAdaptation | null;
+}
+
+/** What a draft says about the recipient adaptation it used (duo#262): who, learned from how many sends, and which register that came out as. */
+export interface RecipientAdaptation {
+  readonly recipientId: string;
+  readonly recipientName: string | null;
+  readonly sampleSize: number;
+  readonly register: RecipientRegister;
 }
 
 export interface DraftEscalation {
@@ -140,6 +153,14 @@ export async function draftReply(
    * draft row — the record's stated guard), not to any record or embedding.
    */
   attachments?: readonly WorkspaceGroundedAttachment[],
+  /**
+   * duo#262: who this reply is addressed to. When set, it is recorded on the
+   * draft row (so the owner's eventual send teaches the duo how they write
+   * to this person), and once RECIPIENT_ADAPTATION_MIN_SENDS approved sends
+   * to them exist, generation is conditioned on that learned style. Omitted
+   * by every caller that drafts for no particular person.
+   */
+  recipient?: DraftRecipient,
 ): Promise<DraftPipelineResult> {
   // Checked first, before any retrieval or generation: a refused subject
   // escalates "without reasoning about it" (#34 AC2) — there is no
@@ -160,11 +181,21 @@ export async function draftReply(
       refused: true,
       escalationThreshold: confidenceConfig.escalationThreshold,
       provenance: OWNER_PROVENANCE,
+      recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
   }
 
-  const context = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider, undefined, publicClearanceCeiling);
+  const retrieved = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider, undefined, publicClearanceCeiling);
+  // duo#262: how the owner writes to this recipient, when they named one and
+  // there are enough approved sends to them to learn from — otherwise
+  // undefined, and the general voice applies unchanged.
+  const recipientVoice = recipient !== undefined ? deriveRecipientVoice(storePath, passphrase, recipient) : undefined;
+  const context: DraftContext = recipientVoice !== undefined ? { ...retrieved, recipientVoice } : retrieved;
+  // Only a generated draft reads the prompt the adaptation lives in; the
+  // extractive fallback quotes a rule or evidence verbatim, so it is never
+  // "tuned" for anyone and must not claim to be.
+  const adaptedForRecipient = recipientVoice !== undefined && inferenceProvider !== undefined;
   const providedAttachments = attachments ?? [];
   const sources = buildSources(context, providedAttachments);
 
@@ -199,6 +230,7 @@ export async function draftReply(
       refused: false,
       escalationThreshold: confidenceConfig.escalationThreshold,
       provenance: OWNER_PROVENANCE,
+      recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence: undefined };
   }
@@ -250,6 +282,7 @@ export async function draftReply(
       refused: false,
       escalationThreshold: confidenceConfig.escalationThreshold,
       provenance: OWNER_PROVENANCE,
+      recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence };
   }
@@ -266,6 +299,8 @@ export async function draftReply(
     refused: false,
     escalationThreshold: confidenceConfig.escalationThreshold,
     provenance: OWNER_PROVENANCE,
+    recipient: recipient ?? null,
+    adaptedForRecipient,
   });
   return {
     kind: "draft",
@@ -276,5 +311,15 @@ export async function draftReply(
     topicId: context.topicId,
     evidenceAgeDays: context.freshestEvidenceAgeDays,
     evidenceTimestamp: context.freshestEvidenceTimestamp,
+    adaptedForRecipient,
+    recipientAdaptation:
+      adaptedForRecipient && recipientVoice !== undefined
+        ? {
+            recipientId: recipientVoice.recipient.id,
+            recipientName: recipientVoice.recipient.name,
+            sampleSize: recipientVoice.sampleSize,
+            register: recipientVoice.features.register,
+          }
+        : null,
   };
 }

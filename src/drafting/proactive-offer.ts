@@ -81,6 +81,12 @@ export async function offerDraftForMention(
     embeddingProvider,
     inferenceProvider,
     confidenceConfig,
+    undefined,
+    undefined,
+    // guangshinhaha/duo#262: the person who mentioned the owner is who the
+    // offered reply goes to — tuned to how the owner writes to them, and the
+    // owner's eventual send teaches that.
+    mention.from !== undefined && mention.from.trim().length > 0 ? { id: mention.from.trim(), name: null } : undefined,
   );
 
   if (result.kind === "escalation") {

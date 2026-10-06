@@ -49,7 +49,14 @@ function startsWithAny(lower: string, words: readonly string[]): boolean {
   return words.some((word) => lower.startsWith(word));
 }
 
-function computeStats(texts: readonly string[]): VoiceStats {
+/**
+ * The statistical half of the voice profile, over any set of the owner's own
+ * texts. Exported so duo#262's per-recipient adaptation
+ * (`drafting/recipient-voice.ts`) measures the same features, the same way,
+ * over the narrower set of messages the owner sent to one person — one
+ * extractor, two scopes, never a parallel definition of "median length".
+ */
+export function computeVoiceStats(texts: readonly string[]): VoiceStats {
   if (texts.length === 0) {
     return { sampleSize: 0, medianWordCount: 0, hedgeRate: 0, bulletRate: 0, emojiRate: 0, greetingRate: 0, signOffRate: 0 };
   }
@@ -180,7 +187,7 @@ export async function runVoiceProfile(
     return rows.map((row) => row.text);
   });
 
-  const stats = computeStats(texts);
+  const stats = computeVoiceStats(texts);
   const register = await describeRegister(stats, texts.slice(0, 5));
 
   if (existsSync(path) && !options.force) {

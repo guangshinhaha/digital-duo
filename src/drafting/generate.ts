@@ -1,6 +1,7 @@
 import { detectClassification, stripMarkingLine } from "../ingest/record.js";
 import type { WorkspaceGroundedAttachment } from "../workspace/transport.js";
 import type { DraftContext } from "./context.js";
+import { renderRecipientVoiceSection } from "./recipient-voice.js";
 
 /**
  * Renders one door-passed attachment into the prompt's attachment section.
@@ -20,7 +21,8 @@ function attachmentSection(attachments: readonly WorkspaceGroundedAttachment[]):
 
 /**
  * Builds the completion prompt for one draft sample. Includes the
- * standing order (if any), the top evidence, the voice profile, the
+ * standing order (if any), the top evidence, the voice profile (refined by
+ * how the owner writes to this recipient, when known — duo#262), the
  * asker's attachments (#190 — provided material, placed just ahead of the
  * question it rode with), and the piped-in thread context (#32 AC4) ahead
  * of the question itself, so the model answers with that context rather
@@ -37,6 +39,12 @@ export function buildDraftPrompt(
   parts.push("");
   parts.push("Voice profile:");
   parts.push(context.voiceText);
+  if (context.recipientVoice) {
+    // duo#262: right after the general profile it refines, so the model reads
+    // "how they write" and then "how they write to this person" together.
+    parts.push("");
+    parts.push(...renderRecipientVoiceSection(context.recipientVoice));
+  }
   if (context.ruleHit) {
     parts.push("");
     parts.push(`A standing order directly covers this: "${context.ruleHit.text}"`);
