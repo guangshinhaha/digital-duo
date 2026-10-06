@@ -363,6 +363,44 @@ describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
     expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toBeNull();
   });
 
+  it("a discarded channel draft can carry an optional dismissReason through the full orchestration (guangshinhaha/duo#259)", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+    const slack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver() {
+        return undefined;
+      },
+    };
+
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "discarded", undefined, {
+      channelAdapters: [slack],
+      dismissReason: "shouldnt_answer",
+    });
+
+    const draft = getDraft(storePath, PASSPHRASE, draftId);
+    expect(draft?.outcome).toBe("discarded");
+    expect(draft?.dismissReason).toBe("shouldnt_answer");
+  });
+
+  it("refuses a dismissReason attached to a non-discarded outcome, and records nothing (guangshinhaha/duo#259)", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+
+    await expect(
+      recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, {
+        channelAdapters: [],
+        dismissReason: "wrong_facts",
+      }),
+    ).rejects.toThrow(/dismissReason only applies to a "discarded" outcome/);
+
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.outcome).toBeNull();
+  });
+
   it("a sent outcome with no final text at all (escalated draft, no sentText) records a failure rather than delivering emptiness", async () => {
     const storePath = initStore();
     const draftId = appendChannelDraft(storePath, null);

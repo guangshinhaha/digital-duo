@@ -168,6 +168,58 @@ describe("recordDraftOutcome — the outcome is recorded against the draft (#32 
     recordDraftOutcome(storePath, PASSPHRASE, id, "sent");
     expect(getDraft(storePath, PASSPHRASE, id)?.sentText).toBeNull();
   });
+
+  // guangshinhaha/duo#259: an optional one-tap reason alongside a dismissal.
+  it("stores an optional dismissReason alongside a discarded outcome (guangshinhaha/duo#259)", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+    });
+
+    recordDraftOutcome(storePath, PASSPHRASE, id, "discarded", undefined, "shouldnt_answer");
+    const draft = getDraft(storePath, PASSPHRASE, id);
+    expect(draft?.outcome).toBe("discarded");
+    expect(draft?.dismissReason).toBe("shouldnt_answer");
+  });
+
+  it("leaves dismissReason null when a dismissal is silent, same as before #259", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+    });
+
+    recordDraftOutcome(storePath, PASSPHRASE, id, "discarded");
+    expect(getDraft(storePath, PASSPHRASE, id)?.dismissReason).toBeNull();
+  });
+
+  it("leaves dismissReason null on a pre-#259 row, same defensive reading parseProvenance already gives provenance", () => {
+    const storePath = initStore();
+    const id = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a draft",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+    });
+    withDatabase(storePath, PASSPHRASE, true, (db: Database) => {
+      db.prepare(`UPDATE drafts SET dismiss_reason = ? WHERE id = ?`).run("not-a-real-reason", id);
+    });
+    expect(getDraft(storePath, PASSPHRASE, id)?.dismissReason).toBeNull();
+  });
 });
 
 describe("listDrafts", () => {

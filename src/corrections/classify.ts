@@ -1,5 +1,5 @@
 import type { InferenceProvider } from "../provider/types.js";
-import { DraftNotFoundError, getDraft, recordDraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
+import { DraftNotFoundError, getDraft, recordDraftOutcome, type DismissReason, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { contentWords, levenshteinDistance, normalizeWhitespace } from "./text-similarity.js";
 import { queueCorrectionCandidates, type CorrectionCandidateKind } from "./queue.js";
 
@@ -166,6 +166,21 @@ export class BlankEditError extends Error {
 }
 
 /**
+ * Thrown by `recordDraftOutcomeAndClassify` for a `dismissReason` (#259 in
+ * guangshinhaha/duo) attached to any outcome other than `"discarded"`. A
+ * reason only ever means something next to a dismissal — a `"sent"` or
+ * `"edited"` draft was not dismissed at all, so a reason alongside either
+ * would be a client bug worth failing loudly on, the same reasoning
+ * `BlankEditError` above already applies to a blank "edited" `sentText`.
+ */
+export class DismissReasonRequiresDiscardedError extends Error {
+  constructor(draftId: string, outcome: SettableDraftOutcome) {
+    super(`Draft "${draftId}": a dismissReason only applies to a "discarded" outcome, not "${outcome}"`);
+    this.name = "DismissReasonRequiresDiscardedError";
+  }
+}
+
+/**
  * The orchestration entry point (#37): looks the draft up by id, classifies
  * the edit, and queues whatever candidates the classification implies.
  * Never writes to `duo/rules/` or `duo/voice.md` itself — that's #38's
@@ -225,11 +240,15 @@ export async function recordDraftOutcomeAndClassify(
   outcome: SettableDraftOutcome,
   sentText: string | undefined,
   classifier?: EditClassifier,
+  dismissReason?: DismissReason,
 ): Promise<ClassifyAndQueueResult | undefined> {
   if (outcome === "edited" && sentText !== undefined && sentText.trim().length === 0) {
     throw new BlankEditError(draftId);
   }
-  recordDraftOutcome(storePath, passphrase, draftId, outcome, sentText);
+  if (dismissReason !== undefined && outcome !== "discarded") {
+    throw new DismissReasonRequiresDiscardedError(draftId, outcome);
+  }
+  recordDraftOutcome(storePath, passphrase, draftId, outcome, sentText, dismissReason);
   if (outcome !== "edited" || sentText === undefined) {
     return undefined;
   }
