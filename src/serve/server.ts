@@ -22,6 +22,7 @@ import {
   type DismissReason,
   type DraftOutcome,
   type DraftRecipient,
+  type DraftSource,
   type SettableDraftOutcome,
   type ShapeInstruction,
 } from "../drafting/draft-log.js";
@@ -42,6 +43,8 @@ import { hybridSearch } from "../ingest/embeddings.js";
 import { importPastedTranscript } from "../ingest/paste-import.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
+import { listPublicAnswerLogEntries } from "../permissions/public-answer-log.js";
+import { correctPublicAnswer } from "../permissions/public-correction.js";
 import {
   hasRefusalsDecision,
   readRefusalsFile,
@@ -316,10 +319,18 @@ function statusForError(error: Error): number {
     // already, or a stale client copy) — "nothing to act on", same as
     // the rest of this family.
     case "PinnedAnswerNotFoundError":
+    // #267: correcting a public-answer-log entry id that names nothing at
+    // all — a typo, not "the thread is gone" (that's NothingToCorrectError
+    // below, a different failure with a different meaning).
+    case "PublicAnswerEntryNotFoundError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
     case "DraftIsRefusedError":
+    // #267: the entry names a real exchange, but one that never asserted an
+    // answer (passed-on or refused) — there is nothing to be wrong about,
+    // the entry's own state refusing the request, not a malformed one.
+    case "NothingToCorrectError":
     // guangshinhaha/duo#274: the draft's own room is marked off the
     // record — the owner's boundary, not a malformed request.
     case "RoomOffTheRecordError":
@@ -1489,6 +1500,73 @@ function registerRoutes(
   app.get("/escalations/rate", async () => escalationUrgencyRate(deps.storePath, deps.passphrase));
 
   app.get("/audit", async () => listAuditEntries(deps.storePath, deps.passphrase));
+
+  /**
+   * guangshinhaha/duo#267: "everything your duo said on your behalf, in
+   * one log you can correct" — the public-answer-log's own HTTP exposure.
+   * #43/#45/#160 built the whole module (`listPublicAnswerLogEntries`,
+   * `correctPublicAnswer`) and a CLI twin (`duo permissions log`/`correct`)
+   * months ago; nothing here before this route ever read it over HTTP, so
+   * the client's Activity tab could show `GET /audit` (the CLI per-asker
+   * `duo permissions ask` path) but never a colleague's ask-link question
+   * — the surface #43 actually ships through in production. `sources` is
+   * resolved here, not stored on the log row itself: the row only carries
+   * `draftId` (the same "what produced this" reference #43's own doc
+   * comment describes), and every public answer's T1 draft already carries
+   * the sources that grounded it — reading them at request time, rather
+   * than duplicating them into the append-only log, means a client gets
+   * the full picture with one request and the log's own schema stays
+   * exactly what #43/#45/#160 already shipped and tested.
+   */
+  app.get("/mirror/public-answers", async () => {
+    const entries = listPublicAnswerLogEntries(deps.storePath, deps.passphrase);
+    return entries.map((entry) => {
+      const draft = getDraft(deps.storePath, deps.passphrase, entry.draftId);
+      const sources: readonly DraftSource[] = draft?.sources ?? [];
+      return { ...entry, sources };
+    });
+  });
+
+  /**
+   * guangshinhaha/duo#267 AC2/AC3: "That was wrong" — posts a correction
+   * linked to the original entry and demotes the corrected topic's T0
+   * autonomy immediately (`correctPublicAnswer` already does both; this
+   * route is a thin HTTP wrapper, the same shape every other mirror
+   * mutation in this file takes over its own module). `threadStillExists`
+   * defaults to `true` (correctPublicAnswer's own default): there is no
+   * live channel integration in this codebase to ask whether an ask-link
+   * exchange's "thread" still exists (there is no thread at all for an
+   * ask-link ask — epic `e8` stays blocked, digital-duo#265), so a caller
+   * that knows otherwise must say so explicitly rather than this route
+   * guessing.
+   */
+  app.post<{ Params: { id: string }; Body: { correctedText?: unknown; threadStillExists?: unknown } }>(
+    "/mirror/public-answers/:id/correct",
+    async (request, reply) => {
+      const body = request.body ?? {};
+      if (typeof body.correctedText !== "string" || body.correctedText.trim().length === 0) {
+        reply.code(400).send(errorBody("bad_request", "correctedText is required and must be a non-empty string."));
+        return;
+      }
+      if (body.threadStillExists !== undefined && typeof body.threadStillExists !== "boolean") {
+        reply.code(400).send(errorBody("bad_request", "threadStillExists, when present, must be a boolean."));
+        return;
+      }
+      try {
+        return correctPublicAnswer(
+          deps.storePath,
+          deps.passphrase,
+          deps.duoDir,
+          request.params.id,
+          body.correctedText,
+          deps.ownerName,
+          body.threadStillExists ?? true,
+        );
+      } catch (error) {
+        reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+      }
+    },
+  );
 }
 
 /**

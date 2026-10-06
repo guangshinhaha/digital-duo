@@ -24,7 +24,7 @@ import { embedRecords, hybridSearch } from "../src/ingest/embeddings.js";
 import { ingestRecords } from "../src/ingest/two-phase.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { ensureRecordsSchema, writeRecords } from "../src/ingest/record-store.js";
-import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
+import { appendPublicAnswerLogEntry, listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import { queueCorrectionCandidate } from "../src/corrections/queue.js";
 import { listStandingOrderCandidates, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { applyCorrection } from "../src/trust/demotion.js";
@@ -2379,6 +2379,190 @@ describe("GET/POST/DELETE /mirror/pinned-answers — pin exact wording over HTTP
     if (result.kind !== "draft") throw new Error("expected a draft");
     expect(result.text).toBe("Visitor parking is on level 2.");
     expect(result.sources).toEqual([{ kind: "pinned", id: expect.any(String), label: expect.stringContaining("parking policy") }]);
+  });
+});
+
+describe("GET /mirror/public-answers and POST .../correct — the public-answer-log over HTTP (duo#267)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  function seedAnsweredEntry(): string {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how much vacation leave do I get",
+      threadContext: null,
+      draftText: "Five days a quarter.",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [{ kind: "evidence", id: "r1", label: "vacation policy" }],
+    });
+    return appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "how much vacation leave do I get",
+      askerRef: "ask-link:sam",
+      topicId: "topic-leave",
+      outcome: "answered",
+      text: "Five days a quarter.",
+      draftId,
+      askLinkId: "link-1",
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
+  }
+
+  it("GET /mirror/public-answers is empty on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/mirror/public-answers", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([]);
+  });
+
+  it("lists an entry with its sources resolved from the linked draft", async () => {
+    const entryId = seedAnsweredEntry();
+    const response = await app.inject({ method: "GET", url: "/mirror/public-answers", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const [entry] = response.json();
+    expect(entry).toMatchObject({
+      id: entryId,
+      question: "how much vacation leave do I get",
+      outcome: "answered",
+      text: "Five days a quarter.",
+      sources: [{ kind: "evidence", id: "r1", label: "vacation policy" }],
+    });
+  });
+
+  it("a passed-on or declined entry carries an empty sources array, never a crash, when its draft has none", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "can you approve my expense claim",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "not something I can decide",
+      confidenceScore: 0,
+      sources: [],
+    });
+    appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "can you approve my expense claim",
+      askerRef: "ask-link:sam",
+      topicId: null,
+      outcome: "passed_on",
+      text: "I've passed this to the owner.",
+      draftId,
+      askLinkId: "link-1",
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
+    const response = await app.inject({ method: "GET", url: "/mirror/public-answers", headers: authHeader });
+    expect(response.json()[0]).toMatchObject({ outcome: "passed_on", sources: [] });
+  });
+
+  it("POST .../correct posts a linked correction and demotes the topic's autonomy immediately", async () => {
+    const entryId = seedAnsweredEntry();
+    const response = await app.inject({
+      method: "POST",
+      url: `/mirror/public-answers/${entryId}/correct`,
+      headers: authHeader,
+      payload: { correctedText: "Correction: it's actually ten days a quarter." },
+    });
+    expect(response.statusCode).toBe(200);
+    const result = response.json();
+    expect(result.originalEntryId).toBe(entryId);
+    expect(result.postedInThread).toBe(true);
+    expect(result.text).toContain("Correction: it's actually ten days a quarter.");
+    expect(result.demotion).toMatchObject({ topicId: "topic-leave" });
+
+    const listed = await app.inject({ method: "GET", url: "/mirror/public-answers", headers: authHeader });
+    const entries = listed.json();
+    expect(entries).toHaveLength(2);
+    expect(entries[1]).toMatchObject({ correctsEntryId: entryId, outcome: "corrected" });
+  });
+
+  it("threadStillExists: false records the correction without claiming it was posted", async () => {
+    const entryId = seedAnsweredEntry();
+    const response = await app.inject({
+      method: "POST",
+      url: `/mirror/public-answers/${entryId}/correct`,
+      headers: authHeader,
+      payload: { correctedText: "It's ten days.", threadStillExists: false },
+    });
+    expect(response.statusCode).toBe(200);
+    const result = response.json();
+    expect(result.postedInThread).toBe(false);
+    expect(result.threadGoneNotice).toBeTruthy();
+  });
+
+  it("400s a missing or blank correctedText", async () => {
+    const entryId = seedAnsweredEntry();
+    const missing = await app.inject({ method: "POST", url: `/mirror/public-answers/${entryId}/correct`, headers: authHeader, payload: {} });
+    expect(missing.statusCode).toBe(400);
+    const blank = await app.inject({
+      method: "POST",
+      url: `/mirror/public-answers/${entryId}/correct`,
+      headers: authHeader,
+      payload: { correctedText: "   " },
+    });
+    expect(blank.statusCode).toBe(400);
+  });
+
+  it("404s correcting an id that names no entry at all", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/mirror/public-answers/no-such-id/correct",
+      headers: authHeader,
+      payload: { correctedText: "x" },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("409s correcting an entry that never asserted an answer (passed-on, nothing to be wrong about)", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "can you approve my expense claim",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "not something I can decide",
+      confidenceScore: 0,
+      sources: [],
+    });
+    const entryId = appendPublicAnswerLogEntry(storePath, PASSPHRASE, {
+      question: "can you approve my expense claim",
+      askerRef: "ask-link:sam",
+      topicId: null,
+      outcome: "passed_on",
+      text: "I've passed this to the owner.",
+      draftId,
+      askLinkId: "link-1",
+      askerResolved: null,
+      clearanceApplied: "official_open",
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: `/mirror/public-answers/${entryId}/correct`,
+      headers: authHeader,
+      payload: { correctedText: "x" },
+    });
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("is an owner surface: an ask token is refused on every route", async () => {
+    const entryId = seedAnsweredEntry();
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const list = await app.inject({ method: "GET", url: "/mirror/public-answers", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const correct = await app.inject({
+      method: "POST",
+      url: `/mirror/public-answers/${entryId}/correct`,
+      headers: askHeader,
+      payload: { correctedText: "x" },
+    });
+    expect(correct.statusCode).toBe(401);
   });
 });
 
