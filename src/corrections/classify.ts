@@ -1,5 +1,6 @@
 import type { InferenceProvider } from "../provider/types.js";
-import { DraftNotFoundError, getDraft, recordDraftOutcome, type DismissReason, type SettableDraftOutcome } from "../drafting/draft-log.js";
+import { DraftNotFoundError, getDraft, recordDraftOutcome, roomIdForDraft, type DismissReason, type SettableDraftOutcome } from "../drafting/draft-log.js";
+import { isRoomOffTheRecord } from "../workspace/off-the-record.js";
 import { contentWords, levenshteinDistance, normalizeWhitespace } from "./text-similarity.js";
 import { queueCorrectionCandidates, type CorrectionCandidateKind } from "./queue.js";
 
@@ -186,6 +187,16 @@ export class DismissReasonRequiresDiscardedError extends Error {
  * Never writes to `duo/rules/` or `duo/voice.md` itself — that's #38's
  * batched review, per v1-tech-design.md §1.9 ("queue it; do not write
  * immediately").
+ *
+ * `duoDir` is optional (guangshinhaha/duo#274): omitted, behaviour is
+ * byte-identical to before #274 (the eval harness and most tests have no
+ * `duo/` directory to check against). Supplied, a draft whose conversation
+ * is marked off the record still gets classified — `classification` keeps
+ * reporting the truth about the edit, same as a resubmitted or duplicate
+ * edit already does — but `queuedKinds` stays empty: the edit is never
+ * turned into a correction candidate, so it can never become a rule. This
+ * is the owner's "don't learn from this" boundary, checked before any
+ * candidate is queued rather than filtered out of review afterward.
  */
 export async function classifyAndQueueEdit(
   storePath: string,
@@ -193,6 +204,7 @@ export async function classifyAndQueueEdit(
   draftId: string,
   sentText: string,
   classifier?: EditClassifier,
+  duoDir?: string,
 ): Promise<ClassifyAndQueueResult> {
   const draft = getDraft(storePath, passphrase, draftId);
   if (!draft) {
@@ -205,6 +217,12 @@ export async function classifyAndQueueEdit(
   const { classification } = await classifyEdit(draft.question, draft.draftText, sentText, classifier);
   if (classification === "trivial") {
     return { classification, queuedKinds: [] };
+  }
+  if (duoDir !== undefined) {
+    const roomId = roomIdForDraft(draft);
+    if (roomId !== null && isRoomOffTheRecord(duoDir, roomId)) {
+      return { classification, queuedKinds: [] };
+    }
   }
 
   const kinds: CorrectionCandidateKind[] = classification === "both" ? ["style", "substance"] : [classification];
@@ -241,6 +259,7 @@ export async function recordDraftOutcomeAndClassify(
   sentText: string | undefined,
   classifier?: EditClassifier,
   dismissReason?: DismissReason,
+  duoDir?: string,
 ): Promise<ClassifyAndQueueResult | undefined> {
   if (outcome === "edited" && sentText !== undefined && sentText.trim().length === 0) {
     throw new BlankEditError(draftId);
@@ -253,7 +272,7 @@ export async function recordDraftOutcomeAndClassify(
     return undefined;
   }
   try {
-    return await classifyAndQueueEdit(storePath, passphrase, draftId, sentText, classifier);
+    return await classifyAndQueueEdit(storePath, passphrase, draftId, sentText, classifier, duoDir);
   } catch (error) {
     if (error instanceof NoDraftTextError) {
       return undefined;

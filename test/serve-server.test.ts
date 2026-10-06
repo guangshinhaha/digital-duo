@@ -26,7 +26,7 @@ import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { ensureRecordsSchema, writeRecords } from "../src/ingest/record-store.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import { queueCorrectionCandidate } from "../src/corrections/queue.js";
-import { queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
+import { listStandingOrderCandidates, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { confirmNoRefusals, upsertRefusal, writeRefusalsFile } from "../src/trust/refusals.js";
@@ -2643,6 +2643,83 @@ describe("channel policy over HTTP — per-channel, per-thread (#172)", () => {
     expect(mute.statusCode).toBe(401);
     const unmute = await app.inject({ method: "POST", url: "/channels/policy/unmute", headers: askHeader, payload: { channel: "c" } });
     expect(unmute.statusCode).toBe(401);
+  });
+});
+
+describe("off-the-record rooms over HTTP (guangshinhaha/duo#274)", () => {
+  const ROOM = "!a:workspace";
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET reads false for a room never marked", async () => {
+    const response = await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ roomId: ROOM, offTheRecord: false, decidedAt: null });
+  });
+
+  it("POST marks the room, GET then reads it back, and DELETE lifts the marker", async () => {
+    const marked = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(marked.statusCode).toBe(200);
+    expect(marked.json()).toMatchObject({ roomId: ROOM, offTheRecord: true });
+    expect(typeof marked.json().decidedAt).toBe("string");
+
+    const read = await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(read.json()).toMatchObject({ roomId: ROOM, offTheRecord: true });
+
+    const cleared = await app.inject({ method: "DELETE", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual({ roomId: ROOM, offTheRecord: false, wasOn: true });
+
+    const readAfter = await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(readAfter.json()).toMatchObject({ roomId: ROOM, offTheRecord: false });
+  });
+
+  it("DELETE on a room never marked reports wasOn: false, not an error", async () => {
+    const cleared = await app.inject({ method: "DELETE", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual({ roomId: ROOM, offTheRecord: false, wasOn: false });
+  });
+
+  it("POST purges a pending standing-order candidate already queued from this room", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "what is the policy?",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "thin",
+      confidenceScore: 0,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "workspace", askerRef: "@bob:workspace", threadId: ROOM, permalink: null },
+    });
+    const candidateId = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "the policy is X");
+
+    const marked = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(marked.json().purged).toMatchObject({ draftIds: [draftId], standingOrderCandidatesRejected: 1 });
+
+    const candidate = listStandingOrderCandidates(storePath, PASSPHRASE).find((c) => c.id === candidateId);
+    expect(candidate?.status).toBe("rejected");
+  });
+
+  it("is idempotent to mark twice — the second POST purges nothing new and keeps the original decidedAt", async () => {
+    const first = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    const second = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(second.json().decidedAt).toBe(first.json().decidedAt);
+  });
+
+  it("is an owner route: an ask token is refused on the read, the mark, and the clear", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    expect((await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: askHeader })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: askHeader })).statusCode).toBe(401);
+    expect((await app.inject({ method: "DELETE", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: askHeader })).statusCode).toBe(401);
   });
 });
 

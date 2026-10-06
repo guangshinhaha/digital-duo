@@ -123,7 +123,7 @@ async function settleDraft(ctx: ToolContext, id: string, outcome: "sent" | "edit
     return fail(`This draft was already recorded as ${draft.outcome}, so nothing was changed and nothing was delivered again.`);
   }
   const classifier = deps.inferenceProvider ? createLlmEditClassifier(deps.inferenceProvider) : undefined;
-  const result = await recordOutcomeAndDeliver(deps.storePath, deps.passphrase, id, outcome, sentText, { classifier, channelAdapters: deps.channelAdapters });
+  const result = await recordOutcomeAndDeliver(deps.storePath, deps.passphrase, id, outcome, sentText, { classifier, channelAdapters: deps.channelAdapters, duoDir: deps.duoDir });
   const after = getDraft(deps.storePath, deps.passphrase, id);
   return ok({
     recorded: outcome,
@@ -438,7 +438,7 @@ export function registerDuoTools(server: McpServer, ctx: ToolContext): void {
         if (draft?.outcome === "escalation_answered") {
           return fail("This question was already answered, so no second rule candidate was queued.");
         }
-        const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, id, answer);
+        const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, id, answer, deps.duoDir);
         return ok({ candidateId, status: "pending", note: "Queued for the user's approval in the Digital Duo app. The duo's rules are unchanged until then." });
       }),
   );

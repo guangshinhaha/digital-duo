@@ -32,6 +32,7 @@ import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread }
 import { readVoiceText } from "../drafting/context.js";
 import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../drafting/evidence-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
+import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
@@ -52,6 +53,7 @@ import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
 import type { WorkspaceService } from "../workspace/service.js";
+import { clearRoomOffTheRecord, markRoomOffTheRecord, offTheRecordEntryFor } from "../workspace/off-the-record.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
@@ -294,6 +296,9 @@ function statusForError(error: Error): number {
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
     case "DraftIsRefusedError":
+    // guangshinhaha/duo#274: the draft's own room is marked off the
+    // record — the owner's boundary, not a malformed request.
+    case "RoomOffTheRecordError":
     // #180: a second confirmation of an executed T4 request — the guard's
     // exactly-once refusal, a conflict and never a re-execution.
     case "T4RequestAlreadyExecutedError":
@@ -469,6 +474,41 @@ function registerRoutes(
     }
     try {
       return workspace.forgetAlwaysAllowed(request.params.userId);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // guangshinhaha/duo#274: "don't learn from this conversation" — the
+  // owner's per-room marker, plain file + store work like `/channels/policy`
+  // above, not gated on a workspace connection existing (a room id is
+  // meaningful even if the workspace that named it is temporarily
+  // unconfigured; the same stance `/channels/policy` already takes for
+  // channel names). GET reads the marker; POST marks the room and purges
+  // what it already produced (standing-order/correction candidates still
+  // pending, and any rule already written from one of its drafts); DELETE
+  // lifts the marker without undoing the purge — there is nothing left to
+  // restore, the same "a decision, not a cache" stance every reject in
+  // this codebase takes.
+  app.get<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/off-the-record", async (request) => {
+    const entry = offTheRecordEntryFor(deps.duoDir, request.params.roomId);
+    return { roomId: request.params.roomId, offTheRecord: entry !== null, decidedAt: entry?.decidedAt ?? null };
+  });
+
+  app.post<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/off-the-record", async (request, reply) => {
+    try {
+      const entry = markRoomOffTheRecord(deps.duoDir, request.params.roomId);
+      const purge = purgeOffTheRecordRoom(deps.storePath, deps.passphrase, deps.duoDir, request.params.roomId);
+      return { roomId: entry.roomId, offTheRecord: true, decidedAt: entry.decidedAt, purged: purge };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.delete<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/off-the-record", async (request, reply) => {
+    try {
+      const { wasOn } = clearRoomOffTheRecord(deps.duoDir, request.params.roomId);
+      reply.code(200).send({ roomId: request.params.roomId, offTheRecord: false, wasOn });
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
@@ -873,6 +913,7 @@ function registerRoutes(
         dismissReason: dismissReason as DismissReason | undefined,
         alternative,
         ownerDelivered,
+        duoDir: deps.duoDir,
       });
       // guangshinhaha/duo#261: deciding a held draft here, now, overrides
       // its schedule — release the hold so it never shows as still to come.
@@ -942,7 +983,7 @@ function registerRoutes(
       return;
     }
     try {
-      const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, request.params.id, answer);
+      const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, request.params.id, answer, deps.duoDir);
       return { candidateId };
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));

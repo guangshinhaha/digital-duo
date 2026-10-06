@@ -428,6 +428,21 @@ export function recipientKeyOf(provenance: DraftProvenance, recipient: DraftReci
   return undefined;
 }
 
+/**
+ * guangshinhaha/duo#274: the conversation a draft belongs to, for the
+ * off-the-record marker — `provenance.threadId` for a channel-origin
+ * draft, null for an owner-asked or unknown-origin one (there is no room
+ * to mark off the record). For the workspace's own channel kind
+ * (`serve/workspace-wiring.ts`'s `WORKSPACE_CHANNEL_KIND`) this is
+ * literally the Matrix room id (`workspaceDraftProvenance` sets
+ * `threadId: question.roomId`); for any other channel adapter it is
+ * whatever that adapter calls its thread, which the off-the-record marker
+ * treats the same way — one conversation, one id, one marker.
+ */
+export function roomIdForDraft(draft: DraftRecord): string | null {
+  return draft.provenance.origin === "channel" ? draft.provenance.threadId : null;
+}
+
 export interface AppendDraftInput {
   readonly question: string;
   readonly threadContext: string | null;
@@ -1075,4 +1090,19 @@ export function listDrafts(storePath: string, passphrase: string, options: ListD
     const shapes = readShapesFor(db, rows.map((row) => row.id));
     return rows.map((row) => rowToDraft(row, shapes.get(row.id)));
   });
+}
+
+/**
+ * guangshinhaha/duo#274: every draft id whose conversation is `roomId`
+ * (`roomIdForDraft`) — what the off-the-record purge walks to find
+ * everything downstream (standing-order candidates, correction
+ * candidates, correction-derived rules) that a draft in that room already
+ * produced. `provenance` is a JSON column, so this filters in memory
+ * rather than in SQL — the draft log is not the hot path here, the purge
+ * is an occasional owner act.
+ */
+export function listDraftIdsForRoom(storePath: string, passphrase: string, roomId: string): string[] {
+  return listDrafts(storePath, passphrase)
+    .filter((draft) => roomIdForDraft(draft) === roomId)
+    .map((draft) => draft.id);
 }
