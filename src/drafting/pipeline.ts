@@ -28,6 +28,7 @@ import { explainEscalation, noEvidenceEscalationReason, refusedSubjectEscalation
 import { ALTERNATIVE_INSTRUCTIONS, buildDraftPrompt, extractiveDraft, pickRepresentativeSample } from "./generate.js";
 import { matchesRefusedSubject } from "./relevance-gate.js";
 import { readRefusalsFile } from "./refusals.js";
+import { findPinnedAnswer } from "../trust/pinned-answers.js";
 
 export interface DraftAnswer {
   readonly kind: "draft";
@@ -320,6 +321,57 @@ export async function draftReply(
       recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
+  }
+
+  // duo#275: a pinned answer is the owner's own exact wording for this
+  // question/topic — an explicit, owner-authored override that outranks
+  // every derived standing order and every retrieved piece of evidence.
+  // Checked next, still before any retrieval or generation runs: unlike a
+  // rule hit (which only ever influences confidence scoring) a pinned
+  // answer wins outright the moment its pattern matches, so it must never
+  // be computed from, or second-guessed by, anything retrieval would turn
+  // up. The text is quoted verbatim — never a generation target, never
+  // passed through an inference provider — which is the whole point of
+  // "pin exact wording".
+  const pinned = findPinnedAnswer(storePath, passphrase, question);
+  if (pinned !== undefined) {
+    const sources: DraftSource[] = [{ kind: "pinned", id: pinned.id, label: `pinned answer: ${truncate(pinned.pattern, 80)}` }];
+    // Maximal, deliberately: every signal at 1 so the composite score is
+    // 1 regardless of how confidenceConfig.weights are tuned, and
+    // `passesThreshold` can never flip false for a pin — the owner's own
+    // exact words are not a confidence estimate, they are a decision
+    // already made.
+    const confidence = scoreConfidence(
+      { selfConsistency: 1, retrievalStrength: 1, ruleHit: 1, recency: 1, selfReport: 1 },
+      confidenceConfig.weights,
+      confidenceConfig.escalationThreshold,
+    );
+    const draftId = appendDraft(storePath, passphrase, {
+      question,
+      threadContext,
+      draftText: pinned.answerText,
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: confidence.score,
+      sources,
+      refused: false,
+      escalationThreshold: confidenceConfig.escalationThreshold,
+      provenance,
+      recipient: recipient ?? null,
+    });
+    return {
+      kind: "draft",
+      draftId,
+      text: pinned.answerText,
+      sources,
+      confidence,
+      topicId: undefined,
+      evidenceAgeDays: null,
+      evidenceTimestamp: null,
+      adaptedForRecipient: false,
+      recipientAdaptation: null,
+      alternatives: [],
+    };
   }
 
   const retrieved = await gatherDraftContext(storePath, passphrase, duoDir, question, embeddingProvider, undefined, publicClearanceCeiling);

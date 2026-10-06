@@ -2262,6 +2262,126 @@ describe("POST /knowledge/evidence/:recordId/exclude and /restore, GET /knowledg
   });
 });
 
+describe("GET/POST/DELETE /mirror/pinned-answers — pin exact wording over HTTP (duo#275)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /mirror/pinned-answers is empty on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ pinnedAnswers: [] });
+  });
+
+  it("creates, lists, edits and deletes a pinned answer", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: authHeader,
+      payload: { pattern: "vacation leave", answerText: "Ten days a year.", sourceLabel: "pinned from #general" },
+    });
+    expect(create.statusCode).toBe(200);
+    const created = create.json();
+    expect(created).toMatchObject({ pattern: "vacation leave", answerText: "Ten days a year.", sourceLabel: "pinned from #general" });
+
+    const listed = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: authHeader });
+    expect(listed.json()).toEqual({ pinnedAnswers: [created] });
+
+    const edited = await app.inject({
+      method: "POST",
+      url: `/mirror/pinned-answers/${created.id}/edit`,
+      headers: authHeader,
+      payload: { answerText: "Twelve days a year." },
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json()).toMatchObject({ id: created.id, pattern: "vacation leave", answerText: "Twelve days a year." });
+
+    const deleted = await app.inject({ method: "DELETE", url: `/mirror/pinned-answers/${created.id}`, headers: authHeader });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ deleted: true });
+
+    const listedAfterDelete = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: authHeader });
+    expect(listedAfterDelete.json()).toEqual({ pinnedAnswers: [] });
+  });
+
+  it("400s creating with a missing or blank pattern/answerText", async () => {
+    const missing = await app.inject({ method: "POST", url: "/mirror/pinned-answers", headers: authHeader, payload: { pattern: "a" } });
+    expect(missing.statusCode).toBe(400);
+
+    const blank = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: authHeader,
+      payload: { pattern: "   ", answerText: "b" },
+    });
+    expect(blank.statusCode).toBe(400);
+  });
+
+  it("404s editing an unknown pinned answer", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers/no-such-id/edit",
+      headers: authHeader,
+      payload: { pattern: "x" },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("DELETE on an unknown id is a harmless no-op, not a 404", async () => {
+    const response = await app.inject({ method: "DELETE", url: "/mirror/pinned-answers/no-such-id", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("is an owner surface: an ask token is refused on every route", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const list = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const create = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: askHeader,
+      payload: { pattern: "a", answerText: "b" },
+    });
+    expect(create.statusCode).toBe(401);
+    const edit = await app.inject({ method: "POST", url: "/mirror/pinned-answers/some-id/edit", headers: askHeader, payload: { pattern: "a" } });
+    expect(edit.statusCode).toBe(401);
+    const remove = await app.inject({ method: "DELETE", url: "/mirror/pinned-answers/some-id", headers: askHeader });
+    expect(remove.statusCode).toBe(401);
+  });
+
+  it("a draft that quotes a pinned answer carries it in sources, so the client's Why panel can say so", async () => {
+    await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: authHeader,
+      payload: { pattern: "parking policy", answerText: "Visitor parking is on level 2." },
+    });
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      join(tempDir(), "duo"),
+      "what's the parking policy here",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      loadConfig().confidence,
+    );
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toBe("Visitor parking is on level 2.");
+    expect(result.sources).toEqual([{ kind: "pinned", id: expect.any(String), label: expect.stringContaining("parking policy") }]);
+  });
+});
+
 describe("GET /devices and POST /devices/:id/revoke — paired devices over HTTP (#177)", () => {
   let app: FastifyInstance;
   let storePath: string;

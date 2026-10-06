@@ -42,6 +42,7 @@ import { importPastedTranscript } from "../ingest/paste-import.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { hasRefusalsDecision, readRefusalsFile } from "../trust/refusals.js";
+import { createPinnedAnswer, deletePinnedAnswer, listPinnedAnswers, updatePinnedAnswer } from "../trust/pinned-answers.js";
 import { resolveAskerRef } from "../permissions/directory.js";
 import { answerPublicly, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { notifyDraftWaiting } from "../push/notify.js";
@@ -285,6 +286,10 @@ function statusForError(error: Error): number {
     // for a client, like the not-found family above.
     case "NoPendingInviteError":
     case "RoomConsentNotFoundError":
+    // duo#275: editing a pinned answer that doesn't exist (deleted
+    // already, or a stale client copy) — "nothing to act on", same as
+    // the rest of this family.
+    case "PinnedAnswerNotFoundError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
@@ -330,6 +335,9 @@ function statusForError(error: Error): number {
     // guangshinhaha/duo#315: "always allow" on an invitation that isn't a
     // person's one-to-one conversation — a request that can never be valid.
     case "AlwaysAllowNotApplicableError":
+    // duo#275: an empty pattern or empty wording — can never be a valid
+    // pinned answer, same "the request itself is malformed" shape.
+    case "InvalidPinnedAnswerError":
       return 400;
     default:
       return 500;
@@ -1052,6 +1060,71 @@ function registerRoutes(
   // error. add/confirm-none stay terminal-only: they are authoring acts,
   // the same class as rule authoring (AR-18).
   app.get("/mirror/refusals", async () => ({ decided: hasRefusalsDecision(deps.duoDir), refusals: readRefusalsFile(deps.duoDir) }));
+
+  // duo#275: "pin exact wording — always answer this way." Unlike a rule or
+  // a refusal, a pinned answer is authored and edited from the client (the
+  // message action on the owner's own message), so — same reasoning as
+  // #272's evidence exclusions — create/edit/delete are exposed directly
+  // here over the one module (`trust/pinned-answers.ts`), with no second
+  // code path and no CLI twin to drift from it. `findPinnedAnswer` itself
+  // is never a route: it's checked from inside `draftReply`, before
+  // retrieval, never from a client's own request.
+  app.get("/mirror/pinned-answers", async () => ({ pinnedAnswers: listPinnedAnswers(deps.storePath, deps.passphrase) }));
+
+  function readPinnedAnswerBody(body: unknown): { pattern?: string; answerText?: string; sourceLabel?: string | null } {
+    if (typeof body !== "object" || body === null) {
+      throw new BadRequestError("Expected a JSON object body.");
+    }
+    const { pattern, answerText, sourceLabel } = body as { pattern?: unknown; answerText?: unknown; sourceLabel?: unknown };
+    if (pattern !== undefined && typeof pattern !== "string") {
+      throw new BadRequestError("pattern, when present, must be a string.");
+    }
+    if (answerText !== undefined && typeof answerText !== "string") {
+      throw new BadRequestError("answerText, when present, must be a string.");
+    }
+    if (sourceLabel !== undefined && sourceLabel !== null && typeof sourceLabel !== "string") {
+      throw new BadRequestError("sourceLabel, when present, must be a string or null.");
+    }
+    return { pattern, answerText, sourceLabel: sourceLabel as string | null | undefined };
+  }
+
+  app.post<{ Body: { pattern?: unknown; answerText?: unknown; sourceLabel?: unknown } }>("/mirror/pinned-answers", async (request, reply) => {
+    try {
+      const { pattern, answerText, sourceLabel } = readPinnedAnswerBody(request.body);
+      if (pattern === undefined || answerText === undefined) {
+        reply.code(400).send(errorBody("bad_request", "pattern and answerText are both required."));
+        return;
+      }
+      return createPinnedAnswer(deps.storePath, deps.passphrase, pattern, answerText, sourceLabel ?? null);
+    } catch (error) {
+      if (error instanceof BadRequestError) {
+        reply.code(400).send(errorBody("bad_request", error.message));
+        return;
+      }
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post<{ Params: { id: string }; Body: { pattern?: unknown; answerText?: unknown } }>(
+    "/mirror/pinned-answers/:id/edit",
+    async (request, reply) => {
+      try {
+        const { pattern, answerText } = readPinnedAnswerBody(request.body);
+        return updatePinnedAnswer(deps.storePath, deps.passphrase, request.params.id, { pattern, answerText });
+      } catch (error) {
+        if (error instanceof BadRequestError) {
+          reply.code(400).send(errorBody("bad_request", error.message));
+          return;
+        }
+        reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+      }
+    },
+  );
+
+  app.delete<{ Params: { id: string } }>("/mirror/pinned-answers/:id", async (request) => {
+    deletePinnedAnswer(deps.storePath, deps.passphrase, request.params.id);
+    return { deleted: true };
+  });
 
   const RULE_ACTIONS = { approve: approveRule, reject: rejectRule, promote: promoteRule } as const;
   app.post<{ Params: { id: string; action: string } }>("/mirror/rules/:id/:action", async (request, reply) => {

@@ -13,6 +13,7 @@ import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
+import { createPinnedAnswer } from "../src/trust/pinned-answers.js";
 import type { WorkspaceGroundedAttachment } from "../src/workspace/transport.js";
 
 const tempDir = useTempDir();
@@ -431,6 +432,118 @@ describe("draftReply — a refused subject escalates without reasoning about it 
     );
     if (result.kind !== "escalation") throw new Error("expected an escalation");
     expect(result.refused).toBe(false);
+  });
+});
+
+describe("draftReply — a pinned answer wins outright, before any standing order or retrieval (duo#275)", () => {
+  it("quotes the pinned wording verbatim even though a confirmed rule and strong evidence would otherwise answer differently", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath, { answerText: "five days per quarter, per the vacation policy" });
+    createPinnedAnswer(storePath, PASSPHRASE, "vacation leave", "Exactly ten days a year, no exceptions.");
+    const embeddingProvider = createFakeEmbeddingProvider();
+    const inferenceProvider = agreeingProvider("this should never be used");
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      embeddingProvider,
+      inferenceProvider,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toBe("Exactly ten days a year, no exceptions.");
+    expect(result.confidence.passesThreshold).toBe(true);
+    expect(result.sources).toEqual([{ kind: "pinned", id: expect.any(String), label: expect.stringContaining("pinned answer") }]);
+  });
+
+  it("never calls the inference provider or retrieval for a pinned question", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    createPinnedAnswer(storePath, PASSPHRASE, "vacation leave", "Ten days a year.");
+    let calls = 0;
+    const countingProvider = { name: "fake", async complete() { calls += 1; return "should never run"; } };
+
+    await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "how much vacation leave do I get",
+      null,
+      createFakeEmbeddingProvider(),
+      countingProvider,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(calls).toBe(0);
+  });
+
+  it("persists the draft (not an escalation), citing the pinned answer as its one source", async () => {
+    const storePath = initStore();
+    const pinned = createPinnedAnswer(storePath, PASSPHRASE, "parking policy", "Visitor parking is on level 2.");
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "what's the parking policy here",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    const stored = getDraft(storePath, PASSPHRASE, result.draftId);
+    expect(stored?.escalated).toBe(false);
+    expect(stored?.draftText).toBe("Visitor parking is on level 2.");
+    expect(stored?.sources).toEqual([{ kind: "pinned", id: pinned.id, label: expect.stringContaining("parking policy") }]);
+  });
+
+  it("leaves an unrelated question to fall through to the ordinary pipeline", async () => {
+    const storePath = initStore();
+    createPinnedAnswer(storePath, PASSPHRASE, "parking policy", "Visitor parking is on level 2.");
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      duoDir(),
+      "what is the meaning of life",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("escalation");
+  });
+
+  it("a refusal still wins over a pinned answer — checked first, same as it already outranks a standing order", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "refusals.md"), "## vacation\n\nreason\n", "utf8");
+    createPinnedAnswer(storePath, PASSPHRASE, "vacation leave", "Ten days a year.");
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+    );
+
+    expect(result.kind).toBe("escalation");
+    if (result.kind !== "escalation") throw new Error("expected an escalation");
+    expect(result.refused).toBe(true);
   });
 });
 

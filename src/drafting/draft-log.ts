@@ -5,17 +5,21 @@ import { withDatabase } from "../store/store.js";
 
 /**
  * One source a draft (or its escalation explanation) cites — a standing
- * order, a piece of retrieved evidence, or (#190) a file the asker
- * attached to the question — rendered as a short, human-readable link.
- * The attachment kind carries `id` + `label` only (the workspace's file
- * reference and a stripped preview): the bytes grounded the one draft and
- * were then dropped, so the row is a dead-link-plus-honest-label once the
- * workspace deletes the file — the same treatment the audit trail gives
- * every other reference to something outside the store
- * (docs/workspace/attachments.md §3).
+ * order, a piece of retrieved evidence, (#190) a file the asker attached
+ * to the question, or (duo#275) an owner-pinned exact answer — rendered as
+ * a short, human-readable link. The attachment kind carries `id` + `label`
+ * only (the workspace's file reference and a stripped preview): the bytes
+ * grounded the one draft and were then dropped, so the row is a
+ * dead-link-plus-honest-label once the workspace deletes the file — the
+ * same treatment the audit trail gives every other reference to something
+ * outside the store (docs/workspace/attachments.md §3). The `pinned` kind
+ * points at a `trust/pinned-answers.ts` row by id, same as `rule` points at
+ * a `derivation/rules.ts` row — removing it is a Rules-tab action, not a
+ * per-draft one (`SourceRemoveButton.tsx` on the client renders nothing for
+ * it, same as it already does for `attachment`).
  */
 export interface DraftSource {
-  readonly kind: "rule" | "evidence" | "attachment";
+  readonly kind: "rule" | "evidence" | "attachment" | "pinned";
   readonly id: string;
   readonly label: string;
 }
