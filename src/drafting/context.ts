@@ -10,6 +10,7 @@ import { isVisibleToClearance } from "../permissions/classification.js";
 import { ensureQaPairsSchema } from "../derivation/qa-pairs.js";
 import { ensureRulesSchema, readRuleRow, type Rule } from "../derivation/rules.js";
 import { findConflictingRefusal } from "../trust/refusals.js";
+import { listExcludedEvidenceIds } from "./evidence-exclusions.js";
 import type { RecipientVoice } from "./recipient-voice.js";
 
 /** One piece of past evidence the draft can cite — a retrieved record, with a real cosine similarity to the question (not just an ordinal rank). */
@@ -293,10 +294,6 @@ export async function gatherDraftContext(
   clearanceCeiling?: ClassificationLevel,
 ): Promise<DraftContext> {
   const hybrid = await hybridSearch(storePath, passphrase, question, embeddingProvider, limit);
-  const admissible =
-    clearanceCeiling === undefined
-      ? hybrid.results
-      : hybrid.results.filter((result) => isVisibleToClearance(result.record.classification, clearanceCeiling));
 
   let queryVector: readonly number[] | undefined;
   if (hybrid.usedEmbeddings) {
@@ -307,13 +304,27 @@ export async function gatherDraftContext(
     }
   }
 
-  const recordIds = admissible.map((result) => result.record.id);
   const now = new Date();
 
-  const { vectors, ruleHit, topicId } = withDatabase(storePath, passphrase, false, (db) => {
+  // Single withDatabase round trip (store de/encryption is not free): the
+  // exclusion check (duo#272 — a record the owner removed from a draft's Why
+  // panel is excluded here too, not only from the one draft that first
+  // showed it, the same "stops its use in future drafts" guarantee a
+  // rejected rule already has) is folded in alongside the rule-hit/vector
+  // reads this function already made in one pass, rather than opening the
+  // store a second time just to list exclusions.
+  const { admissible, vectors, ruleHit, topicId } = withDatabase(storePath, passphrase, false, (db) => {
     ensureRecordsSchema(db);
+    const excludedIds = listExcludedEvidenceIds(db);
+    const admissibleResults = hybrid.results.filter(
+      (result) =>
+        (clearanceCeiling === undefined || isVisibleToClearance(result.record.classification, clearanceCeiling)) &&
+        !excludedIds.has(result.record.id),
+    );
+    const recordIds = admissibleResults.map((result) => result.record.id);
     const hit = findRuleHit(db, recordIds, duoDir);
     return {
+      admissible: admissibleResults,
       vectors: queryVector ? readStoredVectors(db, recordIds, embeddingProvider.model) : new Map<string, number[]>(),
       ruleHit: hit,
       topicId: resolveEvidenceTopicId(db, recordIds, hit),
