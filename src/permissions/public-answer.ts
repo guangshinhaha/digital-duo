@@ -2,7 +2,8 @@ import { CLASSIFICATION_LEVELS } from "../ingest/record.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import type { DuoConfig } from "../config.js";
 import type { WorkspaceGroundedAttachment } from "../workspace/transport.js";
-import type { DraftSource } from "../drafting/draft-log.js";
+import { recordPublicOutcome, type DraftProvenance, type DraftSource } from "../drafting/draft-log.js";
+import { notGrantedPassOnReason } from "../drafting/escalation.js";
 import type { ConfidenceResult } from "../drafting/confidence.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { resolveAutonomyForAnswering } from "../trust/demotion.js";
@@ -43,6 +44,17 @@ export const PUBLIC_REFUSAL_MESSAGE =
  * answered, and internals never reach either surface.
  */
 export const PUBLIC_ANSWER_FAILED_MESSAGE = "Something went wrong answering that.";
+
+/**
+ * guangshinhaha/duo#315: what a colleague is told when the owner declines
+ * their first message to the duo — carried on the declined invitation
+ * itself (the leave's `reason`). Fixed words, like the outcomes above, and
+ * deliberately reason-free: it never says why, only where to go instead.
+ * It names the owner in the third person — the duo never speaks as them.
+ */
+export function workspaceDeclineNotice(ownerName: string): string {
+  return `Thanks for reaching out. ${ownerName}'s duo won't be answering in this conversation — please message ${ownerName} directly.`;
+}
 
 export interface PublicAnswered {
   readonly kind: "answered";
@@ -174,6 +186,14 @@ export async function answerPublicly(
    * was elsewhere."
    */
   onEscalated?: (draftId: string) => void,
+  /**
+   * guangshinhaha/duo#314: where the question came from — the workspace
+   * answering pipeline passes the conversation and the asker, so a passed-on
+   * question's draft knows where the owner's answer belongs. Omitted (the
+   * ask-link route, the CLI, the connector) the draft is recorded as the
+   * owner's own, exactly as before.
+   */
+  provenance?: DraftProvenance,
 ): Promise<PublicAnswerOutcome> {
   // The asker-context fields every one of the three log appends below
   // carries identically — only topicId/outcome/text/draftId vary by branch.
@@ -194,10 +214,15 @@ export async function answerPublicly(
     confidenceConfig,
     PUBLIC_ANSWER_CLEARANCE_CEILING,
     attachments,
+    undefined, // no recipient: the duo answers, nobody's voice is being learned
+    provenance === undefined ? {} : { provenance },
   );
 
   if (pipelineResult.kind === "escalation") {
     const outcome = pipelineResult.refused ? "declined_refused" : "passed_on";
+    // guangshinhaha/duo#313/#314: what the asker was told, on the draft row
+    // itself, with the pipeline's own reason as the reason it went on.
+    recordPublicOutcome(storePath, passphrase, pipelineResult.draftId, outcome, pipelineResult.reason);
     const message = withPublicAttribution(pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
@@ -226,6 +251,9 @@ export async function answerPublicly(
   // explicitly here means the "answered" path past this point never has to
   // assume that invariant silently holds.
   if (autonomy.level !== "auto" || topicId === undefined) {
+    // guangshinhaha/duo#314: the draft row holds the duo's attempt here (it
+    // was confident), so the reason is the one the row could not say alone.
+    recordPublicOutcome(storePath, passphrase, pipelineResult.draftId, "passed_on", notGrantedPassOnReason(topicId));
     const message = withPublicAttribution(PUBLIC_PASSED_ON_MESSAGE, ownerName);
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
@@ -246,6 +274,7 @@ export async function answerPublicly(
     };
   }
 
+  recordPublicOutcome(storePath, passphrase, pipelineResult.draftId, "answered", null);
   const text = withPublicAttribution(pipelineResult.text, ownerName, pipelineResult.sources, {
     confidence: pipelineResult.confidence.score,
     evidenceAgeDays: pipelineResult.evidenceAgeDays,

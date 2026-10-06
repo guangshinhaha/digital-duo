@@ -14,7 +14,7 @@ import {
   type Room,
 } from "matrix-js-sdk";
 import { localpartOf } from "./directory.js";
-import { fileFromContent, type RoomInvite } from "./messages.js";
+import { fileFromContent, inviteReasonOf, type RoomInvite } from "./messages.js";
 import type { WorkspaceSettings } from "./settings.js";
 import type {
   AnswerEventContent,
@@ -266,11 +266,18 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
     }
     const inviteEvent = room.getMember(settings.userId)?.events.member;
     const nameContent = room.currentState.getStateEvents(EventType.RoomName, "")?.getContent() as Record<string, unknown> | undefined;
+    const inviteContent = inviteEvent?.getContent() as Record<string, unknown> | undefined;
     const invite: RoomInvite = {
       roomId: room.roomId,
       inviterId: inviteEvent?.getSender() ?? null,
       name: typeof nameContent?.name === "string" ? nameContent.name : null,
       joinedMemberCount: room.getMembers().filter((member) => member.membership === "join").length,
+      // guangshinhaha/duo#315: the colleague's first message, when their
+      // client carried it as the invite's reason, and whether they marked
+      // the conversation one-to-one — read by the same rule the sync parser
+      // uses (messages.ts).
+      reason: inviteReasonOf(inviteContent?.reason),
+      direct: inviteContent?.is_direct === true,
     };
     for (const handler of inviteHandlers) {
       handler(invite);
@@ -447,11 +454,24 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
       await client.joinRoom(roomId);
     },
 
-    async leaveRoom(roomId: string) {
+    async leaveRoom(roomId: string, reason?: string) {
       // A leave is also the invite rejection on Matrix — the seam's doc —
       // which is why the refusal path and the withdrawal path share this
       // one primitive.
-      await client.leave(roomId);
+      if (reason === undefined) {
+        await client.leave(roomId);
+        return;
+      }
+      // guangshinhaha/duo#315: the spec's leave body carries an optional
+      // `reason`, which the SDK's leave() doesn't expose — the same raw
+      // authed request the media read above uses, against the spec path.
+      await client.http.authedRequest(Method.Post, `/rooms/${encodeURIComponent(roomId)}/leave`, undefined, { reason });
+    },
+
+    async inviteToRoom(roomId: string, userId: string) {
+      // guangshinhaha/duo#314: the service's one caller invites only the
+      // duo's own owner (the seam's doc) — a plain invite, nothing else.
+      await client.invite(roomId, userId);
     },
   };
 }

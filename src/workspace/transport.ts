@@ -141,8 +141,22 @@ export interface WorkspaceTransport {
    * is how an invite is rejected: the homeserver drops it and stops
    * replaying it in sync) and of a withdrawal (#192). Resolves when the
    * homeserver accepts the exit.
+   *
+   * guangshinhaha/duo#315: `reason` rides the leave as the membership
+   * event's own `reason` — how a declined invitation tells the colleague,
+   * politely, in the daemon's fixed words. Absent is the bare leave.
    */
-  leaveRoom(roomId: string): Promise<void>;
+  leaveRoom(roomId: string, reason?: string): Promise<void>;
+
+  /**
+   * guangshinhaha/duo#314: invites one user into a room the duo is in. The
+   * service calls it with exactly one invitee — the duo's OWN owner, by the
+   * id grammar (`@duo-<owner>` → `@<owner>`) — so the owner can answer a
+   * question the duo passed to them in the conversation it was asked in.
+   * Nothing here can add anyone else: the no-provisioning stance holds
+   * (no member is created), and the service is the one caller.
+   */
+  inviteToRoom(roomId: string, userId: string): Promise<void>;
 }
 
 /**

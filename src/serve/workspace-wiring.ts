@@ -1,11 +1,12 @@
 import { attachmentGroundingDoor } from "../drafting/attachment-grounding.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
-import { answerPublicly } from "../permissions/public-answer.js";
+import { answerPublicly, workspaceDeclineNotice } from "../permissions/public-answer.js";
 import { notifyDraftWaiting } from "../push/notify.js";
 import { askerContextForSender } from "../workspace/asker.js";
 import type { WorkspaceSettings } from "../workspace/settings.js";
 import { WorkspaceService } from "../workspace/service.js";
-import type { WorkspaceTransportFactory } from "../workspace/transport.js";
+import type { WorkspaceQuestion, WorkspaceTransportFactory } from "../workspace/transport.js";
+import type { DraftProvenance } from "../drafting/draft-log.js";
 import { durableDuoReadState } from "./workspace-read-state.js";
 import type { ServeDeps } from "./server.js";
 
@@ -64,7 +65,9 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
     // every other owner policy lives in (consent.ts states why a file
     // and not the store). Wired whenever a workspace exists at all, so
     // the owner surface is never half-configured.
-    consent: { duoDir: duo.duoDir },
+    // guangshinhaha/duo#315: a declined first message tells the colleague,
+    // politely, in fixed words naming the owner.
+    consent: { duoDir: duo.duoDir, declineNotice: workspaceDeclineNotice(duo.ownerName) },
     // #190: the attachment grounding door, wired with the owner's own
     // classification ceiling — the same parsed value every ingest
     // boundary reads, because this is the same policy applied at a
@@ -106,7 +109,35 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
         // digital-duo#251: a workspace message arrived while the owner
         // was away — the epic's own headline case for a push.
         (draftId) => void notifyDraftWaiting(duo, draftId, duo.pushSender),
+        // guangshinhaha/duo#314: whose question, from which conversation —
+        // so a passed-on question reaches the owner with where to answer it.
+        workspaceDraftProvenance(question),
       ),
   });
   return workspace;
+}
+
+/**
+ * The channel kind a workspace conversation's drafts carry. No delivery
+ * adapter owns it: the duo never posts the owner's words — the owner
+ * answers from their own workspace account, and the client records that it
+ * did (`ownerDelivered` on POST /drafts/:id/outcome).
+ */
+export const WORKSPACE_CHANNEL_KIND = "workspace";
+
+/**
+ * guangshinhaha/duo#314: a workspace question's draft provenance — the
+ * asker's Matrix user id, the room as the thread, and the question's own
+ * `matrix.to` permalink (the spec's address for a room and an event, which
+ * the client already reads to find a draft's conversation). Pure, so the
+ * shape is pinned by test without a connection.
+ */
+export function workspaceDraftProvenance(question: Pick<WorkspaceQuestion, "roomId" | "eventId" | "senderId">): DraftProvenance {
+  return {
+    origin: "channel",
+    channelKind: WORKSPACE_CHANNEL_KIND,
+    askerRef: question.senderId,
+    threadId: question.roomId,
+    permalink: `https://matrix.to/#/${encodeURIComponent(question.roomId)}/${encodeURIComponent(question.eventId)}`,
+  };
 }

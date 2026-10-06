@@ -37,6 +37,66 @@ function appendChannelDraft(storePath: string, draftText: string | null = "point
   });
 }
 
+describe("recordOutcomeAndDeliver — the owner posted it themselves (guangshinhaha/duo#314)", () => {
+  it("records delivered without handing anything to an adapter, even when one owns the channel", async () => {
+    const storePath = initStore();
+    const draftId = appendChannelDraft(storePath);
+    const requests: ChannelDeliveryRequest[] = [];
+    const slack: ChannelAdapter = {
+      channelKind: "slack",
+      label: "a channel",
+      async status() {
+        return { state: "connected", lastActivityAt: null };
+      },
+      async deliver(request) {
+        requests.push(request);
+      },
+    };
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "edited", "Ask Priya — she owns deploy access.", {
+      channelAdapters: [slack],
+      ownerDelivered: true,
+    });
+    expect(requests).toEqual([]);
+    expect(getDraft(storePath, PASSPHRASE, draftId)).toMatchObject({
+      outcome: "edited",
+      sentText: "Ask Priya — she owns deploy access.",
+      delivery: { state: "delivered" },
+    });
+  });
+
+  it("a workspace draft with no adapter at all is delivered, not failed, when the owner posted it", async () => {
+    const storePath = initStore();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "how do I get deploy access?",
+      threadContext: null,
+      draftText: "point them at the runbook",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "workspace", askerRef: "@bob:workspace", threadId: "!dm:workspace", permalink: null },
+    });
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { ownerDelivered: true });
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toEqual({ state: "delivered" });
+  });
+
+  it("an owner-asked draft still records no delivery at all", async () => {
+    const storePath = initStore();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+      provenance: { origin: "owner" },
+    });
+    await recordOutcomeAndDeliver(storePath, PASSPHRASE, draftId, "sent", undefined, { ownerDelivered: true });
+    expect(getDraft(storePath, PASSPHRASE, draftId)?.delivery).toBeNull();
+  });
+});
+
 describe("recordOutcomeAndDeliver — the delivery seam (#170)", () => {
   it("a sent channel draft reaches its adapter with the final text and records delivered", async () => {
     const storePath = initStore();

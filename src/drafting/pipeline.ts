@@ -14,7 +14,15 @@ import {
   type ConfidenceSignals,
 } from "./confidence.js";
 import { gatherDraftContext, type DraftContext } from "./context.js";
-import { appendDraft, readShapePreferences, recipientKeyOf, type DraftRecipient, type DraftSource, type ShapeInstruction } from "./draft-log.js";
+import {
+  appendDraft,
+  readShapePreferences,
+  recipientKeyOf,
+  type DraftProvenance,
+  type DraftRecipient,
+  type DraftSource,
+  type ShapeInstruction,
+} from "./draft-log.js";
 import { deriveRecipientVoice, type RecipientRegister } from "./recipient-voice.js";
 import { explainEscalation, noEvidenceEscalationReason, refusedSubjectEscalationReason } from "./escalation.js";
 import { ALTERNATIVE_INSTRUCTIONS, buildDraftPrompt, extractiveDraft, pickRepresentativeSample } from "./generate.js";
@@ -74,6 +82,14 @@ export interface DraftReplyOptions {
    * for (or be scored on) candidates nobody chooses between.
    */
   readonly offerAlternatives?: boolean;
+  /**
+   * guangshinhaha/duo#314: where the question came from, when it was not
+   * the owner. Public answering over the workspace passes the conversation
+   * and the asker (a `channel` provenance), so the passed-on draft knows
+   * which room to answer in and who asked. Omitted, the draft is the
+   * owner's own — every pre-#314 caller, unchanged.
+   */
+  readonly provenance?: DraftProvenance;
 }
 
 export interface DraftEscalation {
@@ -279,6 +295,9 @@ export async function draftReply(
   recipient?: DraftRecipient,
   options: DraftReplyOptions = {},
 ): Promise<DraftPipelineResult> {
+  // guangshinhaha/duo#314: the owner's own draft unless the caller says
+  // whose question this is (public answering over the workspace).
+  const provenance: DraftProvenance = options.provenance ?? OWNER_PROVENANCE;
   // Checked first, before any retrieval or generation: a refused subject
   // escalates "without reasoning about it" (#34 AC2) — there is no
   // internal draft composed and then withheld, because nothing below
@@ -297,7 +316,7 @@ export async function draftReply(
       sources: [],
       refused: true,
       escalationThreshold: confidenceConfig.escalationThreshold,
-      provenance: OWNER_PROVENANCE,
+      provenance,
       recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: true, confidence: undefined };
@@ -346,7 +365,7 @@ export async function draftReply(
       sources,
       refused: false,
       escalationThreshold: confidenceConfig.escalationThreshold,
-      provenance: OWNER_PROVENANCE,
+      provenance,
       recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence: undefined };
@@ -358,9 +377,9 @@ export async function draftReply(
 
   // guangshinhaha/duo#258 AC3: shapes the owner keeps asking for toward
   // this person lean every later draft to them. The person is the named
-  // recipient when the caller gave one (duo#262), else — owner provenance
-  // being the only origin this pipeline drafts for — the owner themself.
-  const recipientKey = recipientKeyOf(OWNER_PROVENANCE, recipient ?? null);
+  // recipient when the caller gave one (duo#262), else the asker for a
+  // colleague's question (#314's channel provenance), else the owner themself.
+  const recipientKey = recipientKeyOf(provenance, recipient ?? null);
   const preferences: readonly ShapeInstruction[] = recipientKey !== undefined ? readShapePreferences(storePath, passphrase, recipientKey) : [];
 
   if (inferenceProvider) {
@@ -402,7 +421,7 @@ export async function draftReply(
       sources,
       refused: false,
       escalationThreshold: confidenceConfig.escalationThreshold,
-      provenance: OWNER_PROVENANCE,
+      provenance,
       recipient: recipient ?? null,
     });
     return { kind: "escalation", draftId, reason, refused: false, confidence };
@@ -438,7 +457,7 @@ export async function draftReply(
     sources,
     refused: false,
     escalationThreshold: confidenceConfig.escalationThreshold,
-    provenance: OWNER_PROVENANCE,
+    provenance,
     recipient: recipient ?? null,
     adaptedForRecipient,
     alternatives: alternatives.map((candidate) => ({

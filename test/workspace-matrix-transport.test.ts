@@ -31,6 +31,8 @@ class StubMatrixClient {
   readonly sentMessages: { roomId: string; content: unknown }[] = [];
   /** Every authenticated media download, exactly as the adapter issued it (#190). */
   readonly authedRequests: { method: unknown; path: string; opts: Record<string, unknown> }[] = [];
+  /** Bodies of every authed request, index-aligned with authedRequests (#315's leave reason rides one). */
+  readonly authedBodies: unknown[] = [];
   /** What authedRequest serves the next media download — a raw body, as rawResponseBody promises. */
   mediaBody: Blob = new Blob([]);
   mediaError: Error | undefined;
@@ -77,7 +79,12 @@ class StubMatrixClient {
   readonly joinedRooms = new Set<string>();
   readonly joinCalls: string[] = [];
   readonly leaveCalls: string[] = [];
+  readonly inviteCalls: { roomId: string; userId: string }[] = [];
   leaveError: Error | undefined;
+
+  async invite(roomId: string, userId: string): Promise<void> {
+    this.inviteCalls.push({ roomId, userId });
+  }
 
   async joinRoom(roomId: string): Promise<void> {
     this.joinCalls.push(roomId);
@@ -114,8 +121,9 @@ class StubMatrixClient {
   }
 
   /** Authenticated media download (MSC3916) — the SDK's httpApi surface the adapter rides (#190). */
-  authedRequest(method: unknown, path: string, _queryParams: unknown, _body: unknown, opts: Record<string, unknown>): Promise<unknown> {
+  authedRequest(method: unknown, path: string, _queryParams: unknown, body: unknown, opts: Record<string, unknown>): Promise<unknown> {
     this.authedRequests.push({ method, path, opts });
+    this.authedBodies.push(body);
     if (this.mediaError) {
       return Promise.reject(this.mediaError);
     }
@@ -219,7 +227,9 @@ function room(members: readonly string[] = ["@duo-alice:workspace", "@bob:worksp
  * membership state events the stripped invite slice carries, and nothing
  * more — no joined-member roster beyond what the heroes make visible.
  */
-function inviteRoom(init: { roomId?: string; inviterId?: string | null; name?: string | null; memberships?: string[] } = {}) {
+function inviteRoom(
+  init: { roomId?: string; inviterId?: string | null; name?: string | null; memberships?: string[]; inviteContent?: Record<string, unknown> } = {},
+) {
   const roomId = init.roomId ?? "!invited:workspace";
   const memberships = init.memberships ?? ["invite", "join", "join"];
   const stateEvents: Record<string, { getContent: () => unknown; getSender: () => string | undefined }[]> = {};
@@ -232,7 +242,12 @@ function inviteRoom(init: { roomId?: string; inviterId?: string | null; name?: s
     getMember: (userId: string) =>
       init.inviterId === null
         ? undefined
-        : { userId, events: { member: { getSender: () => init.inviterId ?? "@bob:workspace" } } },
+        : {
+            userId,
+            events: {
+              member: { getSender: () => init.inviterId ?? "@bob:workspace", getContent: () => ({ membership: "invite", ...init.inviteContent }) },
+            },
+          },
     getMembers: () => memberships.map((membership, index) => ({ membership, userId: `@member${index}:workspace` })),
   };
 }
@@ -550,7 +565,7 @@ describe("Matrix adapter — the invite surface: normalize, never join (#192)", 
     transport.onInvite((invite) => invites.push(invite));
     client.emit(RoomEvent.MyMembership, inviteRoom({ inviterId: "@carol:workspace", name: "Launch planning", memberships: ["invite", "join", "join", "leave"] }), "invite", "leave");
     expect(invites).toEqual([
-      { roomId: "!invited:workspace", inviterId: "@carol:workspace", name: "Launch planning", joinedMemberCount: 2 },
+      { roomId: "!invited:workspace", inviterId: "@carol:workspace", name: "Launch planning", joinedMemberCount: 2, reason: null, direct: false },
     ]);
     // The adapter only translated: nothing joined.
     expect(client.joinCalls).toEqual([]);
@@ -561,7 +576,22 @@ describe("Matrix adapter — the invite surface: normalize, never join (#192)", 
     const invites: RoomInvite[] = [];
     transport.onInvite((invite) => invites.push(invite));
     client.emit(RoomEvent.MyMembership, inviteRoom({ inviterId: null, name: null, memberships: ["invite"] }), "invite", undefined);
-    expect(invites).toEqual([{ roomId: "!invited:workspace", inviterId: null, name: null, joinedMemberCount: 0 }]);
+    expect(invites).toEqual([{ roomId: "!invited:workspace", inviterId: null, name: null, joinedMemberCount: 0, reason: null, direct: false }]);
+  });
+
+  it("carries the invite's reason as a preview and its is_direct flag — a colleague's first message to the duo (guangshinhaha/duo#315)", () => {
+    const transport = createMatrixTransport(settings());
+    const invites: RoomInvite[] = [];
+    transport.onInvite((invite) => invites.push(invite));
+    client.emit(
+      RoomEvent.MyMembership,
+      inviteRoom({ inviterId: "@carol:workspace", name: null, memberships: ["invite", "join"], inviteContent: { reason: "  Where is the deploy runbook?\u0007 ", is_direct: true } }),
+      "invite",
+      undefined,
+    );
+    expect(invites).toEqual([
+      { roomId: "!invited:workspace", inviterId: "@carol:workspace", name: null, joinedMemberCount: 1, reason: "Where is the deploy runbook?", direct: true },
+    ]);
   });
 
   it("ignores every membership change that is not an invite — joins, leaves, bans, knocks are not invitations", () => {
@@ -596,6 +626,22 @@ describe("Matrix adapter — join and leave are plain membership calls (#192)", 
     const transport = createMatrixTransport(settings());
     await transport.leaveRoom("!room:workspace");
     expect(client.leaveCalls).toEqual(["!room:workspace"]);
+  });
+
+  it("leaveRoom with a reason rides the spec's leave body — the polite decline a colleague sees (guangshinhaha/duo#315)", async () => {
+    const transport = createMatrixTransport(settings());
+    await transport.leaveRoom("!room:workspace", "Thanks for reaching out.");
+    // Not the SDK's reason-less leave(): the raw spec call, with the reason as its body.
+    expect(client.leaveCalls).toEqual([]);
+    expect(client.authedRequests.map((request) => request.path)).toEqual(["/rooms/!room%3Aworkspace/leave"]);
+    expect(client.authedBodies).toEqual([{ reason: "Thanks for reaching out." }]);
+  });
+
+  it("inviteToRoom is a plain invite of exactly the user named (guangshinhaha/duo#314)", async () => {
+    const transport = createMatrixTransport(settings());
+    await transport.inviteToRoom("!room:workspace", "@alice:workspace");
+    expect(client.inviteCalls).toEqual([{ roomId: "!room:workspace", userId: "@alice:workspace" }]);
+    expect(client.joinCalls).toEqual([]);
   });
 
   it("propagates the homeserver's refusal of either, unchanged — the service owns the retry story", async () => {

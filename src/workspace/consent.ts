@@ -187,3 +187,74 @@ export function forgetRoomDecision(duoDir: string, roomId: string): { entry: Roo
 export function roomDecisionFor(entries: readonly RoomConsentEntry[], roomId: string): RoomConsentStatus | null {
   return entries.find((entry) => entry.roomId === roomId)?.status ?? null;
 }
+
+/**
+ * guangshinhaha/duo#315: "always allow this person" — the owner's standing
+ * yes, given ahead of time, to one colleague's one-to-one conversations
+ * with the duo. `duo/always-allow.json`, beside the room record and for the
+ * same reasons (owner policy, reviewable and reversible by hand, nothing
+ * secret in it). It is still the owner's act: nothing but the owner's
+ * explicit "Always allow" writes an entry, and a held invitation from a
+ * listed person is then allowed exactly as if the owner had tapped Allow —
+ * recorded in `room-consent.json` like any other allow. It covers direct
+ * conversations only: a group room carries other people the owner never
+ * agreed to, so it is always a fresh decision.
+ */
+export interface AlwaysAllowEntry {
+  /** The colleague's Matrix user id — protocol-issued, matched exactly (the room-id rule, applied to people). */
+  readonly userId: string;
+  /** ISO-8601 instant the owner gave the standing yes. */
+  readonly decidedAt: string;
+}
+
+function alwaysAllowFilePath(duoDir: string): string {
+  return join(duoDir, "always-allow.json");
+}
+
+/** Reads `duo/always-allow.json` — `[]` when absent; a malformed file throws, the room record's own rule (a silent empty list would quietly re-gate people the owner chose). */
+export function readAlwaysAllowed(duoDir: string): AlwaysAllowEntry[] {
+  const path = alwaysAllowFilePath(duoDir);
+  if (!existsSync(path)) {
+    return [];
+  }
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new InvalidRoomConsentError(`expected a JSON array of always-allowed people in ${path}`);
+  }
+  return parsed.map((raw: unknown, index) => {
+    const record = raw as Record<string, unknown> | null;
+    if (typeof record !== "object" || record === null || typeof record.userId !== "string" || record.userId.length === 0) {
+      throw new InvalidRoomConsentError(`always-allow entry at index ${index} is missing a non-empty "userId"`);
+    }
+    if (typeof record.decidedAt !== "string" || record.decidedAt.length === 0) {
+      throw new InvalidRoomConsentError(`always-allow entry "${record.userId}" is missing a non-empty "decidedAt"`);
+    }
+    return { userId: record.userId, decidedAt: record.decidedAt };
+  });
+}
+
+function writeAlwaysAllowed(duoDir: string, entries: readonly AlwaysAllowEntry[]): void {
+  mkdirSync(duoDir, { recursive: true });
+  const sorted = [...entries].sort((a, b) => (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0));
+  writeFileSync(alwaysAllowFilePath(duoDir), `${JSON.stringify(sorted, null, 2)}\n`, "utf8");
+}
+
+/** Records the owner's standing yes for one person — an upsert, one entry per person. Returns the updated list. */
+export function recordAlwaysAllowed(duoDir: string, userId: string): AlwaysAllowEntry[] {
+  const updated = readAlwaysAllowed(duoDir)
+    .filter((entry) => entry.userId !== userId)
+    .concat({ userId, decidedAt: new Date().toISOString() });
+  writeAlwaysAllowed(duoDir, updated);
+  return updated;
+}
+
+/** Takes the standing yes back. `removed` is false when the person was not on the list (the unmute convention: honest about nothing-to-do). */
+export function forgetAlwaysAllowed(duoDir: string, userId: string): { removed: boolean; people: AlwaysAllowEntry[] } {
+  const existing = readAlwaysAllowed(duoDir);
+  const updated = existing.filter((entry) => entry.userId !== userId);
+  if (updated.length === existing.length) {
+    return { removed: false, people: existing };
+  }
+  writeAlwaysAllowed(duoDir, updated);
+  return { removed: true, people: updated };
+}
