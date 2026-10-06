@@ -60,6 +60,7 @@ import { registerOrgRoutes, type OrgAdminAccess } from "./org-routes.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
 import { ScheduledSendRunner } from "./scheduled-send-runner.js";
 import { registerScheduledSendRoutes } from "./scheduled-send-routes.js";
+import { registerAutonomyRoutes } from "./autonomy-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
 
@@ -1262,6 +1263,9 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   registerRoutes(app, deps, draftReady, auth, embedJob, scheduledSends);
   registerOwnerRoutes(app, deps);
   registerScheduledSendRoutes(app, deps, scheduledSends);
+  // guangshinhaha/duo#266/#268: earned autonomy and its undo window. The
+  // hold rides the same runner as a scheduled send.
+  registerAutonomyRoutes(app, deps, scheduledSends);
   registerWorkspaceSessionRoutes(app, deps);
   if (deps.orgAdmin) {
     registerOrgRoutes(app, deps.orgAdmin);

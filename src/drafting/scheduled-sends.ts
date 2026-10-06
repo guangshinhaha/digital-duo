@@ -42,6 +42,16 @@ export interface ScheduledSend {
   readonly state: ScheduledSendState;
   readonly settledAt: string | null;
   readonly failureReason: string | null;
+  /**
+   * guangshinhaha/duo#268: true for a send the duo is making by itself under
+   * autonomy the owner granted (#266) — held for the owner's undo window
+   * rather than scheduled by them. Same table, same runner, same delivery
+   * seam; the flag is what lets a client show it as "your duo is about to
+   * send this" with Stop/Edit instead of as a send the owner scheduled, and
+   * what keeps an autonomous send out of the track record that earned the
+   * autonomy in the first place (`trust/recipient-autonomy.ts`).
+   */
+  readonly autonomous: boolean;
 }
 
 export class ScheduledSendNotFoundError extends Error {
@@ -76,9 +86,18 @@ export function ensureScheduledSendSchema(db: Database): void {
       scheduled_at TEXT NOT NULL,
       state TEXT NOT NULL,
       settled_at TEXT,
-      failure_reason TEXT
+      failure_reason TEXT,
+      autonomous INTEGER NOT NULL DEFAULT 0
     ) STRICT
   `);
+  // guangshinhaha/duo#268: added after #261 shipped — a store whose table
+  // predates the column gets it here, the draft log's own PRAGMA-checked
+  // migration idiom. 0 is the honest reading of every pre-existing row: the
+  // owner scheduled it.
+  const columns = new Set((db.prepare(`PRAGMA table_info(scheduled_sends)`).all() as unknown as { name: string }[]).map((row) => row.name));
+  if (!columns.has("autonomous")) {
+    db.exec(`ALTER TABLE scheduled_sends ADD COLUMN autonomous INTEGER NOT NULL DEFAULT 0`);
+  }
 }
 
 interface ScheduledSendRow {
@@ -90,6 +109,7 @@ interface ScheduledSendRow {
   state: string;
   settled_at: string | null;
   failure_reason: string | null;
+  autonomous: number;
 }
 
 function rowToScheduledSend(row: ScheduledSendRow): ScheduledSend {
@@ -102,6 +122,7 @@ function rowToScheduledSend(row: ScheduledSendRow): ScheduledSend {
     state: row.state as ScheduledSendState,
     settledAt: row.settled_at,
     failureReason: row.failure_reason,
+    autonomous: row.autonomous === 1,
   };
 }
 
@@ -148,6 +169,7 @@ export function scheduleSend(storePath: string, passphrase: string, draftId: str
     state: "scheduled",
     settledAt: null,
     failureReason: null,
+    autonomous: false,
   };
   withDatabase(storePath, passphrase, true, (db) => {
     ensureScheduledSendSchema(db);
@@ -157,14 +179,101 @@ export function scheduleSend(storePath: string, passphrase: string, draftId: str
     }
     // A row that already settled (cancelled, superseded, failed) is replaced: a cancelled hold may be rescheduled.
     db.prepare(
-      `INSERT INTO scheduled_sends (draft_id, outcome, sent_text, send_at, scheduled_at, state, settled_at, failure_reason)
-       VALUES (?, ?, ?, ?, ?, 'scheduled', NULL, NULL)
+      `INSERT INTO scheduled_sends (draft_id, outcome, sent_text, send_at, scheduled_at, state, settled_at, failure_reason, autonomous)
+       VALUES (?, ?, ?, ?, ?, 'scheduled', NULL, NULL, 0)
        ON CONFLICT(draft_id) DO UPDATE SET
          outcome = excluded.outcome, sent_text = excluded.sent_text, send_at = excluded.send_at,
-         scheduled_at = excluded.scheduled_at, state = 'scheduled', settled_at = NULL, failure_reason = NULL`,
+         scheduled_at = excluded.scheduled_at, state = 'scheduled', settled_at = NULL, failure_reason = NULL, autonomous = 0`,
     ).run(record.draftId, record.outcome, record.sentText, record.sendAt, record.scheduledAt);
   });
   return record;
+}
+
+/**
+ * guangshinhaha/duo#268: holds a draft the duo is about to send BY ITSELF —
+ * under autonomy the owner granted for its recipient (#266) — for the owner's
+ * undo window, `holdSeconds` from `now`. It is a scheduled send in every way
+ * that matters (one table, one runner, one delivery seam, the same
+ * already-settled guard at fire time), differing only in who decided it:
+ * flagged `autonomous`, always the draft's own text (`sent`, never an edit
+ * the owner did not write), and allowed a zero-length hold — 0 is a setting
+ * the owner can only choose with explicit confirmation
+ * (`trust/recipient-autonomy.ts`'s `writeAutonomySettings`).
+ *
+ * Refused, before anything is written, for an unknown draft, one already
+ * decided, one with nothing confident to send, or one already held.
+ */
+export function holdAutonomousSend(storePath: string, passphrase: string, draftId: string, holdSeconds: number, now: Date = new Date()): ScheduledSend {
+  const draft = getDraft(storePath, passphrase, draftId);
+  if (!draft) {
+    throw new DraftNotFoundError(draftId);
+  }
+  if (draft.outcome !== null) {
+    throw new DraftAlreadySettledError(draftId, draft.outcome);
+  }
+  if (draft.escalated || draft.refused || draft.draftText === null || draft.draftText.trim().length === 0) {
+    throw new InvalidScheduleError("Only a draft with text to send can be sent by the duo — a passed-on or refused question has none.");
+  }
+  if (!Number.isInteger(holdSeconds) || holdSeconds < 0) {
+    throw new InvalidScheduleError("holdSeconds must be a non-negative whole number of seconds.");
+  }
+  const record: ScheduledSend = {
+    draftId,
+    outcome: "sent",
+    sentText: null,
+    sendAt: new Date(now.getTime() + holdSeconds * 1000).toISOString(),
+    scheduledAt: now.toISOString(),
+    state: "scheduled",
+    settledAt: null,
+    failureReason: null,
+    autonomous: true,
+  };
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureScheduledSendSchema(db);
+    const existing = db.prepare(`SELECT * FROM scheduled_sends WHERE draft_id = ?`).get(draftId) as ScheduledSendRow | undefined;
+    if (existing?.state === "scheduled") {
+      throw new DraftAlreadyScheduledError(draftId, existing.send_at);
+    }
+    db.prepare(
+      `INSERT INTO scheduled_sends (draft_id, outcome, sent_text, send_at, scheduled_at, state, settled_at, failure_reason, autonomous)
+       VALUES (?, 'sent', NULL, ?, ?, 'scheduled', NULL, NULL, 1)
+       ON CONFLICT(draft_id) DO UPDATE SET
+         outcome = 'sent', sent_text = NULL, send_at = excluded.send_at,
+         scheduled_at = excluded.scheduled_at, state = 'scheduled', settled_at = NULL, failure_reason = NULL, autonomous = 1`,
+    ).run(record.draftId, record.sendAt, record.scheduledAt);
+  });
+  return record;
+}
+
+/**
+ * guangshinhaha/duo#268's Stop (and Edit, which is a Stop the client follows
+ * by opening the editor): takes an autonomous send back inside its window.
+ * Nothing is posted, and the draft — which never had an outcome — is simply
+ * waiting on the owner again, a normal draft for them to decide. Only an
+ * autonomous hold can be stopped this way; a send the owner scheduled
+ * themselves is cancelled through `cancelScheduledSend`. Throws
+ * `ScheduledSendNotFoundError` when no autonomous send is held for the
+ * draft — never held, already sent, already stopped.
+ */
+export function stopAutonomousSend(storePath: string, passphrase: string, draftId: string, now: Date = new Date()): void {
+  // The runner records the draft's outcome before it awaits the channel, and
+  // settles the hold only after — so a Stop landing in that gap would find
+  // the hold still "scheduled" while the reply is already on its way. The
+  // draft's own outcome is the truth: once it has one, it was sent, and the
+  // owner must be told so rather than shown a Stop that stopped nothing.
+  const draft = getDraft(storePath, passphrase, draftId);
+  if (draft && draft.outcome !== null) {
+    throw new ScheduledSendNotFoundError(draftId);
+  }
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureScheduledSendSchema(db);
+    const result = db
+      .prepare(`UPDATE scheduled_sends SET state = 'cancelled', settled_at = ? WHERE draft_id = ? AND state = 'scheduled' AND autonomous = 1`)
+      .run(now.toISOString(), draftId);
+    if (result.changes === 0) {
+      throw new ScheduledSendNotFoundError(draftId);
+    }
+  });
 }
 
 /** Takes a held send back before it fires. Throws `ScheduledSendNotFoundError` when nothing is held for the draft (never scheduled, already fired, already cancelled). */

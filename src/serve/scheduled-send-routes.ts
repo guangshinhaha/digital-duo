@@ -52,8 +52,11 @@ export function registerScheduledSendRoutes(app: FastifyInstance, deps: ServeDep
   // Every held send, soonest first, each with its draft — so the client can
   // show a Scheduled list without the draft also sitting in Waiting on you
   // (GET /drafts?outcome=pending leaves held drafts out).
+  // guangshinhaha/duo#268: an autonomous send's undo window shares the
+  // table but is not something the owner scheduled — it is listed under
+  // GET /autonomous-sends, with Stop/Edit, and left out here.
   app.get("/scheduled-sends", async () =>
-    listScheduledSends(deps.storePath, deps.passphrase).flatMap((send) => {
+    listScheduledSends(deps.storePath, deps.passphrase).filter((send) => !send.autonomous).flatMap((send) => {
       const draft = getDraft(deps.storePath, deps.passphrase, send.draftId);
       return draft ? [{ ...send, draft }] : [];
     }),

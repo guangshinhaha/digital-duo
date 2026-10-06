@@ -26,6 +26,14 @@ export async function notifyDraftWaiting(
   deps: { readonly storePath: string; readonly passphrase: string; readonly env: NodeJS.ProcessEnv },
   draftId: string,
   sender: PushSender = webPushSender,
+  /**
+   * guangshinhaha/duo#268: extra fields for a push that is not a plain
+   * "a draft is waiting" — an autonomous send's undo window carries
+   * `kind: "autonomous_hold"` and its `sendAt`, so the notification can
+   * offer Stop/Edit and say how long is left. Ids and fixed values only,
+   * never draft text: a push payload passes through a third-party service.
+   */
+  extra: Readonly<Record<string, string>> = {},
 ): Promise<void> {
   try {
     const subject = deps.env.DUO_PUSH_VAPID_SUBJECT;
@@ -44,7 +52,7 @@ export async function notifyDraftWaiting(
     // The rare path: keys not generated yet (this duo's very first push,
     // ever) is the one case that still needs a write.
     const { publicKey, privateKey } = vapidKeys ?? getOrCreateVapidKeys(deps.storePath, deps.passphrase);
-    const payload = JSON.stringify({ draftId });
+    const payload = JSON.stringify({ ...extra, draftId });
     const now = new Date();
 
     await Promise.allSettled(
