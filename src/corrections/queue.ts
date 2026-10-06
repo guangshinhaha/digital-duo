@@ -210,6 +210,10 @@ export function rejectPendingCorrectionCandidatesForDrafts(storePath: string, pa
     const result = db
       .prepare(`UPDATE correction_candidates SET status = 'rejected', reviewed_at = ? WHERE status = 'pending' AND draft_id IN (${placeholders})`)
       .run(new Date().toISOString(), ...draftIds);
-    return result.changes;
+    // node:sqlite types `.changes` as `number | bigint`; this row count
+    // from a single UPDATE never approaches bigint range, and the
+    // function's own callers (the purge orchestration's reported count)
+    // need a plain number.
+    return Number(result.changes);
   });
 }

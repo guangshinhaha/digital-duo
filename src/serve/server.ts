@@ -42,7 +42,28 @@ import { hybridSearch } from "../ingest/embeddings.js";
 import { importPastedTranscript } from "../ingest/paste-import.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
-import { hasRefusalsDecision, readRefusalsFile } from "../trust/refusals.js";
+import {
+  hasRefusalsDecision,
+  readRefusalsFile,
+  removeNeverAnswerRule,
+  renameNeverAnswerRule,
+  saveNeverAnswerRule,
+  suggestNeverAnswerSubject,
+  RefusalConflictError,
+  RefusalNotFoundError,
+  InvalidRefusalError,
+} from "../trust/refusals.js";
+import {
+  dismissAwaySummary,
+  endAwayNow,
+  getAwayState,
+  listTopicOptions,
+  setAway,
+  AWAY_SCOPES,
+  InvalidAwayError,
+  NotAwayError,
+  type AwayScope,
+} from "../trust/away.js";
 import { createPinnedAnswer, deletePinnedAnswer, listPinnedAnswers, updatePinnedAnswer } from "../trust/pinned-answers.js";
 import { resolveAskerRef } from "../permissions/directory.js";
 import { answerPublicly, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
@@ -288,6 +309,9 @@ function statusForError(error: Error): number {
     // for a client, like the not-found family above.
     case "NoPendingInviteError":
     case "RoomConsentNotFoundError":
+    // digital-duo#287: PUT/DELETE /mirror/refusals/:heading naming a
+    // subject with no recorded rule.
+    case "RefusalNotFoundError":
     // duo#275: editing a pinned answer that doesn't exist (deleted
     // already, or a stale client copy) — "nothing to act on", same as
     // the rest of this family.
@@ -324,6 +348,9 @@ function statusForError(error: Error): number {
     // bring into a conversation — the daemon's state, not the request.
     case "NoOwnerToInviteError":
       return 409;
+    // digital-duo#287: DELETE /away when no period is active.
+    case "NotAwayError":
+      return 409;
     case "BlankEditError":
     // #259 in guangshinhaha/duo: a dismissReason sent alongside any outcome
     // other than "discarded" — the same "caller sent something that can
@@ -340,6 +367,15 @@ function statusForError(error: Error): number {
     // guangshinhaha/duo#315: "always allow" on an invitation that isn't a
     // person's one-to-one conversation — a request that can never be valid.
     case "AlwaysAllowNotApplicableError":
+    // digital-duo#287: a malformed never-answer write (POST/PUT
+    // /mirror/refusals(/:heading)) — blank rule/subject, or a bad shape.
+    case "InvalidRefusalError":
+    // digital-duo#287: PUT /mirror/refusals/:heading renaming onto a
+    // *different* existing rule's subject.
+    case "RefusalConflictError":
+    // digital-duo#287: PUT /away with a past/over-long until, an unknown
+    // scope, or an unknown/refused topic in extraTopicIds.
+    case "InvalidAwayError":
     // duo#275: an empty pattern or empty wording — can never be a valid
     // pinned answer, same "the request itself is malformed" shape.
     case "InvalidPinnedAnswerError":
@@ -1101,6 +1137,113 @@ function registerRoutes(
   // error. add/confirm-none stay terminal-only: they are authoring acts,
   // the same class as rule authoring (AR-18).
   app.get("/mirror/refusals", async () => ({ decided: hasRefusalsDecision(deps.duoDir), refusals: readRefusalsFile(deps.duoDir) }));
+
+  /**
+   * digital-duo#287: never-answer rules, owner-editable from the app
+   * (guangshinhaha/duo#269, PR #339's `src/profile/Refusals.tsx` and
+   * `src/components/NeverAnswerOffer.tsx`) — the mutation half of #182's
+   * read above. Every write answers with the whole, freshly-read
+   * `RefusalsListing` (same shape the GET above returns), so a client can
+   * swap its cache in directly rather than re-fetch.
+   */
+  app.post<{ Body: unknown }>("/mirror/refusals", async (request, reply) => {
+    try {
+      const refusals = saveNeverAnswerRule(deps.duoDir, request.body);
+      reply.code(201);
+      return { decided: true, refusals };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.put<{ Params: { heading: string }; Body: unknown }>("/mirror/refusals/:heading", async (request, reply) => {
+    try {
+      const refusals = renameNeverAnswerRule(deps.duoDir, request.params.heading, request.body);
+      return { decided: true, refusals };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.delete<{ Params: { heading: string } }>("/mirror/refusals/:heading", async (request, reply) => {
+    try {
+      const refusals = removeNeverAnswerRule(deps.duoDir, request.params.heading);
+      return { decided: true, refusals };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  /**
+   * guangshinhaha/duo#259 → #269: starting words for a never-answer rule
+   * off a draft dismissed as "shouldn't answer this" — `NeverAnswerOffer`'s
+   * one-tap follow-up. Records nothing; the owner edits or approves the
+   * suggested subject, and only `POST /mirror/refusals` writes anything.
+   */
+  app.get<{ Params: { id: string } }>("/drafts/:id/never-answer-suggestion", async (request, reply) => {
+    const draft = getDraft(deps.storePath, deps.passphrase, request.params.id);
+    if (draft === undefined) {
+      reply.code(404).send(errorBody("DraftNotFoundError", `No draft "${request.params.id}" exists.`));
+      return;
+    }
+    return { draftId: draft.id, question: draft.question, subject: suggestNeverAnswerSubject(draft.question) };
+  });
+
+  // guangshinhaha/duo#270: the topics an away period's "May do, plus
+  // topics I pick" scope can add — `duo/topics.json` (../derivation/topics.js),
+  // the same ids `GET /trust/grid` and `POST /trust/grant` already use, in
+  // the one `{id, label}` shape an away picker needs.
+  app.get("/topics", async () => listTopicOptions(deps.duoDir));
+
+  // guangshinhaha/duo#270: away mode, over HTTP — `src/trust/away.ts` owns
+  // every behaviour (the one active period, its lazy expiry, the status
+  // line, the summary); these four routes are thin wrappers, the same
+  // shape `scheduled-send-routes.ts` uses for its own module.
+  app.get("/away", async () => getAwayState(deps.storePath, deps.passphrase, deps.duoDir));
+
+  app.put<{ Body: { until?: unknown; scope?: unknown; extraTopicIds?: unknown } | undefined }>("/away", async (request, reply) => {
+    const body = request.body ?? {};
+    if (typeof body.until !== "string" || body.until.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "until is required and must be an ISO-8601 date-time string."));
+      return;
+    }
+    if (typeof body.scope !== "string" || !(AWAY_SCOPES as readonly string[]).includes(body.scope)) {
+      reply.code(400).send(errorBody("bad_request", `scope must be one of: ${AWAY_SCOPES.join(", ")}.`));
+      return;
+    }
+    if (body.extraTopicIds !== undefined && (!Array.isArray(body.extraTopicIds) || !body.extraTopicIds.every((id) => typeof id === "string"))) {
+      reply.code(400).send(errorBody("bad_request", "extraTopicIds, when present, must be an array of strings."));
+      return;
+    }
+    try {
+      setAway(deps.storePath, deps.passphrase, deps.duoDir, {
+        until: new Date(body.until),
+        scope: body.scope as AwayScope,
+        extraTopicIds: body.extraTopicIds as string[] | undefined,
+      });
+      // guangshinhaha/duo#270: the client's own `useSetAway` types the
+      // reply as the full `AwayState` (it sets it straight into the
+      // query cache) — the same shape `GET /away` returns, not the bare
+      // period `setAway` itself answers with.
+      return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.delete("/away", async (_request, reply) => {
+    try {
+      endAwayNow(deps.storePath, deps.passphrase, deps.duoDir);
+      return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post("/away/summary/dismiss", async () => {
+    dismissAwaySummary(deps.storePath, deps.passphrase);
+    return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+  });
 
   // duo#275: "pin exact wording — always answer this way." Unlike a rule or
   // a refusal, a pinned answer is authored and edited from the client (the

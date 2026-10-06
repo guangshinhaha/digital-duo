@@ -226,3 +226,19 @@ export function listPublicAnswerLogEntries(storePath: string, passphrase: string
     return rows.map(rowToEntry);
   });
 }
+
+/**
+ * Every entry created in `[fromIso, toIso)`, oldest first — `trust/away.ts`'s
+ * own read, to build an away period's summary (guangshinhaha/duo#270) from
+ * exactly what the public-answering pipeline already logs, without this
+ * module knowing anything about away mode itself.
+ */
+export function listPublicAnswerLogEntriesBetween(storePath: string, passphrase: string, fromIso: string, toIso: string): PublicAnswerLogEntry[] {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensurePublicAnswerLogSchema(db);
+    const rows = db
+      .prepare(`SELECT * FROM public_answer_log WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC, id ASC`)
+      .all(fromIso, toIso) as unknown as PublicAnswerLogRow[];
+    return rows.map(rowToEntry);
+  });
+}
