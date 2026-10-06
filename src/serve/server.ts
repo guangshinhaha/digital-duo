@@ -27,6 +27,7 @@ import {
 } from "../drafting/draft-log.js";
 import { shapeDraft } from "../drafting/shape.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
+import { settleScheduledSend } from "../drafting/scheduled-sends.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
@@ -54,6 +55,8 @@ import { jobsFor } from "./jobs.js";
 import { registerMcpRoutes, type ConnectorAccess } from "./mcp.js";
 import { registerOrgRoutes, type OrgAdminAccess } from "./org-routes.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
+import { ScheduledSendRunner } from "./scheduled-send-runner.js";
+import { registerScheduledSendRoutes } from "./scheduled-send-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
 
@@ -323,7 +326,14 @@ function statusForError(error: Error): number {
 }
 
 /** Registers every route on an already-constructed Fastify instance. Split out so `createServer` can add auth first and routes after, without routes needing to know that ordering exists. */
-function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: DraftReadyHub, auth: AuthCache, embedJob: EmbedJob): void {
+function registerRoutes(
+  app: FastifyInstance,
+  deps: ServeDeps,
+  draftReady: DraftReadyHub,
+  auth: AuthCache,
+  embedJob: EmbedJob,
+  scheduledSends: ScheduledSendRunner,
+): void {
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/duos", async () => listAvailableDuos(deps.env));
@@ -487,6 +497,14 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       before,
       limit: parsedLimit,
     });
+    // guangshinhaha/duo#261: a draft held for a scheduled send is decided —
+    // the owner approved it — so it is not waiting on them any more. It
+    // stays `outcome IS NULL` in the log until it fires, so it is left out
+    // here and listed under GET /scheduled-sends instead.
+    if (outcome === "pending") {
+      const held = scheduledSends.heldDraftIds();
+      return held.size === 0 ? drafts : drafts.filter((draft) => !held.has(draft.id));
+    }
     return drafts;
   });
 
@@ -738,6 +756,12 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
         dismissReason: dismissReason as DismissReason | undefined,
         alternative,
       });
+      // guangshinhaha/duo#261: deciding a held draft here, now, overrides
+      // its schedule — release the hold so it never shows as still to come.
+      if (scheduledSends.heldDraftIds().has(request.params.id)) {
+        settleScheduledSend(deps.storePath, deps.passphrase, request.params.id, "superseded", "decided directly before its scheduled time");
+        scheduledSends.rearm();
+      }
       return result ?? {};
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
@@ -1171,8 +1195,19 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   const auth = registerAuth(app, deps.storePath, deps.passphrase);
   const draftReady = registerDraftReadySocket(app, deps);
   const embedJob = jobsFor(deps).embed;
-  registerRoutes(app, deps, draftReady, auth, embedJob);
+  // guangshinhaha/duo#261: held sends fire from the daemon, whether or not
+  // any client is connected. One runner per duo app, stopped with it.
+  const scheduledSends = new ScheduledSendRunner({
+    storePath: deps.storePath,
+    passphrase: deps.passphrase,
+    channelAdapters: () => deps.channelAdapters,
+    classifier: () => (deps.inferenceProvider ? createLlmEditClassifier(deps.inferenceProvider) : undefined),
+  });
+  scheduledSends.start();
+  app.addHook("onClose", async () => scheduledSends.stop());
+  registerRoutes(app, deps, draftReady, auth, embedJob, scheduledSends);
   registerOwnerRoutes(app, deps);
+  registerScheduledSendRoutes(app, deps, scheduledSends);
   registerWorkspaceSessionRoutes(app, deps);
   if (deps.orgAdmin) {
     registerOrgRoutes(app, deps.orgAdmin);
