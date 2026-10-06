@@ -271,6 +271,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/drafts/some-draft-id" },
     { method: "GET", url: "/review" },
     { method: "GET", url: "/mirror/portrait" },
+    { method: "GET", url: "/mirror/voice-trend" },
     { method: "GET", url: "/mirror/rules" },
     { method: "GET", url: "/mirror/rules/some-rule-id" },
     { method: "GET", url: "/mirror/refusals" },
@@ -861,6 +862,17 @@ describe("createServer — routes", () => {
     const response = await app.inject({ method: "GET", url: "/mirror/portrait", headers: authHeader });
     expect(response.statusCode).toBe(200);
     expect(response.json().totalQuestions).toBe(0);
+  });
+
+  it("GET /mirror/voice-trend reports tooThin with no approved sends on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/mirror/voice-trend", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ tooThin: true, buckets: [], totalApprovedSends: 0 });
+  });
+
+  it("GET /mirror/voice-trend rejects a bucket value that isn't week or month", async () => {
+    const response = await app.inject({ method: "GET", url: "/mirror/voice-trend?bucket=day", headers: authHeader });
+    expect(response.statusCode).toBe(400);
   });
 
   it("GET /mirror/rules is empty on a fresh store", async () => {
