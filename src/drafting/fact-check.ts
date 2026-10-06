@@ -16,20 +16,23 @@ const RETRIEVAL_FLOOR = 0.55;
 /**
  * #264: how sure the model itself must say it is — out of 100 — that a
  * claim in the owner's text contradicts a specific known fact, before
- * this ever surfaces as a flag. This is deliberately far higher than
- * drafting's own escalation threshold (confidence.ts's composite score):
- * drafting has several independent signals (retrieval strength, self-
- * consistency, recency, an explicit rule hit) to combine, where self-
- * reported confidence is intentionally the lowest-weighted because it's
- * known to be poorly calibrated. Contradiction-detection has no such
- * second signal — cosine similarity tells "about the same thing", never
- * "agrees or disagrees" — so the model's own stated confidence is the
- * ONLY signal available, which is exactly why the bar here sits far
- * above where a single such signal would otherwise sit. This is a v1
- * single-call heuristic, not a calibrated classifier: a wrong flag is
- * worse than a missed one (the issue's own framing), so a future pass
- * should lean toward raising this further — e.g. requiring two
- * independent calls to agree — rather than lowering it for recall.
+ * that single call is even worth a second opinion (see `checkOwnerText`
+ * for the two-call agreement this threshold gates). Deliberately far
+ * higher than drafting's own escalation threshold (confidence.ts's
+ * composite score): drafting has several independent signals (retrieval
+ * strength, self-consistency, recency, an explicit rule hit) to combine,
+ * where self-reported confidence is intentionally the lowest-weighted
+ * because it's known to be poorly calibrated. Contradiction-detection has
+ * no such second signal of its own — cosine similarity tells "about the
+ * same thing", never "agrees or disagrees" — so each individual call's
+ * self-reported confidence is the only per-call signal available, which
+ * is why the bar sits far above where a single such signal would
+ * otherwise sit, even before the second call is asked to agree with it.
+ * This is still a v1 heuristic, not a calibrated classifier: a wrong flag
+ * is worse than a missed one (the issue's own framing), so if real usage
+ * ever shows a confidently-wrong flag, the answer is to raise this
+ * further or require a third independent call, never to lower it for
+ * recall.
  */
 const FACT_CHECK_CONFIDENCE_THRESHOLD = 90;
 
@@ -162,7 +165,12 @@ function verbatimSpan(text: string, claim: string): string | undefined {
  *   the way drafting's `extractiveDraft` has one for generation.
  * - Only facts retrieved at or above `RETRIEVAL_FLOOR`, or an explicit
  *   confirmed+approved standing order, are even shown to the model.
- * - The model must self-report `FACT_CHECK_CONFIDENCE_THRESHOLD` or higher.
+ * - Each call must independently self-report `FACT_CHECK_CONFIDENCE_THRESHOLD`
+ *   or higher AND quote a claim verbatim in the owner's own text — and
+ *   this runs the check TWICE, fresh each time, flagging only when both
+ *   calls land on the same fact. Any disagreement — the second call finds
+ *   nothing, finds a different fact, or fails any of the same checks the
+ *   first passed — is silence, the same as no contradiction at all.
  * - The model's quoted "claim" must appear verbatim in the owner's own
  *   text — anything else is treated as a possible fabrication and the
  *   ENTIRE verdict is discarded, not softened into a vaguer flag.
@@ -192,25 +200,67 @@ export async function checkOwnerText(
     return { flag: null };
   }
 
-  let raw: string;
-  try {
-    raw = await inferenceProvider.complete(buildFactCheckPrompt(trimmed, threadContext, candidates));
-  } catch {
+  // First call: the fast path for the overwhelmingly common case (nothing
+  // wrong) costs exactly one completion, same as before. Only a verdict
+  // that clears every check below — a real contradiction, confident,
+  // verbatim-grounded — is worth a second, independent opinion.
+  const first = await requestVerdict(inferenceProvider, trimmed, threadContext, candidates);
+  if (!first) {
     return { flag: null };
   }
 
-  const verdict = parseVerdict(raw);
-  if (!verdict || !verdict.contradiction || verdict.confidence < FACT_CHECK_CONFIDENCE_THRESHOLD) {
+  // Second, independent call, same question, asked fresh: a single
+  // model call is this module's only signal (see this module's own doc
+  // comment on why the bar is already high), so a flag this consequential
+  // is held to BOTH calls agreeing — same fact, both confident, both
+  // verbatim — rather than trusting either one alone. One disagreement of
+  // any kind is treated exactly like "no contradiction": silence, not a
+  // downgraded or hedged flag.
+  const second = await requestVerdict(inferenceProvider, trimmed, threadContext, candidates);
+  if (!second || second.factIndex !== first.factIndex) {
     return { flag: null };
   }
-  const candidate = candidates[verdict.factIndex];
+
+  const candidate = candidates[first.factIndex];
+  // Unreachable in practice (requestVerdict already validated the index
+  // against this exact `candidates` array), but never trust an index into
+  // a flag's source without checking it again right where it's used.
   if (!candidate) {
     return { flag: null };
   }
-  const span = verbatimSpan(trimmed, verdict.claim);
-  if (span === undefined || verdict.concern.trim().length === 0) {
-    return { flag: null };
-  }
 
-  return { flag: { claim: span, concern: verdict.concern.trim(), source: candidate.source } };
+  return { flag: { claim: first.span, concern: first.concern, source: candidate.source } };
+}
+
+interface ValidatedVerdict {
+  readonly factIndex: number;
+  readonly span: string;
+  readonly concern: string;
+}
+
+/** One completion call, fully validated against every conservative check this module applies — never a thrown error, never a partially-trusted result. */
+async function requestVerdict(
+  inferenceProvider: InferenceProvider,
+  text: string,
+  threadContext: string | null,
+  candidates: readonly Candidate[],
+): Promise<ValidatedVerdict | undefined> {
+  let raw: string;
+  try {
+    raw = await inferenceProvider.complete(buildFactCheckPrompt(text, threadContext, candidates));
+  } catch {
+    return undefined;
+  }
+  const verdict = parseVerdict(raw);
+  if (!verdict || !verdict.contradiction || verdict.confidence < FACT_CHECK_CONFIDENCE_THRESHOLD) {
+    return undefined;
+  }
+  if (!candidates[verdict.factIndex]) {
+    return undefined;
+  }
+  const span = verbatimSpan(text, verdict.claim);
+  if (span === undefined || verdict.concern.trim().length === 0) {
+    return undefined;
+  }
+  return { factIndex: verdict.factIndex, span, concern: verdict.concern.trim() };
 }

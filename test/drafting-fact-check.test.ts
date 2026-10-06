@@ -83,6 +83,28 @@ function providerThatThrows(): InferenceProvider {
   };
 }
 
+/** Returns each response in order, one per call, and counts how many calls it got — for pinning the two-independent-calls agreement requirement. */
+function providerWithResponses(responses: readonly string[]): InferenceProvider & { callCount(): number } {
+  let count = 0;
+  return {
+    name: "fake",
+    async complete() {
+      const response = responses[count] ?? responses.at(-1)!;
+      count += 1;
+      return response;
+    },
+    callCount: () => count,
+  };
+}
+
+const CONFIDENT_CONTRADICTION = JSON.stringify({
+  contradiction: true,
+  factIndex: 0,
+  claim: "ten days a quarter",
+  concern: "You said ten days a quarter; the standing order says five.",
+  confidence: 97,
+});
+
 const CONTRADICTS_LEAVE_TEXT = "quick note — vacation leave is now ten days a quarter";
 
 describe("#264 — checkOwnerText", () => {
@@ -119,6 +141,35 @@ describe("#264 — checkOwnerText", () => {
     expect(result.flag?.claim).toBe("ten days a quarter");
     expect(result.flag?.source.kind).toBe("rule");
     expect(result.flag?.concern.length).toBeGreaterThan(0);
+  });
+
+  it("asks twice, independently, and only flags when both calls agree on the same fact", async () => {
+    const storePath = initStore();
+    await seedLeaveRule(storePath);
+    const provider = providerWithResponses([CONFIDENT_CONTRADICTION, CONFIDENT_CONTRADICTION]);
+    const result = await checkOwnerText(storePath, PASSPHRASE, duoDir(), CONTRADICTS_LEAVE_TEXT, null, createFakeEmbeddingProvider(), provider);
+    expect(result.flag).not.toBeNull();
+    expect(provider.callCount()).toBe(2);
+  });
+
+  it("never flags when the second independent call disagrees with the first — even though the first alone was confident", async () => {
+    const storePath = initStore();
+    await seedLeaveRule(storePath);
+    const noContradiction = JSON.stringify({ contradiction: false, factIndex: -1, claim: "", concern: "", confidence: 0 });
+    const provider = providerWithResponses([CONFIDENT_CONTRADICTION, noContradiction]);
+    const result = await checkOwnerText(storePath, PASSPHRASE, duoDir(), CONTRADICTS_LEAVE_TEXT, null, createFakeEmbeddingProvider(), provider);
+    expect(result).toEqual({ flag: null });
+    expect(provider.callCount()).toBe(2);
+  });
+
+  it("only calls the provider once when the first call already finds nothing — the second opinion is only worth asking for after a confident first hit", async () => {
+    const storePath = initStore();
+    await seedLeaveRule(storePath);
+    const noContradiction = JSON.stringify({ contradiction: false, factIndex: -1, claim: "", concern: "", confidence: 0 });
+    const provider = providerWithResponses([noContradiction, CONFIDENT_CONTRADICTION]);
+    const result = await checkOwnerText(storePath, PASSPHRASE, duoDir(), CONTRADICTS_LEAVE_TEXT, null, createFakeEmbeddingProvider(), provider);
+    expect(result).toEqual({ flag: null });
+    expect(provider.callCount()).toBe(1);
   });
 
   it("never flags below the confidence threshold, even when the model says it's a contradiction", async () => {
