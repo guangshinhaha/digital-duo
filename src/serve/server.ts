@@ -30,6 +30,7 @@ import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "
 import { settleScheduledSend } from "../drafting/scheduled-sends.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { readVoiceText } from "../drafting/context.js";
+import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../drafting/evidence-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
@@ -1014,6 +1015,24 @@ function registerRoutes(
       deps.env,
     ),
   );
+
+  // duo#272: a draft's Why panel lists its evidence; the owner removing one
+  // marks it excluded here so it stops being cited in any future draft
+  // (wired into `gatherDraftContext`'s own admissibility filter), without
+  // ever touching the record itself — restoring is the same reversible
+  // shape as a rule's approve/reject. The Knows tab reads the full list
+  // back so a removal is visible and undoable, not just silent.
+  app.post<{ Params: { recordId: string } }>("/knowledge/evidence/:recordId/exclude", async (request) => {
+    excludeEvidence(deps.storePath, deps.passphrase, request.params.recordId);
+    return { excluded: true };
+  });
+
+  app.post<{ Params: { recordId: string } }>("/knowledge/evidence/:recordId/restore", async (request) => {
+    restoreEvidence(deps.storePath, deps.passphrase, request.params.recordId);
+    return { excluded: false };
+  });
+
+  app.get("/knowledge/evidence/excluded", async () => ({ excluded: listExcludedEvidence(deps.storePath, deps.passphrase) }));
 
   app.get("/mirror/rules", async () => listRulesForReview(deps.storePath, deps.passphrase));
 

@@ -6,6 +6,7 @@ import { useTempDir } from "./helpers/temp-dir.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { gatherDraftContext } from "../src/drafting/context.js";
+import { excludeEvidence, restoreEvidence } from "../src/drafting/evidence-exclusions.js";
 import { embedRecords } from "../src/ingest/embeddings.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
@@ -64,6 +65,66 @@ describe("gatherDraftContext — evidence and voice with no rule yet", () => {
 
     const context = await gatherDraftContext(storePath, PASSPHRASE, dir, "anything", createFakeEmbeddingProvider());
     expect(context.voiceText).toContain("terse and direct");
+  });
+});
+
+describe("gatherDraftContext — evidence the owner excluded (duo#272)", () => {
+  it("leaves out a record the owner excluded from a draft's Why panel, and brings it back once restored", async () => {
+    const storePath = initStore();
+    const answer = record({ text: "five days per quarter, per the vacation policy" });
+    writeRecords(storePath, PASSPHRASE, [answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const before = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(before.evidence.some((item) => item.recordId === answer.id)).toBe(true);
+
+    excludeEvidence(storePath, PASSPHRASE, answer.id);
+    const excluded = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(excluded.evidence.some((item) => item.recordId === answer.id)).toBe(false);
+
+    restoreEvidence(storePath, PASSPHRASE, answer.id);
+    const restored = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(restored.evidence.some((item) => item.recordId === answer.id)).toBe(true);
+  });
+
+  it("an excluded record also drops out of rule-hit and topic resolution when it was the only evidence backing them", async () => {
+    const storePath = initStore();
+    const question = record({ kind: "question_to_me", author: "other", text: "a question about leave", threadId: "t-shared" });
+    const answer = record({ text: "five days per quarter, per the vacation policy", threadId: "t-shared" });
+    writeRecords(storePath, PASSPHRASE, [question, answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const { pairs } = await extractQaPairs([question, answer]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      putRule(
+        db,
+        {
+          id: "topic-leave",
+          topicId: "topic-leave",
+          text: "Standard leave is five days per quarter.",
+          status: "confirmed",
+          supportCount: 3,
+          consistency: 0.95,
+          createdAt: new Date().toISOString(),
+          lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "approved",
+          origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
+        },
+        pairs.map((pair) => pair.id),
+      );
+    });
+
+    excludeEvidence(storePath, PASSPHRASE, answer.id);
+    const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(context.evidence.some((item) => item.recordId === answer.id)).toBe(false);
+    expect(context.ruleHit).toBeUndefined();
+    expect(context.topicId).toBeUndefined();
   });
 });
 

@@ -2202,6 +2202,66 @@ describe("GET /knowledge — what this duo knows (#175)", () => {
   });
 });
 
+describe("POST /knowledge/evidence/:recordId/exclude and /restore, GET /knowledge/evidence/excluded (duo#272)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /knowledge/evidence/excluded is empty on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/knowledge/evidence/excluded", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ excluded: [] });
+  });
+
+  it("excludes a record from the Why panel's evidence, then lists and restores it", async () => {
+    const answer = record({ text: "five days per quarter, per the vacation policy" });
+    writeRecords(storePath, PASSPHRASE, [answer]);
+
+    const exclude = await app.inject({ method: "POST", url: `/knowledge/evidence/${answer.id}/exclude`, headers: authHeader });
+    expect(exclude.statusCode).toBe(200);
+    expect(exclude.json()).toEqual({ excluded: true });
+
+    const listed = await app.inject({ method: "GET", url: "/knowledge/evidence/excluded", headers: authHeader });
+    expect(listed.json()).toEqual({ excluded: [{ recordId: answer.id, excludedAt: expect.any(String), label: answer.text }] });
+
+    // the record itself is untouched — still readable from the corpus, exactly
+    // as #272 intends: excluding stops future citation, it is not deletion.
+    expect(withDatabase(storePath, PASSPHRASE, false, (db) => db.prepare("SELECT id FROM records WHERE id = ?").get(answer.id))).toBeTruthy();
+
+    const restore = await app.inject({ method: "POST", url: `/knowledge/evidence/${answer.id}/restore`, headers: authHeader });
+    expect(restore.statusCode).toBe(200);
+    expect(restore.json()).toEqual({ excluded: false });
+
+    const listedAfterRestore = await app.inject({ method: "GET", url: "/knowledge/evidence/excluded", headers: authHeader });
+    expect(listedAfterRestore.json()).toEqual({ excluded: [] });
+  });
+
+  it("excluding, and restoring, an unknown record id is a harmless no-op rather than a 404", async () => {
+    const exclude = await app.inject({ method: "POST", url: "/knowledge/evidence/no-such-record/exclude", headers: authHeader });
+    expect(exclude.statusCode).toBe(200);
+    const restore = await app.inject({ method: "POST", url: "/knowledge/evidence/no-such-record/restore", headers: authHeader });
+    expect(restore.statusCode).toBe(200);
+  });
+
+  it("is an owner surface: an ask token is refused on all three routes", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const list = await app.inject({ method: "GET", url: "/knowledge/evidence/excluded", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const exclude = await app.inject({ method: "POST", url: "/knowledge/evidence/some-id/exclude", headers: askHeader });
+    expect(exclude.statusCode).toBe(401);
+    const restore = await app.inject({ method: "POST", url: "/knowledge/evidence/some-id/restore", headers: askHeader });
+    expect(restore.statusCode).toBe(401);
+  });
+});
+
 describe("GET /devices and POST /devices/:id/revoke — paired devices over HTTP (#177)", () => {
   let app: FastifyInstance;
   let storePath: string;
