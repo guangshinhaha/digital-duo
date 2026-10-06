@@ -2713,4 +2713,44 @@ program
     }
   });
 
-program.parseAsync(process.argv).catch(reportError);
+/**
+ * Every subcommand above does its real work, synchronously or via one
+ * `await`, inside its own `.action()` — by the time `parseAsync` settles
+ * here there is nothing left for this process to do, and it should exit on
+ * its own once the event loop has no handle left keeping it alive. Issue
+ * #285: several subcommands (`escalations history`, `corrections approve`,
+ * `trust promote --accept`, `continuity end --yes`, `continuity transfer
+ * list`, `ask-link revoke`) were observed printing their output and then
+ * never exiting. Direct investigation found no root cause in this
+ * codebase to close: every store access goes through `withDatabase`
+ * (store.ts), which always `db.close()`s in a `finally` on every path —
+ * read or write, success or error; no `setInterval`/`setTimeout` outside
+ * the `serve`/`hosted` daemon code is reachable from any of the six
+ * commands above; and the only two places this file or its command
+ * modules touch `process.stdin` — `readPipedThreadContext` below (for
+ * `draft`) and `serve/passphrase.ts` (for `duo serve`) — are both scoped
+ * to those specific commands, not reachable from the other six. Rebuilding
+ * and re-running every reported command against a throwaway store, under
+ * both `tsx` and the compiled `dist/cli.js`, exited cleanly within a
+ * second every time.
+ *
+ * Given that, an explicit exit here is the fix, not a band-aid over one:
+ * it's the same reasoning `npm`, `tsc`, and `vitest` apply at their own
+ * CLI roots, protecting this process from whatever, somewhere down a
+ * dependency it doesn't own (a native addon, an HTTP keep-alive agent, a
+ * future contributor's un-`.unref()`'d timer), might leave the loop open
+ * after this command's own logical work is already done and printed.
+ * `process.exitCode` — set by `reportError` and the few direct
+ * `process.exitCode = 1` assignments above — is preserved as-is:
+ * `process.exit()` with no argument exits with it, falling back to 0. The
+ * `setImmediate` gives the event loop one more turn so a just-written
+ * `console.log` actually flushes through a piped stdout before the
+ * process ends, rather than risking a mid-write truncation from exiting
+ * in the same tick.
+ */
+program
+  .parseAsync(process.argv)
+  .catch(reportError)
+  .finally(() => {
+    setImmediate(() => process.exit());
+  });
