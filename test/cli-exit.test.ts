@@ -1,8 +1,13 @@
+import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createEncryptedStore } from "../src/store/store.js";
 import { runCli } from "./helpers/run-cli.js";
 import { useTempDir } from "./helpers/temp-dir.js";
+
+const cliEntry = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+const tsxBin = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
 
 const tempDir = useTempDir();
 const PASSPHRASE = "test-passphrase";
@@ -114,3 +119,55 @@ describe("every duo CLI subcommand exits on its own once its work is done (#285)
     EXIT_BUDGET_MS + 5000,
   );
 });
+
+/**
+ * The exact regression this file's exit-on-settle fix caused in production
+ * (api.digitalduo.world 502, minutes after #290 merged): `duo serve`'s
+ * action resolves as soon as `runServe` finishes binding, so an
+ * unconditional exit-on-settle kills the daemon the instant it starts
+ * listening. `isRunningAsLongLivedServer` in cli.ts is what's supposed to
+ * stop that — this asserts the process genuinely keeps running (and
+ * keeps answering requests) well past the point every other command above
+ * would have already exited, not just that it printed its "listening"
+ * line.
+ */
+it(
+  "duo serve keeps running once it's listening, not just prints that it is (regression: #290 killed the daemon seconds after boot)",
+  async () => {
+    const dir = tempDir();
+    const storePath = join(dir, "data", "duo.db");
+    createEncryptedStore(storePath, PASSPHRASE);
+    const port = 17000 + Math.floor(Math.random() * 1000);
+
+    const child = spawn(tsxBin, [cliEntry, "serve", "--host", "127.0.0.1", "--port", String(port)], {
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? "", DUO_STORE_PATH: storePath, DUO_PASSPHRASE: PASSPHRASE },
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("serve never printed its listening line")), 10_000);
+        child.stderr.on("data", (chunk: Buffer) => {
+          if (chunk.toString().includes("listening")) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        child.on("exit", (code) => {
+          clearTimeout(timer);
+          reject(new Error(`serve exited (code ${code}) before ever printing its listening line`));
+        });
+      });
+
+      // The exact window the bug lived in: settle, then die within a tick.
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      expect(child.exitCode, "serve exited on its own after settling — the regression is back").toBeNull();
+
+      const response = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(response.status).toBe(200);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  },
+  15_000,
+);
