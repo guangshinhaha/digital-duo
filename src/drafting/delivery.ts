@@ -1,7 +1,16 @@
 import type { EditClassifier, ClassifyAndQueueResult } from "../corrections/classify.js";
-import { recordDraftOutcomeAndClassify } from "../corrections/classify.js";
+import { BlankEditError, recordDraftOutcomeAndClassify } from "../corrections/classify.js";
 import { isChannelMuted } from "./channel-mutes.js";
-import { DraftAlreadySettledError, DraftNotFoundError, getDraft, recordDeliveryOutcome, type DismissReason, type DraftRecord, type SettableDraftOutcome } from "./draft-log.js";
+import {
+  chooseAlternative,
+  DraftAlreadySettledError,
+  DraftNotFoundError,
+  getDraft,
+  recordDeliveryOutcome,
+  type DismissReason,
+  type DraftRecord,
+  type SettableDraftOutcome,
+} from "./draft-log.js";
 
 /**
  * The delivery seam (#170): one channel-agnostic interface. Recording
@@ -120,7 +129,18 @@ export async function recordOutcomeAndDeliver(
   draftId: string,
   outcome: SettableDraftOutcome,
   sentText: string | undefined,
-  options: { readonly classifier?: EditClassifier; readonly channelAdapters?: readonly ChannelAdapter[]; readonly dismissReason?: DismissReason } = {},
+  options: {
+    readonly classifier?: EditClassifier;
+    readonly channelAdapters?: readonly ChannelAdapter[];
+    readonly dismissReason?: DismissReason;
+    /**
+     * guangshinhaha/duo#257: which candidate is being sent or kept, for a
+     * draft that offered alternatives (default 0, the draft itself).
+     * Ignored for "discarded" — nothing was chosen, so every candidate
+     * reads as not chosen.
+     */
+    readonly alternative?: number;
+  } = {},
 ): Promise<ClassifyAndQueueResult | undefined> {
   const existing = getDraft(storePath, passphrase, draftId);
   if (!existing) {
@@ -128,6 +148,20 @@ export async function recordOutcomeAndDeliver(
   }
   if (existing.outcome !== null && existing.delivery?.state !== "failed") {
     throw new DraftAlreadySettledError(draftId, existing.outcome);
+  }
+
+  // The chosen candidate becomes the row's draft before the outcome lands,
+  // so the edit diff and the delivered text are both the one picked. The
+  // blank-edit refusal is checked first here (it is checked again, as it
+  // always was, inside recordDraftOutcomeAndClassify) so a refused edit
+  // never leaves the choice half-made.
+  if (outcome === "sent" || outcome === "edited") {
+    if (outcome === "edited" && sentText !== undefined && sentText.trim().length === 0) {
+      throw new BlankEditError(draftId);
+    }
+    if (options.alternative !== undefined || existing.alternatives.length > 0) {
+      chooseAlternative(storePath, passphrase, draftId, options.alternative ?? 0);
+    }
   }
 
   const result = await recordDraftOutcomeAndClassify(storePath, passphrase, draftId, outcome, sentText, options.classifier, options.dismissReason);

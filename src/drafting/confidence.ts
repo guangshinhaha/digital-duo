@@ -65,6 +65,21 @@ export function scoreConfidence(
   return { signals, weights, score, threshold, passesThreshold: score >= threshold };
 }
 
+/**
+ * How far above the escalation threshold a draft must score to count as
+ * confident rather than hedged (guangshinhaha/duo#257). The client draws
+ * the same line — its ConfidenceHairline's HEDGE_MARGIN (duo
+ * `src/workspace/duoAnswer.ts`) — so the drafts that come with
+ * alternatives are exactly the ones the owner already sees marked
+ * "hedging". Keep the two equal.
+ */
+export const HEDGE_MARGIN = 0.15;
+
+/** True for a draft that cleared the threshold but not by HEDGE_MARGIN — shown, but hedged. The same comparison as the client's `hairlineState`, so a score sitting on the line reads the same on both sides. */
+export function isHedged(confidence: ConfidenceResult): boolean {
+  return confidence.passesThreshold && confidence.score < confidence.threshold + HEDGE_MARGIN;
+}
+
 function cosineSimilarity(a: readonly number[], b: readonly number[]): number {
   if (a.length !== b.length || a.length === 0) {
     return 0;

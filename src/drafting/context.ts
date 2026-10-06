@@ -193,6 +193,77 @@ function readVoiceText(duoDir: string): string {
 }
 
 /**
+ * Rebuilds a draft's grounding from the sources it already cites
+ * (guangshinhaha/duo#258) — the re-entry point for regenerating a draft
+ * without re-running retrieval. Every evidence source is re-read by its
+ * record id and the standing order by its rule id: the same pool, by
+ * construction, so a reshaped draft can never lean on evidence its
+ * original could not cite (and a draft held under a clearance ceiling,
+ * whose sources were filtered before they were ever stored, stays under
+ * it). A source whose record has since been deleted, or whose standing
+ * order is no longer active, simply drops out — it is not there to cite
+ * any more. Attachment sources carry no text (the bytes grounded one draft
+ * and were dropped, #190), so a shape of an attachment-grounded draft
+ * leans on the draft's own text for them.
+ *
+ * The rebuilt context is for generation only, never for scoring, so no
+ * similarity is recomputed: each item reads as 1.
+ */
+export function rebuildDraftContext(
+  storePath: string,
+  passphrase: string,
+  duoDir: string,
+  sources: readonly { readonly kind: string; readonly id: string }[],
+): DraftContext {
+  const evidenceIds = sources.filter((source) => source.kind === "evidence").map((source) => source.id);
+  const ruleId = sources.find((source) => source.kind === "rule")?.id;
+  const { evidence, ruleHit } = withDatabase(storePath, passphrase, false, (db) => {
+    ensureRecordsSchema(db);
+    const items: DraftEvidenceItem[] = [];
+    for (const id of evidenceIds) {
+      const row = db.prepare(`SELECT id, text, timestamp, classification FROM records WHERE id = ?`).get(id) as
+        | { id: string; text: string; timestamp: string; classification: RecordClassification }
+        | undefined;
+      if (row) {
+        items.push({
+          recordId: row.id,
+          text: row.text,
+          timestamp: row.timestamp,
+          similarity: 1,
+          classification: row.classification,
+        });
+      }
+    }
+    let rule: Rule | undefined;
+    if (ruleId !== undefined) {
+      ensureRulesSchema(db);
+      const candidate = readRuleRow(db, ruleId);
+      // Re-checked exactly as findRuleHit checks it on every draft: a rule
+      // the owner has since rejected, or a refusal written after the draft,
+      // wins over the draft's own citation — "the refusal wins" (#29 AC3).
+      if (
+        candidate &&
+        candidate.status === "confirmed" &&
+        candidate.reviewStatus === "approved" &&
+        findConflictingRefusal(duoDir, candidate.topicId) === undefined
+      ) {
+        rule = candidate;
+      }
+    }
+    return { evidence: items, ruleHit: rule };
+  });
+  return {
+    evidence,
+    ruleHit,
+    topicId: ruleHit?.topicId,
+    freshestEvidenceAgeDays: null,
+    freshestEvidenceTimestamp: null,
+    voiceText: readVoiceText(duoDir),
+    usedEmbeddings: false,
+  };
+}
+
+/**
  * Gathers everything the draft pipeline needs to generate and score a
  * draft. For the *owner's own* personal duo (the default: `clearanceCeiling`
  * omitted) there is no asker or clearance to resolve — unlike
