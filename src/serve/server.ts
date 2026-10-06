@@ -11,7 +11,7 @@ import { approveCandidate, getReviewCandidate, listReviewCandidates, rejectCandi
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
-import { getDraft, listDrafts, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
+import { getDraft, listDrafts, DISMISS_REASONS, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DismissReason, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { draftReply } from "../drafting/pipeline.js";
@@ -252,6 +252,10 @@ function statusForError(error: Error): number {
     case "DraftAlreadySettledError":
       return 409;
     case "BlankEditError":
+    // #259 in guangshinhaha/duo: a dismissReason sent alongside any outcome
+    // other than "discarded" — the same "caller sent something that can
+    // never be valid" shape as BlankEditError just above.
+    case "DismissReasonRequiresDiscardedError":
     // #172: a channel/thread mute key containing the "/" separator — the
     // entry would be ambiguous in the one mute store, so it is refused.
     case "InvalidMuteKeyError":
@@ -619,14 +623,25 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     }
   });
 
-  app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string } }>("/drafts/:id/outcome", async (request, reply) => {
-    const { outcome, sentText } = request.body;
+  app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string; dismissReason?: string } }>("/drafts/:id/outcome", async (request, reply) => {
+    const { outcome, sentText, dismissReason } = request.body;
     // SETTABLE_DRAFT_OUTCOMES, not the full DRAFT_OUTCOMES: this is the
     // generic outcome-setting route, and escalation_answered must only
     // ever be written by standing-order-candidates.ts's own atomic call —
     // never by a caller here, for any draft, escalated or not.
     if (!SETTABLE_DRAFT_OUTCOMES.includes(outcome as SettableDraftOutcome)) {
       reply.code(400).send(errorBody("bad_request", `outcome must be one of: ${SETTABLE_DRAFT_OUTCOMES.join(", ")}`));
+      return;
+    }
+    // #259 in guangshinhaha/duo: an optional, one-tap reason for a
+    // "discarded" draft. Validated here, the same way `outcome` itself is
+    // validated here — an unrecognized string is a 400, not a value that
+    // reaches storage. Whether it's paired with the right outcome
+    // ("discarded") is checked one layer in, by recordOutcomeAndDeliver via
+    // recordDraftOutcomeAndClassify, the same place the blank-"edited"
+    // check already lives.
+    if (dismissReason !== undefined && !DISMISS_REASONS.includes(dismissReason as DismissReason)) {
+      reply.code(400).send(errorBody("bad_request", `dismissReason must be one of: ${DISMISS_REASONS.join(", ")}`));
       return;
     }
     // The blank-sentText-on-"edited" check lives in recordOutcomeAndDeliver
@@ -641,6 +656,7 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       const result = await recordOutcomeAndDeliver(deps.storePath, deps.passphrase, request.params.id, outcome as SettableDraftOutcome, sentText, {
         classifier,
         channelAdapters: deps.channelAdapters,
+        dismissReason: dismissReason as DismissReason | undefined,
       });
       return result ?? {};
     } catch (error) {

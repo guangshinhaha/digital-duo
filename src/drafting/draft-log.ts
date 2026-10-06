@@ -48,6 +48,23 @@ export const DRAFT_OUTCOMES = [...SETTABLE_DRAFT_OUTCOMES, "escalation_answered"
 export type DraftOutcome = (typeof DRAFT_OUTCOMES)[number];
 
 /**
+ * Why the owner dismissed a draft (#259 in guangshinhaha/duo) — an optional,
+ * one-tap follow-up to a `"discarded"` outcome, never required (a silent
+ * dismissal must keep working exactly as before). Only meaningful alongside
+ * `"discarded"`: recording one against any other outcome is refused by
+ * `recordDraftOutcomeAndClassify` (`corrections/classify.ts`), the same layer
+ * that already refuses a blank "edited" `sentText`.
+ *
+ * `"shouldnt_answer"` is the one value with a second life: the client offers
+ * to turn it into a never-answer rule (the trust epic, #269 in
+ * guangshinhaha/duo). That rule store does not exist in this daemon yet, so
+ * for now this is only ever stored as a signal on the draft row — see this
+ * field's own doc comment on `DraftRecord`.
+ */
+export const DISMISS_REASONS = ["wrong_facts", "wrong_tone", "shouldnt_answer", "will_handle_myself"] as const;
+export type DismissReason = (typeof DISMISS_REASONS)[number];
+
+/**
  * Where a draft came from (#169), as structured data rather than free
  * text. `threadContext` stays exactly what it is — grounding text for the
  * model — because a free-text string can never answer "which thread, in
@@ -158,6 +175,15 @@ export interface DraftRecord {
    * this field existed.
    */
   readonly delivery: DraftDelivery | null;
+  /**
+   * Why the owner dismissed this draft (#259 in guangshinhaha/duo) — set
+   * only when `outcome` is `"discarded"` and the owner picked a reason; null
+   * for a silent dismissal (the common case, always allowed), for every
+   * other outcome, and for any draft recorded before this field existed.
+   * Queryable here, not rendered anywhere yet, so the Activity tab (#267 in
+   * guangshinhaha/duo) has a column to read once it exists.
+   */
+  readonly dismissReason: DismissReason | null;
 }
 
 /**
@@ -188,6 +214,10 @@ const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: st
   // reference to give — rowToDraft reads a NULL event id as simply absent,
   // never a fabricated one (digital-duo#247).
   { column: "delivery_event_id", ddl: "ALTER TABLE drafts ADD COLUMN delivery_event_id TEXT" },
+  // NULL on a pre-existing row and on any draft that was never dismissed
+  // with a reason — rowToDraft reads a NULL dismiss_reason as simply absent
+  // (guangshinhaha/duo#259).
+  { column: "dismiss_reason", ddl: "ALTER TABLE drafts ADD COLUMN dismiss_reason TEXT" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -212,7 +242,8 @@ export function ensureDraftLogSchema(db: Database): void {
       provenance TEXT,
       delivery_state TEXT,
       delivery_reason TEXT,
-      delivery_event_id TEXT
+      delivery_event_id TEXT,
+      dismiss_reason TEXT
     ) STRICT
   `);
 
@@ -322,6 +353,12 @@ export class DraftAlreadySettledError extends Error {
  * (`standing-order-candidates.ts`) writes that value itself, directly and
  * atomically alongside the candidate row it records, on its own already-open
  * database handle rather than through a second call here.
+ *
+ * `dismissReason` (#259 in guangshinhaha/duo) is optional and stored
+ * verbatim — this function trusts its caller the same way it already trusts
+ * `outcome`: the "only alongside `discarded`" rule is enforced one layer up,
+ * in `recordDraftOutcomeAndClassify` (`corrections/classify.ts`), the same
+ * place the blank-"edited" rule already lives, not here.
  */
 export function recordDraftOutcome(
   storePath: string,
@@ -329,12 +366,13 @@ export function recordDraftOutcome(
   draftId: string,
   outcome: SettableDraftOutcome,
   sentText?: string,
+  dismissReason?: DismissReason,
 ): void {
   withDatabase(storePath, passphrase, true, (db) => {
     ensureDraftLogSchema(db);
     const result = db
-      .prepare(`UPDATE drafts SET outcome = ?, outcome_recorded_at = ?, sent_text = ? WHERE id = ?`)
-      .run(outcome, new Date().toISOString(), sentText ?? null, draftId);
+      .prepare(`UPDATE drafts SET outcome = ?, outcome_recorded_at = ?, sent_text = ?, dismiss_reason = ? WHERE id = ?`)
+      .run(outcome, new Date().toISOString(), sentText ?? null, dismissReason ?? null, draftId);
     if (result.changes === 0) {
       throw new DraftNotFoundError(draftId);
     }
@@ -389,6 +427,17 @@ interface DraftRow {
   delivery_state: string | null;
   delivery_reason: string | null;
   delivery_event_id: string | null;
+  dismiss_reason: string | null;
+}
+
+/**
+ * Parses a stored dismiss-reason string into a `DismissReason`, falling
+ * back to null for NULL or any value outside `DISMISS_REASONS` — the same
+ * defensive reading `parseProvenance` gives its own column, so a corrupted
+ * or pre-#259 cell never takes `getDraft`/`listDrafts` down with it.
+ */
+function parseDismissReason(raw: string | null): DismissReason | null {
+  return raw !== null && (DISMISS_REASONS as readonly string[]).includes(raw) ? (raw as DismissReason) : null;
 }
 
 /**
@@ -453,6 +502,7 @@ function rowToDraft(row: DraftRow): DraftRecord {
           : row.delivery_state === "failed"
             ? { state: "failed", reason: row.delivery_reason ?? "delivery failed" }
             : null,
+    dismissReason: parseDismissReason(row.dismiss_reason),
   };
 }
 

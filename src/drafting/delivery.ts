@@ -1,7 +1,7 @@
 import type { EditClassifier, ClassifyAndQueueResult } from "../corrections/classify.js";
 import { recordDraftOutcomeAndClassify } from "../corrections/classify.js";
 import { isChannelMuted } from "./channel-mutes.js";
-import { DraftAlreadySettledError, DraftNotFoundError, getDraft, recordDeliveryOutcome, type DraftRecord, type SettableDraftOutcome } from "./draft-log.js";
+import { DraftAlreadySettledError, DraftNotFoundError, getDraft, recordDeliveryOutcome, type DismissReason, type DraftRecord, type SettableDraftOutcome } from "./draft-log.js";
 
 /**
  * The delivery seam (#170): one channel-agnostic interface. Recording
@@ -107,6 +107,12 @@ export interface ChannelDeliveryRequest {
  * exception is a retry after a FAILED delivery: `recordDeliveryOutcome`'s
  * own doc comment already treats a re-sent draft as recording its latest
  * attempt, so that retry is let through rather than blocked by this check.
+ *
+ * `options.dismissReason` (#259 in guangshinhaha/duo) rides through to
+ * `recordDraftOutcomeAndClassify` unchanged — folded into this existing
+ * options bag, rather than a new positional parameter, so every current
+ * call site (the HTTP route, `duo draft-outcome`, the MCP tool) keeps
+ * compiling unchanged.
  */
 export async function recordOutcomeAndDeliver(
   storePath: string,
@@ -114,7 +120,7 @@ export async function recordOutcomeAndDeliver(
   draftId: string,
   outcome: SettableDraftOutcome,
   sentText: string | undefined,
-  options: { readonly classifier?: EditClassifier; readonly channelAdapters?: readonly ChannelAdapter[] } = {},
+  options: { readonly classifier?: EditClassifier; readonly channelAdapters?: readonly ChannelAdapter[]; readonly dismissReason?: DismissReason } = {},
 ): Promise<ClassifyAndQueueResult | undefined> {
   const existing = getDraft(storePath, passphrase, draftId);
   if (!existing) {
@@ -124,7 +130,7 @@ export async function recordOutcomeAndDeliver(
     throw new DraftAlreadySettledError(draftId, existing.outcome);
   }
 
-  const result = await recordDraftOutcomeAndClassify(storePath, passphrase, draftId, outcome, sentText, options.classifier);
+  const result = await recordDraftOutcomeAndClassify(storePath, passphrase, draftId, outcome, sentText, options.classifier, options.dismissReason);
 
   // Only sent/edited deliver — "discarded" means nothing was sent, and an
   // owner-asked draft is not a reply to anybody (checked in

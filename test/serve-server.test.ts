@@ -509,6 +509,96 @@ describe("createServer — routes", () => {
     expect(stored.json().outcome).toBe("discarded");
   });
 
+  it("POST /drafts/:id/outcome stores an optional dismissReason alongside \"discarded\" (guangshinhaha/duo#259)", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "original draft text",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "discarded", dismissReason: "wrong_tone" },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const stored = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(stored.json().outcome).toBe("discarded");
+    expect(stored.json().dismissReason).toBe("wrong_tone");
+  });
+
+  it("POST /drafts/:id/outcome dismissing without a reason still works, leaving dismissReason null (guangshinhaha/duo#259)", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "original draft text",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "discarded" },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const stored = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(stored.json().dismissReason).toBeNull();
+  });
+
+  it("POST /drafts/:id/outcome rejects an unrecognized dismissReason value with 400 (guangshinhaha/duo#259)", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "original draft text",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "discarded", dismissReason: "not_a_real_reason" },
+    });
+    expect(response.statusCode).toBe(400);
+
+    const stored = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+    expect(stored.json().outcome).toBeNull();
+  });
+
+  it("POST /drafts/:id/outcome rejects a dismissReason attached to a \"sent\" outcome with 400 (guangshinhaha/duo#259)", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: "original draft text",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.8,
+      sources: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/drafts/${draftId}/outcome`,
+      headers: authHeader,
+      payload: { outcome: "sent", dismissReason: "wrong_facts" },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
   it("POST /drafts/:id/outcome 404s for an unknown draft", async () => {
     const response = await app.inject({
       method: "POST",
