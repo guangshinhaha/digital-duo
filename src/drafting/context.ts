@@ -184,7 +184,8 @@ function ageInDays(timestamp: string, now: Date): number | null {
   return Math.max(0, (now.getTime() - then) / (1000 * 60 * 60 * 24));
 }
 
-function readVoiceText(duoDir: string): string {
+/** Exported for #263's rewrite endpoint (rewrite.ts), which conditions on the same voice profile drafting does, rather than re-reading duo/voice.md a second way. */
+export function readVoiceText(duoDir: string): string {
   const path = join(duoDir, "voice.md");
   if (!existsSync(path)) {
     return "Not enough of the owner's own writing has been ingested yet to describe their voice.";
