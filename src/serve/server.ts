@@ -29,7 +29,10 @@ import { shapeDraft } from "../drafting/shape.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
 import { settleScheduledSend } from "../drafting/scheduled-sends.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
+import { readVoiceText } from "../drafting/context.js";
+import { checkOwnerText } from "../drafting/fact-check.js";
 import { draftReply } from "../drafting/pipeline.js";
+import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
 import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
@@ -572,6 +575,57 @@ function registerRoutes(
     // exactly like `draftReady.publish` above: a push failing must not
     // slow or cost the response this route already has.
     void notifyDraftWaiting(deps, result.draftId, deps.pushSender);
+    return result;
+  });
+
+  // #263: polishes the OWNER'S OWN typed composer text — never a duo-
+  // generated draft, which already has `/drafts` for regeneration. Owner-
+  // only by the same table-separation the inventory test above pins: an
+  // ask token is simply absent from device_tokens, so it never reaches
+  // this handler at all.
+  app.post<{ Body: { text?: unknown; instruction?: unknown } }>("/compose/rewrite", async (request, reply) => {
+    const { text, instruction } = request.body ?? {};
+    if (typeof text !== "string" || text.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "text is required"));
+      return;
+    }
+    if (typeof instruction !== "string" || !REWRITE_INSTRUCTIONS.includes(instruction as RewriteInstruction)) {
+      reply.code(400).send(errorBody("bad_request", `instruction must be one of: ${REWRITE_INSTRUCTIONS.join(", ")}`));
+      return;
+    }
+    try {
+      const result = await rewriteOwnerText(text, instruction as RewriteInstruction, readVoiceText(deps.duoDir), deps.inferenceProvider);
+      return result;
+    } catch (error) {
+      if (error instanceof RewriteUnavailableError) {
+        reply.code(503).send(errorBody("rewrite_unavailable", error.message));
+        return;
+      }
+      throw error;
+    }
+  });
+
+  // #264: a quiet, conservative check of the owner's own typed composer
+  // text against what the corpus already knows — see fact-check.ts's own
+  // doc comment for the full conservatism case. Synchronous like
+  // POST /drafts above, for the same reason: with no configured provider
+  // this returns instantly (`{ flag: null }`), and with one it is a
+  // single completion call, not a sampling loop.
+  app.post<{ Body: { text?: unknown; threadContext?: unknown } }>("/compose/fact-check", async (request, reply) => {
+    const { text, threadContext } = request.body ?? {};
+    if (typeof text !== "string") {
+      reply.code(400).send(errorBody("bad_request", "text is required"));
+      return;
+    }
+    const result = await checkOwnerText(
+      deps.storePath,
+      deps.passphrase,
+      deps.duoDir,
+      text,
+      typeof threadContext === "string" ? threadContext : null,
+      deps.embeddingProvider,
+      deps.inferenceProvider,
+    );
     return result;
   });
 

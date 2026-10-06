@@ -286,6 +286,8 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/lifecycle" },
     { method: "GET", url: "/corpus/embed" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
+    { method: "POST", url: "/compose/rewrite", payload: { text: "hi", instruction: "shorter" } },
+    { method: "POST", url: "/compose/fact-check", payload: { text: "hi" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
     { method: "POST", url: "/drafts/some-draft-id/shape", payload: { instruction: "shorter" } },
@@ -485,6 +487,54 @@ describe("createServer — routes", () => {
 
   it("POST /drafts requires a question", async () => {
     const response = await app.inject({ method: "POST", url: "/drafts", headers: authHeader, payload: {} });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("POST /compose/rewrite 503s with no inference provider configured, rather than echoing the input back unrewritten", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/rewrite",
+      headers: authHeader,
+      payload: { text: "hey can u send me the doc", instruction: "proofread" },
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: { code: "rewrite_unavailable" } });
+  });
+
+  it("POST /compose/rewrite requires non-empty text and a known instruction", async () => {
+    const noText = await app.inject({ method: "POST", url: "/compose/rewrite", headers: authHeader, payload: { instruction: "shorter" } });
+    expect(noText.statusCode).toBe(400);
+    const blankText = await app.inject({ method: "POST", url: "/compose/rewrite", headers: authHeader, payload: { text: "   ", instruction: "shorter" } });
+    expect(blankText.statusCode).toBe(400);
+    const badInstruction = await app.inject({ method: "POST", url: "/compose/rewrite", headers: authHeader, payload: { text: "hi", instruction: "yell" } });
+    expect(badInstruction.statusCode).toBe(400);
+  });
+
+  it("POST /compose/rewrite returns the provider's rewritten text, trimmed, when a provider is configured", async () => {
+    app = createServer(deps(storePath, { inferenceProvider: agreeingProvider("  Could you send the document over?  ") }));
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/rewrite",
+      headers: authHeader,
+      payload: { text: "hey can u send me the doc", instruction: "proofread" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ text: "Could you send the document over?" });
+  });
+
+  it("POST /compose/fact-check never flags with no inference provider configured", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/fact-check",
+      headers: authHeader,
+      payload: { text: "let's meet Friday" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ flag: null });
+  });
+
+  it("POST /compose/fact-check requires text", async () => {
+    const response = await app.inject({ method: "POST", url: "/compose/fact-check", headers: authHeader, payload: {} });
     expect(response.statusCode).toBe(400);
   });
 
