@@ -32,6 +32,7 @@ import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread }
 import { readVoiceText } from "../drafting/context.js";
 import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../drafting/evidence-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
+import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
@@ -63,6 +64,7 @@ import {
   NotAwayError,
   type AwayScope,
 } from "../trust/away.js";
+import { createPinnedAnswer, deletePinnedAnswer, listPinnedAnswers, updatePinnedAnswer } from "../trust/pinned-answers.js";
 import { resolveAskerRef } from "../permissions/directory.js";
 import { answerPublicly, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { notifyDraftWaiting } from "../push/notify.js";
@@ -72,6 +74,7 @@ import { loadSharedDuoConfig } from "../shared-duo/config.js";
 import { loadSharedDuo } from "../shared-duo/loader.js";
 import { listGrid } from "../trust/grid.js";
 import type { WorkspaceService } from "../workspace/service.js";
+import { clearRoomOffTheRecord, markRoomOffTheRecord, offTheRecordEntryFor } from "../workspace/off-the-record.js";
 import { MISSING_TOKEN_MESSAGE, registerAuth, type AuthCache, type Principal } from "./auth.js";
 import type { SessionOutcome } from "../hosted/workspace-session.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "./cors.js";
@@ -309,10 +312,17 @@ function statusForError(error: Error): number {
     // digital-duo#287: PUT/DELETE /mirror/refusals/:heading naming a
     // subject with no recorded rule.
     case "RefusalNotFoundError":
+    // duo#275: editing a pinned answer that doesn't exist (deleted
+    // already, or a stale client copy) — "nothing to act on", same as
+    // the rest of this family.
+    case "PinnedAnswerNotFoundError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
     case "DraftIsRefusedError":
+    // guangshinhaha/duo#274: the draft's own room is marked off the
+    // record — the owner's boundary, not a malformed request.
+    case "RoomOffTheRecordError":
     // #180: a second confirmation of an executed T4 request — the guard's
     // exactly-once refusal, a conflict and never a re-execution.
     case "T4RequestAlreadyExecutedError":
@@ -366,6 +376,9 @@ function statusForError(error: Error): number {
     // digital-duo#287: PUT /away with a past/over-long until, an unknown
     // scope, or an unknown/refused topic in extraTopicIds.
     case "InvalidAwayError":
+    // duo#275: an empty pattern or empty wording — can never be a valid
+    // pinned answer, same "the request itself is malformed" shape.
+    case "InvalidPinnedAnswerError":
       return 400;
     default:
       return 500;
@@ -497,6 +510,41 @@ function registerRoutes(
     }
     try {
       return workspace.forgetAlwaysAllowed(request.params.userId);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // guangshinhaha/duo#274: "don't learn from this conversation" — the
+  // owner's per-room marker, plain file + store work like `/channels/policy`
+  // above, not gated on a workspace connection existing (a room id is
+  // meaningful even if the workspace that named it is temporarily
+  // unconfigured; the same stance `/channels/policy` already takes for
+  // channel names). GET reads the marker; POST marks the room and purges
+  // what it already produced (standing-order/correction candidates still
+  // pending, and any rule already written from one of its drafts); DELETE
+  // lifts the marker without undoing the purge — there is nothing left to
+  // restore, the same "a decision, not a cache" stance every reject in
+  // this codebase takes.
+  app.get<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/off-the-record", async (request) => {
+    const entry = offTheRecordEntryFor(deps.duoDir, request.params.roomId);
+    return { roomId: request.params.roomId, offTheRecord: entry !== null, decidedAt: entry?.decidedAt ?? null };
+  });
+
+  app.post<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/off-the-record", async (request, reply) => {
+    try {
+      const entry = markRoomOffTheRecord(deps.duoDir, request.params.roomId);
+      const purge = purgeOffTheRecordRoom(deps.storePath, deps.passphrase, deps.duoDir, request.params.roomId);
+      return { roomId: entry.roomId, offTheRecord: true, decidedAt: entry.decidedAt, purged: purge };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.delete<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/off-the-record", async (request, reply) => {
+    try {
+      const { wasOn } = clearRoomOffTheRecord(deps.duoDir, request.params.roomId);
+      reply.code(200).send({ roomId: request.params.roomId, offTheRecord: false, wasOn });
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
@@ -901,6 +949,7 @@ function registerRoutes(
         dismissReason: dismissReason as DismissReason | undefined,
         alternative,
         ownerDelivered,
+        duoDir: deps.duoDir,
       });
       // guangshinhaha/duo#261: deciding a held draft here, now, overrides
       // its schedule — release the hold so it never shows as still to come.
@@ -970,7 +1019,7 @@ function registerRoutes(
       return;
     }
     try {
-      const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, request.params.id, answer);
+      const candidateId = queueStandingOrderCandidate(deps.storePath, deps.passphrase, request.params.id, answer, deps.duoDir);
       return { candidateId };
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
@@ -1194,6 +1243,160 @@ function registerRoutes(
   app.post("/away/summary/dismiss", async () => {
     dismissAwaySummary(deps.storePath, deps.passphrase);
     return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+  });
+
+  // duo#275: "pin exact wording — always answer this way." Unlike a rule or
+  // a refusal, a pinned answer is authored and edited from the client (the
+  // message action on the owner's own message), so — same reasoning as
+  // #272's evidence exclusions — create/edit/delete are exposed directly
+  // here over the one module (`trust/pinned-answers.ts`), with no second
+  // code path and no CLI twin to drift from it. `findPinnedAnswer` itself
+  // is never a route: it's checked from inside `draftReply`, before
+  // retrieval, never from a client's own request.
+  app.get("/mirror/pinned-answers", async () => ({ pinnedAnswers: listPinnedAnswers(deps.storePath, deps.passphrase) }));
+
+  function readPinnedAnswerBody(body: unknown): { pattern?: string; answerText?: string; sourceLabel?: string | null } {
+    if (typeof body !== "object" || body === null) {
+      throw new BadRequestError("Expected a JSON object body.");
+    }
+    const { pattern, answerText, sourceLabel } = body as { pattern?: unknown; answerText?: unknown; sourceLabel?: unknown };
+    if (pattern !== undefined && typeof pattern !== "string") {
+      throw new BadRequestError("pattern, when present, must be a string.");
+    }
+    if (answerText !== undefined && typeof answerText !== "string") {
+      throw new BadRequestError("answerText, when present, must be a string.");
+    }
+    if (sourceLabel !== undefined && sourceLabel !== null && typeof sourceLabel !== "string") {
+      throw new BadRequestError("sourceLabel, when present, must be a string or null.");
+    }
+    return { pattern, answerText, sourceLabel: sourceLabel as string | null | undefined };
+  }
+
+  app.post<{ Body: { pattern?: unknown; answerText?: unknown; sourceLabel?: unknown } }>("/mirror/pinned-answers", async (request, reply) => {
+    try {
+      const { pattern, answerText, sourceLabel } = readPinnedAnswerBody(request.body);
+      if (pattern === undefined || answerText === undefined) {
+        reply.code(400).send(errorBody("bad_request", "pattern and answerText are both required."));
+        return;
+      }
+      return createPinnedAnswer(deps.storePath, deps.passphrase, pattern, answerText, sourceLabel ?? null);
+    } catch (error) {
+      if (error instanceof BadRequestError) {
+        reply.code(400).send(errorBody("bad_request", error.message));
+        return;
+      }
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.put<{ Params: { heading: string }; Body: unknown }>("/mirror/refusals/:heading", async (request, reply) => {
+    try {
+      const refusals = renameNeverAnswerRule(deps.duoDir, request.params.heading, request.body);
+      return { decided: true, refusals };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.delete<{ Params: { heading: string } }>("/mirror/refusals/:heading", async (request, reply) => {
+    try {
+      const refusals = removeNeverAnswerRule(deps.duoDir, request.params.heading);
+      return { decided: true, refusals };
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  /**
+   * guangshinhaha/duo#259 → #269: starting words for a never-answer rule
+   * off a draft dismissed as "shouldn't answer this" — `NeverAnswerOffer`'s
+   * one-tap follow-up. Records nothing; the owner edits or approves the
+   * suggested subject, and only `POST /mirror/refusals` writes anything.
+   */
+  app.get<{ Params: { id: string } }>("/drafts/:id/never-answer-suggestion", async (request, reply) => {
+    const draft = getDraft(deps.storePath, deps.passphrase, request.params.id);
+    if (draft === undefined) {
+      reply.code(404).send(errorBody("DraftNotFoundError", `No draft "${request.params.id}" exists.`));
+      return;
+    }
+    return { draftId: draft.id, question: draft.question, subject: suggestNeverAnswerSubject(draft.question) };
+  });
+
+  // guangshinhaha/duo#270: the topics an away period's "May do, plus
+  // topics I pick" scope can add — `duo/topics.json` (../derivation/topics.js),
+  // the same ids `GET /trust/grid` and `POST /trust/grant` already use, in
+  // the one `{id, label}` shape an away picker needs.
+  app.get("/topics", async () => listTopicOptions(deps.duoDir));
+
+  // guangshinhaha/duo#270: away mode, over HTTP — `src/trust/away.ts` owns
+  // every behaviour (the one active period, its lazy expiry, the status
+  // line, the summary); these four routes are thin wrappers, the same
+  // shape `scheduled-send-routes.ts` uses for its own module.
+  app.get("/away", async () => getAwayState(deps.storePath, deps.passphrase, deps.duoDir));
+
+  app.put<{ Body: { until?: unknown; scope?: unknown; extraTopicIds?: unknown } | undefined }>("/away", async (request, reply) => {
+    const body = request.body ?? {};
+    if (typeof body.until !== "string" || body.until.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "until is required and must be an ISO-8601 date-time string."));
+      return;
+    }
+    if (typeof body.scope !== "string" || !(AWAY_SCOPES as readonly string[]).includes(body.scope)) {
+      reply.code(400).send(errorBody("bad_request", `scope must be one of: ${AWAY_SCOPES.join(", ")}.`));
+      return;
+    }
+    if (body.extraTopicIds !== undefined && (!Array.isArray(body.extraTopicIds) || !body.extraTopicIds.every((id) => typeof id === "string"))) {
+      reply.code(400).send(errorBody("bad_request", "extraTopicIds, when present, must be an array of strings."));
+      return;
+    }
+    try {
+      setAway(deps.storePath, deps.passphrase, deps.duoDir, {
+        until: new Date(body.until),
+        scope: body.scope as AwayScope,
+        extraTopicIds: body.extraTopicIds as string[] | undefined,
+      });
+      // guangshinhaha/duo#270: the client's own `useSetAway` types the
+      // reply as the full `AwayState` (it sets it straight into the
+      // query cache) — the same shape `GET /away` returns, not the bare
+      // period `setAway` itself answers with.
+      return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.delete("/away", async (_request, reply) => {
+    try {
+      endAwayNow(deps.storePath, deps.passphrase, deps.duoDir);
+      return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  app.post("/away/summary/dismiss", async () => {
+    dismissAwaySummary(deps.storePath, deps.passphrase);
+    return getAwayState(deps.storePath, deps.passphrase, deps.duoDir);
+  });
+
+  app.post<{ Params: { id: string }; Body: { pattern?: unknown; answerText?: unknown } }>(
+    "/mirror/pinned-answers/:id/edit",
+    async (request, reply) => {
+      try {
+        const { pattern, answerText } = readPinnedAnswerBody(request.body);
+        return updatePinnedAnswer(deps.storePath, deps.passphrase, request.params.id, { pattern, answerText });
+      } catch (error) {
+        if (error instanceof BadRequestError) {
+          reply.code(400).send(errorBody("bad_request", error.message));
+          return;
+        }
+        reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+      }
+    },
+  );
+
+  app.delete<{ Params: { id: string } }>("/mirror/pinned-answers/:id", async (request) => {
+    deletePinnedAnswer(deps.storePath, deps.passphrase, request.params.id);
+    return { deleted: true };
   });
 
   const RULE_ACTIONS = { approve: approveRule, reject: rejectRule, promote: promoteRule } as const;

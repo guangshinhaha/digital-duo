@@ -26,7 +26,7 @@ import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { ensureRecordsSchema, writeRecords } from "../src/ingest/record-store.js";
 import { listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import { queueCorrectionCandidate } from "../src/corrections/queue.js";
-import { queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
+import { listStandingOrderCandidates, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
 import { applyCorrection } from "../src/trust/demotion.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { confirmNoRefusals, upsertRefusal, writeRefusalsFile } from "../src/trust/refusals.js";
@@ -2262,6 +2262,126 @@ describe("POST /knowledge/evidence/:recordId/exclude and /restore, GET /knowledg
   });
 });
 
+describe("GET/POST/DELETE /mirror/pinned-answers — pin exact wording over HTTP (duo#275)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /mirror/pinned-answers is empty on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ pinnedAnswers: [] });
+  });
+
+  it("creates, lists, edits and deletes a pinned answer", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: authHeader,
+      payload: { pattern: "vacation leave", answerText: "Ten days a year.", sourceLabel: "pinned from #general" },
+    });
+    expect(create.statusCode).toBe(200);
+    const created = create.json();
+    expect(created).toMatchObject({ pattern: "vacation leave", answerText: "Ten days a year.", sourceLabel: "pinned from #general" });
+
+    const listed = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: authHeader });
+    expect(listed.json()).toEqual({ pinnedAnswers: [created] });
+
+    const edited = await app.inject({
+      method: "POST",
+      url: `/mirror/pinned-answers/${created.id}/edit`,
+      headers: authHeader,
+      payload: { answerText: "Twelve days a year." },
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json()).toMatchObject({ id: created.id, pattern: "vacation leave", answerText: "Twelve days a year." });
+
+    const deleted = await app.inject({ method: "DELETE", url: `/mirror/pinned-answers/${created.id}`, headers: authHeader });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ deleted: true });
+
+    const listedAfterDelete = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: authHeader });
+    expect(listedAfterDelete.json()).toEqual({ pinnedAnswers: [] });
+  });
+
+  it("400s creating with a missing or blank pattern/answerText", async () => {
+    const missing = await app.inject({ method: "POST", url: "/mirror/pinned-answers", headers: authHeader, payload: { pattern: "a" } });
+    expect(missing.statusCode).toBe(400);
+
+    const blank = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: authHeader,
+      payload: { pattern: "   ", answerText: "b" },
+    });
+    expect(blank.statusCode).toBe(400);
+  });
+
+  it("404s editing an unknown pinned answer", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers/no-such-id/edit",
+      headers: authHeader,
+      payload: { pattern: "x" },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("DELETE on an unknown id is a harmless no-op, not a 404", async () => {
+    const response = await app.inject({ method: "DELETE", url: "/mirror/pinned-answers/no-such-id", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("is an owner surface: an ask token is refused on every route", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const list = await app.inject({ method: "GET", url: "/mirror/pinned-answers", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const create = await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: askHeader,
+      payload: { pattern: "a", answerText: "b" },
+    });
+    expect(create.statusCode).toBe(401);
+    const edit = await app.inject({ method: "POST", url: "/mirror/pinned-answers/some-id/edit", headers: askHeader, payload: { pattern: "a" } });
+    expect(edit.statusCode).toBe(401);
+    const remove = await app.inject({ method: "DELETE", url: "/mirror/pinned-answers/some-id", headers: askHeader });
+    expect(remove.statusCode).toBe(401);
+  });
+
+  it("a draft that quotes a pinned answer carries it in sources, so the client's Why panel can say so", async () => {
+    await app.inject({
+      method: "POST",
+      url: "/mirror/pinned-answers",
+      headers: authHeader,
+      payload: { pattern: "parking policy", answerText: "Visitor parking is on level 2." },
+    });
+
+    const result = await draftReply(
+      storePath,
+      PASSPHRASE,
+      join(tempDir(), "duo"),
+      "what's the parking policy here",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      loadConfig().confidence,
+    );
+    expect(result.kind).toBe("draft");
+    if (result.kind !== "draft") throw new Error("expected a draft");
+    expect(result.text).toBe("Visitor parking is on level 2.");
+    expect(result.sources).toEqual([{ kind: "pinned", id: expect.any(String), label: expect.stringContaining("parking policy") }]);
+  });
+});
+
 describe("GET /devices and POST /devices/:id/revoke — paired devices over HTTP (#177)", () => {
   let app: FastifyInstance;
   let storePath: string;
@@ -2523,6 +2643,83 @@ describe("channel policy over HTTP — per-channel, per-thread (#172)", () => {
     expect(mute.statusCode).toBe(401);
     const unmute = await app.inject({ method: "POST", url: "/channels/policy/unmute", headers: askHeader, payload: { channel: "c" } });
     expect(unmute.statusCode).toBe(401);
+  });
+});
+
+describe("off-the-record rooms over HTTP (guangshinhaha/duo#274)", () => {
+  const ROOM = "!a:workspace";
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "mac");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET reads false for a room never marked", async () => {
+    const response = await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ roomId: ROOM, offTheRecord: false, decidedAt: null });
+  });
+
+  it("POST marks the room, GET then reads it back, and DELETE lifts the marker", async () => {
+    const marked = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(marked.statusCode).toBe(200);
+    expect(marked.json()).toMatchObject({ roomId: ROOM, offTheRecord: true });
+    expect(typeof marked.json().decidedAt).toBe("string");
+
+    const read = await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(read.json()).toMatchObject({ roomId: ROOM, offTheRecord: true });
+
+    const cleared = await app.inject({ method: "DELETE", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual({ roomId: ROOM, offTheRecord: false, wasOn: true });
+
+    const readAfter = await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(readAfter.json()).toMatchObject({ roomId: ROOM, offTheRecord: false });
+  });
+
+  it("DELETE on a room never marked reports wasOn: false, not an error", async () => {
+    const cleared = await app.inject({ method: "DELETE", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual({ roomId: ROOM, offTheRecord: false, wasOn: false });
+  });
+
+  it("POST purges a pending standing-order candidate already queued from this room", async () => {
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "what is the policy?",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "thin",
+      confidenceScore: 0,
+      sources: [],
+      provenance: { origin: "channel", channelKind: "workspace", askerRef: "@bob:workspace", threadId: ROOM, permalink: null },
+    });
+    const candidateId = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "the policy is X");
+
+    const marked = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(marked.json().purged).toMatchObject({ draftIds: [draftId], standingOrderCandidatesRejected: 1 });
+
+    const candidate = listStandingOrderCandidates(storePath, PASSPHRASE).find((c) => c.id === candidateId);
+    expect(candidate?.status).toBe("rejected");
+  });
+
+  it("is idempotent to mark twice — the second POST purges nothing new and keeps the original decidedAt", async () => {
+    const first = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    const second = await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: authHeader });
+    expect(second.json().decidedAt).toBe(first.json().decidedAt);
+  });
+
+  it("is an owner route: an ask token is refused on the read, the mark, and the clear", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    expect((await app.inject({ method: "GET", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: askHeader })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: askHeader })).statusCode).toBe(401);
+    expect((await app.inject({ method: "DELETE", url: `/workspace/rooms/${ROOM}/off-the-record`, headers: askHeader })).statusCode).toBe(401);
   });
 });
 

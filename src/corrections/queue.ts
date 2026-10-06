@@ -191,3 +191,29 @@ export function setCandidateStatus(db: Database, id: string, status: "approved" 
   ensureCorrectionCandidateSchema(db);
   db.prepare(`UPDATE correction_candidates SET status = ?, reviewed_at = ? WHERE id = ?`).run(status, new Date().toISOString(), id);
 }
+
+/**
+ * guangshinhaha/duo#274's purge, the correction-candidate half: every
+ * *pending* candidate queued from one of `draftIds` is rejected, the same
+ * reviewably-recorded rejection `setCandidateStatus` already gives a single
+ * candidate. An already-approved candidate already became a rule by the
+ * time it was approved — `rejectRuleForDrafts` (rule-review.ts) is what
+ * un-does that half. Returns how many rows were rejected.
+ */
+export function rejectPendingCorrectionCandidatesForDrafts(storePath: string, passphrase: string, draftIds: readonly string[]): number {
+  if (draftIds.length === 0) {
+    return 0;
+  }
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureCorrectionCandidateSchema(db);
+    const placeholders = draftIds.map(() => "?").join(", ");
+    const result = db
+      .prepare(`UPDATE correction_candidates SET status = 'rejected', reviewed_at = ? WHERE status = 'pending' AND draft_id IN (${placeholders})`)
+      .run(new Date().toISOString(), ...draftIds);
+    // node:sqlite types `.changes` as `number | bigint`; this row count
+    // from a single UPDATE never approaches bigint range, and the
+    // function's own callers (the purge orchestration's reported count)
+    // need a plain number.
+    return Number(result.changes);
+  });
+}

@@ -1,9 +1,16 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
-import { appendDraft, DraftNotFoundError } from "../src/drafting/draft-log.js";
-import { DraftIsRefusedError, listStandingOrderCandidates, NotAnEscalationError, queueStandingOrderCandidate } from "../src/drafting/standing-order-candidates.js";
+import { appendDraft, DraftNotFoundError, type DraftProvenance } from "../src/drafting/draft-log.js";
+import {
+  DraftIsRefusedError,
+  listStandingOrderCandidates,
+  NotAnEscalationError,
+  queueStandingOrderCandidate,
+  RoomOffTheRecordError,
+} from "../src/drafting/standing-order-candidates.js";
 import { createEncryptedStore } from "../src/store/store.js";
+import { markRoomOffTheRecord } from "../src/workspace/off-the-record.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -92,6 +99,77 @@ describe("queueStandingOrderCandidate — an escalation can be turned into a rul
 
     expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an override answer")).toThrow(DraftIsRefusedError);
     expect(listStandingOrderCandidates(storePath, PASSPHRASE)).toHaveLength(0);
+  });
+});
+
+const WORKSPACE_PROVENANCE = (roomId: string): DraftProvenance => ({
+  origin: "channel",
+  channelKind: "workspace",
+  askerRef: "@bob:workspace",
+  threadId: roomId,
+  permalink: null,
+});
+
+describe("queueStandingOrderCandidate — guangshinhaha/duo#274: a room marked off the record is never learned from", () => {
+  it("refuses to queue a candidate for an escalation in an off-the-record room, when duoDir is supplied", () => {
+    const storePath = initStore();
+    const duoDir = tempDir();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "what is my end of year bonus",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no supporting evidence",
+      confidenceScore: 0,
+      sources: [],
+      provenance: WORKSPACE_PROVENANCE("!off:workspace"),
+    });
+    markRoomOffTheRecord(duoDir, "!off:workspace");
+
+    expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an answer", duoDir)).toThrow(RoomOffTheRecordError);
+    expect(listStandingOrderCandidates(storePath, PASSPHRASE)).toHaveLength(0);
+  });
+
+  it("queues normally for a room that is not off the record, even when duoDir is supplied", () => {
+    const storePath = initStore();
+    const duoDir = tempDir();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "what is my end of year bonus",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no supporting evidence",
+      confidenceScore: 0,
+      sources: [],
+      provenance: WORKSPACE_PROVENANCE("!on:workspace"),
+    });
+
+    const candidateId = queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an answer", duoDir);
+    expect(listStandingOrderCandidates(storePath, PASSPHRASE).map((candidate) => candidate.id)).toEqual([candidateId]);
+  });
+
+  it("queues normally when duoDir is omitted — pre-#274 behaviour, byte-identical", () => {
+    const storePath = initStore();
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "q",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "no supporting evidence",
+      confidenceScore: 0,
+      sources: [],
+      provenance: WORKSPACE_PROVENANCE("!off:workspace"),
+    });
+
+    expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an answer")).not.toThrow();
+  });
+
+  it("queues normally for an owner-asked draft (no room at all), even when duoDir is supplied", () => {
+    const storePath = initStore();
+    const duoDir = tempDir();
+    const draftId = seedEscalatedDraft(storePath);
+
+    expect(() => queueStandingOrderCandidate(storePath, PASSPHRASE, draftId, "an answer", duoDir)).not.toThrow();
   });
 });
 

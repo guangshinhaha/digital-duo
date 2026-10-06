@@ -5,17 +5,21 @@ import { withDatabase } from "../store/store.js";
 
 /**
  * One source a draft (or its escalation explanation) cites — a standing
- * order, a piece of retrieved evidence, or (#190) a file the asker
- * attached to the question — rendered as a short, human-readable link.
- * The attachment kind carries `id` + `label` only (the workspace's file
- * reference and a stripped preview): the bytes grounded the one draft and
- * were then dropped, so the row is a dead-link-plus-honest-label once the
- * workspace deletes the file — the same treatment the audit trail gives
- * every other reference to something outside the store
- * (docs/workspace/attachments.md §3).
+ * order, a piece of retrieved evidence, (#190) a file the asker attached
+ * to the question, or (duo#275) an owner-pinned exact answer — rendered as
+ * a short, human-readable link. The attachment kind carries `id` + `label`
+ * only (the workspace's file reference and a stripped preview): the bytes
+ * grounded the one draft and were then dropped, so the row is a
+ * dead-link-plus-honest-label once the workspace deletes the file — the
+ * same treatment the audit trail gives every other reference to something
+ * outside the store (docs/workspace/attachments.md §3). The `pinned` kind
+ * points at a `trust/pinned-answers.ts` row by id, same as `rule` points at
+ * a `derivation/rules.ts` row — removing it is a Rules-tab action, not a
+ * per-draft one (`SourceRemoveButton.tsx` on the client renders nothing for
+ * it, same as it already does for `attachment`).
  */
 export interface DraftSource {
-  readonly kind: "rule" | "evidence" | "attachment";
+  readonly kind: "rule" | "evidence" | "attachment" | "pinned";
   readonly id: string;
   readonly label: string;
 }
@@ -422,6 +426,21 @@ export function recipientKeyOf(provenance: DraftProvenance, recipient: DraftReci
     return `channel:${provenance.channelKind}:${provenance.askerRef}`;
   }
   return undefined;
+}
+
+/**
+ * guangshinhaha/duo#274: the conversation a draft belongs to, for the
+ * off-the-record marker — `provenance.threadId` for a channel-origin
+ * draft, null for an owner-asked or unknown-origin one (there is no room
+ * to mark off the record). For the workspace's own channel kind
+ * (`serve/workspace-wiring.ts`'s `WORKSPACE_CHANNEL_KIND`) this is
+ * literally the Matrix room id (`workspaceDraftProvenance` sets
+ * `threadId: question.roomId`); for any other channel adapter it is
+ * whatever that adapter calls its thread, which the off-the-record marker
+ * treats the same way — one conversation, one id, one marker.
+ */
+export function roomIdForDraft(draft: DraftRecord): string | null {
+  return draft.provenance.origin === "channel" ? draft.provenance.threadId : null;
 }
 
 export interface AppendDraftInput {
@@ -1071,4 +1090,19 @@ export function listDrafts(storePath: string, passphrase: string, options: ListD
     const shapes = readShapesFor(db, rows.map((row) => row.id));
     return rows.map((row) => rowToDraft(row, shapes.get(row.id)));
   });
+}
+
+/**
+ * guangshinhaha/duo#274: every draft id whose conversation is `roomId`
+ * (`roomIdForDraft`) — what the off-the-record purge walks to find
+ * everything downstream (standing-order candidates, correction
+ * candidates, correction-derived rules) that a draft in that room already
+ * produced. `provenance` is a JSON column, so this filters in memory
+ * rather than in SQL — the draft log is not the hot path here, the purge
+ * is an occasional owner act.
+ */
+export function listDraftIdsForRoom(storePath: string, passphrase: string, roomId: string): string[] {
+  return listDrafts(storePath, passphrase)
+    .filter((draft) => roomIdForDraft(draft) === roomId)
+    .map((draft) => draft.id);
 }

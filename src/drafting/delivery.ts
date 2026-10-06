@@ -148,6 +148,13 @@ export async function recordOutcomeAndDeliver(
      * adapter; there is nothing left to send. Ignored for "discarded".
      */
     readonly ownerDelivered?: boolean;
+    /**
+     * guangshinhaha/duo#274: the owner's `duo/` directory, so an edit to a
+     * draft whose room is marked off the record is classified for its own
+     * sake but never queued as a correction candidate. Optional and
+     * byte-identical to pre-#274 behaviour when omitted.
+     */
+    readonly duoDir?: string;
   } = {},
 ): Promise<ClassifyAndQueueResult | undefined> {
   const existing = getDraft(storePath, passphrase, draftId);
@@ -172,7 +179,7 @@ export async function recordOutcomeAndDeliver(
     }
   }
 
-  const result = await recordDraftOutcomeAndClassify(storePath, passphrase, draftId, outcome, sentText, options.classifier, options.dismissReason);
+  const result = await recordDraftOutcomeAndClassify(storePath, passphrase, draftId, outcome, sentText, options.classifier, options.dismissReason, options.duoDir);
 
   // Only sent/edited deliver — "discarded" means nothing was sent, and an
   // owner-asked draft is not a reply to anybody (checked in

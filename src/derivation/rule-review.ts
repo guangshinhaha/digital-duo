@@ -432,3 +432,25 @@ export function listRefusalConflicts(storePath: string, passphrase: string, duoD
       return refusal ? [{ rule, refusal }] : [];
     });
 }
+
+/**
+ * guangshinhaha/duo#274's purge, the rule half: every rule written from a
+ * correction on one of `draftIds` (`Rule.correctionDraftId` — written by
+ * `writeCorrectionRule` when a style/substance edit is approved) that
+ * isn't already rejected gets rejected through the same `rejectRule` an
+ * owner's own "reject" action uses — not deleted, and not silently
+ * un-approved: a rejection the owner's "don't learn from this" boundary
+ * stands for is recorded exactly as reviewably as one the owner clicks
+ * themselves, and it survives re-induction the same way. Returns every
+ * rule this call rejected.
+ */
+export function rejectRulesForDrafts(storePath: string, passphrase: string, duoDir: string, draftIds: readonly string[]): Rule[] {
+  if (draftIds.length === 0) {
+    return [];
+  }
+  const draftIdSet = new Set(draftIds);
+  const toReject = listRules(storePath, passphrase).filter(
+    (rule) => rule.correctionDraftId !== null && draftIdSet.has(rule.correctionDraftId) && rule.reviewStatus !== "rejected",
+  );
+  return toReject.map((rule) => rejectRule(storePath, passphrase, duoDir, rule.id));
+}

@@ -235,6 +235,17 @@ Slack mention
   → DM owner: draft + source links + [Send] [Edit] [Ignore]
 ```
 
+**Extended 2026-10, built (duo#275):** before any of the above runs — before topic
+classification, before retrieval, right after the refused-subject check — the pipeline checks for
+a **pinned answer**: an owner-authored exact answer tied to a question/topic pattern
+(`trust/pinned-answers.ts`). A match wins outright. It is quoted back verbatim (never passed
+through an inference provider, never re-generated), scores maximal confidence by construction,
+and is cited in sources as its own `pinned` kind — distinct from an explicit rule hit, which only
+*influences* confidence and is still a derived, LLM-phrased policy statement. A pinned answer is
+the owner's own words, asserted, never derived; it outranks a standing order the same way a
+refusal outranks everything *except* that it is checked after refusals, not before — a subject
+the owner refused to speak on stays refused even if they also pinned something to it.
+
 **Extended 2026-09-25, proposed (#183, pending ratification):** a question may carry
 *attachments* — and "attach" means ephemeral grounding, never silent import. An attachment
 grounds the one draft it rode with, appears in that draft's sources as a new `attachment`
