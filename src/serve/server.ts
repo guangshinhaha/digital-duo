@@ -9,6 +9,7 @@ import { createLlmEditClassifier } from "../corrections/classify.js";
 import type { CorrectionCandidateStatus } from "../corrections/queue.js";
 import { approveCandidate, getReviewCandidate, listReviewCandidates, rejectCandidate } from "../corrections/review.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
+import { computeVoiceTrend } from "../derivation/voice-trend.js";
 import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
 import {
@@ -1095,6 +1096,18 @@ function registerRoutes(
   });
 
   app.get("/mirror/portrait", async () => buildInterruptionPortrait(deps.storePath, deps.passphrase, deps.duoDir));
+
+  // guangshinhaha/duo#276: the Portrait's voice-match trend — read-only,
+  // computed fresh from the draft log's own approved sends each call (same
+  // "no cache, no staged state" shape as /mirror/portrait just above).
+  app.get<{ Querystring: { bucket?: string } }>("/mirror/voice-trend", async (request, reply) => {
+    const bucket = request.query.bucket ?? "week";
+    if (bucket !== "week" && bucket !== "month") {
+      reply.code(400).send(errorBody("bad_request", `bucket must be "week" or "month"`));
+      return;
+    }
+    return computeVoiceTrend(deps.storePath, deps.passphrase, bucket);
+  });
 
   // #175: what this duo knows, in one read. A pure composition — every
   // number comes from a module function that already existed or a fact the
