@@ -7,6 +7,7 @@ import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { gatherDraftContext } from "../src/drafting/context.js";
 import { excludeEvidence, restoreEvidence } from "../src/drafting/evidence-exclusions.js";
+import { excludeSource, restoreSource } from "../src/drafting/source-exclusions.js";
 import { embedRecords } from "../src/ingest/embeddings.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
@@ -125,6 +126,45 @@ describe("gatherDraftContext — evidence the owner excluded (duo#272)", () => {
     expect(context.evidence.some((item) => item.recordId === answer.id)).toBe(false);
     expect(context.ruleHit).toBeUndefined();
     expect(context.topicId).toBeUndefined();
+  });
+});
+
+describe("gatherDraftContext — a whole source the owner excluded (duo#278)", () => {
+  it("leaves out every record under an excluded source, and brings them back once restored", async () => {
+    const storePath = initStore();
+    const answer = record({ text: "five days per quarter, per the vacation policy", source: "claude-export" });
+    writeRecords(storePath, PASSPHRASE, [answer]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const before = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(before.evidence.some((item) => item.recordId === answer.id)).toBe(true);
+
+    excludeSource(storePath, PASSPHRASE, "claude-export");
+    const excluded = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(excluded.evidence.some((item) => item.recordId === answer.id)).toBe(false);
+
+    restoreSource(storePath, PASSPHRASE, "claude-export");
+    const restored = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(restored.evidence.some((item) => item.recordId === answer.id)).toBe(true);
+  });
+
+  it("excluding one source leaves another source's evidence untouched", async () => {
+    const storePath = initStore();
+    const fromExport = record({ text: "five days per quarter, per the vacation leave policy", source: "claude-export" });
+    const fromPaste = record({ text: "five days per quarter, per the vacation leave handbook", source: "paste" });
+    writeRecords(storePath, PASSPHRASE, [fromExport, fromPaste]);
+    const embeddingProvider = createFakeEmbeddingProvider();
+    await embedRecords(storePath, PASSPHRASE, embeddingProvider);
+
+    const before = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(before.evidence.some((item) => item.recordId === fromExport.id)).toBe(true);
+    expect(before.evidence.some((item) => item.recordId === fromPaste.id)).toBe(true);
+
+    excludeSource(storePath, PASSPHRASE, "claude-export");
+    const context = await gatherDraftContext(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", embeddingProvider);
+    expect(context.evidence.some((item) => item.recordId === fromExport.id)).toBe(false);
+    expect(context.evidence.some((item) => item.recordId === fromPaste.id)).toBe(true);
   });
 });
 

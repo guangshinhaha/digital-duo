@@ -2262,6 +2262,77 @@ describe("POST /knowledge/evidence/:recordId/exclude and /restore, GET /knowledg
   });
 });
 
+describe("GET /knowledge/sources, POST /knowledge/sources/:source/exclude and /restore (duo#278)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /knowledge/sources is empty on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/knowledge/sources", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ sources: [] });
+  });
+
+  it("lists every source with its record count, excludes one, then restores it", async () => {
+    writeRecords(storePath, PASSPHRASE, [
+      record({ text: "a", source: "claude-export" }),
+      record({ text: "b", source: "paste" }),
+    ]);
+
+    const listed = await app.inject({ method: "GET", url: "/knowledge/sources", headers: authHeader });
+    expect(listed.json().sources).toEqual(
+      expect.arrayContaining([
+        { source: "claude-export", recordCount: 1, excluded: false, excludedAt: null },
+        { source: "paste", recordCount: 1, excluded: false, excludedAt: null },
+      ]),
+    );
+
+    const exclude = await app.inject({ method: "POST", url: "/knowledge/sources/claude-export/exclude", headers: authHeader });
+    expect(exclude.statusCode).toBe(200);
+    expect(exclude.json()).toEqual({ excluded: true });
+
+    const afterExclude = await app.inject({ method: "GET", url: "/knowledge/sources", headers: authHeader });
+    expect(afterExclude.json().sources).toEqual([
+      { source: "claude-export", recordCount: 1, excluded: true, excludedAt: expect.any(String) },
+      { source: "paste", recordCount: 1, excluded: false, excludedAt: null },
+    ]);
+
+    const restore = await app.inject({ method: "POST", url: "/knowledge/sources/claude-export/restore", headers: authHeader });
+    expect(restore.statusCode).toBe(200);
+    expect(restore.json()).toEqual({ excluded: false });
+
+    const afterRestore = await app.inject({ method: "GET", url: "/knowledge/sources", headers: authHeader });
+    expect(afterRestore.json().sources).toEqual(
+      expect.arrayContaining([{ source: "claude-export", recordCount: 1, excluded: false, excludedAt: null }]),
+    );
+  });
+
+  it("excluding, and restoring, a source with no records at all is a harmless no-op rather than a 404", async () => {
+    const exclude = await app.inject({ method: "POST", url: "/knowledge/sources/no-such-source/exclude", headers: authHeader });
+    expect(exclude.statusCode).toBe(200);
+    const restore = await app.inject({ method: "POST", url: "/knowledge/sources/no-such-source/restore", headers: authHeader });
+    expect(restore.statusCode).toBe(200);
+  });
+
+  it("is an owner surface: an ask token is refused on all three routes", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    const list = await app.inject({ method: "GET", url: "/knowledge/sources", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const exclude = await app.inject({ method: "POST", url: "/knowledge/sources/paste/exclude", headers: askHeader });
+    expect(exclude.statusCode).toBe(401);
+    const restore = await app.inject({ method: "POST", url: "/knowledge/sources/paste/restore", headers: askHeader });
+    expect(restore.statusCode).toBe(401);
+  });
+});
+
 describe("GET/POST/DELETE /mirror/pinned-answers — pin exact wording over HTTP (duo#275)", () => {
   let app: FastifyInstance;
   let storePath: string;

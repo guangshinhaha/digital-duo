@@ -11,6 +11,7 @@ import { ensureQaPairsSchema } from "../derivation/qa-pairs.js";
 import { ensureRulesSchema, readRuleRow, type Rule } from "../derivation/rules.js";
 import { findConflictingRefusal } from "../trust/refusals.js";
 import { listExcludedEvidenceIds } from "./evidence-exclusions.js";
+import { listExcludedSources } from "./source-exclusions.js";
 import type { RecipientVoice } from "./recipient-voice.js";
 
 /** One piece of past evidence the draft can cite — a retrieved record, with a real cosine similarity to the question (not just an ordinal rank). */
@@ -312,14 +313,21 @@ export async function gatherDraftContext(
   // showed it, the same "stops its use in future drafts" guarantee a
   // rejected rule already has) is folded in alongside the rule-hit/vector
   // reads this function already made in one pass, rather than opening the
-  // store a second time just to list exclusions.
+  // store a second time just to list exclusions. duo#278 adds the
+  // source-level check (listExcludedSources) right beside it, for the
+  // owner turning a whole source off from Privacy settings rather than one
+  // record at a time — every caller of gatherDraftContext (the draft
+  // pipeline, public answering, the eval harness) gets both checks for
+  // free, since neither changes this function's signature.
   const { admissible, vectors, ruleHit, topicId } = withDatabase(storePath, passphrase, false, (db) => {
     ensureRecordsSchema(db);
     const excludedIds = listExcludedEvidenceIds(db);
+    const excludedSources = listExcludedSources(db);
     const admissibleResults = hybrid.results.filter(
       (result) =>
         (clearanceCeiling === undefined || isVisibleToClearance(result.record.classification, clearanceCeiling)) &&
-        !excludedIds.has(result.record.id),
+        !excludedIds.has(result.record.id) &&
+        !excludedSources.has(result.record.source),
     );
     const recordIds = admissibleResults.map((result) => result.record.id);
     const hit = findRuleHit(db, recordIds, duoDir);
