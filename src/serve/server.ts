@@ -32,6 +32,7 @@ import { settleScheduledSend } from "../drafting/scheduled-sends.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { readVoiceText } from "../drafting/context.js";
 import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../drafting/evidence-exclusions.js";
+import { excludeSource, listSourceControls, restoreSource } from "../drafting/source-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
 import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply } from "../drafting/pipeline.js";
@@ -1129,6 +1130,27 @@ function registerRoutes(
   });
 
   app.get("/knowledge/evidence/excluded", async () => ({ excluded: listExcludedEvidence(deps.storePath, deps.passphrase) }));
+
+  // duo#278: the Privacy settings page's per-source switch — every source
+  // the corpus has records under (or had, before the owner excluded it),
+  // with a count and whether it's currently excluded. Same composition
+  // discipline as GET /knowledge: a plain read over what listSourceControls
+  // already computed, nothing re-derived here.
+  app.get("/knowledge/sources", async () => ({ sources: listSourceControls(deps.storePath, deps.passphrase) }));
+
+  // Turning a source off stops it being cited in any future draft (wired
+  // into gatherDraftContext's admissibility filter, beside the per-record
+  // exclusion check above) without touching a single record — reversible
+  // from the same screen, same shape as the evidence-exclusion routes.
+  app.post<{ Params: { source: string } }>("/knowledge/sources/:source/exclude", async (request) => {
+    excludeSource(deps.storePath, deps.passphrase, request.params.source);
+    return { excluded: true };
+  });
+
+  app.post<{ Params: { source: string } }>("/knowledge/sources/:source/restore", async (request) => {
+    restoreSource(deps.storePath, deps.passphrase, request.params.source);
+    return { excluded: false };
+  });
 
   app.get("/mirror/rules", async () => listRulesForReview(deps.storePath, deps.passphrase));
 
