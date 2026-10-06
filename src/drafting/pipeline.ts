@@ -7,15 +7,17 @@ import {
   computeRecencyDecay,
   computeRetrievalStrength,
   computeSelfReport,
+  isHedged,
   runSelfConsistencySampling,
   scoreConfidence,
   type ConfidenceResult,
+  type ConfidenceSignals,
 } from "./confidence.js";
 import { gatherDraftContext, type DraftContext } from "./context.js";
-import { appendDraft, type DraftRecipient, type DraftSource } from "./draft-log.js";
+import { appendDraft, readShapePreferences, recipientKeyOf, type DraftRecipient, type DraftSource, type ShapeInstruction } from "./draft-log.js";
 import { deriveRecipientVoice, type RecipientRegister } from "./recipient-voice.js";
 import { explainEscalation, noEvidenceEscalationReason, refusedSubjectEscalationReason } from "./escalation.js";
-import { buildDraftPrompt, extractiveDraft, pickRepresentativeSample } from "./generate.js";
+import { ALTERNATIVE_INSTRUCTIONS, buildDraftPrompt, extractiveDraft, pickRepresentativeSample } from "./generate.js";
 import { matchesRefusedSubject } from "./relevance-gate.js";
 import { readRefusalsFile } from "./refusals.js";
 
@@ -35,6 +37,15 @@ export interface DraftAnswer {
   readonly adaptedForRecipient: boolean;
   /** The detail behind `adaptedForRecipient`, null exactly when it is false. */
   readonly recipientAdaptation: RecipientAdaptation | null;
+  /**
+   * guangshinhaha/duo#257: every candidate offered for this question when
+   * the draft was hedged and more than one genuinely different candidate
+   * survived — index 0 is this draft itself (`text`, `confidence`). Empty
+   * for a confident draft, for a caller that didn't ask for alternatives,
+   * and whenever the extra candidates came back too close to the default
+   * to be a real choice.
+   */
+  readonly alternatives: readonly DraftCandidate[];
 }
 
 /** What a draft says about the recipient adaptation it used (duo#262): who, learned from how many sends, and which register that came out as. */
@@ -43,6 +54,26 @@ export interface RecipientAdaptation {
   readonly recipientName: string | null;
   readonly sampleSize: number;
   readonly register: RecipientRegister;
+}
+
+/** One candidate reply (guangshinhaha/duo#257) — its own text, its own composite confidence, and the sources it may cite (always the draft's one evidence pool). */
+export interface DraftCandidate {
+  readonly text: string;
+  /** null for the default draft; otherwise the key of the ALTERNATIVE_INSTRUCTIONS entry it answered. */
+  readonly instruction: string | null;
+  readonly confidence: ConfidenceResult;
+  readonly sources: readonly DraftSource[];
+}
+
+/** Optional pipeline behaviour, off unless a caller asks — every pre-#257 caller passes nothing and drafts exactly as before. */
+export interface DraftReplyOptions {
+  /**
+   * guangshinhaha/duo#257: offer up to three candidates when the draft is
+   * hedged. Only the owner-facing `POST /drafts` asks — a public answer
+   * posts one reply, and the eval and calibration harnesses must not pay
+   * for (or be scored on) candidates nobody chooses between.
+   */
+  readonly offerAlternatives?: boolean;
 }
 
 export interface DraftEscalation {
@@ -108,6 +139,91 @@ function buildSources(context: DraftContext, attachments: readonly WorkspaceGrou
   return sources;
 }
 
+/** Lower-cased, whitespace-collapsed — two candidates equal under this are the same reply, whatever the model's spacing. */
+function normalizeForComparison(text: string): string {
+  return text.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function cosine(a: readonly number[], b: readonly number[]): number {
+  if (a.length !== b.length || a.length === 0) {
+    return 0;
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return normA === 0 || normB === 0 ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/**
+ * Two candidates closer than this (cosine over their embeddings) are the
+ * same reply reworded — not a choice worth putting in front of the owner.
+ * Deliberately strict: a "shorter" or "more careful" rewrite of the same
+ * answer still embeds close to it, and those ARE the choices #257 wants;
+ * only a candidate that ignored its instruction lands above this line.
+ */
+export const NEAR_DUPLICATE_SIMILARITY = 0.98;
+
+/**
+ * guangshinhaha/duo#257: generates the extra candidates for a hedged
+ * draft — one call per ALTERNATIVE_INSTRUCTIONS entry, each with its own
+ * instruction over the very same grounding (so every candidate cites the
+ * one evidence pool, never new justification for a different tone), each
+ * scored with the draft's shared signals plus its own self-report. A
+ * candidate is dropped when it fails the escalation threshold on its own
+ * (it would never have been shown alone), when it reads the same as one
+ * already kept, or when the model call fails — alternatives are an extra,
+ * so a failure costs only the extra. Returns the full candidate list with
+ * the default first, or just the default when nothing distinct survived.
+ */
+async function generateAlternatives(
+  primary: DraftCandidate,
+  promptFor: (instruction: string) => string,
+  question: string,
+  sharedSignals: Omit<ConfidenceSignals, "selfReport">,
+  inferenceProvider: InferenceProvider,
+  embeddingProvider: EmbeddingProvider,
+  confidenceConfig: DuoConfig["confidence"],
+): Promise<DraftCandidate[]> {
+  const embedSafely = async (text: string): Promise<readonly number[] | undefined> => {
+    try {
+      return await embeddingProvider.embed(text);
+    } catch {
+      return undefined;
+    }
+  };
+  const kept: DraftCandidate[] = [primary];
+  const keptEmbeddings: (readonly number[] | undefined)[] = [await embedSafely(primary.text)];
+
+  for (const alternative of ALTERNATIVE_INSTRUCTIONS) {
+    let text: string;
+    try {
+      text = (await inferenceProvider.complete(promptFor(alternative.text))).trim();
+    } catch {
+      continue;
+    }
+    if (text.length === 0 || kept.some((candidate) => normalizeForComparison(candidate.text) === normalizeForComparison(text))) {
+      continue;
+    }
+    const embedding = await embedSafely(text);
+    if (embedding && keptEmbeddings.some((other) => other !== undefined && cosine(other, embedding) >= NEAR_DUPLICATE_SIMILARITY)) {
+      continue;
+    }
+    const selfReport = await getSelfReport(inferenceProvider, question, text);
+    const confidence = scoreConfidence({ ...sharedSignals, selfReport }, confidenceConfig.weights, confidenceConfig.escalationThreshold);
+    if (!confidence.passesThreshold) {
+      continue;
+    }
+    kept.push({ text, instruction: alternative.key, confidence, sources: primary.sources });
+    keptEmbeddings.push(embedding);
+  }
+  return kept;
+}
+
 /** Best-effort: asks the model to rate its own confidence in the first draft sample. Never throws — a missing provider or an unparseable response just leaves the self-report signal at its neutral default (computeSelfReport(null)). */
 async function getSelfReport(provider: InferenceProvider, question: string, draftText: string): Promise<number> {
   try {
@@ -161,6 +277,7 @@ export async function draftReply(
    * by every caller that drafts for no particular person.
    */
   recipient?: DraftRecipient,
+  options: DraftReplyOptions = {},
 ): Promise<DraftPipelineResult> {
   // Checked first, before any retrieval or generation: a refused subject
   // escalates "without reasoning about it" (#34 AC2) — there is no
@@ -239,8 +356,15 @@ export async function draftReply(
   let sampleEmbeddings: readonly (readonly number[])[];
   let selfConsistencyAgreement: number;
 
+  // guangshinhaha/duo#258 AC3: shapes the owner keeps asking for toward
+  // this person lean every later draft to them. The person is the named
+  // recipient when the caller gave one (duo#262), else — owner provenance
+  // being the only origin this pipeline drafts for — the owner themself.
+  const recipientKey = recipientKeyOf(OWNER_PROVENANCE, recipient ?? null);
+  const preferences: readonly ShapeInstruction[] = recipientKey !== undefined ? readShapePreferences(storePath, passphrase, recipientKey) : [];
+
   if (inferenceProvider) {
-    const prompt = buildDraftPrompt(question, threadContext, context, providedAttachments);
+    const prompt = buildDraftPrompt(question, threadContext, context, providedAttachments, { preferences });
     const sampling = await runSelfConsistencySampling(
       prompt,
       confidenceConfig.selfConsistencySamples,
@@ -263,11 +387,8 @@ export async function draftReply(
   const recency = computeRecencyDecay(context.freshestEvidenceAgeDays, confidenceConfig.recencyHalfLifeDays);
   const ruleHitSignal = context.ruleHit ? 1 : 0;
 
-  const confidence = scoreConfidence(
-    { selfConsistency: selfConsistencyAgreement, retrievalStrength, ruleHit: ruleHitSignal, recency, selfReport },
-    confidenceConfig.weights,
-    confidenceConfig.escalationThreshold,
-  );
+  const sharedSignals = { selfConsistency: selfConsistencyAgreement, retrievalStrength, ruleHit: ruleHitSignal, recency };
+  const confidence = scoreConfidence({ ...sharedSignals, selfReport }, confidenceConfig.weights, confidenceConfig.escalationThreshold);
 
   if (!confidence.passesThreshold) {
     const reason = explainEscalation(confidence, context);
@@ -288,6 +409,25 @@ export async function draftReply(
   }
 
   const text = pickRepresentativeSample(samples, sampleEmbeddings);
+
+  // guangshinhaha/duo#257: a hedged draft — shown, but only just — is
+  // exactly when one guess is weakest, so (when asked, and when there is a
+  // model to ask) it comes with up to two alternatives. A confident draft
+  // never does: one good answer is not improved by two more to read.
+  let alternatives: DraftCandidate[] = [];
+  if (options.offerAlternatives && inferenceProvider && isHedged(confidence)) {
+    const candidates = await generateAlternatives(
+      { text, instruction: null, confidence, sources },
+      (instruction) => buildDraftPrompt(question, threadContext, context, providedAttachments, { instruction, preferences }),
+      question,
+      sharedSignals,
+      inferenceProvider,
+      embeddingProvider,
+      confidenceConfig,
+    );
+    alternatives = candidates.length > 1 ? candidates : [];
+  }
+
   const draftId = appendDraft(storePath, passphrase, {
     question,
     threadContext,
@@ -301,6 +441,12 @@ export async function draftReply(
     provenance: OWNER_PROVENANCE,
     recipient: recipient ?? null,
     adaptedForRecipient,
+    alternatives: alternatives.map((candidate) => ({
+      text: candidate.text,
+      instruction: candidate.instruction,
+      confidenceScore: candidate.confidence.score,
+      sources: candidate.sources,
+    })),
   });
   return {
     kind: "draft",
@@ -321,5 +467,6 @@ export async function draftReply(
             register: recipientVoice.features.register,
           }
         : null,
+    alternatives,
   };
 }

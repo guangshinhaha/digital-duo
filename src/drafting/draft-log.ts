@@ -127,6 +127,52 @@ export interface DraftRecipient {
 }
 
 /**
+ * One candidate reply among several the pipeline offered for the same
+ * question (guangshinhaha/duo#257) — written only when the draft was
+ * hedged (above the escalation threshold, but not by much) and more than
+ * one genuinely different candidate survived generation. Every candidate
+ * shares one evidence pool: `sources` is the same list the draft row
+ * carries, kept per candidate so a reader never has to assume it.
+ *
+ * Index 0 is the pipeline's own default draft (`instruction` null); the
+ * rest each answered one distinct instruction (`"shorter"`, `"cautious"` —
+ * see generate.ts's ALTERNATIVE_INSTRUCTIONS). `text` is the candidate's
+ * current text, so a shape (#258) applied to one candidate rewrites it here.
+ */
+export interface DraftAlternative {
+  readonly text: string;
+  readonly instruction: string | null;
+  readonly confidenceScore: number;
+  readonly sources: readonly DraftSource[];
+  /**
+   * Derived on read, never stored: `"chosen"` for the one the owner sent or
+   * kept, `"not_chosen"` for the others (and for every candidate of a
+   * dismissed draft), null while the draft is still pending. The passed-over
+   * candidates are the training signal #257 asks for.
+   */
+  readonly outcome: "chosen" | "not_chosen" | null;
+}
+
+/** The instructions a shape (guangshinhaha/duo#258) may carry — a closed set, so each tap is a clean categorical preference signal. */
+export const SHAPE_INSTRUCTIONS = ["shorter", "warmer", "more_formal", "more_direct"] as const;
+export type ShapeInstruction = (typeof SHAPE_INSTRUCTIONS)[number];
+
+/**
+ * One shape applied to a pending draft (guangshinhaha/duo#258): which
+ * candidate it rewrote, with which instruction, and whether the owner took
+ * it back. Each one is a training signal in its own right — the texts it
+ * swapped between stay in the `draft_shapes` table for the correction loop
+ * to read; the record carries only what a surface needs to offer Undo.
+ */
+export interface DraftShape {
+  readonly id: string;
+  readonly alternative: number;
+  readonly instruction: ShapeInstruction;
+  readonly createdAt: string;
+  readonly undoneAt: string | null;
+}
+
+/**
  * One `duo draft` call, in full — durable enough for the correction loop
  * and the offline eval (v1-tech-design.md §1.9/§1.10) to both read later,
  * matching #48-#51's precedent of building a permission/audit surface
@@ -201,6 +247,20 @@ export interface DraftRecord {
   readonly recipient: DraftRecipient | null;
   /** True when this draft's prompt was conditioned on how the owner writes to `recipient` (duo#262) — what a Why panel reads to say "Tuned for how you write to Wei". False for every draft recorded before this field existed. */
   readonly adaptedForRecipient: boolean;
+  /**
+   * The candidates offered for this question (guangshinhaha/duo#257) —
+   * empty when there was only ever one draft, which is every confident
+   * draft, every escalation, and every row recorded before this field
+   * existed. While pending, `draftText` is candidate 0's text; once the
+   * owner sends or keeps candidate N, `draftText`, `sources` and
+   * `confidenceScore` become candidate N's, so the correction loop and
+   * delivery read what was actually chosen.
+   */
+  readonly alternatives: readonly DraftAlternative[];
+  /** Which candidate the owner sent or kept — null while pending, for a dismissed draft, and for a draft with no alternatives. */
+  readonly chosenAlternative: number | null;
+  /** Every shape applied to this draft, oldest first (guangshinhaha/duo#258) — empty when none. */
+  readonly shapes: readonly DraftShape[];
 }
 
 /**
@@ -241,6 +301,11 @@ const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: st
   { column: "recipient_ref", ddl: "ALTER TABLE drafts ADD COLUMN recipient_ref TEXT" },
   { column: "recipient_name", ddl: "ALTER TABLE drafts ADD COLUMN recipient_name TEXT" },
   { column: "adapted_for_recipient", ddl: "ALTER TABLE drafts ADD COLUMN adapted_for_recipient INTEGER NOT NULL DEFAULT 0" },
+  // Both NULL on a pre-existing row (guangshinhaha/duo#257): it had one
+  // draft and nothing to choose between — rowToDraft reads that as no
+  // alternatives and no chosen index.
+  { column: "alternatives", ddl: "ALTER TABLE drafts ADD COLUMN alternatives TEXT" },
+  { column: "chosen_alternative", ddl: "ALTER TABLE drafts ADD COLUMN chosen_alternative INTEGER" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -269,7 +334,9 @@ export function ensureDraftLogSchema(db: Database): void {
       dismiss_reason TEXT,
       recipient_ref TEXT,
       recipient_name TEXT,
-      adapted_for_recipient INTEGER NOT NULL DEFAULT 0
+      adapted_for_recipient INTEGER NOT NULL DEFAULT 0,
+      alternatives TEXT,
+      chosen_alternative INTEGER
     ) STRICT
   `);
 
@@ -281,6 +348,47 @@ export function ensureDraftLogSchema(db: Database): void {
       db.exec(migration.ddl);
     }
   }
+
+  // guangshinhaha/duo#258: one row per shape applied to a pending draft.
+  // A table of its own rather than a JSON column on `drafts`, because each
+  // row is a training signal the correction loop reads on its own (and
+  // `recipient_key` is what later drafts to the same person look up).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS draft_shapes (
+      id TEXT PRIMARY KEY,
+      draft_id TEXT NOT NULL,
+      alternative INTEGER NOT NULL,
+      instruction TEXT NOT NULL,
+      from_text TEXT NOT NULL,
+      to_text TEXT NOT NULL,
+      recipient_key TEXT,
+      created_at TEXT NOT NULL,
+      undone_at TEXT
+    ) STRICT
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS draft_shapes_draft ON draft_shapes (draft_id)`);
+}
+
+/**
+ * Who a draft is ultimately to, as a stable key (guangshinhaha/duo#258's
+ * "toward one person"): the named recipient when the draft has one (duo#262's
+ * `DraftRecipient` — the same id per-recipient voice groups by), else the
+ * asker on a channel for a channel-asked draft, else the owner themself for
+ * an owner-asked one. `undefined` for a row whose origin is unknown and that
+ * names no recipient — a shape there is still logged, it just can't teach
+ * anything about a person.
+ */
+export function recipientKeyOf(provenance: DraftProvenance, recipient: DraftRecipient | null = null): string | undefined {
+  if (recipient !== null) {
+    return `recipient:${recipient.id}`;
+  }
+  if (provenance.origin === "owner") {
+    return "owner";
+  }
+  if (provenance.origin === "channel") {
+    return `channel:${provenance.channelKind}:${provenance.askerRef}`;
+  }
+  return undefined;
 }
 
 export interface AppendDraftInput {
@@ -307,6 +415,12 @@ export interface AppendDraftInput {
   readonly recipient?: DraftRecipient | null;
   /** Whether generation was conditioned on the recipient's learned style (duo#262). Optional; defaults to `false`. */
   readonly adaptedForRecipient?: boolean;
+  /**
+   * guangshinhaha/duo#257: every candidate offered, index 0 being the
+   * default draft (whose text must equal `draftText`). Optional — omitted,
+   * or fewer than two, stores NULL: a single draft has no alternatives.
+   */
+  readonly alternatives?: readonly Omit<DraftAlternative, "outcome">[];
 }
 
 /** Appends one draft (answered or escalated) and returns its id. */
@@ -317,8 +431,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
     ensureDraftLogSchema(db);
     db.prepare(
       `
-      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold, provenance, recipient_ref, recipient_name, adapted_for_recipient)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
+      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold, provenance, recipient_ref, recipient_name, adapted_for_recipient, alternatives)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
     `,
     ).run(
       id,
@@ -336,9 +450,20 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
       input.recipient?.id ?? null,
       input.recipient?.name ?? null,
       input.adaptedForRecipient ? 1 : 0,
+      input.alternatives && input.alternatives.length > 1 ? JSON.stringify(input.alternatives.map(storedAlternative)) : null,
     );
   });
   return id;
+}
+
+/** The stored shape of one candidate — exactly these fields, so a derived `outcome` passed in by mistake never lands in the column. */
+function storedAlternative(alternative: Omit<DraftAlternative, "outcome">): Omit<DraftAlternative, "outcome"> {
+  return {
+    text: alternative.text,
+    instruction: alternative.instruction,
+    confidenceScore: alternative.confidenceScore,
+    sources: alternative.sources,
+  };
 }
 
 /** Thrown by recordDraftOutcome when no draft with the given id exists — a typo'd id should fail loudly, not silently no-op. */
@@ -464,6 +589,8 @@ interface DraftRow {
   recipient_ref: string | null;
   recipient_name: string | null;
   adapted_for_recipient: number;
+  alternatives: string | null;
+  chosen_alternative: number | null;
 }
 
 /**
@@ -474,6 +601,85 @@ interface DraftRow {
  */
 function parseDismissReason(raw: string | null): DismissReason | null {
   return raw !== null && (DISMISS_REASONS as readonly string[]).includes(raw) ? (raw as DismissReason) : null;
+}
+
+interface ShapeRow {
+  id: string;
+  draft_id: string;
+  alternative: number;
+  instruction: string;
+  from_text: string;
+  to_text: string;
+  recipient_key: string | null;
+  created_at: string;
+  undone_at: string | null;
+}
+
+/**
+ * Parses the stored candidates (guangshinhaha/duo#257), deriving each one's
+ * chosen/not-chosen outcome from the row. Defensive like parseProvenance:
+ * an unreadable cell reads as no alternatives — the row still has its one
+ * draft — rather than taking the whole draft log down.
+ */
+function parseAlternatives(raw: string | null, outcome: string | null, chosen: number | null): DraftAlternative[] {
+  if (raw === null) {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+  const alternatives: DraftAlternative[] = [];
+  for (const [index, entry] of parsed.entries()) {
+    const candidate = entry as Partial<Omit<DraftAlternative, "outcome">> | null;
+    if (!candidate || typeof candidate.text !== "string" || typeof candidate.confidenceScore !== "number" || !Array.isArray(candidate.sources)) {
+      return [];
+    }
+    alternatives.push({
+      text: candidate.text,
+      instruction: typeof candidate.instruction === "string" ? candidate.instruction : null,
+      confidenceScore: candidate.confidenceScore,
+      sources: candidate.sources,
+      outcome: outcome === null ? null : chosen === index ? "chosen" : "not_chosen",
+    });
+  }
+  return alternatives;
+}
+
+function rowToShape(row: ShapeRow): DraftShape {
+  return {
+    id: row.id,
+    alternative: row.alternative,
+    instruction: row.instruction as ShapeInstruction,
+    createdAt: row.created_at,
+    undoneAt: row.undone_at,
+  };
+}
+
+/** Every shape for the given drafts, grouped by draft id, oldest first. */
+function readShapesFor(db: Database, draftIds: readonly string[]): Map<string, DraftShape[]> {
+  const grouped = new Map<string, DraftShape[]>();
+  // Chunked: an un-paged listDrafts can hand over the whole log, and one
+  // IN (…) per chunk keeps every statement well under SQLite's bound-
+  // parameter ceiling however long the log grows.
+  for (let start = 0; start < draftIds.length; start += 500) {
+    const chunk = draftIds.slice(start, start + 500);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = db
+      .prepare(`SELECT * FROM draft_shapes WHERE draft_id IN (${placeholders}) ORDER BY created_at, id`)
+      .all(...chunk) as unknown as ShapeRow[];
+    for (const row of rows) {
+      const list = grouped.get(row.draft_id) ?? [];
+      list.push(rowToShape(row));
+      grouped.set(row.draft_id, list);
+    }
+  }
+  return grouped;
 }
 
 /**
@@ -513,7 +719,7 @@ function parseProvenance(raw: string | null): DraftProvenance {
   return { origin: "unknown" };
 }
 
-function rowToDraft(row: DraftRow): DraftRecord {
+function rowToDraft(row: DraftRow, shapes: readonly DraftShape[] = []): DraftRecord {
   return {
     id: row.id,
     question: row.question,
@@ -541,14 +747,207 @@ function rowToDraft(row: DraftRow): DraftRecord {
     dismissReason: parseDismissReason(row.dismiss_reason),
     recipient: row.recipient_ref !== null ? { id: row.recipient_ref, name: row.recipient_name } : null,
     adaptedForRecipient: row.adapted_for_recipient === 1,
+    alternatives: parseAlternatives(row.alternatives, row.outcome, row.chosen_alternative),
+    chosenAlternative: row.chosen_alternative,
+    shapes,
   };
+}
+
+function readDraft(db: Database, draftId: string): DraftRecord | undefined {
+  const row = db.prepare(`SELECT * FROM drafts WHERE id = ?`).get(draftId) as DraftRow | undefined;
+  return row ? rowToDraft(row, readShapesFor(db, [row.id]).get(row.id)) : undefined;
 }
 
 export function getDraft(storePath: string, passphrase: string, draftId: string): DraftRecord | undefined {
   return withDatabase(storePath, passphrase, false, (db) => {
     ensureDraftLogSchema(db);
-    const row = db.prepare(`SELECT * FROM drafts WHERE id = ?`).get(draftId) as DraftRow | undefined;
-    return row ? rowToDraft(row) : undefined;
+    return readDraft(db, draftId);
+  });
+}
+
+/** Thrown for an alternative index a draft does not have (guangshinhaha/duo#257) — a client bug, never silently clamped to a candidate the owner did not pick. */
+export class UnknownAlternativeError extends Error {
+  constructor(draftId: string, index: number, count: number) {
+    super(
+      count > 1
+        ? `Draft "${draftId}" has alternatives 0–${count - 1}; there is no alternative ${index}.`
+        : `Draft "${draftId}" has no alternatives; only alternative 0 (the draft itself) can be chosen, not ${index}.`,
+    );
+    this.name = "UnknownAlternativeError";
+  }
+}
+
+/**
+ * Records which candidate the owner is sending or keeping
+ * (guangshinhaha/duo#257) — called just ahead of the outcome itself, by
+ * `recordOutcomeAndDeliver`. Makes the chosen candidate the row's draft:
+ * `draftText`, `sources` and `confidenceScore` become its, so the edit diff
+ * the correction loop classifies and the text delivery hands to a channel
+ * are both the candidate that was actually picked. The full candidate set
+ * stays in `alternatives`, so the passed-over ones remain readable as "not
+ * chosen". A draft with no alternatives accepts only index 0 and changes
+ * nothing.
+ */
+export function chooseAlternative(storePath: string, passphrase: string, draftId: string, index: number): void {
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureDraftLogSchema(db);
+    const draft = readDraft(db, draftId);
+    if (!draft) {
+      throw new DraftNotFoundError(draftId);
+    }
+    const count = draft.alternatives.length;
+    if (!Number.isInteger(index) || index < 0 || (count === 0 ? index !== 0 : index >= count)) {
+      throw new UnknownAlternativeError(draftId, index, count);
+    }
+    if (count === 0) {
+      return;
+    }
+    const chosen = draft.alternatives[index];
+    db.prepare(`UPDATE drafts SET draft_text = ?, sources = ?, confidence_score = ?, chosen_alternative = ? WHERE id = ?`).run(
+      chosen.text,
+      JSON.stringify(chosen.sources),
+      chosen.confidenceScore,
+      index,
+      draftId,
+    );
+  });
+}
+
+/** Thrown when a shape or its undo is asked of a draft that cannot take one (#258): escalated, already settled, or with nothing to undo. */
+export class DraftNotShapeableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftNotShapeableError";
+  }
+}
+
+/** A draft's current text for one candidate: `alternatives[i].text` when it has alternatives, else `draftText` (index 0 only). */
+export function currentCandidateText(draft: DraftRecord, alternative: number): string {
+  if (draft.alternatives.length === 0) {
+    if (alternative !== 0) {
+      throw new UnknownAlternativeError(draft.id, alternative, 0);
+    }
+    return draft.draftText ?? "";
+  }
+  const candidate = draft.alternatives[alternative];
+  if (!Number.isInteger(alternative) || candidate === undefined) {
+    throw new UnknownAlternativeError(draft.id, alternative, draft.alternatives.length);
+  }
+  return candidate.text;
+}
+
+/** Writes one candidate's text, keeping `draft_text` in step with candidate 0 (the invariant a pending row holds). */
+function writeCandidateText(db: Database, draft: DraftRecord, alternative: number, text: string): void {
+  if (draft.alternatives.length === 0) {
+    db.prepare(`UPDATE drafts SET draft_text = ? WHERE id = ?`).run(text, draft.id);
+    return;
+  }
+  const stored = draft.alternatives.map((candidate, index) => storedAlternative(index === alternative ? { ...candidate, text } : candidate));
+  db.prepare(`UPDATE drafts SET alternatives = ? WHERE id = ?`).run(JSON.stringify(stored), draft.id);
+  if (alternative === 0) {
+    db.prepare(`UPDATE drafts SET draft_text = ? WHERE id = ?`).run(text, draft.id);
+  }
+}
+
+function assertShapeable(draft: DraftRecord): void {
+  if (draft.escalated || draft.draftText === null) {
+    throw new DraftNotShapeableError(`Draft "${draft.id}" was passed to you, not drafted — there is no draft text to shape.`);
+  }
+  if (draft.outcome !== null) {
+    throw new DraftNotShapeableError(`Draft "${draft.id}" was already recorded as "${draft.outcome}" — only a pending draft can be shaped.`);
+  }
+}
+
+/**
+ * Records one shape (guangshinhaha/duo#258) and swaps the candidate's text
+ * to the shaped version, atomically. `fromText` is the text the shape was
+ * generated from: if the candidate no longer reads that way (a second shape
+ * landed first), nothing is written and the call is refused, rather than a
+ * stale rewrite silently overwriting a newer one. Returns the updated draft.
+ */
+export function recordShape(
+  storePath: string,
+  passphrase: string,
+  draftId: string,
+  input: { readonly alternative: number; readonly instruction: ShapeInstruction; readonly fromText: string; readonly toText: string },
+): DraftRecord {
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureDraftLogSchema(db);
+    const draft = readDraft(db, draftId);
+    if (!draft) {
+      throw new DraftNotFoundError(draftId);
+    }
+    assertShapeable(draft);
+    if (currentCandidateText(draft, input.alternative) !== input.fromText) {
+      throw new DraftNotShapeableError(`Draft "${draftId}" changed while it was being shaped — try again.`);
+    }
+    db.prepare(
+      `INSERT INTO draft_shapes (id, draft_id, alternative, instruction, from_text, to_text, recipient_key, created_at, undone_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(randomUUID(), draftId, input.alternative, input.instruction, input.fromText, input.toText, recipientKeyOf(draft.provenance, draft.recipient) ?? null, new Date().toISOString());
+    writeCandidateText(db, draft, input.alternative, input.toText);
+    return readDraft(db, draftId) as DraftRecord;
+  });
+}
+
+/**
+ * Takes back the latest shape still standing on one candidate
+ * (guangshinhaha/duo#258's one-tap undo): restores the text it replaced and
+ * marks it undone — kept, not deleted, because a shape the owner took back
+ * is a signal too. Refused when there is nothing to undo, or the candidate
+ * has moved on from what that shape wrote.
+ */
+export function undoLatestShape(storePath: string, passphrase: string, draftId: string, alternative: number): DraftRecord {
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureDraftLogSchema(db);
+    const draft = readDraft(db, draftId);
+    if (!draft) {
+      throw new DraftNotFoundError(draftId);
+    }
+    assertShapeable(draft);
+    const current = currentCandidateText(draft, alternative);
+    const latest = db
+      .prepare(`SELECT * FROM draft_shapes WHERE draft_id = ? AND alternative = ? AND undone_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+      .get(draftId, alternative) as ShapeRow | undefined;
+    if (!latest) {
+      throw new DraftNotShapeableError(`Draft "${draftId}" has no shape to undo on alternative ${alternative}.`);
+    }
+    if (latest.to_text !== current) {
+      throw new DraftNotShapeableError(`Draft "${draftId}" changed since its last shape — there is nothing to undo back to.`);
+    }
+    db.prepare(`UPDATE draft_shapes SET undone_at = ? WHERE id = ?`).run(new Date().toISOString(), latest.id);
+    writeCandidateText(db, draft, alternative, latest.from_text);
+    return readDraft(db, draftId) as DraftRecord;
+  });
+}
+
+/** How many standing shapes of one kind, toward one person, before later drafts to them lean that way (guangshinhaha/duo#258 AC3). */
+export const SHAPE_PREFERENCE_MIN_COUNT = 3;
+/** How far back a preference is read — recent taps only, so a preference the owner has stopped expressing fades. */
+const SHAPE_PREFERENCE_WINDOW = 20;
+
+/**
+ * The shapes the owner keeps asking for toward one person — every
+ * instruction used at least SHAPE_PREFERENCE_MIN_COUNT times among the last
+ * SHAPE_PREFERENCE_WINDOW shapes to that recipient, not counting ones taken
+ * back. Most-used first. Empty when there is no pattern yet.
+ */
+export function readShapePreferences(storePath: string, passphrase: string, recipientKey: string): ShapeInstruction[] {
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureDraftLogSchema(db);
+    const rows = db
+      .prepare(`SELECT instruction, undone_at FROM draft_shapes WHERE recipient_key = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`)
+      .all(recipientKey, SHAPE_PREFERENCE_WINDOW) as unknown as { instruction: string; undone_at: string | null }[];
+    const counts = new Map<ShapeInstruction, number>();
+    for (const row of rows) {
+      if (row.undone_at === null && (SHAPE_INSTRUCTIONS as readonly string[]).includes(row.instruction)) {
+        const instruction = row.instruction as ShapeInstruction;
+        counts.set(instruction, (counts.get(instruction) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .filter(([, count]) => count >= SHAPE_PREFERENCE_MIN_COUNT)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([instruction]) => instruction);
   });
 }
 
@@ -601,6 +1000,7 @@ export function listDrafts(storePath: string, passphrase: string, options: ListD
     // comment above for why the un-paged order must not change.
     const order = options.limit !== undefined ? "created_at DESC, id DESC" : "created_at, id";
     const rows = db.prepare(`SELECT * FROM drafts ${where} ORDER BY ${order} ${limitClause}`).all(...params) as unknown as DraftRow[];
-    return rows.map(rowToDraft);
+    const shapes = readShapesFor(db, rows.map((row) => row.id));
+    return rows.map((row) => rowToDraft(row, shapes.get(row.id)));
   });
 }

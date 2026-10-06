@@ -288,6 +288,8 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
+    { method: "POST", url: "/drafts/some-draft-id/shape", payload: { instruction: "shorter" } },
+    { method: "POST", url: "/drafts/some-draft-id/shape/undo" },
     { method: "POST", url: "/mirror/rules/some-rule-id/approve" },
     { method: "POST", url: "/devices/some-device-id/revoke" },
     { method: "POST", url: "/channels/policy/mute", payload: { channel: "c" } },
@@ -597,6 +599,91 @@ describe("createServer — routes", () => {
       payload: { outcome: "sent", dismissReason: "wrong_facts" },
     });
     expect(response.statusCode).toBe(400);
+  });
+
+  describe("alternatives and shaping (guangshinhaha/duo#257, #258)", () => {
+    function appendWithAlternatives(): string {
+      return appendDraft(storePath, PASSPHRASE, {
+        question: "q",
+        threadContext: null,
+        draftText: "default",
+        escalated: false,
+        escalationReason: null,
+        confidenceScore: 0.6,
+        sources: [],
+        provenance: { origin: "owner" },
+        alternatives: [
+          { text: "default", instruction: null, confidenceScore: 0.6, sources: [] },
+          { text: "short", instruction: "shorter", confidenceScore: 0.58, sources: [] },
+          { text: "careful", instruction: "cautious", confidenceScore: 0.57, sources: [] },
+        ],
+      });
+    }
+
+    it("GET /drafts/:id carries the alternatives, chosen index and shapes", async () => {
+      const draftId = appendWithAlternatives();
+      const response = await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader });
+      expect(response.json()).toMatchObject({
+        alternatives: [
+          { text: "default", instruction: null, outcome: null },
+          { text: "short", instruction: "shorter", outcome: null },
+          { text: "careful", instruction: "cautious", outcome: null },
+        ],
+        chosenAlternative: null,
+        shapes: [],
+      });
+    });
+
+    it("POST /drafts/:id/outcome records which alternative was sent", async () => {
+      const draftId = appendWithAlternatives();
+      const response = await app.inject({ method: "POST", url: `/drafts/${draftId}/outcome`, headers: authHeader, payload: { outcome: "sent", alternative: 1 } });
+      expect(response.statusCode).toBe(200);
+      const stored = (await app.inject({ method: "GET", url: `/drafts/${draftId}`, headers: authHeader })).json();
+      expect(stored.chosenAlternative).toBe(1);
+      expect(stored.draftText).toBe("short");
+      expect(stored.alternatives.map((a: { outcome: string }) => a.outcome)).toEqual(["not_chosen", "chosen", "not_chosen"]);
+    });
+
+    it("POST /drafts/:id/outcome 400s on a malformed or missing alternative", async () => {
+      const draftId = appendWithAlternatives();
+      const malformed = await app.inject({ method: "POST", url: `/drafts/${draftId}/outcome`, headers: authHeader, payload: { outcome: "sent", alternative: "1" } });
+      expect(malformed.statusCode).toBe(400);
+      const missing = await app.inject({ method: "POST", url: `/drafts/${draftId}/outcome`, headers: authHeader, payload: { outcome: "sent", alternative: 7 } });
+      expect(missing.statusCode).toBe(400);
+      expect(missing.json().error.code).toBe("UnknownAlternativeError");
+    });
+
+    it("POST /drafts/:id/shape regenerates with the instruction and returns the draft; undo puts it back", async () => {
+      const prompts: string[] = [];
+      const shaping: InferenceProvider = { name: "fake", async complete(prompt) { prompts.push(prompt); return "short, warmly"; } };
+      const shapeApp = createServer(deps(storePath, { inferenceProvider: shaping }));
+      const draftId = appendWithAlternatives();
+
+      const shaped = await shapeApp.inject({ method: "POST", url: `/drafts/${draftId}/shape`, headers: authHeader, payload: { instruction: "warmer", alternative: 1 } });
+      expect(shaped.statusCode).toBe(200);
+      expect(shaped.json().alternatives[1].text).toBe("short, warmly");
+      expect(shaped.json().shapes).toEqual([expect.objectContaining({ alternative: 1, instruction: "warmer", undoneAt: null })]);
+      expect(prompts[0]).toContain("The current draft:\nshort");
+
+      const undone = await shapeApp.inject({ method: "POST", url: `/drafts/${draftId}/shape/undo`, headers: authHeader, payload: { alternative: 1 } });
+      expect(undone.statusCode).toBe(200);
+      expect(undone.json().alternatives[1].text).toBe("short");
+
+      const nothingLeft = await shapeApp.inject({ method: "POST", url: `/drafts/${draftId}/shape/undo`, headers: authHeader, payload: { alternative: 1 } });
+      expect(nothingLeft.statusCode).toBe(409);
+    });
+
+    it("POST /drafts/:id/shape 400s on an instruction outside the closed set, 404s an unknown draft, 409s with no model", async () => {
+      const draftId = appendWithAlternatives();
+      const bad = await app.inject({ method: "POST", url: `/drafts/${draftId}/shape`, headers: authHeader, payload: { instruction: "ruder" } });
+      expect(bad.statusCode).toBe(400);
+      const unknown = await app.inject({ method: "POST", url: "/drafts/not-a-real-id/shape", headers: authHeader, payload: { instruction: "shorter" } });
+      expect(unknown.statusCode).toBe(404);
+      // `app` has no inference provider.
+      const noModel = await app.inject({ method: "POST", url: `/drafts/${draftId}/shape`, headers: authHeader, payload: { instruction: "shorter" } });
+      expect(noModel.statusCode).toBe(409);
+      expect(noModel.json().error.code).toBe("ShapingUnavailableError");
+    });
   });
 
   it("POST /drafts/:id/outcome 404s for an unknown draft", async () => {

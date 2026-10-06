@@ -14,14 +14,18 @@ import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule,
 import {
   getDraft,
   listDrafts,
+  undoLatestShape,
   DISMISS_REASONS,
   DRAFT_OUTCOMES,
   SETTABLE_DRAFT_OUTCOMES,
+  SHAPE_INSTRUCTIONS,
   type DismissReason,
   type DraftOutcome,
   type DraftRecipient,
   type SettableDraftOutcome,
+  type ShapeInstruction,
 } from "../drafting/draft-log.js";
+import { shapeDraft } from "../drafting/shape.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { draftReply } from "../drafting/pipeline.js";
@@ -190,6 +194,11 @@ function parsePositiveIntParam(name: string, raw: string | undefined): number | 
   return parsed;
 }
 
+/** A JSON body's alternative index (guangshinhaha/duo#257/#258): a real non-negative integer, never a string or a fraction coerced into one. */
+function isAlternativeIndex(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
 /**
  * Validates the body of POST /channels/policy/mute and /unmute (#172): a
  * required non-empty `channel`, an optional non-empty `threadId` scoping
@@ -287,12 +296,20 @@ function statusForError(error: Error): number {
     // or delivered again, the same "already finalized" conflict as the
     // rest of this family.
     case "DraftAlreadySettledError":
+    // guangshinhaha/duo#258: shaping a draft that can't take one (passed
+    // on, already settled, nothing to undo, changed underneath) — and a
+    // daemon with no model to shape with — are the draft's or the daemon's
+    // state refusing the request, not a malformed one.
+    case "DraftNotShapeableError":
+    case "ShapingUnavailableError":
       return 409;
     case "BlankEditError":
     // #259 in guangshinhaha/duo: a dismissReason sent alongside any outcome
     // other than "discarded" — the same "caller sent something that can
     // never be valid" shape as BlankEditError just above.
     case "DismissReasonRequiresDiscardedError":
+    // guangshinhaha/duo#257: an alternative index the draft doesn't have.
+    case "UnknownAlternativeError":
     // #172: a channel/thread mute key containing the "/" separator — the
     // entry would be ambiguous in the one mute store, so it is refused.
     case "InvalidMuteKeyError":
@@ -519,6 +536,9 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       undefined, // no clearance ceiling: the owner's own draft
       undefined, // no attachments on this path
       recipient,
+      // guangshinhaha/duo#257: the owner chooses between candidates here,
+      // so a hedged draft comes with its alternatives.
+      { offerAlternatives: true },
     );
     // 201, not 202: this is synchronous (see the comment above) and a
     // draft-log row now exists either way (draftReply always writes
@@ -675,8 +695,8 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
     }
   });
 
-  app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string; dismissReason?: string } }>("/drafts/:id/outcome", async (request, reply) => {
-    const { outcome, sentText, dismissReason } = request.body;
+  app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string; dismissReason?: string; alternative?: unknown } }>("/drafts/:id/outcome", async (request, reply) => {
+    const { outcome, sentText, dismissReason, alternative } = request.body;
     // SETTABLE_DRAFT_OUTCOMES, not the full DRAFT_OUTCOMES: this is the
     // generic outcome-setting route, and escalation_answered must only
     // ever be written by standing-order-candidates.ts's own atomic call —
@@ -696,6 +716,13 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       reply.code(400).send(errorBody("bad_request", `dismissReason must be one of: ${DISMISS_REASONS.join(", ")}`));
       return;
     }
+    // guangshinhaha/duo#257: which of a draft's alternatives was sent or
+    // kept. Optional; whether the draft HAS that alternative is the
+    // draft log's to say (UnknownAlternativeError, a 400).
+    if (alternative !== undefined && !isAlternativeIndex(alternative)) {
+      reply.code(400).send(errorBody("bad_request", "alternative must be a non-negative integer"));
+      return;
+    }
     // The blank-sentText-on-"edited" check lives in recordOutcomeAndDeliver
     // (via corrections/classify.ts), not here — so duo draft-outcome gets
     // the same guard as this route, rather than each caller duplicating it
@@ -709,8 +736,58 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
         classifier,
         channelAdapters: deps.channelAdapters,
         dismissReason: dismissReason as DismissReason | undefined,
+        alternative,
       });
       return result ?? {};
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // guangshinhaha/duo#258: regenerate one candidate of a pending draft
+  // with a tone/length instruction, over the sources it already cites (no
+  // fresh retrieval — see shapeDraft). Synchronous like POST /drafts: one
+  // model call. Returns the updated draft, whose `shapes` names the shape
+  // just applied; the tap itself is logged as a training signal.
+  app.post<{ Params: { id: string }; Body: { instruction?: unknown; alternative?: unknown } | undefined }>("/drafts/:id/shape", async (request, reply) => {
+    const { instruction, alternative } = request.body ?? {};
+    if (typeof instruction !== "string" || !SHAPE_INSTRUCTIONS.includes(instruction as ShapeInstruction)) {
+      reply.code(400).send(errorBody("bad_request", `instruction must be one of: ${SHAPE_INSTRUCTIONS.join(", ")}`));
+      return;
+    }
+    if (alternative !== undefined && !isAlternativeIndex(alternative)) {
+      reply.code(400).send(errorBody("bad_request", "alternative must be a non-negative integer"));
+      return;
+    }
+    try {
+      const updated = await shapeDraft(
+        deps.storePath,
+        deps.passphrase,
+        deps.duoDir,
+        request.params.id,
+        instruction as ShapeInstruction,
+        alternative ?? 0,
+        deps.inferenceProvider,
+      );
+      // No draft-ready push: that channel announces a draft *arriving*
+      // (the client notifies on it), and a reshaped draft is not news.
+      return updated;
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // guangshinhaha/duo#258: the one-tap undo — puts back the text the latest
+  // standing shape on that candidate replaced. The shape stays logged,
+  // marked undone: taking one back is a signal too.
+  app.post<{ Params: { id: string }; Body: { alternative?: unknown } | undefined }>("/drafts/:id/shape/undo", async (request, reply) => {
+    const { alternative } = request.body ?? {};
+    if (alternative !== undefined && !isAlternativeIndex(alternative)) {
+      reply.code(400).send(errorBody("bad_request", "alternative must be a non-negative integer"));
+      return;
+    }
+    try {
+      return undoLatestShape(deps.storePath, deps.passphrase, request.params.id, alternative ?? 0);
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
