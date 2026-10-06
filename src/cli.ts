@@ -83,6 +83,19 @@ import { runSharedAsk, runSharedGaps, runSharedUsage } from "./commands/shared.j
 import { runKnowledge, runStatus } from "./commands/status.js";
 import { runTrustCorrect, runTrustGrant, runTrustGrid, runTrustLedger, runTrustPromote, runTrustPromotions } from "./commands/trust.js";
 
+/**
+ * Set only by `serve`'s action once its daemon is actually listening —
+ * never by any other command. `serve` runs forever by design (a Fastify
+ * server kept alive by its own open socket); every other command's
+ * `.action()` resolves once its one-shot work is done, which is what the
+ * exit-on-settle fix below is for. Without this check, that fix kills
+ * `duo serve` the instant it finishes binding, since `parseAsync()`
+ * settles as soon as `runServe`/`runHostedServe` resolve their listening
+ * promise — observed as a production outage (api.digitalduo.world 502)
+ * within seconds of #290 landing.
+ */
+let isRunningAsLongLivedServer = false;
+
 const program = new Command();
 
 program.name("duo").description("Digital Duo CLI").version("0.1.0");
@@ -142,6 +155,7 @@ program
     try {
       const serveOptions = { host: options.host, port: options.port, behindProxy: options.behindProxy };
       const { address } = options.hosted ? await runHostedServe(serveOptions, config) : await runServe(serveOptions, config);
+      isRunningAsLongLivedServer = true;
       console.error(`duo serve listening on ${address}`);
     } catch (error) {
       reportError(error);
@@ -2747,10 +2761,18 @@ program
  * `console.log` actually flushes through a piped stdout before the
  * process ends, rather than risking a mid-write truncation from exiting
  * in the same tick.
+ *
+ * Except `serve`: once its daemon is actually listening it sets
+ * `isRunningAsLongLivedServer`, and this skips the exit — that command is
+ * meant to run forever, not settle. A `serve` invocation that fails before
+ * binding (the flag never gets set) still exits via `reportError`'s
+ * `process.exitCode`, same as any other command's failure.
  */
 program
   .parseAsync(process.argv)
   .catch(reportError)
   .finally(() => {
-    setImmediate(() => process.exit());
+    if (!isRunningAsLongLivedServer) {
+      setImmediate(() => process.exit());
+    }
   });
