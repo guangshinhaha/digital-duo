@@ -650,7 +650,7 @@ describe("invitesFromSync — the invite section is the consent question's wire 
       },
     };
     expect(invitesFromSync(rooms, DUO_ALICE)).toEqual([
-      { roomId: "!planning:workspace", inviterId: BOB, name: "Launch planning", joinedMemberCount: 2 },
+      { roomId: "!planning:workspace", inviterId: BOB, name: "Launch planning", joinedMemberCount: 2, reason: null, direct: false },
     ]);
   });
 
@@ -668,8 +668,8 @@ describe("invitesFromSync — the invite section is the consent question's wire 
       },
     };
     expect(invitesFromSync(rooms, DUO_ALICE)).toEqual([
-      { roomId: "!a:workspace", inviterId: BOB, name: null, joinedMemberCount: 1 },
-      { roomId: "!z:workspace", inviterId: ALICE, name: null, joinedMemberCount: 1 },
+      { roomId: "!a:workspace", inviterId: BOB, name: null, joinedMemberCount: 1, reason: null, direct: false },
+      { roomId: "!z:workspace", inviterId: ALICE, name: null, joinedMemberCount: 1, reason: null, direct: false },
     ]);
   });
 
@@ -677,7 +677,7 @@ describe("invitesFromSync — the invite section is the consent question's wire 
     const bare = invitedMemberEvent();
     delete (bare as { sender?: string }).sender;
     const invites = invitesFromSync({ invite: { "!bare:workspace": inviteRoom([bare]) } }, DUO_ALICE);
-    expect(invites).toEqual([{ roomId: "!bare:workspace", inviterId: null, name: null, joinedMemberCount: 0 }]);
+    expect(invites).toEqual([{ roomId: "!bare:workspace", inviterId: null, name: null, joinedMemberCount: 0, reason: null, direct: false }]);
   });
 
   it("skips an invite-section room with no invite membership event for THIS account — not an invitation to us", () => {

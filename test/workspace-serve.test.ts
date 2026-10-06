@@ -115,6 +115,20 @@ describe("runServe + workspace — the outbound connection alongside the unchang
       expect(entries).toHaveLength(1);
       expect(entries[0].askerRef).toBe("@bob:workspace");
       expect(entries[0].askLinkId).toBeNull();
+      // guangshinhaha/duo#314: the passed-on draft knows whose question it
+      // is and which conversation it came from — not the owner's own turn.
+      const [draft] = listDrafts(storePath, PASSPHRASE);
+      expect(draft).toMatchObject({
+        provenance: {
+          origin: "channel",
+          channelKind: "workspace",
+          askerRef: "@bob:workspace",
+          threadId: "!dm:workspace",
+          permalink: "https://matrix.to/#/!dm%3Aworkspace/%24q1",
+        },
+        publicOutcome: "passed_on",
+      });
+      expect(draft!.passOnReason).toBeTruthy();
     } finally {
       await close();
     }
@@ -455,6 +469,82 @@ describe("runServe + workspace — the consent surface over HTTP (#192)", () => 
     } finally {
       await close();
     }
+  });
+});
+
+describe("runServe + workspace — duo conversations over HTTP (guangshinhaha/duo#314, #315)", () => {
+  it("allows with always, lists and takes back the standing yes, declines politely, and invites the owner in", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}`, "content-type": "application/json" };
+      // The new routes are the owner's, like the rest of the surface.
+      expect((await fetch(`${address}/workspace/always-allowed`)).status).toBe(401);
+      expect((await fetch(`${address}/workspace/rooms/!dm:workspace/invite-owner`, { method: "POST" })).status).toBe(401);
+
+      // A first message rides the invitation as its preview.
+      transport.deliverInvite(invite({ roomId: "!dm:workspace", joinedMemberCount: 1, name: null, reason: "Where is the deploy runbook?", direct: true }));
+      await until(() => transport.inviteDeliveries >= 1);
+      const listed = (await (await fetch(`${address}/workspace/invites`, { headers: auth })).json()) as { invites: RoomInvite[] };
+      expect(listed.invites[0]).toMatchObject({ roomId: "!dm:workspace", reason: "Where is the deploy runbook?", direct: true });
+
+      // `always` must be a boolean.
+      const bad = await fetch(`${address}/workspace/invites/!dm:workspace/allow`, { method: "POST", headers: auth, body: JSON.stringify({ always: "yes" }) });
+      expect(bad.status).toBe(400);
+      const allowed = await fetch(`${address}/workspace/invites/!dm:workspace/allow`, { method: "POST", headers: auth, body: JSON.stringify({ always: true }) });
+      expect(allowed.status).toBe(200);
+      const people = (await (await fetch(`${address}/workspace/always-allowed`, { headers: auth })).json()) as { people: { userId: string }[] };
+      expect(people.people.map((person) => person.userId)).toEqual([BOB]);
+      const forgotten = await fetch(`${address}/workspace/always-allowed/${encodeURIComponent(BOB)}`, { method: "DELETE", headers: { authorization: auth.authorization } });
+      expect(await forgotten.json()).toEqual({ removed: true, people: [] });
+
+      // A group invitation can't be always-allowed: 400, nothing joined.
+      transport.deliverInvite(invite());
+      await until(() => transport.inviteDeliveries >= 2);
+      const notApplicable = await fetch(`${address}/workspace/invites/${ROOM}/allow`, { method: "POST", headers: auth, body: JSON.stringify({ always: true }) });
+      expect(notApplicable.status).toBe(400);
+      expect(transport.joinCalls).toEqual(["!dm:workspace"]);
+
+      // A decline carries the polite notice, naming the owner.
+      await fetch(`${address}/workspace/invites/${ROOM}/refuse`, { method: "POST", headers: { authorization: auth.authorization } });
+      expect(transport.leaveReasons).toEqual(["Thanks for reaching out. the owner's duo won't be answering in this conversation — please message the owner directly."]);
+
+      // The owner is brought into the conversation — and only the owner.
+      const invited = await fetch(`${address}/workspace/rooms/!dm:workspace/invite-owner`, { method: "POST", headers: { authorization: auth.authorization } });
+      expect(invited.status).toBe(200);
+      expect(await invited.json()).toEqual({ roomId: "!dm:workspace", userId: "@alice:workspace" });
+      expect(transport.inviteCalls).toEqual([{ roomId: "!dm:workspace", userId: "@alice:workspace" }]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("records an owner-delivered reply as delivered, and refuses a non-boolean flag", async () => {
+    const { storePath } = initStore();
+    const config = loadConfig(workspaceEnv(storePath));
+    const transport = new FakeWorkspaceTransport();
+    const { address, close } = await runServe({ host: "127.0.0.1", port: 0 }, config, workspaceEnv(storePath), () => transport as WorkspaceTransport);
+    try {
+      await untilConnected(transport);
+      const auth = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "owner-device").token}`, "content-type": "application/json" };
+      transport.deliver({ eventId: "$q1", roomId: "!dm:workspace", senderId: BOB, body: "Who approves laptops?", originServerTs: Date.now(), joinedMemberIds: [SELF, BOB] });
+      await until(() => transport.sentAnswers.length >= 1);
+      const [draft] = listDrafts(storePath, PASSPHRASE);
+      const bad = await fetch(`${address}/drafts/${draft!.id}/outcome`, { method: "POST", headers: auth, body: JSON.stringify({ outcome: "edited", sentText: "Ask IT.", ownerDelivered: "yes" }) });
+      expect(bad.status).toBe(400);
+      // An escalation is answered with the answer route; the outcome route is
+      // for a draft with an attempt — here, recorded against the escalation
+      // row only to pin the delivery bookkeeping.
+      const ok = await fetch(`${address}/drafts/${draft!.id}/outcome`, { method: "POST", headers: auth, body: JSON.stringify({ outcome: "edited", sentText: "Ask IT.", ownerDelivered: true }) });
+      expect(ok.status).toBe(200);
+      expect(listDrafts(storePath, PASSPHRASE)[0]).toMatchObject({ outcome: "edited", delivery: { state: "delivered" } });
+    } finally {
+      await close();
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 5));
   });
 });
 

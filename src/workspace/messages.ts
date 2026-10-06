@@ -416,6 +416,36 @@ export interface RoomInvite {
   readonly name: string | null;
   /** `m.room.member` events in `join` state within the stripped state — heroes-limited, stated as such. */
   readonly joinedMemberCount: number;
+  /**
+   * guangshinhaha/duo#315: the invite event's own `reason` — where a
+   * colleague's client carries their first message to a duo, so the owner
+   * sees what is being asked before allowing it. Null when the invite gave
+   * none; absent on the pre-#315 shape (read as null).
+   */
+  readonly reason?: string | null;
+  /** guangshinhaha/duo#315: the invite event's `is_direct` flag — a one-to-one conversation, as the inviter's client marked it. Absent reads as false. */
+  readonly direct?: boolean;
+}
+
+/** The longest invite reason kept — a first message's preview, not the whole of a long one. */
+export const INVITE_REASON_MAX_CHARS = 500;
+
+/**
+ * guangshinhaha/duo#315: an invite event's `reason`, read as a preview —
+ * inviter-controlled text bound for the owner's screen, so control
+ * characters are dropped and the length capped. Null for anything that is
+ * not a non-blank string. Exported for the seam adapter, which reads the
+ * same field off a live SDK event (one parsing rule, two callers).
+ */
+export function inviteReasonOf(raw: unknown): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const cleaned = raw.replace(/[\p{Cc}\p{Cf}]/gu, (char) => (char === "\n" ? "\n" : "")).trim();
+  if (cleaned.length === 0) {
+    return null;
+  }
+  return cleaned.length > INVITE_REASON_MAX_CHARS ? `${cleaned.slice(0, INVITE_REASON_MAX_CHARS - 1)}…` : cleaned;
 }
 
 /**
@@ -439,11 +469,14 @@ export function invitesFromSync(rooms: RawSyncRooms, selfUserId: string): RoomIn
       const joinedMemberCount = events.filter(
         (event) => event.type === "m.room.member" && stringOrUndefined(contentOf(event)?.membership) === "join",
       ).length;
+      const inviteContent = contentOf(inviteEvent);
       const roomInvite: RoomInvite = {
         roomId,
         inviterId: inviteEvent.sender ?? null,
         name: stringOrUndefined(contentOf(nameEvent)?.name) ?? null,
         joinedMemberCount,
+        reason: inviteReasonOf(inviteContent?.reason),
+        direct: inviteContent?.is_direct === true,
       };
       return roomInvite;
     })

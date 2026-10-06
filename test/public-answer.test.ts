@@ -119,6 +119,8 @@ describe("answerPublicly — a granted topic is answered directly (#43 AC1)", ()
     expect(outcome.text).toContain("Five days per quarter, per policy.");
     expect(outcome.topicId).toBe("topic-leave");
     expect(outcome.sources.length).toBeGreaterThan(0);
+    // guangshinhaha/duo#313: answered, with no reason to pass anything on.
+    expect(getDraft(storePath, PASSPHRASE, outcome.draftId)).toMatchObject({ publicOutcome: "answered", passOnReason: null });
 
     const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
     expect(logged).toHaveLength(1);
@@ -165,6 +167,12 @@ describe("answerPublicly — an ungranted topic is not answered (#43 AC2)", () =
     const privateDraft = getDraft(storePath, PASSPHRASE, outcome.draftId);
     expect(privateDraft?.draftText).toBe("Five days per quarter, per policy.");
     expect(privateDraft?.escalated).toBe(false);
+    // guangshinhaha/duo#314: the row now says what the asker was told, and
+    // why — the attempt is the draft, the reason is the ungranted topic.
+    expect(privateDraft?.publicOutcome).toBe("passed_on");
+    expect(privateDraft?.passOnReason).toContain(`"topic-leave" isn't a topic you've let me answer on my own yet`);
+    // No provenance passed (the CLI): the owner's own draft, as before.
+    expect(privateDraft?.provenance).toEqual({ origin: "owner" });
 
     const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
     expect(logged).toHaveLength(1);
@@ -203,6 +211,48 @@ describe("answerPublicly — a refused subject is declined visibly (#43 AC3)", (
     const logged = listPublicAnswerLogEntries(storePath, PASSPHRASE);
     expect(logged).toHaveLength(1);
     expect(logged[0].outcome).toBe("declined_refused");
+    // guangshinhaha/duo#313/#314: declined, with the refusal's own reason.
+    const row = getDraft(storePath, PASSPHRASE, outcome.draftId);
+    expect(row?.publicOutcome).toBe("declined_refused");
+    expect(row?.passOnReason).toBe(row?.escalationReason);
+    expect(row?.passOnReason).toContain("refusal list");
+  });
+});
+
+describe("answerPublicly — a colleague's question carries where it came from (guangshinhaha/duo#314)", () => {
+  it("records the caller's provenance on the draft, and the escalation's own reason as why it was passed on", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    const provenance = {
+      origin: "channel" as const,
+      channelKind: "workspace",
+      askerRef: "@bob:workspace",
+      threadId: "!dm:workspace",
+      permalink: "https://matrix.to/#/!dm%3Aworkspace/%24q",
+    };
+    // An empty corpus: nothing to ground an answer in, so it escalates with no attempt.
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "who approves the new laptop budget",
+      cliAsker("@bob:workspace"),
+      createFakeEmbeddingProvider(),
+      undefined,
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+      undefined,
+      undefined,
+      provenance,
+    );
+    expect(outcome.kind).toBe("passed_on");
+    const row = getDraft(storePath, PASSPHRASE, outcome.draftId);
+    expect(row?.provenance).toEqual(provenance);
+    expect(row?.escalated).toBe(true);
+    expect(row?.draftText).toBeNull();
+    expect(row?.publicOutcome).toBe("passed_on");
+    expect(row?.passOnReason).toBe(row?.escalationReason);
+    expect(row?.passOnReason).toContain("no standing order or past exchange");
   });
 });
 

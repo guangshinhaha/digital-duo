@@ -309,6 +309,9 @@ function statusForError(error: Error): number {
     // state refusing the request, not a malformed one.
     case "DraftNotShapeableError":
     case "ShapingUnavailableError":
+    // guangshinhaha/duo#314: a duo whose id names no owner has nobody to
+    // bring into a conversation — the daemon's state, not the request.
+    case "NoOwnerToInviteError":
       return 409;
     case "BlankEditError":
     // #259 in guangshinhaha/duo: a dismissReason sent alongside any outcome
@@ -323,6 +326,9 @@ function statusForError(error: Error): number {
     // #176: a pasted transcript with no recognisable turn — the paste
     // adapter's own error names the format it expected.
     case "MalformedTranscriptError":
+    // guangshinhaha/duo#315: "always allow" on an invitation that isn't a
+    // person's one-to-one conversation — a request that can never be valid.
+    case "AlwaysAllowNotApplicableError":
       return 400;
     default:
       return 500;
@@ -405,14 +411,21 @@ function registerRoutes(
 
   app.get("/workspace/rooms", async () => ({ rooms: deps.workspace?.consentedRooms() ?? [] }));
 
-  app.post<{ Params: { roomId: string } }>("/workspace/invites/:roomId/allow", async (request, reply) => {
+  app.post<{ Params: { roomId: string }; Body: { always?: unknown } | undefined }>("/workspace/invites/:roomId/allow", async (request, reply) => {
     const workspace = deps.workspace;
     if (workspace === undefined) {
       reply.code(503).send(errorBody("workspace_not_configured", "Allowing a room invitation needs the workspace connection; this daemon has no workspace configured."));
       return;
     }
+    // guangshinhaha/duo#315: `always: true` is "Allow and always allow this
+    // person" — the same allow, plus the owner's standing yes to the inviter.
+    const always = (request.body ?? {}).always;
+    if (always !== undefined && typeof always !== "boolean") {
+      reply.code(400).send(errorBody("bad_request", "always must be a boolean"));
+      return;
+    }
     try {
-      return await workspace.allowInvite(request.params.roomId);
+      return await workspace.allowInvite(request.params.roomId, { always: always === true });
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
@@ -430,6 +443,39 @@ function registerRoutes(
       // say — no held invitation, no standing record (the executed exit
       // deleted it). What remains is a fresh GET /workspace/invites.
       reply.code(204).send();
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // guangshinhaha/duo#315: the people the owner said always-yes to, and
+  // taking one back. Owner-token gated like the rest of the surface.
+  app.get("/workspace/always-allowed", async () => ({ people: deps.workspace?.alwaysAllowed() ?? [] }));
+
+  app.delete<{ Params: { userId: string } }>("/workspace/always-allowed/:userId", async (request, reply) => {
+    const workspace = deps.workspace;
+    if (workspace === undefined) {
+      reply.code(503).send(errorBody("workspace_not_configured", "Changing who is always allowed needs the workspace connection; this daemon has no workspace configured."));
+      return;
+    }
+    try {
+      return workspace.forgetAlwaysAllowed(request.params.userId);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
+  });
+
+  // guangshinhaha/duo#314: brings the owner into a conversation their duo is
+  // in, to answer — as themselves — a question it passed to them. The duo
+  // can invite only its own owner (WorkspaceService.inviteOwner).
+  app.post<{ Params: { roomId: string } }>("/workspace/rooms/:roomId/invite-owner", async (request, reply) => {
+    const workspace = deps.workspace;
+    if (workspace === undefined) {
+      reply.code(503).send(errorBody("workspace_not_configured", "Joining a conversation your duo is in needs the workspace connection; this daemon has no workspace configured."));
+      return;
+    }
+    try {
+      return await workspace.inviteOwner(request.params.roomId);
     } catch (error) {
       reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
     }
@@ -768,8 +814,15 @@ function registerRoutes(
     }
   });
 
-  app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string; dismissReason?: string; alternative?: unknown } }>("/drafts/:id/outcome", async (request, reply) => {
-    const { outcome, sentText, dismissReason, alternative } = request.body;
+  app.post<{ Params: { id: string }; Body: { outcome: string; sentText?: string; dismissReason?: string; alternative?: unknown; ownerDelivered?: unknown } }>("/drafts/:id/outcome", async (request, reply) => {
+    const { outcome, sentText, dismissReason, alternative, ownerDelivered } = request.body;
+    // guangshinhaha/duo#314: the owner posted the text themselves (a
+    // workspace conversation, from their own account) — record it as
+    // delivered instead of handing it to an adapter. Strictly boolean.
+    if (ownerDelivered !== undefined && typeof ownerDelivered !== "boolean") {
+      reply.code(400).send(errorBody("bad_request", "ownerDelivered must be a boolean"));
+      return;
+    }
     // SETTABLE_DRAFT_OUTCOMES, not the full DRAFT_OUTCOMES: this is the
     // generic outcome-setting route, and escalation_answered must only
     // ever be written by standing-order-candidates.ts's own atomic call —
@@ -810,6 +863,7 @@ function registerRoutes(
         channelAdapters: deps.channelAdapters,
         dismissReason: dismissReason as DismissReason | undefined,
         alternative,
+        ownerDelivered,
       });
       // guangshinhaha/duo#261: deciding a held draft here, now, overrides
       // its schedule — release the hold so it never shows as still to come.

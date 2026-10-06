@@ -57,3 +57,18 @@ export function noEvidenceEscalationReason(): string {
 export function refusedSubjectEscalationReason(matchedRefusal: string): string {
   return `I'd escalate this one: it touches "${matchedRefusal}", which is on the refusal list (duo/refusals.md) — I won't reason about it at all.`;
 }
+
+/**
+ * guangshinhaha/duo#314: the pass-on that is not an escalation — the
+ * pipeline drafted an answer it was confident enough to show, but the
+ * topic is not one the owner lets it answer colleagues on by itself (no
+ * `auto` T0 cell, or no topic resolved at all). The draft row then holds
+ * the attempt, and this says why the colleague was told it went to the
+ * owner instead. Same first-person, owner-facing register as the
+ * escalation reasons above, because it lands in the same place.
+ */
+export function notGrantedPassOnReason(topicId: string | undefined): string {
+  return topicId === undefined
+    ? "I drafted an answer, but couldn't tie this question to a topic you've let me answer on my own — so I passed it to you instead of posting it. Check the draft, then send it or answer in your own words."
+    : `I drafted an answer, but "${topicId}" isn't a topic you've let me answer on my own yet — so I passed it to you instead of posting it. Check the draft, then send it or answer in your own words.`;
+}

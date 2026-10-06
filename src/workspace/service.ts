@@ -1,14 +1,18 @@
 import type { PublicAnswerOutcome } from "../permissions/public-answer.js";
 import {
+  forgetAlwaysAllowed,
   forgetRoomDecision,
+  readAlwaysAllowed,
   readRoomConsent,
+  recordAlwaysAllowed,
   recordRoomDecision,
   roomDecisionFor,
   RoomConsentNotFoundError,
+  type AlwaysAllowEntry,
   type RoomConsentEntry,
   type RoomConsentStatus,
 } from "./consent.js";
-import { workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
+import { duoOwnerUserIdOf, workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
 import type { RoomInvite } from "./messages.js";
 import { buildAnswerEvent, buildAttachmentRefusalEvent, buildFailedAnswerEvent } from "./payload.js";
 import { answerableQuestionFrom, type RoomDecisionLookup } from "./questions.js";
@@ -123,6 +127,20 @@ export interface WorkspaceServiceOptions {
 /** Where the consent record lives — the owner's `duo/` directory (consent.ts states why a file and not the store). */
 export interface WorkspaceConsentOptions {
   readonly duoDir: string;
+  /**
+   * guangshinhaha/duo#315: what a declined invitation tells the colleague —
+   * the leave's `reason`, in the daemon's fixed words (the wiring composes
+   * it with the owner's name). Absent is the bare, silent rejection.
+   */
+  readonly declineNotice?: string;
+}
+
+/** Thrown when the duo's own owner can't be named from its user id — nobody to bring into the conversation. Maps to 409. */
+export class NoOwnerToInviteError extends Error {
+  constructor(selfUserId: string) {
+    super(`The duo's user id ${JSON.stringify(selfUserId)} doesn't name an owner by the @duo-<owner> convention — there is nobody to invite`);
+    this.name = "NoOwnerToInviteError";
+  }
 }
 
 /**
@@ -142,6 +160,14 @@ export class NoPendingInviteError extends Error {
   constructor(roomId: string) {
     super(`No held invitation for room ${JSON.stringify(roomId)} — an allow or a refuse is a decision on an invitation the daemon is holding`);
     this.name = "NoPendingInviteError";
+  }
+}
+
+/** guangshinhaha/duo#315: "always allow" asked of an invitation that names no inviter or isn't one-to-one — a standing yes is to a person, for direct conversations only. Maps to 400. */
+export class AlwaysAllowNotApplicableError extends Error {
+  constructor(roomId: string) {
+    super(`The invitation to room ${JSON.stringify(roomId)} isn't a one-to-one conversation from a named person — "always allow" covers only those; allow it on its own instead`);
+    this.name = "AlwaysAllowNotApplicableError";
   }
 }
 
@@ -334,10 +360,16 @@ export class WorkspaceService {
    * successful join propagates loudly (disk trouble should be loud): the
    * invite stays held and a retry re-joins — Matrix joins are idempotent.
    */
-  async allowInvite(roomId: string): Promise<RoomConsentEntry> {
+  async allowInvite(roomId: string, options: { readonly always?: boolean } = {}): Promise<RoomConsentEntry> {
     const invite = this.requireHeldInvite(roomId);
     const duoDir = this.requireConsentDir("allow the invitation");
     const transport = this.requireLiveTransport("allowing the invitation");
+    if (options.always === true && (invite.inviterId === null || invite.direct !== true)) {
+      // guangshinhaha/duo#315: a standing yes is to a PERSON for one-to-one
+      // conversations — refused before anything happens when the invitation
+      // names nobody or isn't one-to-one, so the owner's Allow never half-lands.
+      throw new AlwaysAllowNotApplicableError(roomId);
+    }
     await transport.joinRoom(roomId);
     const entry: RoomConsentEntry = {
       roomId,
@@ -348,6 +380,9 @@ export class WorkspaceService {
       decidedAt: new Date().toISOString(),
     };
     recordRoomDecision(duoDir, entry);
+    if (options.always === true && invite.inviterId !== null) {
+      recordAlwaysAllowed(duoDir, invite.inviterId);
+    }
     this.pendingInvitesById.delete(roomId);
     // A fresh allow is a fresh consent act — the owner's newer word. It
     // retires the in-flight memory of any earlier withdrawal for this room
@@ -380,7 +415,70 @@ export class WorkspaceService {
       decidedAt: new Date().toISOString(),
     });
     this.pendingInvitesById.delete(roomId);
-    await this.exitRoom(roomId);
+    // guangshinhaha/duo#315: the colleague is told, politely, on the leave
+    // itself — the one place a rejected invitation can carry words.
+    await this.exitRoom(roomId, this.options.consent?.declineNotice);
+  }
+
+  /** guangshinhaha/duo#315: the people the owner has said always yes to. Empty when no consent surface is configured. */
+  alwaysAllowed(): readonly AlwaysAllowEntry[] {
+    const duoDir = this.options.consent?.duoDir;
+    return duoDir === undefined ? [] : readAlwaysAllowed(duoDir);
+  }
+
+  /** guangshinhaha/duo#315: takes a standing yes back — the next invitation from that person is held for the owner again. */
+  forgetAlwaysAllowed(userId: string): { removed: boolean; people: readonly AlwaysAllowEntry[] } {
+    return forgetAlwaysAllowed(this.requireConsentDir("take back an always-allow"), userId);
+  }
+
+  /**
+   * guangshinhaha/duo#314: brings the duo's own owner into a conversation
+   * the duo is in, so they can answer — in that conversation, as
+   * themselves — a question it passed to them. The invitee is fixed by the
+   * id grammar (`@duo-<owner>` → `@<owner>`): there is no parameter that
+   * could make the duo invite anyone else. Whether the room exists and the
+   * duo may invite there is the homeserver's to say; its refusal propagates.
+   */
+  async inviteOwner(roomId: string): Promise<{ readonly roomId: string; readonly userId: string }> {
+    const ownerUserId = duoOwnerUserIdOf(this.options.settings.userId);
+    if (ownerUserId === null) {
+      throw new NoOwnerToInviteError(this.options.settings.userId);
+    }
+    const transport = this.requireLiveTransport("inviting the owner");
+    await transport.inviteToRoom(roomId, ownerUserId);
+    return { roomId, userId: ownerUserId };
+  }
+
+  /**
+   * guangshinhaha/duo#315: held invitations the owner already said yes to
+   * by standing decision — a one-to-one conversation from a person on the
+   * always-allow list — are allowed now, exactly as the owner's own tap
+   * would. Runs on every connect (invitations that arrived while the
+   * connection was down) and on each new invitation while connected. A
+   * failure leaves the invitation held for the owner, logged — never lost.
+   */
+  private async allowStandingInvites(): Promise<void> {
+    const duoDir = this.options.consent?.duoDir;
+    if (duoDir === undefined || this.stateValue.phase !== "connected") {
+      return;
+    }
+    let people: Set<string>;
+    try {
+      people = new Set(readAlwaysAllowed(duoDir).map((entry) => entry.userId));
+    } catch (error) {
+      this.consoleError("reading the always-allow record failed — invitations stay held for the owner", error);
+      return;
+    }
+    for (const invite of this.pendingInvites()) {
+      if (invite.direct !== true || invite.inviterId === null || !people.has(invite.inviterId)) {
+        continue;
+      }
+      try {
+        await this.allowInvite(invite.roomId);
+      } catch (error) {
+        this.consoleError(`allowing the invitation to room ${invite.roomId} from an always-allowed person failed (it stays held)`, error);
+      }
+    }
   }
 
   /**
@@ -412,13 +510,13 @@ export class WorkspaceService {
   }
 
   /** The leave/reject half every exit shares — fail-soft on purpose (the decision is already recorded; the exit retries on connect). */
-  private async exitRoom(roomId: string): Promise<void> {
+  private async exitRoom(roomId: string, reason?: string): Promise<void> {
     const transport = this.transport;
     if (transport === undefined || this.stateValue.phase !== "connected") {
       return;
     }
     try {
-      await transport.leaveRoom(roomId);
+      await (reason === undefined ? transport.leaveRoom(roomId) : transport.leaveRoom(roomId, reason));
     } catch (error) {
       this.consoleError(
         `leaving workspace room ${roomId} failed (the decision is recorded; the leave retries on the next successful connect)`,
@@ -455,7 +553,8 @@ export class WorkspaceService {
       return;
     }
     for (const entry of exits) {
-      await this.exitRoom(entry.roomId);
+      // A refusal still owes the colleague its polite word on retry (#315); a withdrawal never carried one.
+      await this.exitRoom(entry.roomId, entry.status === "refused" ? this.options.consent?.declineNotice : undefined);
     }
   }
 
@@ -628,6 +727,7 @@ export class WorkspaceService {
     this.startPresenceRefresh();
     void this.refreshMembers();
     void this.settleRoomExits();
+    void this.allowStandingInvites();
   }
 
   /**
@@ -760,6 +860,9 @@ export class WorkspaceService {
       `workspace invitation held for the owner's decision — room ${invite.roomId}`,
       new Error(`${facts}; the duo joins only on an explicit allow (see the workspace consent surface)`),
     );
+    // guangshinhaha/duo#315: unless the owner already said always-yes to
+    // this person — then it is allowed now, as their own tap would.
+    void this.allowStandingInvites();
   }
 
   /**

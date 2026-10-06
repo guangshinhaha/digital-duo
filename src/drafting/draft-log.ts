@@ -65,6 +65,21 @@ export const DISMISS_REASONS = ["wrong_facts", "wrong_tone", "shouldnt_answer", 
 export type DismissReason = (typeof DISMISS_REASONS)[number];
 
 /**
+ * What the ASKER was told, for a draft a colleague's question produced
+ * through public answering (guangshinhaha/duo#313/#314) — the same three
+ * kinds `answerPublicly` returns (`permissions/public-answer.ts`). Recorded
+ * on the draft row because the row alone could not say it: a question
+ * passed on only because its topic isn't granted to answer on its own is a
+ * plain, un-escalated draft here (the pipeline was confident), yet the asker
+ * was told it went to the owner — so a surface reading `escalated` alone
+ * would show the owner a "draft ready" for a question a colleague is
+ * waiting on them to answer. Null for every draft no colleague asked (the
+ * owner's own drafts, the eval) and for any row recorded before this existed.
+ */
+export const PUBLIC_DRAFT_OUTCOMES = ["answered", "passed_on", "declined_refused"] as const;
+export type PublicDraftOutcome = (typeof PUBLIC_DRAFT_OUTCOMES)[number];
+
+/**
  * Where a draft came from (#169), as structured data rather than free
  * text. `threadContext` stays exactly what it is — grounding text for the
  * model — because a free-text string can never answer "which thread, in
@@ -261,6 +276,17 @@ export interface DraftRecord {
   readonly chosenAlternative: number | null;
   /** Every shape applied to this draft, oldest first (guangshinhaha/duo#258) — empty when none. */
   readonly shapes: readonly DraftShape[];
+  /** What the asker was told (guangshinhaha/duo#313/#314) — see `PublicDraftOutcome`. Null when no colleague asked. */
+  readonly publicOutcome: PublicDraftOutcome | null;
+  /**
+   * Why the question went to the owner instead of being answered
+   * (guangshinhaha/duo#314), in the daemon's own words — set exactly when
+   * `publicOutcome` is `"passed_on"` or `"declined_refused"`. For an
+   * escalation it is the pipeline's own `escalationReason`; for a question
+   * passed on only because its topic isn't granted, it says so (the draft
+   * itself is then the duo's attempt). Null otherwise.
+   */
+  readonly passOnReason: string | null;
 }
 
 /**
@@ -306,6 +332,11 @@ const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: st
   // alternatives and no chosen index.
   { column: "alternatives", ddl: "ALTER TABLE drafts ADD COLUMN alternatives TEXT" },
   { column: "chosen_alternative", ddl: "ALTER TABLE drafts ADD COLUMN chosen_alternative INTEGER" },
+  // Both NULL on a pre-existing row (guangshinhaha/duo#313/#314): nothing
+  // records what an asker was told before this existed, and rowToDraft
+  // reads NULL as "no colleague asked" rather than guessing.
+  { column: "public_outcome", ddl: "ALTER TABLE drafts ADD COLUMN public_outcome TEXT" },
+  { column: "pass_on_reason", ddl: "ALTER TABLE drafts ADD COLUMN pass_on_reason TEXT" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -336,7 +367,9 @@ export function ensureDraftLogSchema(db: Database): void {
       recipient_name TEXT,
       adapted_for_recipient INTEGER NOT NULL DEFAULT 0,
       alternatives TEXT,
-      chosen_alternative INTEGER
+      chosen_alternative INTEGER,
+      public_outcome TEXT,
+      pass_on_reason TEXT
     ) STRICT
   `);
 
@@ -566,6 +599,37 @@ export function recordDeliveryOutcome(
   });
 }
 
+/**
+ * Records what an asker was told for the draft their question produced
+ * (guangshinhaha/duo#313/#314) — written once, by `answerPublicly`, right
+ * after it decides. A separate write rather than an `appendDraft` field
+ * because the pipeline writes the row before public answering decides (the
+ * trust check runs on the pipeline's result), and the pipeline is shared
+ * with callers no colleague is behind. Throws `DraftNotFoundError` for an
+ * unknown id, same as the other row writers.
+ */
+export function recordPublicOutcome(
+  storePath: string,
+  passphrase: string,
+  draftId: string,
+  outcome: PublicDraftOutcome,
+  passOnReason: string | null,
+): void {
+  withDatabase(storePath, passphrase, true, (db) => {
+    ensureDraftLogSchema(db);
+    const result = db
+      .prepare(`UPDATE drafts SET public_outcome = ?, pass_on_reason = ? WHERE id = ?`)
+      .run(outcome, outcome === "answered" ? null : passOnReason, draftId);
+    if (result.changes === 0) {
+      throw new DraftNotFoundError(draftId);
+    }
+  });
+}
+
+function parsePublicOutcome(raw: string | null): PublicDraftOutcome | null {
+  return raw !== null && (PUBLIC_DRAFT_OUTCOMES as readonly string[]).includes(raw) ? (raw as PublicDraftOutcome) : null;
+}
+
 interface DraftRow {
   id: string;
   question: string;
@@ -591,6 +655,8 @@ interface DraftRow {
   adapted_for_recipient: number;
   alternatives: string | null;
   chosen_alternative: number | null;
+  public_outcome: string | null;
+  pass_on_reason: string | null;
 }
 
 /**
@@ -750,6 +816,8 @@ function rowToDraft(row: DraftRow, shapes: readonly DraftShape[] = []): DraftRec
     alternatives: parseAlternatives(row.alternatives, row.outcome, row.chosen_alternative),
     chosenAlternative: row.chosen_alternative,
     shapes,
+    publicOutcome: parsePublicOutcome(row.public_outcome),
+    passOnReason: row.pass_on_reason,
   };
 }
 

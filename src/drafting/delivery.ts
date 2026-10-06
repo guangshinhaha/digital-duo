@@ -140,6 +140,14 @@ export async function recordOutcomeAndDeliver(
      * reads as not chosen.
      */
     readonly alternative?: number;
+    /**
+     * guangshinhaha/duo#314: the owner already posted this text themselves,
+     * from their own account, in the conversation the question came from
+     * (a workspace room — the duo never posts the owner's words). The
+     * delivery is recorded as delivered without handing anything to an
+     * adapter; there is nothing left to send. Ignored for "discarded".
+     */
+    readonly ownerDelivered?: boolean;
   } = {},
 ): Promise<ClassifyAndQueueResult | undefined> {
   const existing = getDraft(storePath, passphrase, draftId);
@@ -173,6 +181,14 @@ export async function recordOutcomeAndDeliver(
     return result;
   }
   const draft = getDraft(storePath, passphrase, draftId);
+  if (draft && options.ownerDelivered === true) {
+    // The owner's own post IS the delivery; an owner-asked draft still
+    // records nothing, exactly as deliverSentDraft treats it.
+    if (draft.provenance.origin === "channel") {
+      recordDeliveryOutcome(storePath, passphrase, draft.id, { state: "delivered" });
+    }
+    return result;
+  }
   if (draft) {
     await deliverSentDraft(storePath, passphrase, draft, sentText ?? draft.draftText ?? undefined, options.channelAdapters ?? []);
   }

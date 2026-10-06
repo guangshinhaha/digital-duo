@@ -1,4 +1,5 @@
 import type { RoomConsentStatus } from "./consent.js";
+import { duoOwnerUserIdOf } from "./directory.js";
 import { authorFromUserId, isDuoAuthor } from "./messages.js";
 import type { WorkspaceCandidateMessage, WorkspaceQuestion } from "./transport.js";
 
@@ -34,6 +35,16 @@ export function directQuestionFrom(message: WorkspaceCandidateMessage, selfUserI
     return null;
   }
   const joined = new Set(message.joinedMemberIds);
+  // guangshinhaha/duo#314: the duo's OWN owner, brought into the
+  // conversation to answer a question the duo passed to them, doesn't turn
+  // it into a group room — it is still one colleague and that colleague's
+  // conversation with this duo. The owner's own messages there are never
+  // questions to their duo: the sender check below fails for them, because
+  // once the owner is set aside the sender must be the one other member.
+  const ownerUserId = duoOwnerUserIdOf(selfUserId);
+  if (ownerUserId !== null && message.senderId !== ownerUserId) {
+    joined.delete(ownerUserId);
+  }
   // A direct room: the duo and exactly one other member, both joined. More
   // members than that is a group room (#192's consent surface); fewer means
   // a room dissolving under us.

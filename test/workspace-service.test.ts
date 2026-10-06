@@ -142,6 +142,8 @@ class HangingConnectTransport implements WorkspaceTransport {
   async joinRoom(): Promise<void> {}
 
   async leaveRoom(): Promise<void> {}
+
+  async inviteToRoom(): Promise<void> {}
 }
 
 /**

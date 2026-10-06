@@ -45,6 +45,10 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
   inviteDeliveries = 0;
   joinCalls: string[] = [];
   leaveCalls: string[] = [];
+  /** The reason each accepted leave carried (guangshinhaha/duo#315), index-aligned with leaveCalls — undefined for a bare leave. */
+  leaveReasons: (string | undefined)[] = [];
+  /** Every invite the duo issued (guangshinhaha/duo#314). */
+  inviteCalls: { roomId: string; userId: string }[] = [];
   readonly sentAnswers: { roomId: string; content: AnswerEventContent }[] = [];
   /** The membership the fake homeserver holds — what a join added and a leave removed. */
   readonly joinedRooms = new Set<string>();
@@ -236,7 +240,7 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
     this.joinedRooms.add(roomId);
   }
 
-  async leaveRoom(roomId: string): Promise<void> {
+  async leaveRoom(roomId: string, reason?: string): Promise<void> {
     if (!this.connected) {
       throw new Error("fake: not connected");
     }
@@ -246,6 +250,14 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
       throw error;
     }
     this.leaveCalls.push(roomId);
+    this.leaveReasons.push(reason);
     this.joinedRooms.delete(roomId);
+  }
+
+  async inviteToRoom(roomId: string, userId: string): Promise<void> {
+    if (!this.connected) {
+      throw new Error("fake: not connected");
+    }
+    this.inviteCalls.push({ roomId, userId });
   }
 }
