@@ -10,6 +10,7 @@ import { isVisibleToClearance } from "../permissions/classification.js";
 import { ensureQaPairsSchema } from "../derivation/qa-pairs.js";
 import { ensureRulesSchema, readRuleRow, type Rule } from "../derivation/rules.js";
 import { findConflictingRefusal } from "../trust/refusals.js";
+import type { RecipientVoice } from "./recipient-voice.js";
 
 /** One piece of past evidence the draft can cite — a retrieved record, with a real cosine similarity to the question (not just an ordinal rank). */
 export interface DraftEvidenceItem {
@@ -47,6 +48,15 @@ export interface DraftContext {
   readonly freshestEvidenceTimestamp: string | null;
   /** Raw text of duo/voice.md, or a plain "not enough data" placeholder when it doesn't exist yet — conditions generation, never invented. */
   readonly voiceText: string;
+  /**
+   * How the owner writes to this draft's recipient specifically (duo#262) —
+   * present only when the pipeline was told who the draft is for AND enough
+   * approved sends to them exist (`drafting/recipient-voice.ts`). Refines
+   * `voiceText`, never replaces it. Set by `draftReply`, not here: this
+   * function retrieves evidence for a question, and who the reply goes to
+   * has no bearing on that.
+   */
+  readonly recipientVoice?: RecipientVoice;
   readonly usedEmbeddings: boolean;
   readonly warning?: string;
 }

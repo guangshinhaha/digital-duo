@@ -114,6 +114,19 @@ export type DraftDelivery =
   | { readonly state: "failed"; readonly reason: string };
 
 /**
+ * Who a draft is addressed to (guangshinhaha/duo#262) — the person (or, for a
+ * group conversation, the room) the owner would be writing to. Optional
+ * everywhere: an owner-asked draft with no stated recipient is still a draft.
+ * `id` is the stable key per-recipient voice adaptation groups sends by
+ * (`drafting/recipient-voice.ts`); `name` is display-only ("Tuned for how you
+ * write to Wei") and also lets the adaptation measure first-name use.
+ */
+export interface DraftRecipient {
+  readonly id: string;
+  readonly name: string | null;
+}
+
+/**
  * One `duo draft` call, in full — durable enough for the correction loop
  * and the offline eval (v1-tech-design.md §1.9/§1.10) to both read later,
  * matching #48-#51's precedent of building a permission/audit surface
@@ -184,6 +197,10 @@ export interface DraftRecord {
    * guangshinhaha/duo) has a column to read once it exists.
    */
   readonly dismissReason: DismissReason | null;
+  /** Who this draft was addressed to (duo#262) — see `DraftRecipient`. Null when none was stated, and for any draft recorded before this field existed. Its sent/edited text is what per-recipient adaptation learns from. */
+  readonly recipient: DraftRecipient | null;
+  /** True when this draft's prompt was conditioned on how the owner writes to `recipient` (duo#262) — what a Why panel reads to say "Tuned for how you write to Wei". False for every draft recorded before this field existed. */
+  readonly adaptedForRecipient: boolean;
 }
 
 /**
@@ -218,6 +235,12 @@ const DRAFT_LOG_MIGRATIONS: readonly { readonly column: string; readonly ddl: st
   // with a reason — rowToDraft reads a NULL dismiss_reason as simply absent
   // (guangshinhaha/duo#259).
   { column: "dismiss_reason", ddl: "ALTER TABLE drafts ADD COLUMN dismiss_reason TEXT" },
+  // duo#262: NULL recipient on a pre-existing row (no recipient was ever
+  // stated), and 0 for "adapted" — a draft written before adaptation existed
+  // was, honestly, never adapted.
+  { column: "recipient_ref", ddl: "ALTER TABLE drafts ADD COLUMN recipient_ref TEXT" },
+  { column: "recipient_name", ddl: "ALTER TABLE drafts ADD COLUMN recipient_name TEXT" },
+  { column: "adapted_for_recipient", ddl: "ALTER TABLE drafts ADD COLUMN adapted_for_recipient INTEGER NOT NULL DEFAULT 0" },
 ];
 
 export function ensureDraftLogSchema(db: Database): void {
@@ -243,7 +266,10 @@ export function ensureDraftLogSchema(db: Database): void {
       delivery_state TEXT,
       delivery_reason TEXT,
       delivery_event_id TEXT,
-      dismiss_reason TEXT
+      dismiss_reason TEXT,
+      recipient_ref TEXT,
+      recipient_name TEXT,
+      adapted_for_recipient INTEGER NOT NULL DEFAULT 0
     ) STRICT
   `);
 
@@ -277,6 +303,10 @@ export interface AppendDraftInput {
    * adapters are the callers that set it.
    */
   readonly provenance?: DraftProvenance;
+  /** Who the draft is addressed to (duo#262) — see `DraftRecipient`. Optional; omitted stores NULL. */
+  readonly recipient?: DraftRecipient | null;
+  /** Whether generation was conditioned on the recipient's learned style (duo#262). Optional; defaults to `false`. */
+  readonly adaptedForRecipient?: boolean;
 }
 
 /** Appends one draft (answered or escalated) and returns its id. */
@@ -287,8 +317,8 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
     ensureDraftLogSchema(db);
     db.prepare(
       `
-      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold, provenance)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+      INSERT INTO drafts (id, question, thread_context, draft_text, escalated, escalation_reason, confidence_score, sources, created_at, outcome, outcome_recorded_at, refused, escalation_threshold, provenance, recipient_ref, recipient_name, adapted_for_recipient)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
     `,
     ).run(
       id,
@@ -303,6 +333,9 @@ export function appendDraft(storePath: string, passphrase: string, input: Append
       input.refused ? 1 : 0,
       input.escalationThreshold ?? DEFAULT_CONFIDENCE_ESCALATION_THRESHOLD,
       input.provenance ? JSON.stringify(input.provenance) : null,
+      input.recipient?.id ?? null,
+      input.recipient?.name ?? null,
+      input.adaptedForRecipient ? 1 : 0,
     );
   });
   return id;
@@ -428,6 +461,9 @@ interface DraftRow {
   delivery_reason: string | null;
   delivery_event_id: string | null;
   dismiss_reason: string | null;
+  recipient_ref: string | null;
+  recipient_name: string | null;
+  adapted_for_recipient: number;
 }
 
 /**
@@ -503,6 +539,8 @@ function rowToDraft(row: DraftRow): DraftRecord {
             ? { state: "failed", reason: row.delivery_reason ?? "delivery failed" }
             : null,
     dismissReason: parseDismissReason(row.dismiss_reason),
+    recipient: row.recipient_ref !== null ? { id: row.recipient_ref, name: row.recipient_name } : null,
+    adaptedForRecipient: row.adapted_for_recipient === 1,
   };
 }
 

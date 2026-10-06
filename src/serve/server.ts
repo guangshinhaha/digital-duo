@@ -11,7 +11,17 @@ import { approveCandidate, getReviewCandidate, listReviewCandidates, rejectCandi
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
-import { getDraft, listDrafts, DISMISS_REASONS, DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES, type DismissReason, type DraftOutcome, type SettableDraftOutcome } from "../drafting/draft-log.js";
+import {
+  getDraft,
+  listDrafts,
+  DISMISS_REASONS,
+  DRAFT_OUTCOMES,
+  SETTABLE_DRAFT_OUTCOMES,
+  type DismissReason,
+  type DraftOutcome,
+  type DraftRecipient,
+  type SettableDraftOutcome,
+} from "../drafting/draft-log.js";
 import { describeChannels, recordOutcomeAndDeliver, type ChannelAdapter } from "../drafting/delivery.js";
 import { muteChannel, muteThread, readMutedPolicy, unmuteChannel, unmuteThread } from "../drafting/channel-mutes.js";
 import { draftReply } from "../drafting/pipeline.js";
@@ -204,6 +214,33 @@ function readMuteTarget(body: { channel?: unknown; threadId?: unknown }): { chan
     throw new BadRequestError(`threadId must not contain "/" — it scopes a thread within a channel — got ${JSON.stringify(threadId)}`);
   }
   return { channel, threadId };
+}
+
+/** Longest recipient id or name POST /drafts accepts — a Matrix id or an email fits with room to spare; anything longer is not an identity. */
+const MAX_RECIPIENT_FIELD_LENGTH = 256;
+
+/**
+ * Validates POST /drafts' optional `recipient` (guangshinhaha/duo#262):
+ * omitted or null means "no particular person"; otherwise an object with a
+ * non-empty string `id` (the key adaptation groups sends by) and an
+ * optional string `name` for display.
+ */
+function parseDraftRecipient(raw: unknown): DraftRecipient | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BadRequestError("recipient, when present, must be an object: { id, name? }");
+  }
+  const { id, name } = raw as { id?: unknown; name?: unknown };
+  if (typeof id !== "string" || id.trim().length === 0 || id.length > MAX_RECIPIENT_FIELD_LENGTH) {
+    throw new BadRequestError(`recipient.id is required and must be a non-empty string of at most ${MAX_RECIPIENT_FIELD_LENGTH} characters`);
+  }
+  if (name !== undefined && name !== null && (typeof name !== "string" || name.length > MAX_RECIPIENT_FIELD_LENGTH)) {
+    throw new BadRequestError(`recipient.name, when present, must be a string of at most ${MAX_RECIPIENT_FIELD_LENGTH} characters`);
+  }
+  const trimmedName = typeof name === "string" && name.trim().length > 0 ? name.trim() : null;
+  return { id: id.trim(), name: trimmedName };
 }
 
 /**
@@ -452,10 +489,22 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
   // that case, deliberately deferred here (see the PR description) so a
   // synchronous, fully-tested route ships now rather than a half-tested
   // job queue.
-  app.post<{ Body: { question: string; threadContext?: string | null } }>("/drafts", async (request, reply) => {
+  app.post<{ Body: { question: string; threadContext?: string | null; recipient?: unknown } }>("/drafts", async (request, reply) => {
     const { question, threadContext } = request.body;
     if (!question) {
       reply.code(400).send(errorBody("bad_request", "question is required"));
+      return;
+    }
+    // duo#262: optional — who the reply is for, so the draft can be tuned to
+    // how the owner writes to them and the eventual send teaches that.
+    let recipient: DraftRecipient | undefined;
+    try {
+      recipient = parseDraftRecipient(request.body.recipient);
+    } catch (error) {
+      if (!(error instanceof BadRequestError)) {
+        throw error;
+      }
+      reply.code(400).send(errorBody("bad_request", error.message));
       return;
     }
     const result = await draftReply(
@@ -467,6 +516,9 @@ function registerRoutes(app: FastifyInstance, deps: ServeDeps, draftReady: Draft
       deps.embeddingProvider,
       deps.inferenceProvider,
       deps.confidenceConfig,
+      undefined, // no clearance ceiling: the owner's own draft
+      undefined, // no attachments on this path
+      recipient,
     );
     // 201, not 202: this is synchronous (see the comment above) and a
     // draft-log row now exists either way (draftReply always writes
