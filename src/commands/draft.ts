@@ -56,14 +56,14 @@ export async function runRecordDraftOutcome(
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
   const provider = tryResolveProvider(config);
   const classifier = provider ? createLlmEditClassifier(provider) : undefined;
-  return recordOutcomeAndDeliver(config.storePath, passphrase, draftId, outcome, sentText, { classifier });
+  return recordOutcomeAndDeliver(config.storePath, passphrase, draftId, outcome, sentText, { classifier, duoDir: config.duoDir });
 }
 
 /** Implements `duo draft-answer <draftId> <answer>` (#34 AC3): turns an escalation the owner knows the answer to into a queued standing-order candidate. */
 export function runRecordEscalationAnswer(draftId: string, answerText: string, config: DuoConfig, env: NodeJS.ProcessEnv = process.env): string {
   requireStoreExists(config.storePath);
   const passphrase = resolveOrCreatePassphrase(config.storePath, env);
-  return queueStandingOrderCandidate(config.storePath, passphrase, draftId, answerText);
+  return queueStandingOrderCandidate(config.storePath, passphrase, draftId, answerText, config.duoDir);
 }
 
 /**

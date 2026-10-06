@@ -1,10 +1,11 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { useTempDir } from "./helpers/temp-dir.js";
-import { appendDraft, DraftNotFoundError } from "../src/drafting/draft-log.js";
+import { appendDraft, DraftNotFoundError, type DraftProvenance } from "../src/drafting/draft-log.js";
 import { classifyAndQueueEdit, NoDraftTextError } from "../src/corrections/classify.js";
 import { getCorrectionCandidate, listCorrectionCandidates, queueCorrectionCandidate, requirePendingCandidate, setCandidateStatus } from "../src/corrections/queue.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
+import { markRoomOffTheRecord } from "../src/workspace/off-the-record.js";
 
 const tempDir = useTempDir();
 const PASSPHRASE = "pw";
@@ -15,7 +16,7 @@ function initStore(): string {
   return storePath;
 }
 
-function seedDraft(storePath: string, question: string, draftText: string): string {
+function seedDraft(storePath: string, question: string, draftText: string, provenance?: DraftProvenance): string {
   return appendDraft(storePath, PASSPHRASE, {
     question,
     threadContext: null,
@@ -24,8 +25,17 @@ function seedDraft(storePath: string, question: string, draftText: string): stri
     escalationReason: null,
     confidenceScore: 0.9,
     sources: [],
+    provenance,
   });
 }
+
+const WORKSPACE_PROVENANCE = (roomId: string): DraftProvenance => ({
+  origin: "channel",
+  channelKind: "workspace",
+  askerRef: "@bob:workspace",
+  threadId: roomId,
+  permalink: null,
+});
 
 describe("classifyAndQueueEdit — every candidate stores the draft, the sent text, and the question (#37 AC checklist)", () => {
   it("queues one style candidate for a style-only edit, carrying the full triple", async () => {
@@ -127,6 +137,38 @@ describe("classifyAndQueueEdit — every candidate stores the draft, the sent te
 
     expect(result.queuedKinds).toEqual([]);
     expect(listCorrectionCandidates(storePath, PASSPHRASE, "pending")).toEqual([]);
+  });
+});
+
+describe("classifyAndQueueEdit — guangshinhaha/duo#274: a room marked off the record is never learned from", () => {
+  it("still reports the true classification, but queues nothing, for a draft in an off-the-record room", async () => {
+    const storePath = initStore();
+    const duoDir = tempDir();
+    const draftId = seedDraft(storePath, "when is the meeting?", "the meeting is on tuesday at 3pm in the main office", WORKSPACE_PROVENANCE("!off:workspace"));
+    markRoomOffTheRecord(duoDir, "!off:workspace");
+
+    const result = await classifyAndQueueEdit(storePath, PASSPHRASE, draftId, "meeting tuesday 3pm main office", undefined, duoDir);
+    expect(result.classification).toBe("style");
+    expect(result.queuedKinds).toEqual([]);
+    expect(listCorrectionCandidates(storePath, PASSPHRASE)).toEqual([]);
+  });
+
+  it("queues normally for a room that is not off the record, even when duoDir is supplied", async () => {
+    const storePath = initStore();
+    const duoDir = tempDir();
+    const draftId = seedDraft(storePath, "when is the meeting?", "the meeting is on tuesday at 3pm in the main office", WORKSPACE_PROVENANCE("!on:workspace"));
+
+    const result = await classifyAndQueueEdit(storePath, PASSPHRASE, draftId, "meeting tuesday 3pm main office", undefined, duoDir);
+    expect(result.queuedKinds).toEqual(["style"]);
+    expect(listCorrectionCandidates(storePath, PASSPHRASE)).toHaveLength(1);
+  });
+
+  it("queues normally when duoDir is omitted — pre-#274 behaviour, byte-identical", async () => {
+    const storePath = initStore();
+    const draftId = seedDraft(storePath, "when is the meeting?", "the meeting is on tuesday at 3pm in the main office", WORKSPACE_PROVENANCE("!off:workspace"));
+
+    const result = await classifyAndQueueEdit(storePath, PASSPHRASE, draftId, "meeting tuesday 3pm main office");
+    expect(result.queuedKinds).toEqual(["style"]);
   });
 });
 

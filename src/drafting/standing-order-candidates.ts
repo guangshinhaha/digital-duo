@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../store/store.js";
 import { withDatabase } from "../store/store.js";
-import { DraftNotFoundError, ensureDraftLogSchema, getDraft } from "./draft-log.js";
+import { isRoomOffTheRecord } from "../workspace/off-the-record.js";
+import { DraftNotFoundError, ensureDraftLogSchema, getDraft, roomIdForDraft } from "./draft-log.js";
 
 /**
  * #34 AC3: "an escalation the owner knows the answer to" — answering it on
@@ -68,6 +69,20 @@ export class DraftIsRefusedError extends Error {
 }
 
 /**
+ * guangshinhaha/duo#274: thrown when the draft's own conversation is marked
+ * off the record — the owner's "don't learn from this" boundary, same rank
+ * as a refusal (`DraftIsRefusedError`): the answer stands (the draft's
+ * outcome is not what this guards), but it must never become a
+ * standing-order candidate, and therefore never a rule.
+ */
+export class RoomOffTheRecordError extends Error {
+  constructor(draftId: string, roomId: string) {
+    super(`Draft "${draftId}" belongs to room "${roomId}", which is off the record — the owner's duo does not learn from it`);
+    this.name = "RoomOffTheRecordError";
+  }
+}
+
+/**
  * Queues a standing-order candidate from the owner's own answer to an
  * escalated draft. Looks the draft up first — by id, not by trusting the
  * caller's own copy of its question — both to get the exact original
@@ -84,8 +99,17 @@ export class DraftIsRefusedError extends Error {
  * dedup shape `corrections/queue.ts`'s `queueCorrectionCandidate` already
  * uses for the same reason. The *text* of a resubmission is ignored on a
  * repeat call — the first answer queued is the one of record.
+ *
+ * `duoDir` is optional (guangshinhaha/duo#274): omitted, this is the exact
+ * pre-#274 behaviour (every caller that has no `duo/` directory to check
+ * against — the eval harness, tests). Supplied, a draft whose conversation
+ * is marked off the record refuses with `RoomOffTheRecordError` before
+ * anything is queued or the draft's outcome is touched — the owner's "don't
+ * learn from this" boundary is checked before the refused-escalation one
+ * below, for the same reason `DraftIsRefusedError` is checked early: this
+ * must never silently create a standing-order candidate.
  */
-export function queueStandingOrderCandidate(storePath: string, passphrase: string, draftId: string, answerText: string): string {
+export function queueStandingOrderCandidate(storePath: string, passphrase: string, draftId: string, answerText: string, duoDir?: string): string {
   const draft = getDraft(storePath, passphrase, draftId);
   if (!draft) {
     throw new DraftNotFoundError(draftId);
@@ -95,6 +119,12 @@ export function queueStandingOrderCandidate(storePath: string, passphrase: strin
   }
   if (draft.refused) {
     throw new DraftIsRefusedError(draftId);
+  }
+  if (duoDir !== undefined) {
+    const roomId = roomIdForDraft(draft);
+    if (roomId !== null && isRoomOffTheRecord(duoDir, roomId)) {
+      throw new RoomOffTheRecordError(draftId, roomId);
+    }
   }
 
   const id = randomUUID();
@@ -213,4 +243,28 @@ export function requirePendingStandingOrderCandidate(db: Database, id: string): 
 export function setStandingOrderCandidateStatus(db: Database, id: string, status: "approved" | "rejected"): void {
   ensureStandingOrderCandidateSchema(db);
   db.prepare(`UPDATE standing_order_candidates SET status = ?, reviewed_at = ? WHERE id = ?`).run(status, new Date().toISOString(), id);
+}
+
+/**
+ * guangshinhaha/duo#274's purge: every *pending* standing-order candidate
+ * queued from one of `draftIds` is rejected — never deleted, the same
+ * "a decision, reviewably recorded" stance every other rejection in this
+ * table takes (`rejectCandidate`, `rejectRule`). An already-approved
+ * candidate is not touched here: by the time it was approved it had
+ * already become a rule, and `rejectRuleForDrafts` (rule-review.ts) is
+ * what un-does that half. Returns how many rows were rejected, so the
+ * purge orchestration can report an honest count.
+ */
+export function rejectPendingStandingOrderCandidatesForDrafts(storePath: string, passphrase: string, draftIds: readonly string[]): number {
+  if (draftIds.length === 0) {
+    return 0;
+  }
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureStandingOrderCandidateSchema(db);
+    const placeholders = draftIds.map(() => "?").join(", ");
+    const result = db
+      .prepare(`UPDATE standing_order_candidates SET status = 'rejected', reviewed_at = ? WHERE status = 'pending' AND draft_id IN (${placeholders})`)
+      .run(new Date().toISOString(), ...draftIds);
+    return result.changes;
+  });
 }
