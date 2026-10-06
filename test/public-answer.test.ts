@@ -13,6 +13,7 @@ import { writeRecords } from "../src/ingest/record-store.js";
 import { grantAutonomy } from "../src/trust/grants.js";
 import { writeRefusalsFile } from "../src/trust/refusals.js";
 import { listGrid } from "../src/trust/grid.js";
+import { setAway } from "../src/trust/away.js";
 import { answerPublicly, PUBLIC_ANSWER_CLEARANCE_CEILING, PUBLIC_PASSED_ON_MESSAGE, PUBLIC_REFUSAL_MESSAGE, type AskerContext } from "../src/permissions/public-answer.js";
 import { appendPublicAnswerLogEntry, ensurePublicAnswerLogSchema, getPublicAnswerLogEntry, listPublicAnswerLogEntries } from "../src/permissions/public-answer-log.js";
 import type { InferenceProvider } from "../src/provider/types.js";
@@ -621,5 +622,122 @@ describe("public_answer_log — ask-link asker context (#160)", () => {
       expect(columns.filter((name) => name === "asker_resolved")).toHaveLength(1);
       expect(columns.filter((name) => name === "clearance_applied")).toHaveLength(1);
     });
+  });
+});
+
+describe("answerPublicly — away mode (guangshinhaha/duo#270, digital-duo#287)", () => {
+  it("appends the away status line to an answered message, while leaving the answer itself untouched", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    grantAutonomy(storePath, PASSPHRASE, dir, { scopeText: "vacation leave", tier: "T0", topicId: "topic-leave" });
+    const until = new Date(Date.now() + 60 * 60 * 1000);
+    setAway(storePath, PASSPHRASE, dir, { until, scope: "may_do" });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      cliAsker("colleague-away-1"),
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+
+    expect(outcome.kind).toBe("answered");
+    if (outcome.kind !== "answered") throw new Error("expected an answered outcome");
+    expect(outcome.text).toContain("Five days per quarter, per policy.");
+    expect(outcome.text).toContain("away until");
+    // What the asker saw is exactly what got logged.
+    expect(listPublicAnswerLogEntries(storePath, PASSPHRASE)[0].text).toBe(outcome.text);
+  });
+
+  it("appends the status line to a passed-on message too — 'on every message while it runs'", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    // No grant: stays at "ask", and "may_do" away adds no extra topics.
+    setAway(storePath, PASSPHRASE, dir, { until: new Date(Date.now() + 60 * 60 * 1000), scope: "may_do" });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      cliAsker("colleague-away-2"),
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+
+    expect(outcome.kind).toBe("passed_on");
+    if (outcome.kind !== "passed_on") throw new Error("expected a passed_on outcome");
+    expect(outcome.message).toContain(PUBLIC_PASSED_ON_MESSAGE);
+    expect(outcome.message).toContain("away until");
+  });
+
+  it("a topic picked for 'May do, plus topics' is answered even though the trust grid alone still says ask", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    // No grantAutonomy call: "topic-leave" is still "ask" on the trust grid.
+    setAway(storePath, PASSPHRASE, dir, { until: new Date(Date.now() + 60 * 60 * 1000), scope: "may_do_and_topics", extraTopicIds: ["topic-leave"] });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      cliAsker("colleague-away-3"),
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+
+    expect(outcome.kind).toBe("answered");
+    if (outcome.kind !== "answered") throw new Error("expected an answered outcome — away added this topic");
+    expect(outcome.topicId).toBe("topic-leave");
+    expect(outcome.text).toContain("Five days per quarter, per policy.");
+  });
+
+  it("an away period past its until no longer adds its topics or its status line, even though nothing has read GET /away to lazily close it yet", async () => {
+    const storePath = initStore();
+    const dir = duoDir();
+    await seedLeaveTopic(storePath, true);
+    writeLeaveTopicFile(dir);
+    // setAway itself refuses a past `until` — so to get an expired row
+    // without going through the lazy-close write path at all (the point of
+    // this test), start a valid period and then backdate it directly, the
+    // same way a real period simply ages past its own `until` with nobody
+    // having read `GET /away` since.
+    setAway(storePath, PASSPHRASE, dir, { until: new Date(Date.now() + 60 * 60 * 1000), scope: "may_do_and_topics", extraTopicIds: ["topic-leave"] });
+    withDatabase(storePath, PASSPHRASE, true, (db) => {
+      db.prepare(`UPDATE away_periods SET until = ? WHERE ended_at IS NULL`).run(new Date(Date.now() - 1000).toISOString());
+    });
+
+    const outcome = await answerPublicly(
+      storePath,
+      PASSPHRASE,
+      dir,
+      "how much vacation leave do I get",
+      cliAsker("colleague-away-4"),
+      createFakeEmbeddingProvider(),
+      agreeingProvider("Five days per quarter, per policy."),
+      CONFIDENCE_CONFIG,
+      OWNER_NAME,
+    );
+    // Not granted on the trust grid, and the away period that would have
+    // added it is already past its own until — passed on, same as if no
+    // away period existed at all.
+    expect(outcome.kind).toBe("passed_on");
+    if (outcome.kind !== "passed_on") throw new Error("expected a passed_on outcome");
+    expect(outcome.message).not.toContain("away until");
   });
 });

@@ -106,7 +106,20 @@ export function hasRefusalsDecision(duoDir: string): boolean {
   return existsSync(refusalsFilePath(duoDir));
 }
 
-export class InvalidRefusalError extends Error {}
+/**
+ * `.name` is set explicitly (unlike a bare `extends Error {}`, which would
+ * leave every instance reporting the generic `"Error"`) because
+ * digital-duo#287's `statusForError` (`serve/server.ts`) now switches on
+ * it to map this to a 400 for the HTTP mutation routes below — a mapping
+ * that silently fell through to 500 before this was added, since nothing
+ * read `.name` off this class until now.
+ */
+export class InvalidRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidRefusalError";
+  }
+}
 
 /**
  * Adds a refusal, or — if a refusal with the same heading (case-
@@ -173,4 +186,179 @@ export function requireRefusalsDecision(duoDir: string): void {
   if (!hasRefusalsDecision(duoDir)) {
     throw new RefusalsNotDecidedError();
   }
+}
+
+// ---------------------------------------------------------------------------
+// guangshinhaha/duo#269: owner-editable never-answer rules, from the app —
+// add/edit/remove a rule in the owner's own words, over HTTP
+// (digital-duo#287). Built against duo PR #339's client, which already
+// landed on `main` wired to this contract (`src/profile/Refusals.tsx`,
+// `src/components/NeverAnswerOffer.tsx`, `docs/client-tech-design.md`
+// §1.4): `POST`/`PUT`/`DELETE /mirror/refusals(/:heading)`, each returning
+// the whole `RefusalsListing`, plus a suggestion route off a dismissed
+// draft. These sit beside `upsertRefusal`/`confirmNoRefusals` above (the
+// CLI's own writes, #29) rather than replacing them — `upsertRefusal`
+// keeps the CLI's "a refusal needs a non-empty reason" discipline exactly
+// as its own tests pin it; the app's "No thanks" / proactive-offer flow
+// genuinely has no reason text to send (`NeverAnswerOffer.tsx` posts
+// `{ subject }` alone), so the functions below accept an empty reason
+// on purpose rather than loosening the CLI's own contract to allow it.
+// ---------------------------------------------------------------------------
+
+export class RefusalNotFoundError extends Error {
+  constructor(heading: string) {
+    super(`No never-answer rule is recorded for "${heading}".`);
+    this.name = "RefusalNotFoundError";
+  }
+}
+
+export class RefusalConflictError extends Error {
+  constructor(heading: string) {
+    super(`A never-answer rule already covers "${heading}" — pick a different subject, or edit that one instead.`);
+    this.name = "RefusalConflictError";
+  }
+}
+
+/**
+ * The owner's own sentence ("I never answer about budget approvals")
+ * reduced to its subject, for the heading a refusal is matched and shown
+ * by (`findRefusalByHeading`, `RuleRow`'s own `data-testid="refusal-
+ * heading"`). Strips the handful of sentence frames an owner is likely to
+ * actually type — "I never/don't/won't answer/discuss/talk about/speak
+ * about X", optionally "questions about X" — and falls back to the whole
+ * trimmed sentence when none match, which is always a safe fallback: this
+ * is a *suggestion* the owner sees and can retype before Save
+ * (`client-tech-design.md`: "the subject is read off it"), never recorded
+ * silently.
+ */
+const NEVER_ANSWER_SENTENCE_PREFIX =
+  /^(?:i\s+)?(?:never|don'?t|do\s+not|won'?t|will\s+not|can'?t|cannot)\s+(?:answer|discuss|talk\s+about|speak\s+about|say\s+anything\s+about|comment\s+on)\s*(?:questions?\s+)?(?:about|on|regarding|concerning|re:?)?\s*/i;
+
+const MAX_SUBJECT_LENGTH = 80;
+
+function truncateSubject(subject: string): string {
+  return subject.length > MAX_SUBJECT_LENGTH ? `${subject.slice(0, MAX_SUBJECT_LENGTH - 3)}...` : subject;
+}
+
+export function deriveNeverAnswerSubject(rule: string): string {
+  const trimmed = rule.trim().replace(/[.!]+$/, "").trim();
+  const stripped = trimmed.replace(NEVER_ANSWER_SENTENCE_PREFIX, "").trim();
+  return truncateSubject(stripped.length > 0 ? stripped : trimmed);
+}
+
+/**
+ * The daemon's starting words for a never-answer rule off a dismissed
+ * draft's own question (guangshinhaha/duo#259 → #269) — the "shouldn't
+ * answer this" follow-up offer. A light heuristic in the same spirit as
+ * `../derivation/topics.ts`'s `defaultTopicLabel`: strips a handful of
+ * common question openers and the trailing "?", and otherwise reads the
+ * question back verbatim — an honest placeholder the owner edits or
+ * approves, never one the duo invents facts for.
+ */
+// Order matters here: a longer alternative ("how much does") must come
+// before any shorter prefix of it ("how much") — regex alternation commits
+// to the first alternative whose continuation can succeed at all, not the
+// longest match, so a shorter prefix listed first would "win" and leave
+// the rest of the opener (e.g. "does") stuck to the subject.
+const QUESTION_OPENER =
+  /^(?:so\s+)?(?:what\s+do(?:es)?|what'?s|what\s+is|what\s+are|how\s+much\s+do(?:es)?|how\s+many\s+do(?:es)?|how\s+do(?:es)?|how'?s|how\s+is|how\s+are|how\s+much|how\s+many|why\s+do(?:es)?|why'?s|why\s+is|why\s+are|when'?s|when\s+is|when\s+are|where'?s|where\s+is|where\s+are|who'?s|who\s+is|who\s+are|which|can\s+you\s+(?:tell\s+me|share|explain)|could\s+you\s+(?:tell\s+me|share|explain)|do\s+you\s+know|is\s+it\s+true\s+that)\s+/i;
+
+export function suggestNeverAnswerSubject(question: string): string {
+  const trimmed = question.trim().replace(/[?]+$/, "").trim();
+  const stripped = trimmed.replace(QUESTION_OPENER, "").trim();
+  return truncateSubject(stripped.length > 0 ? stripped : trimmed);
+}
+
+/**
+ * Validates and normalizes the wire shape of a never-answer write
+ * (`NeverAnswerInput` in the client's `src/api/types.ts`): either `{ rule }`
+ * — the owner's own sentence, whose subject is read off it and the
+ * sentence itself kept as the reason — or `{ subject, reason? }` directly.
+ * Throws `InvalidRefusalError` for anything else, including a blank
+ * subject either way arrives at.
+ */
+export function parseNeverAnswerInput(raw: unknown): { heading: string; reason: string } {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new InvalidRefusalError('Body must be { rule } (a sentence) or { subject, reason? }.');
+  }
+  const body = raw as { rule?: unknown; subject?: unknown; reason?: unknown };
+  if (typeof body.rule === "string") {
+    const rule = body.rule.trim();
+    if (rule.length === 0) {
+      throw new InvalidRefusalError("rule must be a non-empty sentence.");
+    }
+    return { heading: deriveNeverAnswerSubject(rule), reason: rule };
+  }
+  if (typeof body.subject === "string") {
+    const subject = body.subject.trim();
+    if (subject.length === 0) {
+      throw new InvalidRefusalError("subject must be non-empty.");
+    }
+    if (body.reason !== undefined && typeof body.reason !== "string") {
+      throw new InvalidRefusalError("reason, when present, must be a string.");
+    }
+    return { heading: subject, reason: (body.reason ?? "").trim() };
+  }
+  throw new InvalidRefusalError('Body must be { rule } (a sentence) or { subject, reason? }.');
+}
+
+/**
+ * `POST /mirror/refusals`: adds a never-answer rule, or — matching
+ * `upsertRefusal`'s own case-insensitive-heading convention — edits it in
+ * place when the subject already names an existing one
+ * (`client-tech-design.md`: "adding an existing subject edits it").
+ * Deliberately not `upsertRefusal` itself: that one refuses an empty
+ * reason (the CLI's own long-standing contract, pinned by
+ * `trust-refusals.test.ts`), which the app's reason-free flows
+ * (`NeverAnswerOffer.tsx`) must be able to send.
+ */
+export function saveNeverAnswerRule(duoDir: string, raw: unknown): Refusal[] {
+  const { heading, reason } = parseNeverAnswerInput(raw);
+  const existing = readRefusalsFile(duoDir);
+  const index = existing.findIndex((refusal) => refusal.heading.toLowerCase() === heading.toLowerCase());
+  const updated =
+    index === -1 ? [...existing, { heading, reason }] : existing.map((refusal, i) => (i === index ? { heading, reason } : refusal));
+  writeRefusalsFile(duoDir, updated);
+  return updated;
+}
+
+/**
+ * `PUT /mirror/refusals/:heading`: renames and rewords one rule in place.
+ * 404 (`RefusalNotFoundError`) when `heading` names no recorded rule; 400
+ * (`RefusalConflictError`) when the new subject would collide with a
+ * *different* existing rule — renaming a rule onto itself (same subject,
+ * new reason) is not a conflict with itself.
+ */
+export function renameNeverAnswerRule(duoDir: string, heading: string, raw: unknown): Refusal[] {
+  const existing = readRefusalsFile(duoDir);
+  const index = existing.findIndex((refusal) => refusal.heading.toLowerCase() === heading.trim().toLowerCase());
+  if (index === -1) {
+    throw new RefusalNotFoundError(heading);
+  }
+  const { heading: newHeading, reason: newReason } = parseNeverAnswerInput(raw);
+  const conflictIndex = existing.findIndex((refusal, i) => i !== index && refusal.heading.toLowerCase() === newHeading.toLowerCase());
+  if (conflictIndex !== -1) {
+    throw new RefusalConflictError(newHeading);
+  }
+  const updated = existing.map((refusal, i) => (i === index ? { heading: newHeading, reason: newReason } : refusal));
+  writeRefusalsFile(duoDir, updated);
+  return updated;
+}
+
+/**
+ * `DELETE /mirror/refusals/:heading`: removes one rule. 404
+ * (`RefusalNotFoundError`) when `heading` names no recorded rule.
+ * Removing the last one still leaves `decided: true` — the file itself is
+ * rewritten (with zero entries), never deleted, the same "reviewed and
+ * recorded none" state `confirmNoRefusals` produces (#29 AC2).
+ */
+export function removeNeverAnswerRule(duoDir: string, heading: string): Refusal[] {
+  const existing = readRefusalsFile(duoDir);
+  const index = existing.findIndex((refusal) => refusal.heading.toLowerCase() === heading.trim().toLowerCase());
+  if (index === -1) {
+    throw new RefusalNotFoundError(heading);
+  }
+  const updated = existing.filter((_, i) => i !== index);
+  writeRefusalsFile(duoDir, updated);
+  return updated;
 }

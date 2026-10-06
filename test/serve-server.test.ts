@@ -2768,6 +2768,261 @@ describe("GET /mirror/refusals and GET /mirror/rules/:id — refusals and rule e
   });
 });
 
+describe("POST/PUT/DELETE /mirror/refusals(/:heading) — never-answer rules, owner-editable from the app (digital-duo#287, duo#269)", () => {
+  it("POST adds a rule from a free-text sentence, 201, returning the whole listing", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/mirror/refusals",
+      headers: authHeader,
+      payload: { rule: "I never answer about budget approvals" },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toEqual({ decided: true, refusals: [{ heading: "budget approvals", reason: "I never answer about budget approvals" }] });
+  });
+
+  it("POST with { subject } alone (the proactive-offer flow) records an empty reason rather than refusing", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+
+    const response = await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "budget approvals" } });
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toEqual({ decided: true, refusals: [{ heading: "budget approvals", reason: "" }] });
+  });
+
+  it("POSTing an existing subject again edits it in place rather than duplicating it", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+
+    await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Budget approvals", reason: "first" } });
+    const second = await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Budget approvals", reason: "second" } });
+    expect(second.json().refusals).toEqual([{ heading: "Budget approvals", reason: "second" }]);
+  });
+
+  it("POST 400s a blank rule", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { rule: "   " } });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("PUT renames and rewords a rule in place", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Budget approvals", reason: "old" } });
+
+    const response = await app.inject({
+      method: "PUT",
+      url: "/mirror/refusals/Budget%20approvals",
+      headers: authHeader,
+      payload: { subject: "Headcount", reason: "new" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ decided: true, refusals: [{ heading: "Headcount", reason: "new" }] });
+  });
+
+  it("PUT 404s an unknown heading", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({ method: "PUT", url: "/mirror/refusals/Nope", headers: authHeader, payload: { subject: "x" } });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("PUT 400s renaming onto a different existing rule's subject", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Budget approvals" } });
+    await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Headcount" } });
+    const response = await app.inject({ method: "PUT", url: "/mirror/refusals/Budget%20approvals", headers: authHeader, payload: { subject: "Headcount" } });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("DELETE removes one rule, returning the whole listing (not 204) — the client reads RefusalsListing back", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Budget approvals" } });
+    await app.inject({ method: "POST", url: "/mirror/refusals", headers: authHeader, payload: { subject: "Headcount" } });
+
+    const response = await app.inject({ method: "DELETE", url: "/mirror/refusals/Budget%20approvals", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ decided: true, refusals: [{ heading: "Headcount", reason: "" }] });
+  });
+
+  it("DELETE 404s an unknown heading", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({ method: "DELETE", url: "/mirror/refusals/Nope", headers: authHeader });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("every never-answer write is an owner route: an ask token is refused", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    expect((await app.inject({ method: "POST", url: "/mirror/refusals", headers: askHeader, payload: { subject: "x" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "PUT", url: "/mirror/refusals/x", headers: askHeader, payload: { subject: "x" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "DELETE", url: "/mirror/refusals/x", headers: askHeader })).statusCode).toBe(401);
+  });
+});
+
+describe("GET /drafts/:id/never-answer-suggestion — guangshinhaha/duo#259 → #269 (digital-duo#287)", () => {
+  it("suggests a subject off the dismissed draft's own question, recording nothing", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const draftId = appendDraft(storePath, PASSPHRASE, {
+      question: "What is the budget for the marketing campaign?",
+      threadContext: null,
+      draftText: "Some figure.",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.9,
+      sources: [],
+      refused: false,
+    });
+    recordDraftOutcome(storePath, PASSPHRASE, draftId, "discarded", undefined, "shouldnt_answer");
+
+    const response = await app.inject({ method: "GET", url: `/drafts/${draftId}/never-answer-suggestion`, headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ draftId, question: "What is the budget for the marketing campaign?", subject: "the budget for the marketing campaign" });
+
+    // Nothing recorded: still undecided.
+    const refusals = await app.inject({ method: "GET", url: "/mirror/refusals", headers: authHeader });
+    expect(refusals.json()).toEqual({ decided: false, refusals: [] });
+  });
+
+  it("404s for an unknown draft id", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({ method: "GET", url: "/drafts/not-a-real-id/never-answer-suggestion", headers: authHeader });
+    expect(response.statusCode).toBe(404);
+  });
+});
+
+describe("GET /topics — digital-duo#287, duo#270's away-scope picker", () => {
+  it("returns every topic's id and label", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    writeTopicsFile(join(tempDir(), "duo"), [{ id: "topic-1", label: "Facilities", createdAt: new Date().toISOString() }]);
+
+    const response = await app.inject({ method: "GET", url: "/topics", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([{ id: "topic-1", label: "Facilities" }]);
+  });
+});
+
+describe("GET/PUT/DELETE /away, POST /away/summary/dismiss — away mode over HTTP (digital-duo#287, duo#270)", () => {
+  it("GET /away with nobody away reports the scopes/maxDays and nothing else", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({ method: "GET", url: "/away", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ active: null, last: null, statusLine: null, summary: null, scopes: ["may_do", "may_do_and_topics"], maxDays: 14 });
+  });
+
+  it("PUT /away starts a period and returns the full AwayState (not the bare period)", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+    const response = await app.inject({ method: "PUT", url: "/away", headers: authHeader, payload: { until, scope: "may_do" } });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.active).toMatchObject({ until, scope: "may_do", extraTopics: [] });
+    expect(body.statusLine).toContain("away until");
+    expect(body.summary).toMatchObject({ ended: false });
+  });
+
+  it("PUT /away with scope may_do_and_topics validates the topic ids", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+    const unknown = await app.inject({ method: "PUT", url: "/away", headers: authHeader, payload: { until, scope: "may_do_and_topics", extraTopicIds: ["nope"] } });
+    expect(unknown.statusCode).toBe(400);
+
+    writeTopicsFile(join(tempDir(), "duo"), [{ id: "topic-1", label: "Facilities", createdAt: new Date().toISOString() }]);
+    const ok = await app.inject({ method: "PUT", url: "/away", headers: authHeader, payload: { until, scope: "may_do_and_topics", extraTopicIds: ["topic-1"] } });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().active.extraTopics).toEqual([{ id: "topic-1", label: "Facilities" }]);
+  });
+
+  it("PUT /away 400s a past until", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({
+      method: "PUT",
+      url: "/away",
+      headers: authHeader,
+      payload: { until: new Date(Date.now() - 60 * 60 * 1000).toISOString(), scope: "may_do" },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("DELETE /away ends an active period early, returning the full AwayState", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await app.inject({ method: "PUT", url: "/away", headers: authHeader, payload: { until, scope: "may_do" } });
+
+    const response = await app.inject({ method: "DELETE", url: "/away", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().active).toBeNull();
+    expect(response.json().last).toMatchObject({ endedEarly: true });
+  });
+
+  it("DELETE /away 409s when nobody is away", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const response = await app.inject({ method: "DELETE", url: "/away", headers: authHeader });
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("POST /away/summary/dismiss puts the return summary away", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const authHeader = { authorization: `Bearer ${createDeviceToken(storePath, PASSPHRASE, "mac").token}` };
+    const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await app.inject({ method: "PUT", url: "/away", headers: authHeader, payload: { until, scope: "may_do" } });
+    await app.inject({ method: "DELETE", url: "/away", headers: authHeader });
+
+    const dismissed = await app.inject({ method: "POST", url: "/away/summary/dismiss", headers: authHeader });
+    expect(dismissed.statusCode).toBe(200);
+    expect(dismissed.json().summary).toBeNull();
+  });
+
+  it("every away route is an owner route: an ask token is refused", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+    expect((await app.inject({ method: "GET", url: "/away", headers: askHeader })).statusCode).toBe(401);
+    expect((await app.inject({ method: "PUT", url: "/away", headers: askHeader, payload: { until: new Date().toISOString(), scope: "may_do" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "DELETE", url: "/away", headers: askHeader })).statusCode).toBe(401);
+    expect((await app.inject({ method: "GET", url: "/topics", headers: askHeader })).statusCode).toBe(401);
+  });
+});
+
 describe("actions over HTTP — the T4 confirmation moment and the attempt log (#180)", () => {
   /** What `duo actions register` writes for the one tier that can never be autonomous: audience "external" classifies T4 whatever the other properties say (registry.ts's own decisive rule). */
   function registerT4Action(storePath: string): void {

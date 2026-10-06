@@ -7,6 +7,7 @@ import { notGrantedPassOnReason } from "../drafting/escalation.js";
 import type { ConfidenceResult } from "../drafting/confidence.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { resolveAutonomyForAnswering } from "../trust/demotion.js";
+import { awayAnswerContext } from "../trust/away.js";
 import { withPublicAttribution } from "./attribution.js";
 import { appendPublicAnswerLogEntry } from "./public-answer-log.js";
 
@@ -203,6 +204,13 @@ export async function answerPublicly(
     askerResolved: asker.resolved,
     clearanceApplied: PUBLIC_ANSWER_CLEARANCE_CEILING,
   };
+  // guangshinhaha/duo#270: "colleagues see a status line on every message
+  // while [away mode] runs" (duo PR #339) — read once, appended to
+  // whichever of the three outcomes below actually gets composed. Null
+  // (the common case: nobody is away) leaves every message exactly as
+  // before.
+  const away = awayAnswerContext(storePath, passphrase, duoDir);
+  const withAwayStatusLine = (text: string): string => (away.statusLine === null ? text : `${text}\n\n${away.statusLine}`);
   const pipelineResult = await draftReply(
     storePath,
     passphrase,
@@ -223,7 +231,7 @@ export async function answerPublicly(
     // guangshinhaha/duo#313/#314: what the asker was told, on the draft row
     // itself, with the pipeline's own reason as the reason it went on.
     recordPublicOutcome(storePath, passphrase, pipelineResult.draftId, outcome, pipelineResult.reason);
-    const message = withPublicAttribution(pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE, ownerName);
+    const message = withAwayStatusLine(withPublicAttribution(pipelineResult.refused ? PUBLIC_REFUSAL_MESSAGE : PUBLIC_PASSED_ON_MESSAGE, ownerName));
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
       ...askerLogContext,
@@ -244,17 +252,26 @@ export async function answerPublicly(
     ? resolveAutonomyForAnswering(storePath, passphrase, duoDir, topicId, "T0")
     : { level: "ask" as const, stale: false, demotionNotice: undefined };
 
+  // guangshinhaha/duo#270: an away period scoped "May do, plus topics I
+  // pick" can make a topic auto-answerable for its window even though the
+  // trust grid alone still says "ask" — never-answer rules and the
+  // classification ceiling are untouched (both are already enforced
+  // earlier, inside `draftReply` itself, before any topic or autonomy is
+  // even resolved), exactly as `Away.tsx`'s own copy promises the owner
+  // ("Never-answer rules and your ceiling still apply").
+  const awayAllowsTopic = topicId !== undefined && autonomy.level !== "auto" && away.allowsTopic(topicId);
+
   // `topicId === undefined` is folded into this same guard (rather than
   // left implicit) so the narrowing below is airtight: resolveAutonomyForAnswering
   // is only ever called above when topicId is defined, and the fallback
   // literal "ask" used otherwise can never equal "auto" — but stating it
   // explicitly here means the "answered" path past this point never has to
   // assume that invariant silently holds.
-  if (autonomy.level !== "auto" || topicId === undefined) {
+  if ((autonomy.level !== "auto" && !awayAllowsTopic) || topicId === undefined) {
     // guangshinhaha/duo#314: the draft row holds the duo's attempt here (it
     // was confident), so the reason is the one the row could not say alone.
     recordPublicOutcome(storePath, passphrase, pipelineResult.draftId, "passed_on", notGrantedPassOnReason(topicId));
-    const message = withPublicAttribution(PUBLIC_PASSED_ON_MESSAGE, ownerName);
+    const message = withAwayStatusLine(withPublicAttribution(PUBLIC_PASSED_ON_MESSAGE, ownerName));
     const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
       question,
       ...askerLogContext,
@@ -275,10 +292,12 @@ export async function answerPublicly(
   }
 
   recordPublicOutcome(storePath, passphrase, pipelineResult.draftId, "answered", null);
-  const text = withPublicAttribution(pipelineResult.text, ownerName, pipelineResult.sources, {
-    confidence: pipelineResult.confidence.score,
-    evidenceAgeDays: pipelineResult.evidenceAgeDays,
-  });
+  const text = withAwayStatusLine(
+    withPublicAttribution(pipelineResult.text, ownerName, pipelineResult.sources, {
+      confidence: pipelineResult.confidence.score,
+      evidenceAgeDays: pipelineResult.evidenceAgeDays,
+    }),
+  );
   const logEntryId = appendPublicAnswerLogEntry(storePath, passphrase, {
     question,
     ...askerLogContext,
