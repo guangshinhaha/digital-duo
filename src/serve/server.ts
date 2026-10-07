@@ -9,6 +9,7 @@ import { createLlmEditClassifier } from "../corrections/classify.js";
 import type { CorrectionCandidateStatus } from "../corrections/queue.js";
 import { approveCandidate, getReviewCandidate, listReviewCandidates, rejectCandidate } from "../corrections/review.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
+import { buildTopicCoverage } from "../derivation/coverage.js";
 import { computeVoiceTrend } from "../derivation/voice-trend.js";
 import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
@@ -1143,6 +1144,12 @@ function registerRoutes(
   });
 
   app.get("/knowledge/evidence/excluded", async () => ({ excluded: listExcludedEvidence(deps.storePath, deps.passphrase) }));
+
+  // guangshinhaha/duo#277: what your duo can and can't answer yet — the
+  // profile's coverage view. A pure composition over two reads that already
+  // exist (the portrait's own topic breakdown, the rules table's own review
+  // state), same "adds no behaviour" discipline as GET /knowledge above.
+  app.get("/knowledge/coverage", async () => buildTopicCoverage(deps.storePath, deps.passphrase, deps.duoDir));
 
   // duo#278: the Privacy settings page's per-source switch — every source
   // the corpus has records under (or had, before the owner excluded it),
