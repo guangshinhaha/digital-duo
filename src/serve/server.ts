@@ -74,7 +74,7 @@ import {
 } from "../trust/away.js";
 import { createPinnedAnswer, deletePinnedAnswer, listPinnedAnswers, updatePinnedAnswer } from "../trust/pinned-answers.js";
 import { resolveAskerRef } from "../permissions/directory.js";
-import { answerPublicly, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { answerPublicly, answeringPausedOutcome, PUBLIC_ANSWER_FAILED_MESSAGE, type AskerContext, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import { notifyDraftWaiting } from "../push/notify.js";
 import type { PushSender } from "../push/sender.js";
 import { answerSharedDuo } from "../shared-duo/answer.js";
@@ -116,6 +116,17 @@ export interface WorkspaceSessionAccess {
   renew(): Promise<void>;
   /** A device of this duo was revoked, or the duo was ended: end the session the daemon holds. Best effort, never throws. */
   end(): void;
+}
+
+/**
+ * duo#318: whether this duo may currently answer colleagues — bound to one duo by hosted mode, like
+ * `WorkspaceSessionAccess` and `orgAdmin` above it. Read fresh at every colleague-facing answer (`POST /ask`
+ * for an ask-link principal, and the workspace answering pipeline), never cached, so an org admin's revoke
+ * takes effect on the very next question. Absent on a personal (non-hosted) duo, which reads as always able
+ * to answer — identical to its behaviour before this existed.
+ */
+export interface VerificationAccess {
+  status(): { readonly verified: boolean; readonly answeringEnabled: boolean };
 }
 
 export interface ServeDeps {
@@ -177,6 +188,8 @@ export interface ServeDeps {
   readonly workspaceSession?: WorkspaceSessionAccess;
   /** #254: set by hosted mode, bound to this duo; absent (a personal duo), the `/org*` routes do not exist. */
   readonly orgAdmin?: OrgAdminAccess;
+  /** duo#318: set by hosted mode, bound to this duo; absent (a personal duo), every colleague-facing answer path treats the duo as verified and enabled, unchanged from before this existed. */
+  readonly verification?: VerificationAccess;
   /**
    * digital-duo#251: how a push notification actually reaches a device.
    * Optional — omitted, `notifyDraftWaiting`'s own default (`webPushSender`,
@@ -887,6 +900,15 @@ function registerRoutes(
         // No owner-only projection: the shared outcome has none, so both
         // principal kinds get this same envelope (R8).
         return envelope;
+      }
+
+      // duo#318: an ask-link principal is a colleague; a device principal is the owner asking
+      // their own duo (`duo ask`, the app's chat), which this gate never applies to. Checked
+      // before `answerPublicly` runs at all, so a paused duo leaves no draft and costs no
+      // evidence lookup over a question it was never going to post publicly.
+      if (principal.kind !== "device" && deps.verification?.status().answeringEnabled === false) {
+        const outcome = answeringPausedOutcome();
+        return { duo: "personal", kind: outcome.kind, text: outcome.message };
       }
 
       const outcome = await answerPublicly(

@@ -9,7 +9,7 @@ import type { DuoConfig } from "../config.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { CORS_ALLOWED_HEADERS, resolveCorsOrigins } from "../serve/cors.js";
 import type { OrgAdminAccess } from "../serve/org-routes.js";
-import { createServer, type ServeDeps, type WorkspaceSessionAccess } from "../serve/server.js";
+import { createServer, type ServeDeps, type VerificationAccess, type WorkspaceSessionAccess } from "../serve/server.js";
 import type { WorkspaceService } from "../workspace/service.js";
 import { WorkspaceConfigError } from "../workspace/settings.js";
 import type { WorkspaceTransportFactory } from "../workspace/transport.js";
@@ -295,6 +295,11 @@ function withLiveWorkspace(deps: ServeDeps, current: () => WorkspaceService | un
   return Object.defineProperty({ ...deps }, "workspace", { get: current, enumerable: true, configurable: true }) as ServeDeps;
 }
 
+/** duo#318: `ServeDeps.verification` bound to one duo — a live read of the registry, never a snapshot, so a revoke reaches the very next answer. */
+function verificationAccessFor(registry: HostedRegistry, duoId: string): VerificationAccess {
+  return { status: () => registry.verificationStatus(duoId) };
+}
+
 export function tenantDeps(
   shared: SharedDuoRuntime,
   settings: HostedSettings,
@@ -303,6 +308,7 @@ export function tenantDeps(
   workspaceSession?: WorkspaceSessionAccess,
   workspace?: () => WorkspaceService | undefined,
   orgAdmin?: OrgAdminAccess,
+  verification?: VerificationAccess,
 ): ServeDeps {
   const paths = tenantPaths(settings.hostedRoot, tenant.id);
   const deps: ServeDeps = {
@@ -330,6 +336,7 @@ export function tenantDeps(
     trustProxy: shared.trustProxy,
     ...(workspaceSession ? { workspaceSession } : {}),
     ...(orgAdmin ? { orgAdmin } : {}),
+    ...(verification ? { verification } : {}),
   };
   return workspace ? withLiveWorkspace(deps, workspace) : deps;
 }
@@ -511,7 +518,10 @@ export async function createHostedServer(
     // #261: `withConnector`'s `{ ...deps, connectorAccess }` spread reads `deps.workspace` once, so it must run on
     // deps that do NOT yet carry the live getter — `withLiveWorkspace` goes last, same order as the root duo below,
     // or a tenant's workspace consent routes would freeze at whatever `workspace()` returned at mount time.
-    const base = withConnector(tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), undefined, orgAdmin.forDuo(tenant.id)), tenant.id);
+    const base = withConnector(
+      tenantDeps(shared, settings, tenant, passphrase, sessionAccess(tenant.id), undefined, orgAdmin.forDuo(tenant.id), verificationAccessFor(registry, tenant.id)),
+      tenant.id,
+    );
     const tenantLive = liveWorkspace(tenant.id);
     const deps = tenantLive ? withLiveWorkspace(base, tenantLive) : base;
     const mounted = await mountDuo(deps);
@@ -524,7 +534,12 @@ export async function createHostedServer(
   }
   const rootAccess = sessionAccess(ROOT_DUO_ID);
   const rootLive = liveWorkspace(ROOT_DUO_ID);
-  const rootServed = root && withConnector({ ...root, ...(rootAccess ? { workspaceSession: rootAccess } : {}), orgAdmin: orgAdmin.forDuo(ROOT_DUO_ID) }, ROOT_DUO_ID);
+  const rootServed =
+    root &&
+    withConnector(
+      { ...root, ...(rootAccess ? { workspaceSession: rootAccess } : {}), orgAdmin: orgAdmin.forDuo(ROOT_DUO_ID), verification: verificationAccessFor(registry, ROOT_DUO_ID) },
+      ROOT_DUO_ID,
+    );
   const rootDuo = rootServed ? await mountDuo(rootLive ? withLiveWorkspace(rootServed, rootLive) : rootServed) : undefined;
   if (root) {
     registry.declareRootDuo(root.ownerName);
@@ -891,6 +906,18 @@ export async function createHostedServer(
       scope.post<{ Params: { orgId: string; duoId: string } }>(`/hosted/orgs/:orgId/admins/:duoId/${action}`, { preHandler: requireAdmin }, async (request, reply) => {
         const { orgId, duoId } = request.params;
         const outcome = orgAdmin[action](orgId, duoId, SUPER_ADMIN_ACTOR);
+        if (!outcome.ok) {
+          sendError(reply, outcome.status, outcome.code, outcome.message);
+          return;
+        }
+        return outcome.value;
+      });
+    }
+    // duo#318: the super admin's own path to the same answering toggle an org admin's `/org/members/:duoId/answering/*` reaches.
+    for (const action of ["revoke", "restore"] as const) {
+      scope.post<{ Params: { orgId: string; duoId: string } }>(`/hosted/orgs/:orgId/members/:duoId/answering/${action}`, { preHandler: requireAdmin }, async (request, reply) => {
+        const { orgId, duoId } = request.params;
+        const outcome = action === "revoke" ? orgAdmin.revokeAnswering(orgId, duoId, SUPER_ADMIN_ACTOR) : orgAdmin.restoreAnswering(orgId, duoId, SUPER_ADMIN_ACTOR);
         if (!outcome.ok) {
           sendError(reply, outcome.status, outcome.code, outcome.message);
           return;

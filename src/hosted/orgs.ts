@@ -109,6 +109,13 @@ export interface OrgAdminLogEntry {
 /** Each duo keeps its latest entries only, so the registry file cannot grow without bound. */
 export const ORG_ADMIN_LOG_CAP = 50;
 
+/** When and by whom a duo's ability to answer colleagues was revoked (duo#318). Present only while revoked. */
+export interface AnsweringRevocation {
+  readonly since: string;
+  /** `SUPER_ADMIN_ACTOR` or the revoking org admin's duo id. */
+  readonly by: string;
+}
+
 /** One duo in an org. `duoId` is the tenant id, or `ROOT_DUO_ID` for the pre-hosted root duo. */
 export interface OrgMember {
   readonly duoId: string;
@@ -122,6 +129,19 @@ export interface OrgMember {
   readonly orgAdmin: OrgAdminGrant | null;
   /** The duo's appoint/revoke history, oldest first (bounded); empty for a duo never appointed. */
   readonly orgAdminLog: readonly OrgAdminLogEntry[];
+  /**
+   * duo#318: whether this duo's owner has been identity-verified — signed up with a Google
+   * account the invite was addressed to (or empty, open to anyone) — rather than a typed
+   * name with no sign-in. The root duo, always claimed by a verified admin sign-in, is
+   * always true. An informational label (`AnsweringMark`/`RoleMark` in the client), not a
+   * gate: a deployment with no Google sign-in configured signs up every duo unverified, by
+   * design, and still answers normally — only `answeringEnabled` ever blocks answering.
+   */
+  readonly verified: boolean;
+  /** Whether this duo may currently answer colleagues at all: verified, and not revoked. */
+  readonly answeringEnabled: boolean;
+  /** Set while answering is revoked: when and by whom. Null otherwise, including for the root duo (never revocable). */
+  readonly answeringRevoked: AnsweringRevocation | null;
 }
 
 export class OrgNotFoundError extends Error {

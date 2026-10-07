@@ -47,6 +47,32 @@ export const PUBLIC_REFUSAL_MESSAGE =
 export const PUBLIC_ANSWER_FAILED_MESSAGE = "Something went wrong answering that.";
 
 /**
+ * duo#318: what a colleague sees while an admin has turned off a duo's answering (deliberately
+ * vague, like the outcomes above — it never says who turned it off, or why).
+ */
+export const PUBLIC_ANSWERING_PAUSED_MESSAGE = "This duo isn't answering for its owner right now. Please message the owner directly.";
+
+/**
+ * duo#318's own gate, checked by every colleague-facing caller of `answerPublicly` (never by the
+ * owner's own use — `serve/mcp-tools.ts`'s `ask_my_duo` and the CLI's `duo ask` are the owner
+ * asking their own duo, and stay ungated) BEFORE the answering pipeline ever runs: a question a
+ * paused duo never saw costs no evidence lookup and leaves no draft behind.
+ *
+ * Gates on `answeringEnabled` alone, never on `verified`: a hosted deployment that never
+ * configures Google sign-in (`identityVerifier` unset, docs/deploy/hosted-mode.md's "local
+ * development" path) signs up every duo with no identity at all, by design — that duo reads
+ * `verified: false` (an honest, informational label, `AnsweringMark`/`RoleMark` in the client)
+ * but was never meant to be blocked from answering, and gating on it here would silently break
+ * a deployment style the signup route itself still serves. `verified` becoming a real, visible
+ * precondition for answering is future work, not this gate's job. A personal (non-hosted) duo,
+ * and hosted mode's root duo, have no `VerificationAccess` or always read
+ * `{ verified: true, answeringEnabled: true }` — identical to never having this gate at all.
+ */
+export function answeringPausedOutcome(): PublicDeclinedRefused {
+  return { kind: "declined_refused", draftId: "", logEntryId: "", message: PUBLIC_ANSWERING_PAUSED_MESSAGE };
+}
+
+/**
  * guangshinhaha/duo#315: what a colleague is told when the owner declines
  * their first message to the duo — carried on the declined invitation
  * itself (the leave's `reason`). Fixed words, like the outcomes above, and
