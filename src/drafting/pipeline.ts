@@ -112,6 +112,45 @@ export type DraftPipelineResult = DraftAnswer | DraftEscalation;
  */
 const OWNER_PROVENANCE = { origin: "owner" } as const;
 
+/**
+ * guangshinhaha/duo#285: "your duo is drafting" — a signal fired at
+ * `draftReply`'s own entry (see below), before the refusal check and
+ * everything after it, so every caller is heard from identically. A plain
+ * listener set, not an event-bus dependency threaded through eight call
+ * sites: nobody has to pass anything for this to exist, so every pre-#285
+ * caller (the CLI's `duo draft`, the eval harness, calibration, the MCP
+ * connector, `offerDraftForMention`) runs exactly as before — a `for`
+ * loop over an empty set costs nothing worth measuring. The one
+ * subscriber today is `serve/server.ts`, which turns a workspace-channel
+ * provenance into a `draft-drafting` push over `/ws`
+ * (`docs/client-tech-design.md` §1.4's `GET /ws` row) — see
+ * `onDraftingStarted` below.
+ */
+const draftingStartedListeners = new Set<(provenance: DraftProvenance) => void>();
+
+/**
+ * Subscribes to every `draftReply` call's own "I'm about to compose a
+ * draft for this provenance" signal (guangshinhaha/duo#285). Returns the
+ * unsubscribe. A listener that throws is caught and dropped on the floor —
+ * fire-and-forget means a subscriber's own bug must never interrupt
+ * drafting, which is the one thing this signal must never risk being
+ * blamed for.
+ */
+export function onDraftingStarted(listener: (provenance: DraftProvenance) => void): () => void {
+  draftingStartedListeners.add(listener);
+  return () => draftingStartedListeners.delete(listener);
+}
+
+function emitDraftingStarted(provenance: DraftProvenance): void {
+  for (const listener of draftingStartedListeners) {
+    try {
+      listener(provenance);
+    } catch {
+      // See onDraftingStarted's own doc comment.
+    }
+  }
+}
+
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
@@ -299,6 +338,12 @@ export async function draftReply(
   // guangshinhaha/duo#314: the owner's own draft unless the caller says
   // whose question this is (public answering over the workspace).
   const provenance: DraftProvenance = options.provenance ?? OWNER_PROVENANCE;
+  // guangshinhaha/duo#285: fired before anything else — the refusal check
+  // included — so a subscriber hears about every call this function is
+  // about to make a decision on, not only the ones that end in an actual
+  // draft. See emitDraftingStarted's own doc comment for why this is safe
+  // for every one of this function's callers.
+  emitDraftingStarted(provenance);
   // Checked first, before any retrieval or generation: a refused subject
   // escalates "without reasoning about it" (#34 AC2) — there is no
   // internal draft composed and then withheld, because nothing below

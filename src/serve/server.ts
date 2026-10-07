@@ -38,7 +38,7 @@ import { excludeSource, listSourceControls, restoreSource } from "../drafting/so
 import { checkOwnerText } from "../drafting/fact-check.js";
 import { explainMessage, ExplainUnavailableError } from "../drafting/explain.js";
 import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
-import { draftReply } from "../drafting/pipeline.js";
+import { draftReply, onDraftingStarted } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
@@ -95,6 +95,7 @@ import { registerScheduledSendRoutes } from "./scheduled-send-routes.js";
 import { registerAutonomyRoutes } from "./autonomy-routes.js";
 import { getDeviceToken, listDeviceTokens, revokeDeviceToken } from "./tokens.js";
 import { registerDraftReadySocket, type DraftReadyHub } from "./ws.js";
+import { WORKSPACE_CHANNEL_KIND } from "./workspace-wiring.js";
 
 /**
  * Everything a route needs, resolved once at boot (`client-tech-design.md`
@@ -1731,6 +1732,21 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   });
   const auth = registerAuth(app, deps.storePath, deps.passphrase);
   const draftReady = registerDraftReadySocket(app, deps);
+  // guangshinhaha/duo#285: "your duo is drafting" — a draftReply call that
+  // started for a workspace question (the duo was mentioned, or answered
+  // publicly, over Matrix — `workspaceDraftProvenance`'s own
+  // `WORKSPACE_CHANNEL_KIND`) pushes its room id over the same socket
+  // `draft-ready` already uses. Every other caller's provenance (the
+  // owner's own `POST /drafts`, the CLI, the eval harness, calibration,
+  // the MCP connector, an ask-link question) is left alone — this
+  // listener simply never matches them, so this app behaves exactly as
+  // before for every one of them.
+  const unsubscribeDraftingStarted = onDraftingStarted((provenance) => {
+    if (provenance.origin === "channel" && provenance.channelKind === WORKSPACE_CHANNEL_KIND && provenance.threadId !== null) {
+      draftReady.publishDrafting(provenance.threadId);
+    }
+  });
+  app.addHook("onClose", async () => unsubscribeDraftingStarted());
   const embedJob = jobsFor(deps).embed;
   // guangshinhaha/duo#261: held sends fire from the daemon, whether or not
   // any client is connected. One runner per duo app, stopped with it.

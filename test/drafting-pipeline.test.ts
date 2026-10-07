@@ -7,7 +7,8 @@ import { loadConfig } from "../src/config.js";
 import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { getDraft, listDrafts } from "../src/drafting/draft-log.js";
-import { draftReply } from "../src/drafting/pipeline.js";
+import type { DraftProvenance } from "../src/drafting/draft-log.js";
+import { draftReply, onDraftingStarted } from "../src/drafting/pipeline.js";
 import { embedRecords } from "../src/ingest/embeddings.js";
 import { createRecord, type RecordInput } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
@@ -689,5 +690,94 @@ describe("draftReply — attachments ground the one draft without touching the c
           prompt.includes("Question: how much vacation leave do I get"),
       ),
     ).toBe(true);
+  });
+});
+
+describe("draftReply — guangshinhaha/duo#285's 'drafting started' signal", () => {
+  it("fires once, before the result resolves, with the owner's own default provenance when no caller sets one", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const seen: DraftProvenance[] = [];
+    const unsubscribe = onDraftingStarted((provenance) => seen.push(provenance));
+    try {
+      expect(seen).toEqual([]);
+      await draftReply(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", null, createFakeEmbeddingProvider(), undefined, CONFIDENCE_CONFIG);
+      expect(seen).toEqual([{ origin: "owner" }]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("carries the caller's own provenance straight through — the workspace-channel shape duo#314 builds", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const workspaceProvenance: DraftProvenance = {
+      origin: "channel",
+      channelKind: "workspace",
+      askerRef: "@bose:workspace.example",
+      threadId: "!project-x:workspace.example",
+      permalink: null,
+    };
+    const seen: DraftProvenance[] = [];
+    const unsubscribe = onDraftingStarted((provenance) => seen.push(provenance));
+    try {
+      await draftReply(
+        storePath,
+        PASSPHRASE,
+        duoDir(),
+        "how much vacation leave do I get",
+        null,
+        createFakeEmbeddingProvider(),
+        undefined,
+        CONFIDENCE_CONFIG,
+        undefined,
+        undefined,
+        undefined,
+        { provenance: workspaceProvenance },
+      );
+      expect(seen).toEqual([workspaceProvenance]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("still fires for a refused subject — before the refusal check runs, not only when a draft is actually produced", async () => {
+    const dir = duoDir();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "refusals.md"), "## vacation\n\nreason\n", "utf8");
+    const storePath = initStore();
+    const seen: DraftProvenance[] = [];
+    const unsubscribe = onDraftingStarted((provenance) => seen.push(provenance));
+    try {
+      const result = await draftReply(storePath, PASSPHRASE, dir, "how much vacation leave do I get", null, createFakeEmbeddingProvider(), undefined, CONFIDENCE_CONFIG);
+      expect(result.kind).toBe("escalation");
+      expect(seen).toEqual([{ origin: "owner" }]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("a throwing listener never interrupts drafting — fire-and-forget means forgetting a bad subscriber too", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const unsubscribe = onDraftingStarted(() => {
+      throw new Error("a subscriber's own bug");
+    });
+    try {
+      const result = await draftReply(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", null, createFakeEmbeddingProvider(), undefined, CONFIDENCE_CONFIG);
+      expect(result.kind).toBe("draft");
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("unsubscribe stops it from hearing the next call", async () => {
+    const storePath = initStore();
+    await seedConfirmedRule(storePath);
+    const seen: DraftProvenance[] = [];
+    const unsubscribe = onDraftingStarted((provenance) => seen.push(provenance));
+    unsubscribe();
+    await draftReply(storePath, PASSPHRASE, duoDir(), "how much vacation leave do I get", null, createFakeEmbeddingProvider(), undefined, CONFIDENCE_CONFIG);
+    expect(seen).toEqual([]);
   });
 });
