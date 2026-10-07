@@ -24,7 +24,7 @@ import { MatrixProvisioner, type ProvisionOutcome } from "./matrix-accounts.js";
 import { OrgAdmin, parseInviteInput } from "./org-admin.js";
 import { OrgSpaceProvisioner, type SpaceSummary } from "./org-spaces.js";
 import { OrgNameError, OrgNameTakenError, OrgNotFoundError, ROOT_DUO_ID, SUPER_ADMIN_ACTOR } from "./orgs.js";
-import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedTenant } from "./registry.js";
+import { HostedRegistry, InviteInvalidError, matrixAccountsView, type HostedMatrixAccountsView, type HostedTenant } from "./registry.js";
 import { assertSynapseBaseUrl, SynapseAdmin, SynapseConfigError } from "./synapse-admin.js";
 import { WorkspaceSessions } from "./workspace-session.js";
 
@@ -341,9 +341,27 @@ export function tenantDeps(
   return workspace ? withLiveWorkspace(deps, workspace) : deps;
 }
 
+/**
+ * A duo's Matrix accounts as an admin may see them over HTTP: ids and a date, never a token, and
+ * never `displayName` — that field is the reconcile sweep's own bookkeeping (#272: the name last
+ * pushed to Matrix, compared on the next sweep so an unchanged name costs no call), not something
+ * the admin surface ever decided to expose (#289). `MatrixProvisioner` still returns it on
+ * `ProvisionOutcome.accounts` for its own tests to check the resync worked; this is the one place
+ * that value crosses into an HTTP response, so this is the one place that strips it.
+ */
+function publicMatrixAccounts(view: HostedMatrixAccountsView): Omit<HostedMatrixAccountsView, "displayName"> {
+  const { displayName: _displayName, ...rest } = view;
+  return rest;
+}
+
 /** A provisioning outcome as an admin may see it: ids and status, never a token. */
 function publicOutcome(outcome: ProvisionOutcome) {
-  return { duoId: outcome.duoId, status: outcome.status, ...(outcome.accounts ? { accounts: outcome.accounts } : {}), ...(outcome.error ? { error: outcome.error } : {}) };
+  return {
+    duoId: outcome.duoId,
+    status: outcome.status,
+    ...(outcome.accounts ? { accounts: publicMatrixAccounts(outcome.accounts) } : {}),
+    ...(outcome.error ? { error: outcome.error } : {}),
+  };
 }
 
 /** The org-space sweep as an admin may see it: counts and per-item status, no secret exists in it to leave out. */
@@ -935,7 +953,7 @@ export async function createHostedServer(
       const state = connection.get(rest.id);
       return {
         ...rest,
-        ...(accounts ? { matrix: matrixAccountsView(accounts) } : {}),
+        ...(accounts ? { matrix: publicMatrixAccounts(matrixAccountsView(accounts)) } : {}),
         ...(state ? { workspace: { phase: state.phase, attempts: state.attempts } } : {}),
       };
     });
