@@ -36,6 +36,7 @@ import { readVoiceText } from "../drafting/context.js";
 import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../drafting/evidence-exclusions.js";
 import { excludeSource, listSourceControls, restoreSource } from "../drafting/source-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
+import { explainMessage, ExplainUnavailableError } from "../drafting/explain.js";
 import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
@@ -773,6 +774,37 @@ function registerRoutes(
       deps.inferenceProvider,
     );
     return result;
+  });
+
+  // duo#283: privately explains a message the member received — not
+  // necessarily one the duo wrote or the owner sent — to the owner alone;
+  // the client never posts this anywhere (see explain.ts's own doc
+  // comment for the conservatism case). Owner-only by the same table-
+  // separation as /compose/rewrite and /compose/fact-check above.
+  app.post<{ Body: { text?: unknown; threadContext?: unknown } }>("/compose/explain", async (request, reply) => {
+    const { text, threadContext } = request.body ?? {};
+    if (typeof text !== "string" || text.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "text is required"));
+      return;
+    }
+    try {
+      const result = await explainMessage(
+        deps.storePath,
+        deps.passphrase,
+        deps.duoDir,
+        text,
+        typeof threadContext === "string" ? threadContext : null,
+        deps.embeddingProvider,
+        deps.inferenceProvider,
+      );
+      return result;
+    } catch (error) {
+      if (error instanceof ExplainUnavailableError) {
+        reply.code(503).send(errorBody("explain_unavailable", error.message));
+        return;
+      }
+      throw error;
+    }
   });
 
   // Issue #159: the one route an ask token authorizes. A thin wrapper, not
