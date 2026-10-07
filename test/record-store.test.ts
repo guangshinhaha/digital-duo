@@ -1,7 +1,16 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { InvalidRecordError } from "../src/ingest/record.js";
-import { countRecords, getRecord, searchRecords, writeRecords } from "../src/ingest/record-store.js";
+import {
+  countRecords,
+  getRecord,
+  InvalidRecordEditError,
+  listRecordsPage,
+  RecordNotFoundError,
+  searchRecords,
+  updateRecordText,
+  writeRecords,
+} from "../src/ingest/record-store.js";
 import { createEncryptedStore, StoreNotInitializedError } from "../src/store/store.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 
@@ -129,5 +138,106 @@ describe("searchRecords — FTS5 index over text, ranked", () => {
   it("returns an empty result set, with no error and no fabricated matches, for an empty store", () => {
     const storePath = initStore();
     expect(searchRecords(storePath, PASSPHRASE, "anything")).toEqual([]);
+  });
+});
+
+describe("updateRecordText — digital-duo#286, correcting a record's stored text in place", () => {
+  it("edits the text, stamps editedAt, and leaves every other field untouched", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [record({ id: "rec-1", text: "five days per quarter" })]);
+
+    const edited = updateRecordText(storePath, PASSPHRASE, "rec-1", "ten days per quarter");
+    expect(edited.text).toBe("ten days per quarter");
+    expect(edited.editedAt).toEqual(expect.any(String));
+    expect(edited.id).toBe("rec-1");
+    expect(edited.source).toBe("claude-export");
+
+    // The edit is durable: a fresh read sees it too, not just the mutation's own return value.
+    expect(getRecord(storePath, PASSPHRASE, "rec-1")?.text).toBe("ten days per quarter");
+  });
+
+  it("trims whitespace and refuses to edit a record down to nothing", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [record({ id: "rec-1" })]);
+    expect(() => updateRecordText(storePath, PASSPHRASE, "rec-1", "   ")).toThrow(InvalidRecordEditError);
+    expect(getRecord(storePath, PASSPHRASE, "rec-1")?.text).toBe("when does the leave policy change?");
+  });
+
+  it("refuses to edit a record id that doesn't exist", () => {
+    const storePath = initStore();
+    expect(() => updateRecordText(storePath, PASSPHRASE, "no-such-id", "new text")).toThrow(RecordNotFoundError);
+  });
+
+  it("keeps the FTS5 index in step: search finds the edited text, not the old wording", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [record({ id: "rec-1", text: "the printer is broken" })]);
+    updateRecordText(storePath, PASSPHRASE, "rec-1", "the leave policy changes every January");
+
+    expect(searchRecords(storePath, PASSPHRASE, "leave policy").map((r) => r.record.id)).toContain("rec-1");
+    expect(searchRecords(storePath, PASSPHRASE, "printer")).toEqual([]);
+  });
+
+  it("leaves classification exactly as ingest detected it — an edit never re-runs classification detection", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [record({ id: "rec-1", text: "Restricted: see below", classification: "restricted" })]);
+    const edited = updateRecordText(storePath, PASSPHRASE, "rec-1", "Secret: a completely different sentence now");
+    expect(edited.classification).toBe("restricted");
+  });
+});
+
+describe("listRecordsPage — digital-duo#286, the Knows tab's paginated browse", () => {
+  it("pages newest-first, honouring limit and cursor", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [
+      record({ id: "rec-1", timestamp: "2026-01-01T00:00:00.000Z" }),
+      record({ id: "rec-2", timestamp: "2026-01-02T00:00:00.000Z" }),
+      record({ id: "rec-3", timestamp: "2026-01-03T00:00:00.000Z" }),
+    ]);
+
+    const first = listRecordsPage(storePath, PASSPHRASE, { limit: 2 });
+    expect(first.records.map((r) => r.id)).toEqual(["rec-3", "rec-2"]);
+    expect(first.nextCursor).toBe(2);
+
+    const second = listRecordsPage(storePath, PASSPHRASE, { limit: 2, cursor: first.nextCursor! });
+    expect(second.records.map((r) => r.id)).toEqual(["rec-1"]);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("filters by source", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [
+      record({ id: "rec-1", source: "claude-export" }),
+      record({ id: "rec-2", source: "paste" }),
+    ]);
+    const page = listRecordsPage(storePath, PASSPHRASE, { source: "paste" });
+    expect(page.records.map((r) => r.id)).toEqual(["rec-2"]);
+  });
+
+  it("filters by full-text q, combined with source", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [
+      record({ id: "rec-1", source: "claude-export", text: "the leave policy changes every January" }),
+      record({ id: "rec-2", source: "paste", text: "the leave policy is five days" }),
+      record({ id: "rec-3", source: "paste", text: "unrelated printer talk" }),
+    ]);
+    const page = listRecordsPage(storePath, PASSPHRASE, { q: "leave policy", source: "paste" });
+    expect(page.records.map((r) => r.id)).toEqual(["rec-2"]);
+  });
+
+  it("returns an empty page, not an error, for a fresh store", () => {
+    const storePath = initStore();
+    expect(listRecordsPage(storePath, PASSPHRASE)).toEqual({ records: [], nextCursor: null });
+  });
+
+  it("every row carries editedAt — null for a record no edit has touched", () => {
+    const storePath = initStore();
+    writeRecords(storePath, PASSPHRASE, [record({ id: "rec-1" })]);
+    updateRecordText(storePath, PASSPHRASE, "rec-1", "edited text");
+    writeRecords(storePath, PASSPHRASE, [record({ id: "rec-2" })]);
+
+    const page = listRecordsPage(storePath, PASSPHRASE);
+    const byId = new Map(page.records.map((r) => [r.id, r.editedAt]));
+    expect(byId.get("rec-1")).toEqual(expect.any(String));
+    expect(byId.get("rec-2")).toBeNull();
   });
 });

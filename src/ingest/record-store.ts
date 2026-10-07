@@ -10,10 +10,20 @@ import { parseRecord } from "./record.js";
  * fresh staging database — see #21) still gets it on first use.
  *
  * The FTS5 table duplicates `text` rather than using SQLite's
- * external-content mode: records are only ever inserted, never updated or
- * deleted in this store, so there's no rowid-sync trigger machinery to keep
- * consistent — a plain duplicate is the simpler correct choice at this
- * corpus scale.
+ * external-content mode: there's no rowid-sync trigger machinery to keep
+ * consistent, so every write path that touches a record's text
+ * (`writeRecords`, `deleteRecords`, and digital-duo#286's `updateRecordText`
+ * below) is responsible for keeping `records` and `records_fts` in step by
+ * hand — a plain duplicate is the simpler correct choice at this corpus
+ * scale, not a claim that records never change.
+ *
+ * `edited_at` (digital-duo#286) is null on every record written by an
+ * import adapter and set only by `updateRecordText` — it is how the Knows
+ * tab's record browser tells an owner-corrected row from an originally
+ * ingested one. Added via `RECORDS_MIGRATIONS` below rather than in this
+ * literal `CREATE TABLE`, the same reasoning `drafting/draft-log.ts`'s own
+ * migration list gives: `CREATE TABLE IF NOT EXISTS` is a no-op against a
+ * `records` table a pre-#286 store already created.
  *
  * Exported (not just called internally) so #20's embeddings module can
  * ensure the `records` table exists before querying it — a store that has
@@ -32,11 +42,25 @@ export function ensureRecordsSchema(db: Database): void {
       thread_id TEXT,
       audience TEXT NOT NULL,
       classification TEXT,
-      topics TEXT NOT NULL DEFAULT '[]'
+      topics TEXT NOT NULL DEFAULT '[]',
+      edited_at TEXT
     ) STRICT
   `);
+  const existingColumns = new Set(
+    (db.prepare(`PRAGMA table_info(records)`).all() as unknown as { name: string }[]).map((row) => row.name),
+  );
+  for (const migration of RECORDS_MIGRATIONS) {
+    if (!existingColumns.has(migration.column)) {
+      db.exec(migration.ddl);
+    }
+  }
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(id UNINDEXED, text)`);
 }
+
+/** Columns added to `records` after its first release — see `ensureRecordsSchema`'s doc comment. */
+const RECORDS_MIGRATIONS: readonly { readonly column: string; readonly ddl: string }[] = [
+  { column: "edited_at", ddl: "ALTER TABLE records ADD COLUMN edited_at TEXT" },
+];
 
 interface RecordRow {
   id: string;
@@ -50,6 +74,7 @@ interface RecordRow {
   audience: string;
   classification: string;
   topics: string;
+  edited_at: string | null;
 }
 
 function rowToRecord(row: RecordRow): IngestRecord {
@@ -66,6 +91,15 @@ function rowToRecord(row: RecordRow): IngestRecord {
     classification: row.classification as RecordClassification,
     topics: JSON.parse(row.topics) as string[],
   };
+}
+
+/** A record as the Knows tab's browser needs it (digital-duo#286): the normalised `IngestRecord` plus whether — and when — the owner last corrected its text. `null` for every record no edit has ever touched. */
+export interface StoredRecord extends IngestRecord {
+  readonly editedAt: string | null;
+}
+
+function rowToStoredRecord(row: RecordRow): StoredRecord {
+  return { ...rowToRecord(row), editedAt: row.edited_at };
 }
 
 export interface WriteRecordsResult {
@@ -133,6 +167,75 @@ export function getRecord(storePath: string, passphrase: string, id: string): In
   });
 }
 
+export class RecordNotFoundError extends Error {
+  constructor(id: string) {
+    super(`No record "${id}"`);
+    this.name = "RecordNotFoundError";
+  }
+}
+
+export class InvalidRecordEditError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidRecordEditError";
+  }
+}
+
+/**
+ * digital-duo#286: the Knows tab's record browser editing a record's text
+ * in place — "correct the stored text going forward", never a re-run of
+ * derivation. Deliberately narrow: only `text` (and the `edited_at` marker)
+ * changes. Everything else about the record — its `id` (still the content
+ * hash of the *original* text, by design: a later re-import of the
+ * unedited source material looks up that same id and, via `writeRecords`'s
+ * `INSERT OR IGNORE`, leaves the owner's edit in place rather than
+ * overwriting it), `classification`, `topics`, `source` — is untouched.
+ * `classification` in particular is never re-detected here: it is
+ * policy-set, read once at ingest (`detectClassification`, #48), and an
+ * edit silently loosening or tightening it without the owner naming that
+ * as the intent would be the wrong kind of surprise for a classification
+ * field (concept.md §5).
+ *
+ * Keeps `records_fts` in step by hand (no triggers — see
+ * `ensureRecordsSchema`'s doc comment) and best-effort drops any stored
+ * embedding for this record, the same "doesn't exist yet is not a failure"
+ * shape `deleteRecords` already uses: the next `duo embed` / `POST
+ * /corpus/embed` run re-embeds it under the corrected text rather than a
+ * search silently ranking it by its old wording.
+ *
+ * Does **not** touch anything the derivation pipeline already produced
+ * from this record (qa_pairs, rules, the voice profile): those are the
+ * output of an explicit `duo derive` run over the corpus as it stood at
+ * that time, never recomputed live off a single record the way retrieval
+ * and search are. An edit here changes what the record says for every
+ * *future* draft, re-embed and re-derive; it does not reach back and alter
+ * a rule already confirmed from the old wording — the same "stops future
+ * use, never rewrites the past" contract `evidence-exclusions.ts` and
+ * `source-exclusions.ts` already keep.
+ */
+export function updateRecordText(storePath: string, passphrase: string, id: string, text: string): StoredRecord {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    throw new InvalidRecordEditError("A record's text can't be edited down to nothing.");
+  }
+  return withDatabase(storePath, passphrase, true, (db) => {
+    ensureRecordsSchema(db);
+    const existing = db.prepare(`SELECT * FROM records WHERE id = ?`).get(id) as RecordRow | undefined;
+    if (!existing) {
+      throw new RecordNotFoundError(id);
+    }
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE records SET text = ?, edited_at = ? WHERE id = ?`).run(trimmed, now, id);
+    db.prepare(`UPDATE records_fts SET text = ? WHERE id = ?`).run(trimmed, id);
+    try {
+      db.prepare(`DELETE FROM record_embeddings WHERE record_id = ?`).run(id);
+    } catch {
+      // record_embeddings doesn't exist in this store yet — nothing to invalidate.
+    }
+    return rowToStoredRecord({ ...existing, text: trimmed, edited_at: now });
+  });
+}
+
 /** Total record count in the store. */
 export function countRecords(storePath: string, passphrase: string): number {
   return withDatabase(storePath, passphrase, false, (db) => {
@@ -170,6 +273,76 @@ export function listRecords(storePath: string, passphrase: string): IngestRecord
     ensureRecordsSchema(db);
     const rows = db.prepare(`SELECT * FROM records`).all() as unknown as RecordRow[];
     return rows.map(rowToRecord);
+  });
+}
+
+export interface RecordsPage {
+  readonly records: readonly StoredRecord[];
+  /** The offset to pass back as `cursor` for the next page; null once this page came up short of `limit` (end of the list, same end-of-history signal `/escalations/history` already uses). */
+  readonly nextCursor: number | null;
+}
+
+/**
+ * digital-duo#286: the Knows tab's record browser — `GET
+ * /knowledge/records`'s own read, paged (newest first) and optionally
+ * narrowed to one `source` and/or a full-text `q`. This is the first
+ * paginated, filterable read over the raw corpus itself (every existing
+ * read over `records` is either unbounded — `listRecords`, used only by
+ * #21's own retention pass, never by a client — or a relevance search with
+ * no source filter — `searchRecords`); the gap `digital-duo#286` names.
+ *
+ * `q` reuses the same FTS5 index and the same query-sanitising
+ * `toMatchQuery` `searchRecords` already uses, so a browse-with-search and
+ * a plain "most recent records" read share one ranking/paging discipline
+ * rather than inventing a second one. Without `q`, ordering is simply
+ * `timestamp DESC, id` (a stable tiebreaker two records sharing a
+ * timestamp still need) — browsing is "what's newest", not a relevance
+ * rank.
+ */
+export function listRecordsPage(
+  storePath: string,
+  passphrase: string,
+  opts: { readonly source?: string; readonly q?: string; readonly limit?: number; readonly cursor?: number } = {},
+): RecordsPage {
+  const limit = opts.limit ?? 20;
+  const cursor = opts.cursor ?? 0;
+  return withDatabase(storePath, passphrase, false, (db) => {
+    ensureRecordsSchema(db);
+    // Built together, clause-then-its-own-param, so the two always line up
+    // regardless of which filters are present.
+    const whereClauses: string[] = [];
+    const params: string[] = [];
+    const hasQuery = opts.q !== undefined && opts.q.trim().length > 0;
+    if (hasQuery) {
+      whereClauses.push("records_fts MATCH ?");
+      params.push(toMatchQuery(opts.q!));
+    }
+    if (opts.source !== undefined) {
+      whereClauses.push("records.source = ?");
+      params.push(opts.source);
+    }
+    const where = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+
+    const sql = hasQuery
+      ? `
+        SELECT records.*
+        FROM records_fts
+        JOIN records ON records.id = records_fts.id
+        ${where}
+        ORDER BY records.timestamp DESC, records.id
+        LIMIT ? OFFSET ?
+      `
+      : `
+        SELECT * FROM records
+        ${where}
+        ORDER BY timestamp DESC, id
+        LIMIT ? OFFSET ?
+      `;
+    const rows = db.prepare(sql).all(...params, limit + 1, cursor) as unknown as RecordRow[];
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return { records: page.map(rowToStoredRecord), nextCursor: hasMore ? cursor + limit : null };
   });
 }
 
