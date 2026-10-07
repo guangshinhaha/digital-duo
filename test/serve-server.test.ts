@@ -295,6 +295,9 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     // duo#280/#281 (digital-duo#279): catch-up summaries and the daily brief — same auth gate.
     { method: "POST", url: "/compose/catch-up", payload: { messages: [{ from: "Alice", text: "hi" }] } },
     { method: "GET", url: "/daily-brief" },
+    // duo#305: starters and follow-up suggestions — same auth gate.
+    { method: "GET", url: "/suggestions/starters" },
+    { method: "POST", url: "/suggestions/follow-ups", payload: { question: "q", answer: "a" } },
     { method: "POST", url: "/search/answer", payload: { query: "q", hits: [] } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -665,6 +668,66 @@ describe("createServer — routes", () => {
   it("GET /daily-brief rejects a malformed since timestamp with 400", async () => {
     const response = await app.inject({ method: "GET", url: "/daily-brief?since=not-a-date", headers: authHeader });
     expect(response.statusCode).toBe(400);
+  });
+
+  it("GET /suggestions/starters returns the fixed prompts on a fresh store with nothing pending", async () => {
+    const response = await app.inject({ method: "GET", url: "/suggestions/starters", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(Array.isArray(body.starters)).toBe(true);
+    expect(body.starters.length).toBeGreaterThan(0);
+    expect(body.starters.length).toBeLessThanOrEqual(4);
+  });
+
+  it("GET /suggestions/starters surfaces what's waiting on you when a draft is pending", async () => {
+    appendDraft(storePath, PASSPHRASE, {
+      question: "draft waiting",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    const response = await app.inject({ method: "GET", url: "/suggestions/starters", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().starters).toContain("What's waiting on me?");
+  });
+
+  it("POST /suggestions/follow-ups returns none with no inference provider configured, never an error", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/suggestions/follow-ups",
+      headers: authHeader,
+      payload: { question: "What's my leave policy?", answer: "Five days per quarter." },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ followUps: [] });
+  });
+
+  it("POST /suggestions/follow-ups requires a non-empty question and answer", async () => {
+    const noAnswer = await app.inject({ method: "POST", url: "/suggestions/follow-ups", headers: authHeader, payload: { question: "q" } });
+    expect(noAnswer.statusCode).toBe(400);
+    const blankAnswer = await app.inject({ method: "POST", url: "/suggestions/follow-ups", headers: authHeader, payload: { question: "q", answer: "   " } });
+    expect(blankAnswer.statusCode).toBe(400);
+  });
+
+  it("POST /suggestions/follow-ups returns the provider's follow-ups, capped at three and de-duplicated", async () => {
+    app = createServer(
+      deps(storePath, {
+        inferenceProvider: agreeingProvider(
+          JSON.stringify({ followUps: ["What about part-timers?", "What about part-timers?", "Does it roll over?", "Who approves it?", "One more?"] }),
+        ),
+      }),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/suggestions/follow-ups",
+      headers: authHeader,
+      payload: { question: "What's my leave policy?", answer: "Five days per quarter." },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().followUps).toEqual(["What about part-timers?", "Does it roll over?", "Who approves it?"]);
   });
 
   it("POST /search/answer is no_answer with no inference provider configured", async () => {
