@@ -2649,6 +2649,79 @@ describe("GET /mirror/public-answers and POST .../correct — the public-answer-
   });
 });
 
+describe("GET /knowledge/coverage — what your duo can and can't answer yet (guangshinhaha/duo#277)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("a fresh store still answers 200 — the honest empty picture, thin corpus verdict included", async () => {
+    const response = await app.inject({ method: "GET", url: "/knowledge/coverage", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.tooThin).toBe(true);
+    expect(body.totalQuestions).toBe(0);
+    expect(body.coveredShare).toBe(0);
+    expect(body.topics).toEqual([]);
+    expect(body.gaps).toEqual([]);
+  });
+
+  it("joins the portrait's topics against the rules table: covered only once a rule is approved", async () => {
+    const dir = join(tempDir(), "duo");
+    const { pairs } = await extractQaPairs([
+      record({ source: "paste", kind: "question_to_me", author: "other", text: "what is the leave policy?", threadId: "t1" }),
+      record({ source: "paste", kind: "my_answer", author: "me", text: "five days per quarter", threadId: "t1" }),
+    ]);
+    writeQaPairs(storePath, PASSPHRASE, pairs.map((pair) => ({ ...pair, topicId: "topic-leave" })));
+    writeTopicsFile(dir, [{ id: "topic-leave", label: "Leave policy", createdAt: new Date().toISOString() }]);
+    writeRuleByHand(storePath, PASSPHRASE, dir, "leave", "five days per quarter");
+
+    // writeRuleByHand mints its own fresh topic (it has no existing topic to
+    // attach to), so point an approved rule at THIS run's actual topic id
+    // directly — the join under test is coverage.ts's, not writeRuleByHand's.
+    withDatabase(storePath, PASSPHRASE, true, (db) =>
+      putRule(
+        db,
+        {
+          id: "topic-leave",
+          topicId: "topic-leave",
+          text: "Standard leave is five days per quarter.",
+          status: "confirmed",
+          supportCount: 3,
+          consistency: 0.95,
+          createdAt: new Date().toISOString(),
+          lastConfirmedAt: new Date().toISOString(),
+          reviewStatus: "approved",
+          origin: "derived",
+          supersededByRuleId: null,
+          correctionDraftId: null,
+          correctionQuestion: null,
+        },
+        pairs.map((pair) => pair.id),
+      ),
+    );
+
+    const response = await app.inject({ method: "GET", url: "/knowledge/coverage", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.topics).toEqual([{ topicId: "topic-leave", label: "Leave policy", questionCount: 1, share: 1, covered: true, ruleStatus: "confirmed", reviewStatus: "approved" }]);
+    expect(body.coveredShare).toBe(1);
+    expect(body.gaps).toEqual([]);
+  });
+
+  it("is an owner route: an ask token is refused like any other", async () => {
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const response = await app.inject({ method: "GET", url: "/knowledge/coverage", headers: { authorization: `Bearer ${minted.token}` } });
+    expect(response.statusCode).toBe(401);
+  });
+});
+
 describe("GET /devices and POST /devices/:id/revoke — paired devices over HTTP (#177)", () => {
   let app: FastifyInstance;
   let storePath: string;
