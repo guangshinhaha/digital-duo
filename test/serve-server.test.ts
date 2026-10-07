@@ -289,6 +289,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/drafts", payload: { question: "q" } },
     { method: "POST", url: "/compose/rewrite", payload: { text: "hi", instruction: "shorter" } },
     { method: "POST", url: "/compose/fact-check", payload: { text: "hi" } },
+    { method: "POST", url: "/compose/explain", payload: { text: "hi" } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
     { method: "POST", url: "/drafts/some-draft-id/shape", payload: { instruction: "shorter" } },
@@ -537,6 +538,40 @@ describe("createServer — routes", () => {
   it("POST /compose/fact-check requires text", async () => {
     const response = await app.inject({ method: "POST", url: "/compose/fact-check", headers: authHeader, payload: {} });
     expect(response.statusCode).toBe(400);
+  });
+
+  it("POST /compose/explain 503s with no inference provider configured, rather than guessing at what a message means", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/explain",
+      headers: authHeader,
+      payload: { text: "the RTO slipped again, heads up" },
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: { code: "explain_unavailable" } });
+  });
+
+  it("POST /compose/explain requires non-empty text", async () => {
+    const noText = await app.inject({ method: "POST", url: "/compose/explain", headers: authHeader, payload: {} });
+    expect(noText.statusCode).toBe(400);
+    const blankText = await app.inject({ method: "POST", url: "/compose/explain", headers: authHeader, payload: { text: "   " } });
+    expect(blankText.statusCode).toBe(400);
+  });
+
+  it("POST /compose/explain returns the provider's explanation and only the sources it actually cited", async () => {
+    app = createServer(
+      deps(storePath, {
+        inferenceProvider: agreeingProvider(JSON.stringify({ explanation: "RTO means return-to-office.", usedIndices: [] })),
+      }),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/explain",
+      headers: authHeader,
+      payload: { text: "the RTO slipped again, heads up" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ explanation: "RTO means return-to-office.", sources: [] });
   });
 
   it("POST /drafts/:id/outcome records the outcome and echoes classification", async () => {
