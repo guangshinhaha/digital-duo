@@ -40,6 +40,7 @@ import { explainMessage, ExplainUnavailableError } from "../drafting/explain.js"
 import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply, onDraftingStarted } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
+import { answerFromSearchHits, type SearchAnswerHit } from "../drafting/search-answer.js";
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
 import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
@@ -1540,6 +1541,37 @@ function registerRoutes(
       }
     }
     return hybridSearch(deps.storePath, deps.passphrase, q, deps.embeddingProvider, limit, cursor);
+  });
+
+  // duo#300: an answer for the OTHER search — "search what was said", the
+  // workspace's own message search, which lives entirely client-side
+  // against the homeserver and never reaches this daemon (see
+  // `workspace/matrix.ts#searchMessages` on the client). This route touches
+  // no corpus and does no retrieval of its own: `hits` is exactly what the
+  // caller's own membership-scoped search already returned, so the answer
+  // structurally cannot use anything the member couldn't already read
+  // (#300 AC3). Reuses `deps.inferenceProvider` the same way
+  // `/compose/rewrite` and `/compose/fact-check` do — a prompt-and-parse
+  // call, not a new pipeline — and is device-only by the same default every
+  // route past `registerAuth` already has.
+  app.post<{ Body: { query?: unknown; hits?: unknown } }>("/search/answer", async (request, reply) => {
+    const body = request.body;
+    const { query, hits } = (typeof body === "object" && body !== null && !Array.isArray(body) ? body : {}) as { query?: unknown; hits?: unknown };
+    if (typeof query !== "string" || query.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "query is required and must be a non-empty string"));
+      return;
+    }
+    const isHit = (value: unknown): value is SearchAnswerHit =>
+      typeof value === "object" &&
+      value !== null &&
+      typeof (value as Record<string, unknown>).id === "string" &&
+      typeof (value as Record<string, unknown>).text === "string" &&
+      typeof (value as Record<string, unknown>).from === "string";
+    if (!Array.isArray(hits) || !hits.every(isHit)) {
+      reply.code(400).send(errorBody("bad_request", "hits must be an array of { id, text, from }"));
+      return;
+    }
+    return answerFromSearchHits(query.trim(), hits, deps.inferenceProvider);
   });
 
   // #178: `duo escalations digest|history|rate` over HTTP — how the owner

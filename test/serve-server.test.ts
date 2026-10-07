@@ -290,6 +290,7 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/compose/rewrite", payload: { text: "hi", instruction: "shorter" } },
     { method: "POST", url: "/compose/fact-check", payload: { text: "hi" } },
     { method: "POST", url: "/compose/explain", payload: { text: "hi" } },
+    { method: "POST", url: "/search/answer", payload: { query: "q", hits: [] } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
     { method: "POST", url: "/drafts/some-draft-id/shape", payload: { instruction: "shorter" } },
@@ -572,6 +573,40 @@ describe("createServer — routes", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ explanation: "RTO means return-to-office.", sources: [] });
+  });
+
+  it("POST /search/answer is no_answer with no inference provider configured", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/search/answer",
+      headers: authHeader,
+      payload: { query: "refund policy?", hits: [{ id: "$a", text: "Refunds within 30 days.", from: "Bose" }] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ kind: "no_answer" });
+  });
+
+  it("POST /search/answer requires a non-empty query and a well-shaped hits array", async () => {
+    const noQuery = await app.inject({ method: "POST", url: "/search/answer", headers: authHeader, payload: { hits: [] } });
+    expect(noQuery.statusCode).toBe(400);
+    const blankQuery = await app.inject({ method: "POST", url: "/search/answer", headers: authHeader, payload: { query: "   ", hits: [] } });
+    expect(blankQuery.statusCode).toBe(400);
+    const badHits = await app.inject({ method: "POST", url: "/search/answer", headers: authHeader, payload: { query: "q", hits: [{ id: "$a" }] } });
+    expect(badHits.statusCode).toBe(400);
+    const notAnArray = await app.inject({ method: "POST", url: "/search/answer", headers: authHeader, payload: { query: "q", hits: "nope" } });
+    expect(notAnArray.statusCode).toBe(400);
+  });
+
+  it("POST /search/answer returns the provider's answer, with its sources mapped back to the caller's own hit ids — never a hit the caller didn't send", async () => {
+    app = createServer(deps(storePath, { inferenceProvider: agreeingProvider(JSON.stringify({ answered: true, text: "Refunds are automatic within 30 days.", citedIndices: [0] })) }));
+    const response = await app.inject({
+      method: "POST",
+      url: "/search/answer",
+      headers: authHeader,
+      payload: { query: "what's the refund policy?", hits: [{ id: "$event-1", text: "Refunds within 30 days are automatic.", from: "Bose" }] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ kind: "answered", text: "Refunds are automatic within 30 days.", citedIds: ["$event-1"] });
   });
 
   it("POST /drafts/:id/outcome records the outcome and echoes classification", async () => {
