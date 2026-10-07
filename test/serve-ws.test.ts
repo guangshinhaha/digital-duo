@@ -5,8 +5,10 @@ import WebSocket from "ws";
 import { createFakeEmbeddingProvider } from "./fixtures/fake-embedding-provider.js";
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
+import { draftReply } from "../src/drafting/pipeline.js";
 import { createServer, type ServeDeps } from "../src/serve/server.js";
 import { createDeviceToken, listDeviceTokens, revokeDeviceToken } from "../src/serve/tokens.js";
+import { workspaceDraftProvenance } from "../src/serve/workspace-wiring.js";
 import { createEncryptedStore } from "../src/store/store.js";
 
 // Issue #162: GET /ws — one channel, draft-ready. Auth is by first message,
@@ -152,6 +154,63 @@ describe("GET /ws — the draft-ready channel (issue #162)", () => {
     // (POST /drafts/:id/answer), so it still pushes.
     expect(body.kind).toBe("escalation");
     expect(JSON.parse(await pushed)).toEqual({ type: "draft-ready", draftId: body.draftId });
+    socket.close();
+  });
+
+  it("guangshinhaha/duo#285: pushes {type:draft-drafting} the instant a workspace question starts drafting — before draft-ready, and with no draftId yet", async () => {
+    const socket = connect(wsUrl);
+    const first = nextMessage(socket);
+    await new Promise((resolve) => socket.once("open", resolve));
+    send(socket, { type: "auth", token });
+    await first;
+
+    const messages: string[] = [];
+    socket.on("message", (data) => messages.push(data.toString()));
+
+    const config = loadConfig();
+    // A real draftReply call, over this same server's own deps — the
+    // workspace answering pipeline's exact provenance shape (duo#314),
+    // never a direct publishDrafting call, so this exercises the real
+    // subscription server.ts itself wires up, not a mock of it.
+    await draftReply(
+      storePath,
+      PASSPHRASE,
+      join(tempDir(), "duo"),
+      "what is the meaning of life",
+      null,
+      createFakeEmbeddingProvider(),
+      undefined,
+      config.confidence,
+      undefined,
+      undefined,
+      undefined,
+      { provenance: workspaceDraftProvenance({ roomId: "!project-x:workspace.example", eventId: "$1", senderId: "@bose:workspace.example" }) },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(messages.map((m) => JSON.parse(m))).toContainEqual({ type: "draft-drafting", roomId: "!project-x:workspace.example" });
+    socket.close();
+  });
+
+  it("guangshinhaha/duo#285: the owner's own POST /drafts never pushes draft-drafting — only a workspace-channel provenance does", async () => {
+    const socket = connect(wsUrl);
+    const first = nextMessage(socket);
+    await new Promise((resolve) => socket.once("open", resolve));
+    send(socket, { type: "auth", token });
+    await first;
+
+    const messages: string[] = [];
+    socket.on("message", (data) => messages.push(data.toString()));
+
+    await app.inject({
+      method: "POST",
+      url: "/drafts",
+      headers: { ...authHeader, "content-type": "application/json" },
+      payload: { question: "what is the meaning of life" },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(messages.map((m) => JSON.parse(m) as { type: string })).not.toContainEqual(expect.objectContaining({ type: "draft-drafting" }));
     socket.close();
   });
 

@@ -4,9 +4,12 @@ import type { WebSocket } from "ws";
 import { touchLastSeen, verifyDeviceToken } from "./tokens.js";
 
 /**
- * `GET /ws` — the one push channel: `draft-ready` (`client-tech-design.md`
- * Part 1.1: "one channel: draft-ready"). Everything else is request/response,
- * because nothing else in this product is time-critical.
+ * `GET /ws` — the one push channel: `draft-ready` and, since
+ * guangshinhaha/duo#285, `draft-drafting` (`client-tech-design.md` Part
+ * 1.1 called it "one channel: draft-ready"; #285 adds a second message
+ * shape to that same one channel rather than opening a second socket).
+ * Everything else is request/response, because nothing else in this
+ * product is time-critical.
  *
  * Auth is by **first message**, never a query parameter: the browser
  * `WebSocket` API cannot set an `Authorization` header, and a `?token=` would
@@ -21,10 +24,22 @@ const AUTH_CLOSE = 4001;
 /** How often live sockets' tokens are re-verified, so a revocation done by `duo pair revoke` in another process closes this daemon's sockets — the same documented staleness window the HTTP token cache accepts (auth.ts TOKEN_CACHE_TTL_MS). Overridable for tests/ops via `DUO_WS_REVERIFY_MS`. */
 const DEFAULT_REVERIFY_MS = 5_000;
 
-/** What a connected, authenticated socket is allowed to push about — today, exactly one message shape. */
+/** What a connected, authenticated socket is allowed to push about. */
 export interface DraftReadyHub {
   /** Announces a draft id now pending owner action. Sends to every live authenticated socket; a socket that has gone away is skipped, never thrown on. */
   publish(draftId: string): void;
+  /**
+   * guangshinhaha/duo#285: "your duo is drafting" — announces that a draft
+   * is now being composed for this room, before it exists as a draft row
+   * at all. Every live socket here is already authenticated as one of the
+   * owner's own devices (the same auth `publish` relies on), which is the
+   * whole of "shows only to the owner" (#285 AC3): nobody else ever opens
+   * this socket. There is no matching "stopped drafting" push — the
+   * client clears its own indicator once room activity or its own timeout
+   * says the wait is over, the same one-shot shape `draft-ready` already
+   * has (it never un-publishes a draft either).
+   */
+  publishDrafting(roomId: string): void;
   /**
    * Closes every live socket authenticated as one device (#177). Same close
    * code and reason the re-verify pass uses for an out-of-process `duo pair
@@ -152,6 +167,14 @@ export function registerDraftReadySocket(
   return {
     publish(draftId: string): void {
       const payload = JSON.stringify({ type: "draft-ready", draftId });
+      for (const socket of live.keys()) {
+        if (socket.readyState === socket.OPEN) {
+          socket.send(payload);
+        }
+      }
+    },
+    publishDrafting(roomId: string): void {
+      const payload = JSON.stringify({ type: "draft-drafting", roomId });
       for (const socket of live.keys()) {
         if (socket.readyState === socket.OPEN) {
           socket.send(payload);
