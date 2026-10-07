@@ -18,8 +18,11 @@ export type OrgAdminOutcome<T = unknown> = { readonly ok: true; readonly value: 
  * role live from the registry, so an appointment or a revoke reaches a signed-in person on their next request.
  */
 export interface OrgAdminAccess {
-  /** The duo's org and role; open to every signed-in member (it is how the app learns whether to show its admin screens). */
-  overview(): { org: { id: string; name: string }; role: string; superAdmin: boolean } | undefined;
+  /**
+   * The duo's org and role; open to every signed-in member (it is how the app learns whether to show its admin
+   * screens, and, with `verified`/`answeringEnabled` (duo#318), whether its own duo's label should say so).
+   */
+  overview(): { org: { id: string; name: string }; role: string; superAdmin: boolean; verified: boolean; answeringEnabled: boolean } | undefined;
   /** The org's members with role marks and the appoint/revoke history. Org admins only. */
   members(): OrgAdminOutcome;
   /** This org's pending invites, and no other org's. Org admins only. */
@@ -32,6 +35,10 @@ export interface OrgAdminAccess {
   grant(duoId: string): OrgAdminOutcome;
   /** Takes the role from a member of this org (or the caller's own, to step down). Refused for the last org admin. Org admins only. */
   revoke(duoId: string): OrgAdminOutcome;
+  /** duo#318: stops a member of this org from answering colleagues at all, until restored. Idempotent. Org admins only. */
+  revokeAnswering(duoId: string): OrgAdminOutcome;
+  /** duo#318: lets a member of this org answer colleagues again. Idempotent. Org admins only. */
+  restoreAnswering(duoId: string): OrgAdminOutcome;
 }
 
 function send<T>(reply: FastifyReply, outcome: OrgAdminOutcome<T>): unknown {
@@ -95,6 +102,15 @@ export function registerOrgRoutes(app: FastifyInstance, access: OrgAdminAccess):
     scope.post<{ Params: { duoId: string } }>("/org/admins/:duoId/revoke", async (request, reply) => {
       reply.header("cache-control", "no-store");
       return send(reply, access.revoke(request.params.duoId));
+    });
+    // duo#318: same no-body scope — an org admin toggling whether a member's duo may answer colleagues.
+    scope.post<{ Params: { duoId: string } }>("/org/members/:duoId/answering/revoke", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      return send(reply, access.revokeAnswering(request.params.duoId));
+    });
+    scope.post<{ Params: { duoId: string } }>("/org/members/:duoId/answering/restore", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      return send(reply, access.restoreAnswering(request.params.duoId));
     });
   });
 }

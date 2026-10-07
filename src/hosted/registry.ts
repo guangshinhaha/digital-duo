@@ -16,6 +16,7 @@ import {
   RegistryVersionError,
   ROOT_DUO_ID,
   RootNotAppointableError,
+  type AnsweringRevocation,
   type HostedOrg,
   type HostedOrgSummary,
   type OrgAdminGrant,
@@ -115,6 +116,15 @@ export interface HostedTenant {
   readonly orgAdmin?: OrgAdminGrant;
   /** Every appoint and revoke of this duo, oldest first, capped at `ORG_ADMIN_LOG_CAP`. Survives a revoke, so the history does. */
   readonly orgAdminLog?: readonly OrgAdminLogEntry[];
+  /**
+   * duo#318: true when this duo was created by a sign-up whose Google identity was checked (the
+   * invite named no email, or it matched). Absent (a build before this existed, or a typed-name
+   * sign-up with no identity provider configured) reads as unverified, exactly like a fresh field
+   * on a v2 registry: an older build spreads tenants and leaves it alone.
+   */
+  readonly verified?: boolean;
+  /** Set while this duo's ability to answer colleagues is revoked (duo#318): when and by whom. Absent means enabled. */
+  readonly answeringRevoked?: AnsweringRevocation;
   /** Set once the duo's Matrix accounts exist (#232). Absent means not provisioned yet. */
   readonly matrix?: HostedMatrixAccounts;
   /** Set while provisioning is owed and failing, so an outage is visible and retried. */
@@ -379,6 +389,11 @@ export class HostedRegistry {
         orgRole: "member",
         orgAdmin: null,
         orgAdminLog: [],
+        // The root duo is only ever claimed by a verified admin sign-in (`claimRoot`), and its
+        // answering is never managed through this surface (`requireManageableTenant` excludes it).
+        verified: true,
+        answeringEnabled: true,
+        answeringRevoked: null,
       });
     }
     for (const tenant of this.data.tenants) {
@@ -392,6 +407,9 @@ export class HostedRegistry {
           orgRole: tenant.orgAdmin ? "org_admin" : "member",
           orgAdmin: tenant.orgAdmin ?? null,
           orgAdminLog: tenant.orgAdminLog ?? [],
+          verified: tenant.verified ?? false,
+          answeringEnabled: !tenant.answeringRevoked,
+          answeringRevoked: tenant.answeringRevoked ?? null,
         });
       }
     }
@@ -454,6 +472,53 @@ export class HostedRegistry {
       });
     });
     return { member: this.memberOf(orgId, duoId), changed: true };
+  }
+
+  /**
+   * duo#318: enables or revokes a tenant's ability to answer colleagues. Idempotent, like
+   * `grantOrgAdmin`/`revokeOrgAdmin` — setting the state it already has changes nothing and
+   * writes nothing. The root duo is not a tenant and so is never a target here (`OrgMemberNotFoundError`),
+   * because its answering is never managed this way: it is always enabled.
+   */
+  setAnswering(orgId: string, duoId: string, enabled: boolean, by: string): { member: OrgMember; changed: boolean } {
+    const tenant = this.requireTenantInOrg(orgId, duoId);
+    const currentlyEnabled = !tenant.answeringRevoked;
+    if (currentlyEnabled === enabled) {
+      return { member: this.memberOf(orgId, duoId), changed: false };
+    }
+    const since = new Date().toISOString();
+    this.commit((draft) => {
+      draft.tenants = draft.tenants.map((candidate) => {
+        if (candidate.id !== duoId) {
+          return candidate;
+        }
+        if (enabled) {
+          const { answeringRevoked: _restored, ...rest } = candidate;
+          return rest;
+        }
+        return { ...candidate, answeringRevoked: { since, by } };
+      });
+    });
+    return { member: this.memberOf(orgId, duoId), changed: true };
+  }
+
+  /** `duoId`'s verification and answering state, for `ServeDeps.verification` (duo#318). The root duo always reads as verified and enabled. */
+  verificationStatus(duoId: string): { verified: boolean; answeringEnabled: boolean } {
+    if (duoId === ROOT_DUO_ID) {
+      return { verified: true, answeringEnabled: true };
+    }
+    const tenant = this.data.tenants.find((candidate) => candidate.id === duoId);
+    return { verified: tenant?.verified ?? false, answeringEnabled: tenant ? !tenant.answeringRevoked : true };
+  }
+
+  /** The tenant `duoId` if it is in `orgId`; an unknown id, another org's duo, and the root duo (never a tenant) are the same 404. */
+  private requireTenantInOrg(orgId: string, duoId: string): HostedTenant {
+    this.requireOrg(orgId);
+    const tenant = this.data.tenants.find((candidate) => candidate.id === duoId && candidate.orgId === orgId);
+    if (!tenant) {
+      throw new OrgMemberNotFoundError();
+    }
+    return tenant;
   }
 
   private rootIn(orgId: string): boolean {
@@ -743,6 +808,11 @@ export class HostedRegistry {
       name,
       createdAt: new Date().toISOString(),
       passphraseCipher: encrypt(Buffer.from(passphrase, "utf8"), this.masterKey).toString("base64"),
+      // duo#318: a sign-up carries an identity only once `/hosted/signup` has already checked it
+      // against the invite's own email (or the invite named none) — by the time a tenant is
+      // created, its owner's Google account is exactly who the invite was for. A typed-name
+      // sign-up with no identity provider configured carries none, and stays unverified.
+      verified: identity.identitySubject !== undefined,
       ...identity,
     };
     return this.commit((draft) => {

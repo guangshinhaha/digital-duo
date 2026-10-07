@@ -100,7 +100,7 @@ export function runHostedOrgMembers(orgId: string, env: NodeJS.ProcessEnv = proc
   return callDaemon(env, "GET", `/hosted/orgs/${encodeURIComponent(orgId)}/members`);
 }
 
-/** One line of `duo hosted org members`: id, name, email, then the role marks (`super admin`, or `org admin` with who appointed them and when). */
+/** One line of `duo hosted org members`: id, name, email, then the role marks (`super admin`, or `org admin` with who appointed them and when), and duo#318's verification/answering marks. */
 export function formatOrgMemberLine(member: OrgMemberView): string {
   const marks: string[] = [];
   if (member.superAdmin) {
@@ -108,6 +108,12 @@ export function formatOrgMemberLine(member: OrgMemberView): string {
   }
   if (member.orgRole === "org_admin") {
     marks.push(`org admin (appointed by ${member.appointedByName ?? member.appointedBy ?? "unknown"}${member.appointedAt ? ` on ${member.appointedAt.slice(0, 10)}` : ""})`);
+  }
+  if (!member.verified) {
+    marks.push("unverified");
+  }
+  if (!member.answeringEnabled) {
+    marks.push(`answering revoked (by ${member.answeringRevokedByName ?? "unknown"}${member.answeringRevokedAt ? ` on ${member.answeringRevokedAt.slice(0, 10)}` : ""})`);
   }
   return [member.duoId, member.name, member.email ?? "-", ...marks].join("\t");
 }
@@ -126,6 +132,16 @@ export function runHostedOrgAdminGrant(orgId: string, duoId: string, env: NodeJS
 /** Implements `duo hosted org admin revoke <orgId> <duoId>`: as the super admin, so it may revoke an org's last org admin. */
 export function runHostedOrgAdminRevoke(orgId: string, duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgAdminChange> {
   return callDaemon(env, "POST", `/hosted/orgs/${encodeURIComponent(orgId)}/admins/${encodeURIComponent(duoId)}/revoke`, {});
+}
+
+/** duo#318: implements `duo hosted answering revoke <orgId> <duoId>`: stops a member's duo from answering colleagues, as the super admin. Idempotent. */
+export function runHostedAnsweringRevoke(orgId: string, duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgAdminChange> {
+  return callDaemon(env, "POST", `/hosted/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(duoId)}/answering/revoke`, {});
+}
+
+/** duo#318: implements `duo hosted answering restore <orgId> <duoId>`: lets a member's duo answer colleagues again, as the super admin. Idempotent. */
+export function runHostedAnsweringRestore(orgId: string, duoId: string, env: NodeJS.ProcessEnv = process.env): Promise<OrgAdminChange> {
+  return callDaemon(env, "POST", `/hosted/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(duoId)}/answering/restore`, {});
 }
 
 /** What `duo hosted end <duoId>` answers: whether the duo was found, which Matrix accounts were just deactivated, and any Synapse trouble (never a token). */

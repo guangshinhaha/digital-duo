@@ -1,6 +1,6 @@
 import { attachmentGroundingDoor } from "../drafting/attachment-grounding.js";
 import { parseClassificationCeiling } from "../permissions/classification.js";
-import { answerPublicly, workspaceDeclineNotice } from "../permissions/public-answer.js";
+import { answeringPausedOutcome, answerPublicly, workspaceDeclineNotice } from "../permissions/public-answer.js";
 import { notifyDraftWaiting } from "../push/notify.js";
 import { askerContextForSender } from "../workspace/asker.js";
 import type { WorkspaceSettings } from "../workspace/settings.js";
@@ -26,6 +26,9 @@ export type DuoWorkspaceInputs = Pick<
   // every existing caller that builds one already has them.
   | "env"
   | "pushSender"
+  // duo#318: whether this duo may currently answer colleagues — undefined on a personal duo,
+  // which answers exactly as before this existed.
+  | "verification"
 >;
 
 export interface DuoWorkspaceServiceOptions {
@@ -82,8 +85,14 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
     // the asking Matrix user resolved through the same directory
     // lookup. A question over the workspace connection and a question
     // over an ask link cannot diverge, because this is one call.
-    answer: (question) =>
-      answerPublicly(
+    answer: (question) => {
+      // duo#318: a workspace question is always a colleague's (the owner's own loop never goes
+      // through this pipeline) — checked before `answerPublicly` runs at all, same as `POST /ask`'s
+      // ask-link branch, so a paused duo leaves no draft behind.
+      if (duo.verification?.status().answeringEnabled === false) {
+        return Promise.resolve(answeringPausedOutcome());
+      }
+      return answerPublicly(
         duo.storePath,
         duo.passphrase,
         duo.duoDir,
@@ -112,7 +121,8 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
         // guangshinhaha/duo#314: whose question, from which conversation —
         // so a passed-on question reaches the owner with where to answer it.
         workspaceDraftProvenance(question),
-      ),
+      );
+    },
   });
   return workspace;
 }

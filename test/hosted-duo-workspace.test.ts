@@ -10,7 +10,8 @@ import { extractQaPairs, writeQaPairs } from "../src/derivation/qa-pairs.js";
 import { putRule } from "../src/derivation/rules.js";
 import { writeTopicsFile } from "../src/derivation/topics.js";
 import { DuoWorkspaceConnections, jitterFactor, sdkLoggerFor } from "../src/hosted/duo-workspace.js";
-import type { IdentityVerifier } from "../src/hosted/google.js";
+import { IdentityError, type IdentityVerifier } from "../src/hosted/google.js";
+import { DEFAULT_ORG_ID } from "../src/hosted/orgs.js";
 import { HostedRegistry } from "../src/hosted/registry.js";
 import {
   createHostedServer,
@@ -24,7 +25,7 @@ import {
 import { embedRecords } from "../src/ingest/embeddings.js";
 import { createRecord } from "../src/ingest/record.js";
 import { writeRecords } from "../src/ingest/record-store.js";
-import { PUBLIC_PASSED_ON_MESSAGE } from "../src/permissions/public-answer.js";
+import { PUBLIC_ANSWERING_PAUSED_MESSAGE, PUBLIC_PASSED_ON_MESSAGE } from "../src/permissions/public-answer.js";
 import type { InferenceProvider } from "../src/provider/types.js";
 import { createEncryptedStore, withDatabase } from "../src/store/store.js";
 import { grantAutonomy } from "../src/trust/grants.js";
@@ -322,6 +323,66 @@ describe("each hosted duo connects to the workspace as itself and answers there 
     // Nothing a duo said went out on the other's connection.
     expect(aliceTransport.sentAnswers.every((sent) => !sent.content.body.includes("BRAVO"))).toBe(true);
     expect(bobTransport.sentAnswers.every((sent) => !sent.content.body.includes("ALPHA"))).toBe(true);
+  });
+
+  it("duo#318: a duo signed up with no identity check is unverified, but still answers colleagues — only an admin's revoke pauses that", async () => {
+    const fake = createFakeSynapse();
+    const transports = new Transports();
+    const { hosted, base } = await start({ fake, transports, inference: markerProvider });
+    // `joinDuo` sends no credential; with no `identityVerifier` configured (local development, as `hosted/server.ts`'s
+    // own signup comment says), that is sign-up as usual, and it leaves the duo unverified — an honest label, not a gate:
+    // this deployment never offered an identity check to pass in the first place, so it must not block answering.
+    const sam = await joinDuo(base, "Sam");
+    await connected(hosted, sam.tenantId);
+    expect(hosted.registry.verificationStatus(sam.tenantId)).toEqual({ verified: false, answeringEnabled: true });
+
+    const duoUserId = duoUserOf(hosted, sam.tenantId);
+    const transport = transports.latest(duoUserId);
+    transport.deliver(question(duoUserId, "when is the audit?", "$q1"));
+    expect((await answersOf(transport))[0]).toContain(PUBLIC_PASSED_ON_MESSAGE);
+  });
+
+  it("duo#318: an org admin's revoke stops a verified duo from answering colleagues at once, and restore brings it back", async () => {
+    const fake = createFakeSynapse();
+    const transports = new Transports();
+    /** Credentials are "subject|email|name"; no invite in this test names an email, so any Google account matches. */
+    const fakeIdentity: IdentityVerifier = {
+      async verify(credential) {
+        const [subject, email, name] = credential.split("|");
+        if (!subject || !email) {
+          throw new IdentityError("bad credential");
+        }
+        return { subject, email, name };
+      },
+    };
+    const { hosted, base } = await start({ fake, transports, inference: markerProvider, identityVerifier: fakeIdentity });
+    const invite = (await (
+      await fetch(`${base}/hosted/invites`, { method: "POST", headers: { "content-type": "application/json", ...admin }, body: JSON.stringify({ name: "Sam" }) })
+    ).json()) as { code: string };
+    const signup = (await (
+      await fetch(`${base}/hosted/signup`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ invite: invite.code, credential: "sub-sam|sam@x.com|Sam" }) })
+    ).json()) as { tenantId: string; token: string };
+    await connected(hosted, signup.tenantId);
+    expect(hosted.registry.verificationStatus(signup.tenantId)).toEqual({ verified: true, answeringEnabled: true });
+
+    const duoUserId = duoUserOf(hosted, signup.tenantId);
+    const transport = transports.latest(duoUserId);
+    transport.deliver(question(duoUserId, "when is the audit?", "$q1"));
+    expect((await answersOf(transport))[0]).toContain(PUBLIC_PASSED_ON_MESSAGE);
+
+    const revoked = await fetch(`${base}/hosted/orgs/${DEFAULT_ORG_ID}/members/${signup.tenantId}/answering/revoke`, { method: "POST", headers: admin });
+    expect(revoked.status).toBe(200);
+    expect(hosted.registry.verificationStatus(signup.tenantId)).toEqual({ verified: true, answeringEnabled: false });
+
+    transport.deliver(question(duoUserId, "when is the audit, again?", "$q2"));
+    const second = (await answersOf(transport, 2))[1]!;
+    expect(second).toBe(PUBLIC_ANSWERING_PAUSED_MESSAGE);
+
+    const restored = await fetch(`${base}/hosted/orgs/${DEFAULT_ORG_ID}/members/${signup.tenantId}/answering/restore`, { method: "POST", headers: admin });
+    expect(restored.status).toBe(200);
+    transport.deliver(question(duoUserId, "when is the audit, once more?", "$q3"));
+    const third = (await answersOf(transport, 3))[2]!;
+    expect(third).toContain(PUBLIC_PASSED_ON_MESSAGE);
   });
 
   it("the root duo connects too, as its own account, and answers from its own store", async () => {

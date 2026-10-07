@@ -7,7 +7,14 @@ import { createFakeSynapse, FAKE_ADMIN_TOKEN, FAKE_SYNAPSE_URL, type FakeSynapse
 import { useTempDir } from "./helpers/temp-dir.js";
 import { loadConfig } from "../src/config.js";
 import { IdentityError, type IdentityVerifier } from "../src/hosted/google.js";
-import { formatOrgMemberLine, runHostedOrgAdminGrant, runHostedOrgAdminRevoke, runHostedOrgMembers } from "../src/hosted/invite.js";
+import {
+  formatOrgMemberLine,
+  runHostedAnsweringRestore,
+  runHostedAnsweringRevoke,
+  runHostedOrgAdminGrant,
+  runHostedOrgAdminRevoke,
+  runHostedOrgMembers,
+} from "../src/hosted/invite.js";
 import {
   DEFAULT_ORG_ID,
   LastOrgAdminError,
@@ -309,19 +316,67 @@ describe("org admin — registry", () => {
     expect(file.tenants[0]).not.toHaveProperty("orgAdminLog");
     expect(new HostedRegistry(path, MASTER).orgRoleOf(registry.tenants()[0].id)).toBe("member");
   });
+
+  it("duo#318: a sign-up with an identity is verified; one with none is not; the root duo is always verified", () => {
+    const { registry, org } = newRegistry();
+    const { invite: openInvite } = registry.createInvite("Ann", new Date(Date.now() + 3_600_000).toISOString(), null, org.id);
+    const unverified = registry.addTenant(openInvite.id, "Ann", "pw", registry.newTenantId());
+    expect(registry.verificationStatus(unverified.id)).toEqual({ verified: false, answeringEnabled: true });
+    const { invite: secondInvite } = registry.createInvite("Ari", new Date(Date.now() + 3_600_000).toISOString(), null, org.id);
+    const verified = registry.addTenant(secondInvite.id, "Ari", "pw", registry.newTenantId(), { identitySubject: "sub-ari", email: "ari@x.com" });
+    expect(registry.verificationStatus(verified.id)).toEqual({ verified: true, answeringEnabled: true });
+    expect(registry.verificationStatus(ROOT_DUO_ID)).toEqual({ verified: true, answeringEnabled: true });
+    // An id this registry has never heard of answers as able to — not this feature's refusal to make.
+    expect(registry.verificationStatus("nosuchduo1")).toEqual({ verified: false, answeringEnabled: true });
+  });
+
+  it("duo#318: setAnswering revokes and restores, idempotently, and records who and when", () => {
+    const { registry, org, add } = newRegistry();
+    const ann = add("Ann", org.id);
+    expect(registry.verificationStatus(ann.id).answeringEnabled).toBe(true);
+
+    const revoked = registry.setAnswering(org.id, ann.id, false, SUPER_ADMIN_ACTOR);
+    expect(revoked.changed).toBe(true);
+    expect(revoked.member.answeringEnabled).toBe(false);
+    expect(revoked.member.answeringRevoked).toMatchObject({ by: SUPER_ADMIN_ACTOR });
+    expect(Date.parse(revoked.member.answeringRevoked!.since)).not.toBeNaN();
+
+    const again = registry.setAnswering(org.id, ann.id, false, "someone-else");
+    expect(again.changed).toBe(false);
+    expect(again.member.answeringRevoked!.by).toBe(SUPER_ADMIN_ACTOR);
+
+    const restored = registry.setAnswering(org.id, ann.id, true, SUPER_ADMIN_ACTOR);
+    expect(restored.changed).toBe(true);
+    expect(restored.member.answeringEnabled).toBe(true);
+    expect(restored.member.answeringRevoked).toBeNull();
+
+    expect(registry.setAnswering(org.id, ann.id, true, SUPER_ADMIN_ACTOR).changed).toBe(false);
+  });
+
+  it("duo#318: setAnswering refuses the root duo, an unknown id, and another org's duo — all the same 404", () => {
+    const { registry, org, other, add } = newRegistry();
+    const bob = add("Bob", other.id);
+    registry.declareRootDuo("Shin");
+    expect(() => registry.setAnswering(org.id, ROOT_DUO_ID, false, SUPER_ADMIN_ACTOR)).toThrow(OrgMemberNotFoundError);
+    expect(() => registry.setAnswering(org.id, bob.id, false, SUPER_ADMIN_ACTOR)).toThrow(OrgMemberNotFoundError);
+    expect(() => registry.setAnswering(org.id, "nosuchduo1", false, SUPER_ADMIN_ACTOR)).toThrow(OrgMemberNotFoundError);
+    expect(() => registry.setAnswering("nosuchorg", bob.id, false, SUPER_ADMIN_ACTOR)).toThrow(OrgNotFoundError);
+  });
 });
 
 describe("org admin — GET /org and the sign-in responses", () => {
   it("tells every signed-in member their org, role and whether they are the super admin", async () => {
     const w = await world({ root: true });
-    expect(await json(await w.as(w.ann, "GET", "/org"))).toEqual({ org: { id: w.orgA.id, name: "Alpha" }, role: "member", superAdmin: false });
+    // `join_` always signs up with a matching Google identity (duo#318): every member here is verified and answering.
+    expect(await json(await w.as(w.ann, "GET", "/org"))).toEqual({ org: { id: w.orgA.id, name: "Alpha" }, role: "member", superAdmin: false, verified: true, answeringEnabled: true });
     await grantByAdmin(w, w.orgA.id, w.ann);
-    expect(await json(await w.as(w.ann, "GET", "/org"))).toEqual({ org: { id: w.orgA.id, name: "Alpha" }, role: "org_admin", superAdmin: false });
+    expect(await json(await w.as(w.ann, "GET", "/org"))).toEqual({ org: { id: w.orgA.id, name: "Alpha" }, role: "org_admin", superAdmin: false, verified: true, answeringEnabled: true });
 
     // The root duo, claimed by the super admin's first sign-in, is a member of the default org and the super admin.
     const shin = await json<Session>(await call(w.base, "POST", "/hosted/login", undefined, { credential: "sub-shin|shin@x.com|Shin" }), 200);
     expect(shin).toMatchObject({ basePath: "", isAdmin: true, orgRole: "member" });
-    expect(await json(await call(w.base, "GET", "/org", shin.token))).toEqual({ org: { id: DEFAULT_ORG_ID, name: "Default" }, role: "member", superAdmin: true });
+    // The root duo is always verified and able to answer (duo#318).
+    expect(await json(await call(w.base, "GET", "/org", shin.token))).toEqual({ org: { id: DEFAULT_ORG_ID, name: "Default" }, role: "member", superAdmin: true, verified: true, answeringEnabled: true });
   });
 
   it("login and sign-up keep isAdmin and gain orgRole", async () => {
@@ -781,8 +836,42 @@ describe("duo hosted org admin … (terminal)", () => {
     await expect(runHostedOrgAdminGrant("nosuchorg", w.ann.tenantId, env)).rejects.toThrow(/no org "nosuchorg"/);
   });
 
+  it("duo#318: revokes and restores answering as the super admin, and the member listing marks it", async () => {
+    const w = await world();
+    const env = { DUO_HOSTED_MASTER_KEY: MASTER, DUO_HOSTED_ADMIN_TOKEN: ADMIN, PORT: new URL(w.base).port };
+
+    const revoked = await runHostedAnsweringRevoke(w.orgA.id, w.ari.tenantId, env);
+    expect(revoked).toMatchObject({ changed: true, member: { name: "ari", answeringEnabled: false } });
+    expect((await runHostedAnsweringRevoke(w.orgA.id, w.ari.tenantId, env)).changed).toBe(false);
+
+    const lines = (await runHostedOrgMembers(w.orgA.id, env)).map(formatOrgMemberLine);
+    expect(lines.find((line) => line.includes("ari@x.com"))).toMatch(/answering revoked \(by Super admin on \d{4}-\d{2}-\d{2}\)/);
+
+    const restored = await runHostedAnsweringRestore(w.orgA.id, w.ari.tenantId, env);
+    expect(restored).toMatchObject({ changed: true, member: { name: "ari", answeringEnabled: true } });
+    expect((await runHostedAnsweringRestore(w.orgA.id, w.ari.tenantId, env)).changed).toBe(false);
+
+    await expect(runHostedAnsweringRevoke(w.orgA.id, w.bob.tenantId, env)).rejects.toThrow(/no such member/);
+    await expect(runHostedAnsweringRevoke("nosuchorg", w.ari.tenantId, env)).rejects.toThrow(/no org "nosuchorg"/);
+  });
+
   it("marks a super admin apart from an org admin in the member listing", () => {
-    const base = { duoId: "d", name: "N", email: "n@x.com", isRoot: false, joinedAt: null, isAdmin: true, orgAdminLog: [], appointedBy: null, appointedByName: null, appointedAt: null };
+    const base = {
+      duoId: "d",
+      name: "N",
+      email: "n@x.com",
+      isRoot: false,
+      joinedAt: null,
+      isAdmin: true,
+      orgAdminLog: [],
+      appointedBy: null,
+      appointedByName: null,
+      appointedAt: null,
+      verified: true,
+      answeringEnabled: true,
+      answeringRevokedByName: null,
+      answeringRevokedAt: null,
+    };
     expect(formatOrgMemberLine({ ...base, superAdmin: true, orgRole: "member" })).toBe("d\tN\tn@x.com\tsuper admin");
     expect(formatOrgMemberLine({ ...base, superAdmin: false, orgRole: "member" })).toBe("d\tN\tn@x.com");
   });
@@ -874,6 +963,15 @@ describe("org admin — a super admin who is also an org admin", () => {
     expect((await json(await w.as(w.ann, "POST", `/org/admins/${w.ari.tenantId}/grant`), 409)).error.code).toBe("super_admin_protected");
     expect(w.hosted.registry.orgRoleOf(w.ari.tenantId)).toBe("org_admin");
   });
+
+  it("duo#318: an org admin cannot revoke or restore the super admin's own answering, either", async () => {
+    const w = await dual(true);
+    expect((await json(await w.as(w.ann, "POST", `/org/members/${w.ari.tenantId}/answering/revoke`), 409)).error.code).toBe("super_admin_protected");
+    expect((await json(await w.as(w.ann, "POST", `/org/members/${w.ari.tenantId}/answering/restore`), 409)).error.code).toBe("super_admin_protected");
+    expect(w.hosted.registry.verificationStatus(w.ari.tenantId).answeringEnabled).toBe(true);
+    // The super admin may still act on their own duo's answering, from the terminal.
+    expect((await json(await w.admin("POST", `/hosted/orgs/${w.orgA.id}/members/${w.ari.tenantId}/answering/revoke`))).changed).toBe(true);
+  });
 });
 
 describe("org admin — every appoint and revoke reaches the server log", () => {
@@ -964,5 +1062,74 @@ describe("org admin — POST /org/admins/:duoId/grant and /revoke need a signed-
     // The control: Ann's own device token is what works.
     expect((await w.as(w.ann, "POST", `/org/admins/${w.abe.tenantId}/grant`)).status).toBe(200);
     expect((await w.as(w.ann, "POST", `/org/admins/${w.abe.tenantId}/revoke`)).status).toBe(200);
+  });
+});
+
+describe("org admin — answering (duo#318)", () => {
+  it("every member row carries verified and answeringEnabled, from the super admin's list and an org admin's alike", async () => {
+    const w = await world();
+    const members = await json<any[]>(await w.admin("GET", `/hosted/orgs/${w.orgA.id}/members`), 200);
+    // `join_` always signs up with a matching Google identity, so every member here is verified and enabled.
+    expect(members.every((member) => member.verified === true && member.answeringEnabled === true && member.answeringRevokedAt === null)).toBe(true);
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    const fromOrgAdmin = await json<any[]>(await w.as(w.ann, "GET", "/org/members"), 200);
+    expect(fromOrgAdmin.find((m) => m.duoId === w.ari.tenantId)).toMatchObject({ verified: true, answeringEnabled: true });
+  });
+
+  it("the super admin revokes a member's answering and restores it; the member row and GET /org both reflect it at once", async () => {
+    const w = await world();
+    const before = await json<any[]>(await w.admin("GET", `/hosted/orgs/${w.orgA.id}/members`), 200);
+    expect(before.find((m) => m.duoId === w.ari.tenantId)).toMatchObject({ answeringEnabled: true });
+    expect(await json(await w.as(w.ari, "GET", "/org"))).toMatchObject({ verified: true, answeringEnabled: true });
+
+    const revoked = await json(await w.admin("POST", `/hosted/orgs/${w.orgA.id}/members/${w.ari.tenantId}/answering/revoke`), 200);
+    expect(revoked).toMatchObject({ changed: true, member: { duoId: w.ari.tenantId, answeringEnabled: false } });
+    expect(revoked.member.answeringRevokedByName).toBe("Super admin");
+    expect(await json(await w.as(w.ari, "GET", "/org"))).toMatchObject({ verified: true, answeringEnabled: false });
+
+    // Idempotent: revoking again changes nothing.
+    expect((await json(await w.admin("POST", `/hosted/orgs/${w.orgA.id}/members/${w.ari.tenantId}/answering/revoke`))).changed).toBe(false);
+
+    const restored = await json(await w.admin("POST", `/hosted/orgs/${w.orgA.id}/members/${w.ari.tenantId}/answering/restore`), 200);
+    expect(restored).toMatchObject({ changed: true, member: { duoId: w.ari.tenantId, answeringEnabled: true, answeringRevokedAt: null } });
+    expect(await json(await w.as(w.ari, "GET", "/org"))).toMatchObject({ answeringEnabled: true });
+  });
+
+  it("an org admin revokes and restores answering for a member of their own org, never another org's", async () => {
+    const w = await world();
+    await grantByAdmin(w, w.orgA.id, w.ann);
+    const revoked = await json(await w.as(w.ann, "POST", `/org/members/${w.ari.tenantId}/answering/revoke`), 200);
+    expect(revoked.member).toMatchObject({ answeringEnabled: false });
+    expect(revoked.member.answeringRevokedByName).toBe("ann");
+    await json(await w.as(w.ann, "POST", `/org/members/${w.ari.tenantId}/answering/restore`), 200);
+
+    // Bob is in org B: 404, the same "no such member" every other-org id gets.
+    const crossOrg = await w.as(w.ann, "POST", `/org/members/${w.bob.tenantId}/answering/revoke`);
+    expect(crossOrg.status).toBe(404);
+    expect((await crossOrg.json()).error.code).toBe("not_found");
+  });
+
+  it("a plain member gets the same 403 every other org-admin route gives, and changes nothing", async () => {
+    const w = await world();
+    const before = await (await w.admin("GET", `/hosted/orgs/${w.orgA.id}/members`)).text();
+    const response = await w.as(w.ari, "POST", `/org/members/${w.abe.tenantId}/answering/revoke`);
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.message).toBe("Only an admin can do this.");
+    expect(await (await w.admin("GET", `/hosted/orgs/${w.orgA.id}/members`)).text()).toBe(before);
+  });
+
+  it("the root duo is never a target: 404 from the super admin's route, same as any other id this feature does not manage", async () => {
+    const w = await world({ root: true });
+    const shin = await json<Session>(await call(w.base, "POST", "/hosted/login", undefined, { credential: "sub-shin|shin@x.com|Shin" }), 200);
+    const response = await w.admin("POST", `/hosted/orgs/${DEFAULT_ORG_ID}/members/root/answering/revoke`);
+    expect(response.status).toBe(404);
+    // The root duo always reads as verified and able to answer, whatever is attempted against it.
+    expect(await json(await call(w.base, "GET", "/org", shin.token))).toMatchObject({ verified: true, answeringEnabled: true });
+  });
+
+  it("needs a signed-in device: 401 with no token, and an ask link is refused, same as grant/revoke", async () => {
+    const w = await world();
+    expect((await call(w.base, "POST", `${w.ann.basePath}/org/members/${w.ari.tenantId}/answering/revoke`)).status).toBe(401);
+    expect((await call(w.base, "POST", `${w.ann.basePath}/org/members/${w.ari.tenantId}/answering/revoke`, "nope")).status).toBe(401);
   });
 });

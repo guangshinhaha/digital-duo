@@ -112,9 +112,11 @@ Routes (all super admin only; POST for rename because CORS allows only GET and P
 | `GET /hosted/orgs` | `[{ id, name, createdAt, memberCount }]` |
 | `POST /hosted/orgs` `{ name }` | create; 201, 400 on a bad name, 409 if the name is taken |
 | `POST /hosted/orgs/:orgId/rename` `{ name }` | rename; 404 for an unknown org, 409 `org_name_taken` if another org has the name |
-| `GET /hosted/orgs/:orgId/members` | `[{ duoId, name, email, isRoot, joinedAt, isAdmin, superAdmin, orgRole, appointedBy, appointedByName, appointedAt, orgAdminLog }]` |
+| `GET /hosted/orgs/:orgId/members` | `[{ duoId, name, email, isRoot, joinedAt, isAdmin, superAdmin, orgRole, appointedBy, appointedByName, appointedAt, orgAdminLog, verified, answeringEnabled, answeringRevoked }]` (`verified`/`answeringEnabled`/`answeringRevoked`: duo#318) |
 | `POST /hosted/orgs/:orgId/admins/:duoId/grant` | appoint a member as org admin, as `super-admin`; `{ member, changed }` |
 | `POST /hosted/orgs/:orgId/admins/:duoId/revoke` | revoke the role, and may revoke the org's last org admin; `{ member, changed }`. Revoking a member who holds no role is 200 `changed: false`; revoking `root` is 409 `root_not_appointable`, as granting it is |
+| `POST /hosted/orgs/:orgId/members/:duoId/answering/revoke` | duo#318: stops a member's duo answering colleagues at all, as `super-admin`; `{ member, changed }`. 404 `not_found` for a member who left or `root` (never a target) |
+| `POST /hosted/orgs/:orgId/members/:duoId/answering/restore` | duo#318: lets the duo answer colleagues again; `{ member, changed }` |
 | `POST /hosted/invites` `{ name, orgId?, email?, expiresInHours? }` | as before, plus the org |
 
 `duoId` is the tenant id, or `root` for the pre-hosted root duo. `isAdmin` and `superAdmin` are the same
@@ -130,23 +132,45 @@ duo's `basePath` (`/t/<id>`, or empty for the root duo), with the duo's device t
 
 | Route (under `<basePath>`) | Who | What |
 |---|---|---|
-| `GET /org` | any signed-in member | `{ org: { id, name }, role, superAdmin }`: how the app learns and refreshes its role |
+| `GET /org` | any signed-in member | `{ org: { id, name }, role, superAdmin, verified, answeringEnabled }`: how the app learns and refreshes its role (`verified`/`answeringEnabled`: duo#318, the signed-in duo's own) |
 | `GET /org/members` | org admin | the org's members, as the super admin's list above |
 | `GET /org/invites` | org admin | `[{ id, name, email, orgId, createdAt, expiresAt }]`, this org's pending invites only |
 | `POST /org/invites` `{ name, email?, expiresInHours? }` | org admin | 201 `{ id, name, email, orgId, expiresAt, code, link }`; always this org. `name` at most 80 characters (400 beyond); 409 `too_many_invites` when the org already has 50 unused, unexpired invites (expired ones are dropped as a new one is made) |
 | `POST /org/rename` `{ name }` | org admin | `{ org: { id, name } }`; also renames the org's Space. A name another org has is the generic 409 `name_unavailable` |
 | `POST /org/admins/:duoId/grant` | org admin | `{ member, changed }`; idempotent |
 | `POST /org/admins/:duoId/revoke` | org admin | `{ member, changed }`; 409 `last_org_admin` for the last one |
+| `POST /org/members/:duoId/answering/revoke` | org admin | duo#318: `{ member, changed }`; stops a member of this org answering colleagues; 409 `super_admin_protected` for the super admin's own duo |
+| `POST /org/members/:duoId/answering/restore` | org admin | duo#318: `{ member, changed }`; same refusals as the revoke above |
 
 Errors: 401 no or bad device token (also an ask link or a connector token: these routes take a
 device token only); 403 `forbidden` for everything that is not the caller's to do (one body); 404
-`not_found` for a `:duoId` that is not in the caller's org; 409 `last_org_admin`,
-`root_not_appointable` (granting or revoking `root`), `super_admin_protected` (an org admin acting on
-another super admin), `name_unavailable`, `too_many_invites`; 400 `bad_request`. The super admin's own
+`not_found` for a `:duoId` that is not in the caller's org (or, for the answering routes, `root`:
+never a target there); 409 `last_org_admin`, `root_not_appointable` (granting or revoking `root`),
+`super_admin_protected` (an org admin acting on another super admin, including that super admin's
+answering, duo#318), `name_unavailable`, `too_many_invites`; 400 `bad_request`. The super admin's own
 routes above keep the specific `org_name_taken` and have no invite cap. `org_name_taken` is never sent
 to an org admin, who sees no other org's name.
 The routes exist only in hosted mode (`ServeDeps.orgAdmin`, bound to one duo in
 `src/hosted/server.ts`; the logic is `src/hosted/org-admin.ts`).
+
+### Verification and answering (duo#318)
+
+Every tenant carries `verified` (set once, at sign-up: true iff it signed up through an identity
+provider — `identityVerifier` configured — false for a typed-name sign-up with none configured) and
+`answeringRevoked` (absent means enabled; set to `{ since, by }` by an org admin's or the super
+admin's revoke, cleared by restore). The root duo always reads `verified: true,
+answeringEnabled: true` — it is never a target of the answering routes. `HostedRegistry.verificationStatus(duoId)`
+is the one live read (`{ verified, answeringEnabled }`), and `ServeDeps.verification`
+(`src/serve/server.ts`) is the per-duo handle hosted mode builds from it (`verificationAccessFor` in
+`src/hosted/server.ts`), bound like `orgAdmin` and `workspaceSession` above it.
+
+**`verified` is an informational label only — it gates nothing.** `src/permissions/public-answer.ts`'s
+gate (checked before `POST /ask`'s ask-link branch and the workspace answering pipeline ever call
+`answerPublicly`) reads `answeringEnabled` alone. A deployment with no `identityVerifier` configured
+signs up every duo unverified, by design (the typed-name path, this doc's §"Routes" above), and must
+keep answering normally — gating on `verified` there would silently break that deployment style. A
+paused duo's colleagues see the fixed `PUBLIC_ANSWERING_PAUSED_MESSAGE`, deliberately as vague as the
+other asker-visible outcomes in that module.
 
 Code that needs org membership imports from `src/hosted/registry.ts` (`HostedRegistry`, reachable
 as `hosted.registry`) and `src/hosted/orgs.ts` (types and constants):

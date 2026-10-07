@@ -53,6 +53,13 @@ export interface OrgMemberView {
   readonly appointedAt: string | null;
   /** Every appoint and revoke of this duo, oldest first (bounded). */
   readonly orgAdminLog: ReadonlyArray<OrgAdminLogEntry & { byName: string | null }>;
+  /** duo#318: whether this duo's owner is identity-verified. The root duo is always true. */
+  readonly verified: boolean;
+  /** duo#318: whether this duo may currently answer colleagues — verified, and not revoked. */
+  readonly answeringEnabled: boolean;
+  /** duo#318: set while answering is revoked — when and by whom (named like `appointedByName`). Null otherwise. */
+  readonly answeringRevokedAt: string | null;
+  readonly answeringRevokedByName: string | null;
 }
 
 export interface OrgAdminDeps {
@@ -139,6 +146,10 @@ export class OrgAdmin {
       appointedByName: member.orgAdmin ? this.actorName(member.orgAdmin.by) : null,
       appointedAt: member.orgAdmin?.since ?? null,
       orgAdminLog: member.orgAdminLog.map((entry) => ({ ...entry, byName: this.actorName(entry.by) })),
+      verified: member.verified,
+      answeringEnabled: member.answeringEnabled,
+      answeringRevokedAt: member.answeringRevoked?.since ?? null,
+      answeringRevokedByName: member.answeringRevoked ? this.actorName(member.answeringRevoked.by) : null,
     };
   }
 
@@ -203,6 +214,44 @@ export class OrgAdmin {
     }
   }
 
+  /**
+   * duo#318: sets whether `duoId` (a member of `orgId`) may answer colleagues. Idempotent, like `grant`/`revoke`.
+   * Unlike the org admin role, there is no "last one" constraint — answering is a per-duo gate, not a role the
+   * org must always have someone holding — so an org admin may revoke or restore it for any member of their own
+   * org, including another org admin. The root duo and ids outside the org are the same 404 `requireTenantInOrg`
+   * gives. The super admin's own duo is protected the same way `grant`/`revoke` protect the role: an org admin
+   * cannot silence the super admin's duo, only the super admin can act on it (here, on itself).
+   */
+  private setAnswering(orgId: string, duoId: string, enabled: boolean, actor: string): OrgAdminOutcome<{ member: OrgMemberView; changed: boolean }> {
+    try {
+      const target = this.deps.registry.listOrgMembers(orgId).find((member) => member.duoId === duoId);
+      if (actor !== SUPER_ADMIN_ACTOR && target && !target.isRoot && this.deps.isAdminEmail(target.email ?? undefined)) {
+        return { ok: false, status: 409, code: "super_admin_protected", message: "The super admin's duo is not managed by an org admin." };
+      }
+      const { member, changed } = this.deps.registry.setAnswering(orgId, duoId, enabled, actor);
+      if (changed) {
+        (this.deps.log ?? ((line) => console.error(line)))(`hosted: org admin ${enabled ? "restore" : "revoke"}-answering org=${orgId} duo=${duoId} by=${actor}`);
+      }
+      return { ok: true, value: { member: this.view(member), changed } };
+    } catch (error) {
+      const refusal = refusalFor(error);
+      if (refusal) {
+        return refusal;
+      }
+      throw error;
+    }
+  }
+
+  /** Revokes `duoId`'s ability to answer colleagues (duo#318). */
+  revokeAnswering(orgId: string, duoId: string, actor: string): OrgAdminOutcome<{ member: OrgMemberView; changed: boolean }> {
+    return this.setAnswering(orgId, duoId, false, actor);
+  }
+
+  /** Restores `duoId`'s ability to answer colleagues (duo#318). */
+  restoreAnswering(orgId: string, duoId: string, actor: string): OrgAdminOutcome<{ member: OrgMemberView; changed: boolean }> {
+    return this.setAnswering(orgId, duoId, true, actor);
+  }
+
   /** `renameOrg` for an org admin's own org, answering as a value. `hideTakenNames`: an org admin sees no other org's name, so a taken name is a generic 409 `name_unavailable`, not `org_name_taken`. */
   async renameAs(orgId: string, body: unknown, options: { hideTakenNames?: boolean } = {}): Promise<OrgAdminOutcome> {
     try {
@@ -244,7 +293,11 @@ export class OrgAdmin {
     return {
       overview: () => {
         const own = org();
-        return own && { org: { id: own.id, name: own.name }, role: registry.orgRoleOf(duoId), superAdmin: this.isSuperAdminDuo(duoId) };
+        if (!own) {
+          return undefined;
+        }
+        const verification = registry.verificationStatus(duoId);
+        return { org: { id: own.id, name: own.name }, role: registry.orgRoleOf(duoId), superAdmin: this.isSuperAdminDuo(duoId), ...verification };
       },
       members: () => {
         const scope = asOrgAdmin();
@@ -286,6 +339,14 @@ export class OrgAdmin {
       revoke: (target) => {
         const scope = asOrgAdmin();
         return "orgId" in scope ? this.revoke(scope.orgId, target, duoId) : scope;
+      },
+      revokeAnswering: (target) => {
+        const scope = asOrgAdmin();
+        return "orgId" in scope ? this.revokeAnswering(scope.orgId, target, duoId) : scope;
+      },
+      restoreAnswering: (target) => {
+        const scope = asOrgAdmin();
+        return "orgId" in scope ? this.restoreAnswering(scope.orgId, target, duoId) : scope;
       },
     };
   }

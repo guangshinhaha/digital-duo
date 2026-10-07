@@ -29,7 +29,22 @@ import { runAsk } from "./commands/ask.js";
 import { runDerivePairs, runDeriveRules, runDeriveSync, runDeriveTopics, runDeriveVoice } from "./commands/derive.js";
 import { runDraft, runDraftsList, runRecordDraftOutcome, runRecordEscalationAnswer } from "./commands/draft.js";
 import { runList } from "./commands/list.js";
-import { runHostedInvite, runHostedOrgCreate, runHostedOrgList, runHostedOrgMembers, runHostedOrgRename, runHostedOrgAdminGrant, runHostedOrgAdminRevoke, runHostedEnd, formatOrgMemberLine, runHostedProvision, runHostedRemint, runHostedServe } from "./commands/hosted.js";
+import {
+  runHostedInvite,
+  runHostedOrgCreate,
+  runHostedOrgList,
+  runHostedOrgMembers,
+  runHostedOrgRename,
+  runHostedOrgAdminGrant,
+  runHostedOrgAdminRevoke,
+  runHostedAnsweringRevoke,
+  runHostedAnsweringRestore,
+  runHostedEnd,
+  formatOrgMemberLine,
+  runHostedProvision,
+  runHostedRemint,
+  runHostedServe,
+} from "./commands/hosted.js";
 import { runAskLink, runAskLinkList, runAskLinkRevoke, runConnectorNew, runPair, runPairList, runPairRevoke, runServe } from "./commands/serve.js";
 import { HELD_OUT_CAVEAT, type CalibrationItem } from "./derivation/calibration.js";
 import { DRAFT_OUTCOMES, SETTABLE_DRAFT_OUTCOMES } from "./drafting/draft-log.js";
@@ -311,6 +326,34 @@ hostedOrgAdminCommand
     try {
       const { member, changed } = await runHostedOrgAdminRevoke(orgId, duoId);
       console.log(changed ? `${member.name} (${member.duoId}) is no longer an org admin of ${orgId}.` : `${member.name} (${member.duoId}) was not an org admin of ${orgId}; nothing changed.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+const hostedAnsweringCommand = hostedCommand
+  .command("answering")
+  .description("duo#318: whether a member's duo may answer colleagues at all — distinct from the org admin role above");
+
+hostedAnsweringCommand
+  .command("revoke <orgId> <duoId>")
+  .description("Stop a member's duo from answering colleagues until restored (find duo ids with `duo hosted org members <orgId>`)")
+  .action(async (orgId: string, duoId: string) => {
+    try {
+      const { member, changed } = await runHostedAnsweringRevoke(orgId, duoId);
+      console.log(changed ? `${member.name} (${member.duoId}) can no longer answer colleagues in ${orgId}.` : `${member.name} (${member.duoId}) already could not answer colleagues; nothing changed.`);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+
+hostedAnsweringCommand
+  .command("restore <orgId> <duoId>")
+  .description("Let a member's duo answer colleagues again")
+  .action(async (orgId: string, duoId: string) => {
+    try {
+      const { member, changed } = await runHostedAnsweringRestore(orgId, duoId);
+      console.log(changed ? `${member.name} (${member.duoId}) can answer colleagues again in ${orgId}.` : `${member.name} (${member.duoId}) could already answer colleagues; nothing changed.`);
     } catch (error) {
       reportError(error);
     }
