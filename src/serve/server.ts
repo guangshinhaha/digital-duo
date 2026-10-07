@@ -10,6 +10,7 @@ import type { CorrectionCandidateStatus } from "../corrections/queue.js";
 import { approveCandidate, getReviewCandidate, listReviewCandidates, rejectCandidate } from "../corrections/review.js";
 import { buildInterruptionPortrait } from "../derivation/portrait.js";
 import { buildTopicCoverage } from "../derivation/coverage.js";
+import { buildStarterSuggestions } from "../derivation/suggestions.js";
 import { computeVoiceTrend } from "../derivation/voice-trend.js";
 import { assembleEscalationDigest, escalationUrgencyRate, listEscalationDigests } from "../escalation/digest.js";
 import { approveRule, describeRuleWithEvidence, listRulesForReview, promoteRule, rejectRule } from "../derivation/rule-review.js";
@@ -37,6 +38,7 @@ import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../draft
 import { excludeSource, listSourceControls, restoreSource } from "../drafting/source-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
 import { explainMessage, ExplainUnavailableError } from "../drafting/explain.js";
+import { suggestFollowUps } from "../drafting/follow-ups.js";
 import { summarizeCatchUp, CatchUpUnavailableError, type CatchUpMessageInput } from "../drafting/catch-up.js";
 import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply, onDraftingStarted } from "../drafting/pipeline.js";
@@ -1020,6 +1022,26 @@ function registerRoutes(
       return;
     }
     return assembleDailyBrief(deps.storePath, deps.passphrase, since);
+  });
+
+  // duo#305: "suggested questions and follow-ups" — starters for an empty
+  // Your duo. A pure composition over `knowledge/coverage` and
+  // `daily-brief` above (see suggestions.ts's own doc comment); reading it
+  // changes nothing, same as both of those.
+  app.get("/suggestions/starters", async () => buildStarterSuggestions(deps.storePath, deps.passphrase, deps.duoDir));
+
+  // duo#305: up to three follow-ups for one self-chat turn. Ambient and
+  // optional (the client can turn the chips off), so this never 503s —
+  // see follow-ups.ts's own doc comment for why a missing provider or an
+  // unparseable response both just mean "no suggestions", not an error.
+  app.post<{ Body: { question?: unknown; answer?: unknown } }>("/suggestions/follow-ups", async (request, reply) => {
+    const { question, answer } = request.body ?? {};
+    if (typeof question !== "string" || typeof answer !== "string" || answer.trim().length === 0) {
+      reply.code(400).send(errorBody("bad_request", "question and answer are required"));
+      return;
+    }
+    const result = await suggestFollowUps(question, answer, deps.inferenceProvider);
+    return result;
   });
 
   // Issue #159: the one route an ask token authorizes. A thin wrapper, not
