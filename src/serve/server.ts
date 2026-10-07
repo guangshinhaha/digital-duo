@@ -307,6 +307,52 @@ function parseDraftRecipient(raw: unknown): DraftRecipient | undefined {
 }
 
 /**
+ * duo#304: splits already-decided draft text into word-sized reveal chunks
+ * for `POST /drafts/stream`. Each run of whitespace folds into the END of
+ * the preceding word, so concatenating every chunk in order reproduces the
+ * original text byte-for-byte — the client never has to re-insert spacing.
+ */
+function wordChunks(text: string): string[] {
+  const parts = text.split(/(\s+)/);
+  const chunks: string[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const chunk = `${parts[i] ?? ""}${parts[i + 1] ?? ""}`;
+    if (chunk.length > 0) {
+      chunks.push(chunk);
+    }
+  }
+  return chunks;
+}
+
+// duo#304: pacing for the reveal, not simulated generation latency — the
+// answer is already fully decided (draftReply has already returned) by the
+// time any of this runs. Capped by total, not fixed per chunk, so a long
+// answer's reveal still finishes in about a second rather than growing
+// without bound.
+const STREAM_MAX_TOTAL_REVEAL_MS = 1200;
+const STREAM_MAX_CHUNK_DELAY_MS = 20;
+
+function chunkDelayMs(chunkCount: number): number {
+  if (chunkCount <= 1) {
+    return 0;
+  }
+  return Math.max(0, Math.min(STREAM_MAX_CHUNK_DELAY_MS, STREAM_MAX_TOTAL_REVEAL_MS / chunkCount));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * One `event: <name>\ndata: <json>\n\n` SSE frame (duo#304). `JSON.stringify`
+ * never contains a bare `\n\n` (it escapes newlines inside strings as
+ * `\n`), so this framing is always unambiguous to a line-based SSE parser.
+ */
+function sseFrame(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
  * One shape for every error response (`client-tech-design.md` §1.5): a
  * domain error's own message is already written for a human, so this maps
  * the *class* to a status code and passes the message straight through
@@ -738,6 +784,107 @@ function registerRoutes(
     // slow or cost the response this route already has.
     void notifyDraftWaiting(deps, result.draftId, deps.pushSender);
     return result;
+  });
+
+  // duo#304: "your duo's answers appear as they're written" — self-chat's
+  // own composer (`Duo.tsx`/`Composer.tsx`, the ONE caller) streams through
+  // this route instead of POST /drafts above, which is left completely
+  // unchanged for every other caller (none over HTTP today — the CLI, the
+  // MCP connector, predecessor consultation, calibration and the eval
+  // harness all call `draftReply` directly, in-process, never through this
+  // server). Additive, not a contract change: same body shape, same
+  // side effects (the draft-log row, the same-tick `draftReady` push, the
+  // waiting-on-you notification), same 400s for a missing question or a
+  // malformed recipient — only the successful response's shape differs.
+  //
+  // draftReply still runs to completion, self-consistency sampling and all,
+  // before a single byte reaches the client: the pipeline picks its
+  // representative sample only once every sample has returned (§1.7), so
+  // there is no in-flight generation to tap tokens from without either
+  // weakening that confidence signal or risking the displayed text getting
+  // silently swapped once the "real" pick comes in — both bigger, riskier
+  // changes than this issue asked for. What streams is the DECIDED answer,
+  // revealed word by word instead of flashed in all at once, over a
+  // connection the owner can cut short with Stop (closing it leaves the
+  // draft-log row exactly as POST /drafts would have left it — nothing
+  // generated is ever lost, because nothing streams until it already
+  // exists).
+  app.post<{ Body: { question: string; threadContext?: string | null; recipient?: unknown } }>("/drafts/stream", async (request, reply) => {
+    const { question, threadContext } = request.body ?? {};
+    if (!question) {
+      reply.code(400).send(errorBody("bad_request", "question is required"));
+      return;
+    }
+    let recipient: DraftRecipient | undefined;
+    try {
+      recipient = parseDraftRecipient(request.body?.recipient);
+    } catch (error) {
+      if (!(error instanceof BadRequestError)) {
+        throw error;
+      }
+      reply.code(400).send(errorBody("bad_request", error.message));
+      return;
+    }
+
+    // No try/catch around this call, deliberately matching POST /drafts'
+    // own no-catch precedent above: a pipeline failure here still gets
+    // Fastify's normal error response, because nothing has been written to
+    // the client yet — `reply.hijack()` only happens after this resolves.
+    const result = await draftReply(
+      deps.storePath,
+      deps.passphrase,
+      deps.duoDir,
+      question,
+      threadContext ?? null,
+      deps.embeddingProvider,
+      deps.inferenceProvider,
+      deps.confidenceConfig,
+      undefined, // no clearance ceiling: the owner's own draft
+      undefined, // no attachments on this path
+      recipient,
+      { offerAlternatives: true },
+    );
+    draftReady.publish(result.draftId);
+    void notifyDraftWaiting(deps, result.draftId, deps.pushSender);
+
+    // Past this point the response is ours to write directly — Fastify's
+    // own JSON serialization would otherwise fight an SSE body.
+    // `reply.hijack()` is this codebase's existing seam for exactly that
+    // (the MCP Streamable HTTP transport in `mcp.ts` takes raw control of
+    // the response the same way).
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    });
+
+    let closed = false;
+    raw.on("close", () => {
+      closed = true;
+    });
+
+    const chunks = wordChunks(result.kind === "draft" ? result.text : "");
+    const delayMs = chunkDelayMs(chunks.length);
+    for (const chunk of chunks) {
+      if (closed || !raw.writable) {
+        break;
+      }
+      raw.write(sseFrame("chunk", { text: chunk }));
+      if (delayMs > 0) {
+        await sleep(delayMs);
+      }
+    }
+    // Skipped on an early Stop by the same closed/writable guard the loop
+    // above uses. When it does send, it carries the full
+    // DraftPipelineResult (sources, confidence, alternatives — the exact
+    // shape POST /drafts returns) so a client that stayed connected to the
+    // end can finish rendering without a second request.
+    if (!closed && raw.writable) {
+      raw.write(sseFrame("done", result));
+    }
+    raw.end();
   });
 
   // #263: polishes the OWNER'S OWN typed composer text — never a duo-

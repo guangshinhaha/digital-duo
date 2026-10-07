@@ -287,6 +287,8 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "GET", url: "/lifecycle" },
     { method: "GET", url: "/corpus/embed" },
     { method: "POST", url: "/drafts", payload: { question: "q" } },
+    // duo#304: self-chat's streamed sibling of POST /drafts — same auth gate.
+    { method: "POST", url: "/drafts/stream", payload: { question: "q" } },
     { method: "POST", url: "/compose/rewrite", payload: { text: "hi", instruction: "shorter" } },
     { method: "POST", url: "/compose/fact-check", payload: { text: "hi" } },
     { method: "POST", url: "/compose/explain", payload: { text: "hi" } },
