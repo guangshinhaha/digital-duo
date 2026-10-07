@@ -2417,6 +2417,133 @@ describe("GET /knowledge/sources, POST /knowledge/sources/:source/exclude and /r
   });
 });
 
+describe("GET /knowledge/records, PUT /knowledge/records/:id — the Knows tab's browse and edit (digital-duo#286)", () => {
+  let app: FastifyInstance;
+  let storePath: string;
+  let authHeader: { authorization: string };
+
+  beforeEach(() => {
+    storePath = initStore();
+    app = createServer(deps(storePath));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "test-device");
+    authHeader = { authorization: `Bearer ${paired.token}` };
+  });
+
+  it("GET /knowledge/records is an empty page, not an error, on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/knowledge/records", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ records: [], nextCursor: null });
+  });
+
+  it("lists records newest first, each carrying its own excluded state", async () => {
+    const older = record({ text: "the leave policy is five days per quarter" });
+    const newer = record({ text: "deploys freeze on Fridays" });
+    writeRecords(storePath, PASSPHRASE, [older, newer]);
+
+    const listed = await app.inject({ method: "GET", url: "/knowledge/records", headers: authHeader });
+    expect(listed.statusCode).toBe(200);
+    const body = listed.json();
+    expect(body.records.map((r: { id: string }) => r.id)).toEqual([newer.id, older.id]);
+    expect(body.records.every((r: { excluded: boolean; excludedAt: string | null }) => r.excluded === false && r.excludedAt === null)).toBe(true);
+    expect(body.nextCursor).toBeNull();
+
+    const exclude = await app.inject({ method: "POST", url: `/knowledge/evidence/${older.id}/exclude`, headers: authHeader });
+    expect(exclude.statusCode).toBe(200);
+
+    const afterExclude = await app.inject({ method: "GET", url: "/knowledge/records", headers: authHeader });
+    const olderRow = afterExclude.json().records.find((r: { id: string }) => r.id === older.id);
+    expect(olderRow.excluded).toBe(true);
+    expect(olderRow.excludedAt).toEqual(expect.any(String));
+  });
+
+  it("pages with limit and cursor", async () => {
+    writeRecords(storePath, PASSPHRASE, [
+      record({ text: "one" }),
+      record({ text: "two" }),
+      record({ text: "three" }),
+    ]);
+    const first = await app.inject({ method: "GET", url: "/knowledge/records?limit=2", headers: authHeader });
+    expect(first.json().records).toHaveLength(2);
+    expect(first.json().nextCursor).toBe(2);
+
+    const second = await app.inject({ method: "GET", url: `/knowledge/records?limit=2&cursor=${first.json().nextCursor}`, headers: authHeader });
+    expect(second.json().records).toHaveLength(1);
+    expect(second.json().nextCursor).toBeNull();
+  });
+
+  it("filters by source and by full-text q", async () => {
+    writeRecords(storePath, PASSPHRASE, [
+      record({ text: "the leave policy is five days per quarter", source: "paste" }),
+      record({ text: "deploys freeze on Fridays", source: "claude-export" }),
+    ]);
+    const bySource = await app.inject({ method: "GET", url: "/knowledge/records?source=paste", headers: authHeader });
+    expect(bySource.json().records).toHaveLength(1);
+    expect(bySource.json().records[0].source).toBe("paste");
+
+    const byQuery = await app.inject({ method: "GET", url: "/knowledge/records?q=deploys", headers: authHeader });
+    expect(byQuery.json().records).toHaveLength(1);
+    expect(byQuery.json().records[0].text).toContain("deploys");
+  });
+
+  it("refuses a limit or cursor outside their valid range", async () => {
+    const badLimit = await app.inject({ method: "GET", url: "/knowledge/records?limit=0", headers: authHeader });
+    expect(badLimit.statusCode).toBe(400);
+    const badCursor = await app.inject({ method: "GET", url: "/knowledge/records?cursor=-1", headers: authHeader });
+    expect(badCursor.statusCode).toBe(400);
+  });
+
+  it("edits a record's text in place through PUT, and the listing reflects it", async () => {
+    const seeded = record({ text: "five days per quarter" });
+    writeRecords(storePath, PASSPHRASE, [seeded]);
+
+    const edited = await app.inject({
+      method: "PUT",
+      url: `/knowledge/records/${seeded.id}`,
+      headers: authHeader,
+      payload: { text: "ten days per quarter" },
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().text).toBe("ten days per quarter");
+    expect(edited.json().editedAt).toEqual(expect.any(String));
+
+    const listed = await app.inject({ method: "GET", url: "/knowledge/records", headers: authHeader });
+    expect(listed.json().records[0].text).toBe("ten days per quarter");
+  });
+
+  it("PUT on an unknown record id is a 404", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: "/knowledge/records/no-such-id",
+      headers: authHeader,
+      payload: { text: "anything" },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("PUT with blank text is a 400, and PUT with no text at all is a 400", async () => {
+    const seeded = record({ text: "five days per quarter" });
+    writeRecords(storePath, PASSPHRASE, [seeded]);
+
+    const blank = await app.inject({ method: "PUT", url: `/knowledge/records/${seeded.id}`, headers: authHeader, payload: { text: "   " } });
+    expect(blank.statusCode).toBe(400);
+
+    const missing = await app.inject({ method: "PUT", url: `/knowledge/records/${seeded.id}`, headers: authHeader, payload: {} });
+    expect(missing.statusCode).toBe(400);
+  });
+
+  it("is an owner surface: an ask token is refused on both routes", async () => {
+    const seeded = record({ text: "five days per quarter" });
+    writeRecords(storePath, PASSPHRASE, [seeded]);
+    const minted = createAskToken(storePath, PASSPHRASE, "Sam", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const askHeader = { authorization: `Bearer ${minted.token}` };
+
+    const list = await app.inject({ method: "GET", url: "/knowledge/records", headers: askHeader });
+    expect(list.statusCode).toBe(401);
+    const edit = await app.inject({ method: "PUT", url: `/knowledge/records/${seeded.id}`, headers: askHeader, payload: { text: "x" } });
+    expect(edit.statusCode).toBe(401);
+  });
+});
+
 describe("GET/POST/DELETE /mirror/pinned-answers — pin exact wording over HTTP (duo#275)", () => {
   let app: FastifyInstance;
   let storePath: string;

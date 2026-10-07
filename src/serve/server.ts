@@ -44,8 +44,10 @@ import { answerFromSearchHits, type SearchAnswerHit } from "../drafting/search-a
 import { queueStandingOrderCandidate } from "../drafting/standing-order-candidates.js";
 import { listAvailableDuos } from "../duo/registry.js";
 import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
+import { describeKnowledgeRecords } from "../duo/knowledge-records.js";
 import { hybridSearch } from "../ingest/embeddings.js";
 import { importPastedTranscript } from "../ingest/paste-import.js";
+import { updateRecordText } from "../ingest/record-store.js";
 import type { EmbeddingProvider, InferenceProvider } from "../provider/types.js";
 import { listAuditEntries } from "../permissions/audit.js";
 import { listPublicAnswerLogEntries } from "../permissions/public-answer-log.js";
@@ -388,6 +390,10 @@ function statusForError(error: Error): number {
     // all — a typo, not "the thread is gone" (that's NothingToCorrectError
     // below, a different failure with a different meaning).
     case "PublicAnswerEntryNotFoundError":
+    // digital-duo#286: PUT /knowledge/records/:id naming an id no longer
+    // (or never) in the corpus — "nothing to act on", same family as
+    // PinnedAnswerNotFoundError above.
+    case "RecordNotFoundError":
       return 404;
     case "CandidateAlreadyReviewedError":
     case "NotAnEscalationError":
@@ -455,6 +461,8 @@ function statusForError(error: Error): number {
     // duo#275: an empty pattern or empty wording — can never be a valid
     // pinned answer, same "the request itself is malformed" shape.
     case "InvalidPinnedAnswerError":
+    // digital-duo#286: PUT /knowledge/records/:id with blank/whitespace-only text.
+    case "InvalidRecordEditError":
       return 400;
     default:
       return 500;
@@ -1373,6 +1381,60 @@ function registerRoutes(
   app.post<{ Params: { source: string } }>("/knowledge/sources/:source/restore", async (request) => {
     restoreSource(deps.storePath, deps.passphrase, request.params.source);
     return { excluded: false };
+  });
+
+  /**
+   * digital-duo#286: the Knows tab's record browser. `GET /knowledge`
+   * (#175) only ever gave counts; this is the first route that lists the
+   * individual records themselves — paged newest-first, optionally
+   * narrowed to one `source` and/or a full-text `q` (duo#273 AC4, "search
+   * across everything the duo knows", scoped here to the raw corpus the
+   * Knows tab is browsing). Same limit/cursor validation as `/search` and
+   * `/escalations/history`, so the three paged routes refuse a malformed
+   * query string identically.
+   */
+  app.get<{ Querystring: { source?: string; q?: string; limit?: string; cursor?: string } }>(
+    "/knowledge/records",
+    async (request, reply) => {
+      let limit = 20;
+      if (request.query.limit !== undefined) {
+        limit = Number.parseInt(request.query.limit, 10);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+          reply.code(400).send(errorBody("bad_request", "limit must be an integer between 1 and 100"));
+          return;
+        }
+      }
+      let cursor = 0;
+      if (request.query.cursor !== undefined) {
+        cursor = Number.parseInt(request.query.cursor, 10);
+        if (!Number.isInteger(cursor) || cursor < 0) {
+          reply.code(400).send(errorBody("bad_request", "cursor must be a non-negative integer"));
+          return;
+        }
+      }
+      return describeKnowledgeRecords(deps.storePath, deps.passphrase, { source: request.query.source, q: request.query.q, limit, cursor });
+    },
+  );
+
+  /**
+   * digital-duo#286: edits a record's own text in place — "correct the
+   * stored text going forward", per `updateRecordText`'s own doc comment.
+   * Deletion deliberately has no twin route here: removing a record from
+   * this browser is `POST /knowledge/evidence/:recordId/exclude` above,
+   * the same soft-delete duo#272 already shipped and this route's own
+   * listing already reports back as `excluded`.
+   */
+  app.put<{ Params: { id: string }; Body: { text?: unknown } }>("/knowledge/records/:id", async (request, reply) => {
+    const { text } = request.body ?? {};
+    if (typeof text !== "string") {
+      reply.code(400).send(errorBody("bad_request", "text is required and must be a string."));
+      return;
+    }
+    try {
+      return updateRecordText(deps.storePath, deps.passphrase, request.params.id, text);
+    } catch (error) {
+      reply.code(statusForError(error as Error)).send(errorBody((error as Error).name, (error as Error).message));
+    }
   });
 
   app.get("/mirror/rules", async () => listRulesForReview(deps.storePath, deps.passphrase));
