@@ -292,6 +292,9 @@ describe("createServer — auth (client-tech-design.md Part 2)", () => {
     { method: "POST", url: "/compose/rewrite", payload: { text: "hi", instruction: "shorter" } },
     { method: "POST", url: "/compose/fact-check", payload: { text: "hi" } },
     { method: "POST", url: "/compose/explain", payload: { text: "hi" } },
+    // duo#280/#281 (digital-duo#279): catch-up summaries and the daily brief — same auth gate.
+    { method: "POST", url: "/compose/catch-up", payload: { messages: [{ from: "Alice", text: "hi" }] } },
+    { method: "GET", url: "/daily-brief" },
     { method: "POST", url: "/search/answer", payload: { query: "q", hits: [] } },
     { method: "POST", url: "/drafts/some-draft-id/outcome", payload: { outcome: "sent" } },
     { method: "POST", url: "/drafts/some-draft-id/answer", payload: { answer: "a" } },
@@ -575,6 +578,93 @@ describe("createServer — routes", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ explanation: "RTO means return-to-office.", sources: [] });
+  });
+
+  it("POST /compose/catch-up 503s with no inference provider configured, rather than a silent empty card", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/catch-up",
+      headers: authHeader,
+      payload: { messages: [{ from: "Alice", text: "let's ship Friday" }] },
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: { code: "catch_up_unavailable" } });
+  });
+
+  it("POST /compose/catch-up requires a non-empty messages array of { from, text }", async () => {
+    const empty = await app.inject({ method: "POST", url: "/compose/catch-up", headers: authHeader, payload: { messages: [] } });
+    expect(empty.statusCode).toBe(400);
+    const malformed = await app.inject({ method: "POST", url: "/compose/catch-up", headers: authHeader, payload: { messages: [{ from: "Alice" }] } });
+    expect(malformed.statusCode).toBe(400);
+    const missing = await app.inject({ method: "POST", url: "/compose/catch-up", headers: authHeader, payload: {} });
+    expect(missing.statusCode).toBe(400);
+  });
+
+  it("POST /compose/catch-up returns the provider's bullets (resolved back to request indices) and one-line gist", async () => {
+    app = createServer(
+      deps(storePath, {
+        inferenceProvider: agreeingProvider(
+          JSON.stringify({ bullets: [{ index: 1, text: "Decided to ship Friday." }], oneLine: "Ship date moved to Friday." }),
+        ),
+      }),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/compose/catch-up",
+      headers: authHeader,
+      payload: {
+        messages: [
+          { from: "Alice", text: "how's the release going" },
+          { from: "Bob", text: "let's ship Friday" },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ bullets: [{ index: 1, text: "Decided to ship Friday." }], oneLine: "Ship date moved to Friday." });
+  });
+
+  it("GET /daily-brief is all-clear on a fresh store", async () => {
+    const response = await app.inject({ method: "GET", url: "/daily-brief", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ waitingOnYou: [], passedOn: [], handledByDuo: [], allClear: true });
+  });
+
+  it("GET /daily-brief splits pending drafts into waiting-on-you and passed-on, and never sends an escalation digest as a side effect", async () => {
+    const waiting = appendDraft(storePath, PASSPHRASE, {
+      question: "draft waiting",
+      threadContext: null,
+      draftText: "a",
+      escalated: false,
+      escalationReason: null,
+      confidenceScore: 0.7,
+      sources: [],
+    });
+    const passed = appendDraft(storePath, PASSPHRASE, {
+      question: "passed on question",
+      threadContext: null,
+      draftText: null,
+      escalated: true,
+      escalationReason: "below confidence threshold",
+      confidenceScore: 0.2,
+      sources: [],
+    });
+
+    const response = await app.inject({ method: "GET", url: "/daily-brief", headers: authHeader });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.waitingOnYou.map((item: { draftId: string }) => item.draftId)).toEqual([waiting]);
+    expect(body.passedOn.map((item: { draftId: string }) => item.draftId)).toEqual([passed]);
+    expect(body.allClear).toBe(false);
+
+    // Viewing the brief must not mark anything digested — a later real
+    // digest assembly still sees this escalation as outstanding.
+    const digests = listEscalationDigests(storePath, PASSPHRASE);
+    expect(digests).toEqual([]);
+  });
+
+  it("GET /daily-brief rejects a malformed since timestamp with 400", async () => {
+    const response = await app.inject({ method: "GET", url: "/daily-brief?since=not-a-date", headers: authHeader });
+    expect(response.statusCode).toBe(400);
   });
 
   it("POST /search/answer is no_answer with no inference provider configured", async () => {

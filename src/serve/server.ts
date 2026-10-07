@@ -37,6 +37,7 @@ import { excludeEvidence, listExcludedEvidence, restoreEvidence } from "../draft
 import { excludeSource, listSourceControls, restoreSource } from "../drafting/source-exclusions.js";
 import { checkOwnerText } from "../drafting/fact-check.js";
 import { explainMessage, ExplainUnavailableError } from "../drafting/explain.js";
+import { summarizeCatchUp, CatchUpUnavailableError, type CatchUpMessageInput } from "../drafting/catch-up.js";
 import { purgeOffTheRecordRoom } from "../drafting/off-the-record-purge.js";
 import { draftReply, onDraftingStarted } from "../drafting/pipeline.js";
 import { REWRITE_INSTRUCTIONS, RewriteUnavailableError, rewriteOwnerText, type RewriteInstruction } from "../drafting/rewrite.js";
@@ -45,6 +46,7 @@ import { queueStandingOrderCandidate } from "../drafting/standing-order-candidat
 import { listAvailableDuos } from "../duo/registry.js";
 import { describeDuoKnowledge } from "../duo/knowledge-summary.js";
 import { describeKnowledgeRecords } from "../duo/knowledge-records.js";
+import { assembleDailyBrief } from "../duo/daily-brief.js";
 import { hybridSearch } from "../ingest/embeddings.js";
 import { importPastedTranscript } from "../ingest/paste-import.js";
 import { updateRecordText } from "../ingest/record-store.js";
@@ -975,6 +977,49 @@ function registerRoutes(
       }
       throw error;
     }
+  });
+
+  // duo#280/#281 (digital-duo#279): catch-up summaries — the busy-room
+  // card and the sidebar one-line gist share this one route (see
+  // catch-up.ts's own doc comment for why). `messages` is the unread
+  // window the client already holds from the homeserver, oldest first;
+  // this route never reads or writes anything else. Owner-only, same
+  // table-separation as /compose/explain above.
+  app.post<{ Body: { messages?: unknown } }>("/compose/catch-up", async (request, reply) => {
+    const { messages } = request.body ?? {};
+    if (
+      !Array.isArray(messages) ||
+      messages.length === 0 ||
+      !messages.every((message) => typeof message === "object" && message !== null && typeof message.from === "string" && typeof message.text === "string")
+    ) {
+      reply.code(400).send(errorBody("bad_request", "messages must be a non-empty array of { from, text }"));
+      return;
+    }
+    try {
+      const result = await summarizeCatchUp(messages as CatchUpMessageInput[], deps.inferenceProvider);
+      return result;
+    } catch (error) {
+      if (error instanceof CatchUpUnavailableError) {
+        reply.code(503).send(errorBody("catch_up_unavailable", error.message));
+        return;
+      }
+      throw error;
+    }
+  });
+
+  // duo#282 (digital-duo#279): the daily brief — a pure read, never a
+  // send (see daily-brief.ts's own doc comment on why it is built
+  // directly over `drafts`/`public_answer_log` rather than over
+  // escalation/digest.ts's assembling functions). `since` lets the
+  // client ask for exactly the window since the brief was last shown;
+  // omitted, it defaults to the last 24 hours.
+  app.get<{ Querystring: { since?: string } }>("/daily-brief", async (request, reply) => {
+    const { since } = request.query;
+    if (since !== undefined && Number.isNaN(Date.parse(since))) {
+      reply.code(400).send(errorBody("bad_request", "since must be a valid ISO-8601 timestamp"));
+      return;
+    }
+    return assembleDailyBrief(deps.storePath, deps.passphrase, since);
   });
 
   // Issue #159: the one route an ask token authorizes. A thin wrapper, not
