@@ -218,11 +218,21 @@ function fileTimelineEvent(init: { eventId: string; senderId?: string; url: stri
   });
 }
 
-function room(members: readonly string[] = ["@duo-alice:workspace", "@bob:workspace"], liveEvents: readonly object[] = []) {
+/**
+ * `extraEvents` backs `findEventById` (reply/thread-root resolution, #312/S1)
+ * beyond whatever is already on `liveEvents` — the SDK's own `findEventById`
+ * reaches into every timeline it holds, not only the live one, so a reply
+ * target can resolve even when it isn't itself part of the visible live
+ * window. Absent entirely (undefined) is the "not on any loaded timeline"
+ * case the adapter must resolve to `null` without throwing.
+ */
+function room(members: readonly string[] = ["@duo-alice:workspace", "@bob:workspace"], liveEvents: readonly object[] = [], extraEvents: readonly { getId: () => string | undefined }[] = []) {
+  const known = [...liveEvents, ...extraEvents] as { getId: () => string | undefined }[];
   return {
     roomId: "!room:workspace",
     getJoinedMembers: () => members.map((userId) => ({ userId })),
     getLiveTimeline: () => ({ getEvents: () => [...liveEvents] }),
+    findEventById: (eventId: string) => known.find((event) => event.getId() === eventId),
   };
 }
 
@@ -354,6 +364,9 @@ describe("Matrix adapter — timeline normalization at the seam", () => {
         body: "What did Alice decide?",
         originServerTs: 1_758_000_000_000,
         joinedMemberIds: ["@duo-alice:workspace", "@bob:workspace"],
+        mentionedUserIds: [],
+        replyToSenderId: null,
+        threadRootSenderId: null,
       },
       {
         eventId: "$live",
@@ -362,6 +375,9 @@ describe("Matrix adapter — timeline normalization at the seam", () => {
         body: "What did Alice decide?",
         originServerTs: 1_758_000_004_000,
         joinedMemberIds: ["@duo-alice:workspace", "@bob:workspace"],
+        mentionedUserIds: [],
+        replyToSenderId: null,
+        threadRootSenderId: null,
       },
     ]);
   });
@@ -396,6 +412,9 @@ describe("Matrix adapter — timeline normalization at the seam", () => {
         body: "What did Alice decide about the renewal?",
         originServerTs: 1_758_000_000_000,
         joinedMemberIds: ["@duo-alice:workspace", "@bob:workspace"],
+        mentionedUserIds: [],
+        replyToSenderId: null,
+        threadRootSenderId: null,
       },
     ]);
   });
@@ -410,6 +429,225 @@ describe("Matrix adapter — timeline normalization at the seam", () => {
     client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$nosender", senderMissing: true }), room(), false, false, {});
     client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$removed" }), room(), false, true, {});
     expect(messages).toEqual([]);
+  });
+});
+
+describe("Matrix adapter — mentions and reply targets (#312/S1)", () => {
+  const DUO = "@duo-alice:workspace";
+
+  it("reads mentions from content['m.mentions'].user_ids", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({ eventId: "$mention", content: { "m.mentions": { user_ids: [DUO, "@carol:workspace"] } } }),
+      room([DUO, "@bob:workspace", "@carol:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([DUO, "@carol:workspace"]);
+  });
+
+  it("falls back to a matrix.to anchor in formatted_body when the client sent no m.mentions", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$legacy-mention",
+        content: {
+          format: "org.matrix.custom.html",
+          formatted_body: `<a href="https://matrix.to/#/${encodeURIComponent(DUO)}">Alice's duo</a> what did Alice decide?`,
+        },
+      }),
+      room([DUO, "@bob:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([DUO]);
+  });
+
+  it("does not fall back to formatted_body when m.mentions is present, even if it names nobody", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$explicit-empty",
+        content: {
+          "m.mentions": { user_ids: [] },
+          format: "org.matrix.custom.html",
+          formatted_body: `<a href="https://matrix.to/#/${encodeURIComponent(DUO)}">Alice's duo</a> hello`,
+        },
+      }),
+      room([DUO, "@bob:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([]);
+  });
+
+  it("names nobody when neither m.mentions nor a matrix.to anchor is present", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(RoomEvent.Timeline, timelineEvent({ eventId: "$plain" }), room([DUO, "@bob:workspace"]), false, false, {});
+    expect(messages[0]!.mentionedUserIds).toEqual([]);
+  });
+
+  it("does not fall back to formatted_body when m.mentions is present with no user_ids key at all — MSC3952's own shorthand for naming nobody (review finding on PR #319)", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$bare-mentions-object",
+        content: {
+          "m.mentions": {},
+          format: "org.matrix.custom.html",
+          formatted_body: `<a href="https://matrix.to/#/${encodeURIComponent(DUO)}">Alice's duo</a> hello`,
+        },
+      }),
+      room([DUO, "@bob:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([]);
+  });
+
+  it("a matrix.to anchor followed by sentence punctuation mentions the mxid alone, not the mxid with the punctuation glued on (review finding on PR #319)", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$punctuated-mention",
+        content: {
+          format: "org.matrix.custom.html",
+          formatted_body: `see https://matrix.to/#/${encodeURIComponent(DUO)}, thanks`,
+        },
+      }),
+      room([DUO, "@bob:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([DUO]);
+  });
+
+  it("resolves a reply's target sender through room.findEventById", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const original = timelineEvent({ eventId: "$original", senderId: DUO, body: "Here's the status." });
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({ eventId: "$reply", content: { "m.relates_to": { "m.in_reply_to": { event_id: "$original" } } } }),
+      room([DUO, "@bob:workspace"], [], [original]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.replyToSenderId).toBe(DUO);
+    expect(messages[0]!.threadRootSenderId).toBeNull();
+  });
+
+  it("resolves a thread root's sender through room.findEventById", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const root = timelineEvent({ eventId: "$root", senderId: DUO, body: "Kicking off the thread." });
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({ eventId: "$threaded", content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root" } } }),
+      room([DUO, "@bob:workspace"], [], [root]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.threadRootSenderId).toBe(DUO);
+    expect(messages[0]!.replyToSenderId).toBeNull();
+  });
+
+  it("resolves to null, never throwing, when a reply target is not on any loaded timeline", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    expect(() =>
+      client.emit(
+        RoomEvent.Timeline,
+        timelineEvent({ eventId: "$orphan-reply", content: { "m.relates_to": { "m.in_reply_to": { event_id: "$unknown" } } } }),
+        room([DUO, "@bob:workspace"], [], []),
+        false,
+        false,
+        {},
+      ),
+    ).not.toThrow();
+    expect(messages[0]!.replyToSenderId).toBeNull();
+  });
+
+  it("resolves to null, never throwing, when a thread root is not on any loaded timeline", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    expect(() =>
+      client.emit(
+        RoomEvent.Timeline,
+        timelineEvent({ eventId: "$orphan-thread", content: { "m.relates_to": { rel_type: "m.thread", event_id: "$unknown-root" } } }),
+        room([DUO, "@bob:workspace"], [], []),
+        false,
+        false,
+        {},
+      ),
+    ).not.toThrow();
+    expect(messages[0]!.threadRootSenderId).toBeNull();
+  });
+
+  it("resolves to null when the room itself offers no findEventById (an SDK Room object without the method)", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const bareRoom = { ...room([DUO, "@bob:workspace"]), findEventById: undefined } as unknown as ReturnType<typeof room>;
+    expect(() =>
+      client.emit(
+        RoomEvent.Timeline,
+        timelineEvent({ eventId: "$bare-room-reply", content: { "m.relates_to": { "m.in_reply_to": { event_id: "$original" } } } }),
+        bareRoom,
+        false,
+        false,
+        {},
+      ),
+    ).not.toThrow();
+    expect(messages[0]!.replyToSenderId).toBeNull();
+  });
+
+  it("populates mentions and reply targets for sync-replayed events exactly like live ones", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const original = timelineEvent({ eventId: "$original", senderId: DUO, body: "Here's the status." });
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$replayed-reply",
+        content: { "m.mentions": { user_ids: [DUO] }, "m.relates_to": { "m.in_reply_to": { event_id: "$original" } } },
+      }),
+      room([DUO, "@bob:workspace"], [], [original]),
+      true,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([DUO]);
+    expect(messages[0]!.replyToSenderId).toBe(DUO);
   });
 });
 

@@ -224,6 +224,31 @@ export interface WorkspaceCandidateMessage {
    * files; the adapter only sets it when the run is non-empty.
    */
   readonly attachments?: readonly WorkspaceFileReference[];
+  /**
+   * #312/S1: who this message named, read from `content["m.mentions"].user_ids`
+   * (falling back to a `matrix.to` anchor in `formatted_body` linking to that
+   * user id, for a client that doesn't send `m.mentions`). Empty when the
+   * message names nobody — the shared-room question filter (`questions.ts`)
+   * is the one consumer, gating a group room on whether the duo's own id
+   * appears here.
+   */
+  readonly mentionedUserIds: readonly string[];
+  /**
+   * #312/S1: the sender of the event this message replies to
+   * (`m.relates_to["m.in_reply_to"].event_id`), or `null` when this message
+   * is not a reply, or when it is a reply to an event the adapter cannot
+   * resolve (not on the loaded timeline — a reply target is never guessed
+   * at, never thrown over).
+   */
+  readonly replyToSenderId: string | null;
+  /**
+   * #312/S1: the sender of the root event of the thread
+   * (`m.relates_to.rel_type === "m.thread"`) this message belongs to, or
+   * `null` when this message is not in a thread, or the root cannot be
+   * resolved. A thread root the duo itself sent is "addressed" exactly like
+   * a direct reply to the duo (`questions.ts`).
+   */
+  readonly threadRootSenderId: string | null;
 }
 
 /**

@@ -101,7 +101,26 @@ export type RoomDecisionLookup = (roomId: string) => RoomConsentStatus | null;
  * upstream of the consent check: another duo's message is never a question,
  * in a direct room or a consented one, so no consent state can create two
  * daemons answering each other forever.
+ *
+ * #312/S1: a consented SHARED room additionally requires the message to be
+ * *addressed* to the duo — @mentioned, a reply to the duo's own message, or
+ * in a thread the duo started — the PRD's "a duo speaks only when spoken
+ * to" rule for group rooms. This check runs before the question is ever
+ * built (`isAddressedTo` below, short-circuited out entirely for an
+ * unaddressed message), so an ordinary message between other people in an
+ * allowed group room never reaches the pipeline, never opens the store,
+ * never fires a drafting signal, and never advances read state — exactly
+ * as if the duo were not in the room for that one line. The direct-room
+ * posture is unaffected: `directQuestionFrom` above never consults
+ * addressing, matching S2 (a 1:1 answers everything, mention or not).
  */
+function isAddressedTo(message: WorkspaceCandidateMessage, selfUserId: string): boolean {
+  return (
+    message.mentionedUserIds.includes(selfUserId) ||
+    message.replyToSenderId === selfUserId ||
+    message.threadRootSenderId === selfUserId
+  );
+}
 export function answerableQuestionFrom(
   message: WorkspaceCandidateMessage,
   selfUserId: string,
@@ -138,6 +157,12 @@ export function answerableQuestionFrom(
     // null (no record) is the v1 default refusal for shared rooms. The
     // message is not work — before any retrieval, generation, or store
     // access (the refusal gate's short-circuit shape).
+    return null;
+  }
+  if (!isAddressedTo(message, selfUserId)) {
+    // #312/S1: an allowed shared room still only answers what it is
+    // addressed to — the gate above handles WHETHER the duo may ever speak
+    // here, this one handles WHICH lines it answers once it may.
     return null;
   }
   return {

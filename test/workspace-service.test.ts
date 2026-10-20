@@ -1182,8 +1182,25 @@ function invite(overrides: Partial<RoomInvite> = {}): RoomInvite {
   return { roomId: "!room:workspace", inviterId: "@bob:workspace", name: "Launch planning", joinedMemberCount: 3, ...overrides };
 }
 
-/** A message in a shared (3+ member) room, both the duo and the sender joined. */
-function roomMessage(message: { eventId: string; body: string; senderId?: string; roomId?: string; originServerTs?: number; joinedMemberIds?: string[] }) {
+/**
+ * A message in a shared (3+ member) room, both the duo and the sender
+ * joined. Every test in this file that predates #312/S1 is exercising
+ * consent/join/loop-guard mechanics, not addressing, so this defaults to
+ * mentioning the duo (addressed) unless a case explicitly says otherwise —
+ * the dedicated #312/S1 describe block below overrides this to cover the
+ * unaddressed case itself.
+ */
+function roomMessage(message: {
+  eventId: string;
+  body: string;
+  senderId?: string;
+  roomId?: string;
+  originServerTs?: number;
+  joinedMemberIds?: string[];
+  mentionedUserIds?: string[];
+  replyToSenderId?: string | null;
+  threadRootSenderId?: string | null;
+}) {
   return {
     eventId: message.eventId,
     roomId: message.roomId ?? "!room:workspace",
@@ -1191,6 +1208,9 @@ function roomMessage(message: { eventId: string; body: string; senderId?: string
     body: message.body,
     originServerTs: message.originServerTs ?? Date.now(),
     joinedMemberIds: message.joinedMemberIds ?? [SELF, "@bob:workspace", "@carol:workspace"],
+    mentionedUserIds: message.mentionedUserIds ?? [SELF],
+    replyToSenderId: message.replyToSenderId ?? null,
+    threadRootSenderId: message.threadRootSenderId ?? null,
   };
 }
 
@@ -1382,6 +1402,41 @@ describe("WorkspaceService — the owner's allow is the only join (#192)", () =>
     transport.deliver(dm({ eventId: "$dm", body: "still answerable without any record" }));
     await flush();
     expect(answers.map((question) => question.body)).toEqual(["still answerable without any record"]);
+    await service.stop();
+  });
+});
+
+describe("WorkspaceService — #312/S1: an allowed shared room still only answers what it's addressed to", () => {
+  it("an unaddressed message in an allowed group room never reaches the pipeline — no answer, no draft-drafting, no card", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$unaddressed", body: "chatting about something else entirely", mentionedUserIds: [] }));
+    await flush();
+    // The pipeline (the fake `answer` the drafting signal wraps) was never
+    // called at all: zero calls, not a declined/refused one.
+    expect(answers).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    expect(transport.sentCards).toEqual([]);
+    await service.stop();
+  });
+
+  it("the SAME message answers once it's addressed — a mention, in the same allowed room", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service, answers } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$addressed", body: "@duo-alice what did Alice decide?", mentionedUserIds: [SELF] }));
+    await flush();
+    expect(answers.map((question) => question.body)).toEqual(["@duo-alice what did Alice decide?"]);
+    expect(transport.sentAnswers.map((sent) => sent.roomId)).toEqual(["!room:workspace"]);
     await service.stop();
   });
 });
