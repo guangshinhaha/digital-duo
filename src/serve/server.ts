@@ -97,6 +97,7 @@ import { jobsFor } from "./jobs.js";
 import { registerMcpRoutes, type ConnectorAccess } from "./mcp.js";
 import { registerOrgRoutes, type OrgAdminAccess } from "./org-routes.js";
 import { registerOwnerRoutes } from "./owner-routes.js";
+import { registerTaskRoutes } from "./task-routes.js";
 import { ScheduledSendRunner } from "./scheduled-send-runner.js";
 import { registerScheduledSendRoutes } from "./scheduled-send-routes.js";
 import { registerAutonomyRoutes } from "./autonomy-routes.js";
@@ -2077,6 +2078,18 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
     }
   });
   app.addHook("onClose", async () => unsubscribeDraftingStarted());
+  // W-S4-6: the task/card-shaped twins of the draft-drafting wiring above —
+  // same shape, same reason: the workspace service (W-S4-5's ack timer and
+  // outcome branches) knows nothing about `/ws` or Fastify, it only emits
+  // ids-and-state-only facts (`onTaskEvent`/`onCardEvent`), and this app is
+  // the one place that turns those into a push. Absent a workspace
+  // (`deps.workspace` undefined — no workspace configured), there is
+  // nothing to subscribe to and these routes' own GETs simply read an
+  // always-empty store.
+  if (deps.workspace) {
+    deps.workspace.onTaskEvent((event) => draftReady.publishTask(event.taskId, event.roomId, event.state));
+    deps.workspace.onCardEvent((event) => draftReady.publishCard(event.cardId, event.roomId));
+  }
   const embedJob = jobsFor(deps).embed;
   // guangshinhaha/duo#261: held sends fire from the daemon, whether or not
   // any client is connected. One runner per duo app, stopped with it.
@@ -2090,6 +2103,7 @@ export function createServer(deps: ServeDeps, options: { serverFactory?: Fastify
   app.addHook("onClose", async () => scheduledSends.stop());
   registerRoutes(app, deps, draftReady, auth, embedJob, scheduledSends);
   registerOwnerRoutes(app, deps);
+  registerTaskRoutes(app, deps);
   registerScheduledSendRoutes(app, deps, scheduledSends);
   // guangshinhaha/duo#266/#268: earned autonomy and its undo window. The
   // hold rides the same runner as a scheduled send.

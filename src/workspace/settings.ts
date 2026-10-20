@@ -55,6 +55,8 @@ export interface WorkspaceSettings {
    * above take.
    */
   readonly backlog: WorkspaceBacklogPolicy;
+  /** W-S4-5: the ack threshold (`DUO_WORKSPACE_ACK_AFTER_MS`, default 2000) — docs/workspace/cards.md §8. */
+  readonly ackAfterMs: number;
 }
 
 /**
@@ -115,6 +117,11 @@ export function workspaceSettingsFrom(config: DuoConfig): WorkspaceSettings | nu
     { envVar: "DUO_WORKSPACE_RECONNECT_INITIAL_MS", value: config.workspace.reconnect.initialDelayMs },
     { envVar: "DUO_WORKSPACE_RECONNECT_MAX_MS", value: config.workspace.reconnect.maxDelayMs },
     { envVar: "DUO_WORKSPACE_PRESENCE_INTERVAL_MS", value: config.workspace.presenceIntervalMs },
+    // W-S4-5: the ack threshold is armed verbatim as a setTimeout delay
+    // (the service's own ack timer) — the same hot-loop risk a zero or
+    // negative reconnect/presence knob has, so it is validated the same
+    // all-or-nothing way.
+    { envVar: "DUO_WORKSPACE_ACK_AFTER_MS", value: config.workspace.ackAfterMs },
   ];
   for (const knob of timingKnobs) {
     if (!Number.isFinite(knob.value) || knob.value <= 0) {
@@ -150,5 +157,6 @@ export function workspaceSettingsFrom(config: DuoConfig): WorkspaceSettings | nu
     reconnect: config.workspace.reconnect,
     presenceIntervalMs: config.workspace.presenceIntervalMs,
     backlog: config.workspace.backlog,
+    ackAfterMs: config.workspace.ackAfterMs,
   };
 }

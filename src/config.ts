@@ -118,6 +118,13 @@ const DEFAULT_WORKSPACE_BACKLOG_MAX_AGE_MS = 3_600_000;
 // conversation never meets it — only a sync-replay burst or a live flood
 // does, and its excess is marked read and logged rather than queued.
 const DEFAULT_WORKSPACE_MAX_ANSWERS_PER_MINUTE = 30;
+// W-S4-5 / PRD v0.4 Q2 (resolved 20 Oct 2026): the ack threshold —
+// docs/workspace/cards.md §8. If the answering pipeline hasn't finished
+// within this many ms of picking up a question, the duo sends a task card
+// in `acknowledged` first and the eventual outcome edits it in place,
+// rather than leaving the visitor looking at nothing for however long the
+// draft takes.
+const DEFAULT_WORKSPACE_ACK_AFTER_MS = 2_000;
 
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
@@ -232,6 +239,8 @@ export interface DuoConfig {
       /** Max answers per rolling 60s — the flood bound protecting the pipeline. Defaults to 30. */
       maxAnswersPerMinute: number;
     };
+    /** W-S4-5: if the answering pipeline hasn't finished within this many ms, send a task card in `acknowledged` first (docs/workspace/cards.md §8). Defaults to 2000. */
+    ackAfterMs: number;
   };
 }
 
@@ -299,6 +308,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DuoConfig {
         maxAgeMs: parseNumberEnv(env.DUO_WORKSPACE_BACKLOG_MAX_AGE_MS, DEFAULT_WORKSPACE_BACKLOG_MAX_AGE_MS),
         maxAnswersPerMinute: parseNumberEnv(env.DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE, DEFAULT_WORKSPACE_MAX_ANSWERS_PER_MINUTE),
       },
+      ackAfterMs: parseNumberEnv(env.DUO_WORKSPACE_ACK_AFTER_MS, DEFAULT_WORKSPACE_ACK_AFTER_MS),
     },
   };
 }

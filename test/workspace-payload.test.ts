@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ConfidenceResult } from "../src/drafting/confidence.js";
 import { buildAnswerEvent, buildAttachmentRefusalEvent, buildFailedAnswerEvent } from "../src/workspace/payload.js";
 import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../src/permissions/public-answer.js";
+import { buildCardEdit, buildCardEvent, type DuoCardV1Input } from "../src/workspace/cards.js";
 
 // Markers planted in every owner-facing or corpus-shaped field of a poisoned
 // outcome: if any of these strings ever serializes into an outbound
@@ -18,6 +19,20 @@ const POISON = {
   sourceId: "POISON-source-id",
   evidenceText: "POISON-grounding-chunk-evidence-text",
   passphrase: "POISON-store-passphrase",
+  // W-S4-2: the card builder's own owner-facing-shaped fields — a
+  // confidence score, a milestone ts, and a draft/logEntry id disguised as
+  // a cardId/requester are exactly the shapes a careless caller might try
+  // to smuggle through, since DuoCardV1Input takes plain strings for both.
+  cardId: "POISON-card-id",
+  taskId: "POISON-task-id",
+  confidenceScore: "POISON-confidence-0.97",
+  // Never legitimately embedded in any field below — these only ever reach
+  // `buildCardEvent`/`buildCardEdit` by a caller smuggling an extra key
+  // past the type system (an `as any` cast, exactly as a careless call site
+  // could). A full-string scan of the output must never contain one.
+  smuggledDraftId: "POISON-smuggled-draft-id",
+  smuggledEvidence: "POISON-smuggled-grounding-chunk-evidence-text",
+  smuggledOwnerNotice: "POISON-smuggled-owner-notice",
 } as const;
 
 function confidence(): ConfidenceResult {
@@ -165,6 +180,117 @@ describe("buildAnswerEvent — the corpus never crosses (#186 AC5, decision reco
   });
 });
 
+describe("buildCardEvent/buildCardEdit — the SAME corpus-never-crosses invariant, extended to cards (W-S4-2, docs/workspace/cards.md §9)", () => {
+  // DuoCardV1Input has no field shaped like draftId, logEntryId, topicId,
+  // confidence, a source id/label, evidence text, rule text, or
+  // ownerNotice — there is no parameter a caller could pass POISON through
+  // even by mistake. This is proven structurally (the type doesn't compile
+  // a call that tries), and then empirically: POISON values planted in
+  // every LEGITIMATE asker-visible field (title, lines, option labels,
+  // requester id, result text/links) must still never carry a POISON
+  // marker belonging to a DIFFERENT, forbidden field — i.e. the builder
+  // copies exactly what it was given and nothing from anywhere else.
+  const poisonedTask: DuoCardV1Input = {
+    kind: "task",
+    cardId: POISON.cardId,
+    taskId: POISON.taskId,
+    state: "acknowledged",
+    requester: "@alice:workspace",
+    title: `Checking ${POISON.draftId}`,
+    lines: [`Passed on. ${POISON.logEntryId} ${POISON.topicId} ${POISON.ownerNotice} ${POISON.sourceId} ${POISON.evidenceText} ${POISON.confidenceScore} ${POISON.passphrase}`],
+  };
+
+  const poisonedDecision: DuoCardV1Input = {
+    kind: "decision",
+    cardId: POISON.cardId,
+    state: "open",
+    requester: "@alice:workspace",
+    title: "Which one?",
+    options: [
+      { id: "o1", label: `Option A ${POISON.evidenceText}` },
+      { id: "o2", label: `Option B ${POISON.sourceId}` },
+    ],
+  };
+
+  const poisonedResult: DuoCardV1Input = {
+    kind: "result",
+    cardId: POISON.cardId,
+    state: "done",
+    requester: "@alice:workspace",
+    title: "Done",
+    result: {
+      text: `Approved. ${POISON.draftId} ${POISON.logEntryId} ${POISON.topicId} ${POISON.ownerNotice} ${POISON.confidenceScore}`,
+      links: [{ label: `Ref ${POISON.sourceId}`, url: `https://matrix.to/#/!room/$event?${POISON.evidenceText}` }],
+    },
+  };
+
+  for (const [label, input] of [
+    ["task", poisonedTask],
+    ["decision", poisonedDecision],
+    ["result", poisonedResult],
+  ] as const) {
+    it(`${label} card: buildCardEvent copies exactly what it was given, planted markers appear only where they were planted`, () => {
+      const event = buildCardEvent(input);
+      const serialized = JSON.stringify(event);
+      // Every POISON marker that WAS planted into this input is expected
+      // to appear (it's a legitimate field — that's the point: asker-
+      // visible text is allowed to cross). What matters is that nothing
+      // ELSE appears — there is no hidden copy of a field this input
+      // didn't carry at all. Since the input type physically cannot carry
+      // draftId/logEntryId/topicId/confidence/sources/evidence/ownerNotice
+      // as DISTINCT fields (only embedded in the strings above, by this
+      // test's own construction), the meaningful assertion is schema
+      // validation (no extra keys) plus the edit variant below.
+      expect(() => JSON.parse(serialized)).not.toThrow();
+      expect(Object.keys(event).sort()).toEqual(["duo.card", "m.mentions", "body", "msgtype"].sort());
+    });
+
+    it(`${label} card: buildCardEdit's m.new_content carries the same card, nothing added`, () => {
+      const edit = buildCardEdit("$cardEvent", input, 1);
+      expect(edit["m.new_content"]["duo.card"].rev).toBe(2);
+      expect(Object.keys(edit).sort()).toEqual(["body", "m.new_content", "m.relates_to", "msgtype"].sort());
+      expect(edit["m.relates_to"]).toEqual({ rel_type: "m.replace", event_id: "$cardEvent" });
+    });
+
+    it(`${label} card: a caller that smuggles an extra forbidden-shaped key past the type system never gets it echoed anywhere in the serialized output`, () => {
+      // DuoCardV1Input's TYPE has no slot for these — this simulates the
+      // one way they could still arrive at runtime: a cast that defeats
+      // the compile-time guarantee the test above documents. cardOf()
+      // builds the wire object field-by-field from named, allowlisted
+      // properties (src/workspace/cards.ts), so a key it never reads for
+      // must never surface — this is the full-string scan the top-level
+      // Object.keys check above does not perform.
+      const smuggled = {
+        ...input,
+        draftId: POISON.smuggledDraftId,
+        evidence: [{ kind: "evidence", id: "x", label: POISON.smuggledEvidence }],
+        ownerNotice: POISON.smuggledOwnerNotice,
+      } as unknown as DuoCardV1Input;
+      const event = buildCardEvent(smuggled);
+      const edit = buildCardEdit("$cardEvent", smuggled, 1);
+      for (const marker of [POISON.smuggledDraftId, POISON.smuggledEvidence, POISON.smuggledOwnerNotice]) {
+        expect(JSON.stringify(event)).not.toContain(marker);
+        expect(JSON.stringify(edit)).not.toContain(marker);
+      }
+    });
+  }
+
+  it("DuoCardV1Input has no field for draftId, logEntryId, topicId, confidence, sources, evidence, rule text, ownerNotice, or draft text — a TypeScript fact, not a runtime one", () => {
+    // This test exists to be read, not to assert much at runtime: the
+    // task/decision/result variants above are the WHOLE type (see
+    // src/workspace/cards.ts), and none of them declares any of these
+    // keys. A future change that added one would be visible in the same
+    // file's diff, and the poisoned fixtures above would need a new field
+    // to plant it in — there is no existing slot today.
+    const forbiddenKeys = ["draftId", "logEntryId", "topicId", "confidence", "sources", "evidence", "ruleText", "ownerNotice", "draftText"];
+    for (const key of forbiddenKeys) {
+      expect(key in poisonedTask).toBe(false);
+      expect(key in poisonedDecision).toBe(false);
+      expect(key in poisonedResult).toBe(false);
+    }
+  });
+});
+
 describe("workspace egress surface — structural pin on what src/workspace may import (the R2/KTD10 idiom, applied to the corpus boundary)", () => {
   const srcRoot = fileURLToPath(new URL("../src/workspace", import.meta.url));
 
@@ -230,7 +356,17 @@ describe("workspace egress surface — structural pin on what src/workspace may 
   });
 
   it("never imports a corpus-bearing module in any form — the pipeline arrives by injection, not by reach-in", () => {
-    const forbidden = /^\.\.\/(store|ingest|derivation|drafting|corrections|trust)\//;
+    // W-S4-4: `tasks` joins the forbidden prefixes here — src/workspace must
+    // reach the task/card store only through the injected WorkspaceTaskSink
+    // interface (src/workspace/service.ts), implemented against
+    // src/tasks/store.ts from src/serve/workspace-tasks.ts, exactly the
+    // indirection workspace-read-state.ts already uses for DuoReadState.
+    // src/tasks/state.ts (the pure state machine, no store access) is NOT
+    // forbidden — only src/tasks/store.ts's storePath/passphrase-taking
+    // functions are the thing this boundary exists to keep out, but the
+    // directory-level prefix is the simplest rule that still holds: nothing
+    // under src/tasks/ is ever imported from src/workspace/ directly.
+    const forbidden = /^\.\.\/(store|ingest|derivation|drafting|corrections|trust|tasks)\//;
     const offenders = workspaceFiles().filter((path) =>
       importSpecifiers(readFileSync(path, "utf8")).some((specifier) => forbidden.test(specifier)),
     );

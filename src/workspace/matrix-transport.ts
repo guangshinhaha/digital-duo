@@ -13,12 +13,14 @@ import {
   type Membership,
   type Room,
 } from "matrix-js-sdk";
+import type { DuoCardEditContent, DuoCardEventContent } from "./cards.js";
 import { localpartOf } from "./directory.js";
 import { fileFromContent, inviteReasonOf, type RoomInvite } from "./messages.js";
 import type { WorkspaceSettings } from "./settings.js";
 import type {
   AnswerEventContent,
   WorkspaceCandidateMessage,
+  WorkspaceCardResponse,
   WorkspaceFileBody,
   WorkspaceFileReference,
   WorkspaceMember,
@@ -28,6 +30,9 @@ import type {
   WorkspaceTransport,
 } from "./transport.js";
 import { WorkspaceTokenRevokedError } from "./transport.js";
+
+/** The custom, non-`m.room.message` event type a card response rides (cards.md §2) — not an SDK-known constant, so it's named here rather than destructured from matrix-js-sdk's EventType enum. */
+const CARD_RESPONSE_EVENT_TYPE = "duo.card.response";
 
 /**
  * The page size asked of the homeserver's user directory. Not configuration:
@@ -165,8 +170,69 @@ function attachmentsForQuestion(room: Room, questionEventId: string, senderId: s
   return attachments;
 }
 
+/**
+ * W-S4-3: parses one `duo.card.response` timeline event's content into the
+ * seam's shape, or `undefined` for anything malformed — cards.md §2's wire
+ * shape plus the §4 rule that the daemon drops an unknown `v`. Never
+ * throws: a tap from a legitimate client sends well-formed content, and
+ * anything else (a hostile or buggy sender) is dropped here rather than
+ * crashing the timeline listener. This function only checks SHAPE; the
+ * anti-spoofing checks that need the daemon's own state (does this card
+ * exist, is it still open, is the sender the right person — cards.md §6)
+ * are the service's, over `workspace_cards`, not this adapter's.
+ */
+function cardResponseOf(content: Record<string, unknown>, eventId: string, roomId: string, senderId: string, originServerTs: number): WorkspaceCardResponse | undefined {
+  const relatesTo = content["m.relates_to"];
+  if (relatesTo === null || typeof relatesTo !== "object") {
+    return undefined;
+  }
+  const cardEventId = (relatesTo as Record<string, unknown>).event_id;
+  if (typeof cardEventId !== "string" || cardEventId.length === 0) {
+    return undefined;
+  }
+  const response = content["duo.card.response"];
+  if (response === null || typeof response !== "object") {
+    return undefined;
+  }
+  const { v, card_id: cardId, action_id: actionId, values } = response as Record<string, unknown>;
+  if (v !== 1) {
+    return undefined;
+  }
+  if (typeof cardId !== "string" || cardId.length === 0) {
+    return undefined;
+  }
+  if (typeof actionId !== "string" || actionId.length === 0) {
+    return undefined;
+  }
+  if (values === null || typeof values !== "object" || Array.isArray(values)) {
+    return undefined;
+  }
+  return {
+    eventId,
+    roomId,
+    senderId,
+    cardEventId,
+    cardId,
+    actionId,
+    values: values as Record<string, unknown>,
+    originServerTs,
+  };
+}
+
 /** The SDK's own logger interface, for a caller that wants this client's SDK logging elsewhere (a hosted daemon runs many clients in one process, #236). */
 export type MatrixSdkLogger = NonNullable<Parameters<typeof createClient>[0]["logger"]>;
+
+/**
+ * `client.sendMessage`'s SDK type is `RoomMessageEventContent` — a closed
+ * set of known msgtypes that does not (and should not) know about
+ * `duo.card`. The card builders are this codebase's only constructors of
+ * that content (cards.ts), already schema-validated before it reaches
+ * here, so this cast is the one place a card's wire shape crosses into the
+ * SDK's narrower type — never a license to send arbitrary content.
+ */
+function sendRoomMessage(client: MatrixClient, roomId: string, content: DuoCardEventContent | DuoCardEditContent): Promise<{ event_id: string }> {
+  return client.sendMessage(roomId, content as unknown as Parameters<MatrixClient["sendMessage"]>[1] & object);
+}
 
 export function createMatrixTransport(settings: WorkspaceSettings, options: { readonly sdkLogger?: MatrixSdkLogger } = {}): WorkspaceTransport {
   // The access token lives in the client and in the env var it came from,
@@ -181,6 +247,7 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
   let stopped = false;
   let pendingConnectReject: ((error: Error) => void) | undefined;
   const messageHandlers: ((message: WorkspaceCandidateMessage) => void)[] = [];
+  const cardResponseHandlers: ((response: WorkspaceCardResponse) => void)[] = [];
   const inviteHandlers: ((invite: RoomInvite) => void)[] = [];
   const disconnectHandlers: (() => void)[] = [];
 
@@ -246,6 +313,47 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
     };
     for (const handler of messageHandlers) {
       handler(message);
+    }
+  });
+
+  // W-S4-3: duo.card.response is NOT an m.room.message (cards.md §2) — it
+  // rides the same RoomEvent.Timeline the text-message listener above
+  // reads, just filtered on its own event type instead of msgtype. Not
+  // gated on `removed` only, matching the message listener's own pattern:
+  // a response replayed by the sync catch-up `connect()` resolves on must
+  // reach a handler exactly like a live one (held-not-lost applies here
+  // too), so the only early-outs are `stopped` and the wrong event type.
+  client.on(RoomEvent.Timeline, (event: MatrixEvent, room: Room | undefined, _toStartOfTimeline: boolean | undefined, removed: boolean, _data: IRoomTimelineData) => {
+    if (stopped || removed) {
+      return;
+    }
+    if (event.getType() !== CARD_RESPONSE_EVENT_TYPE) {
+      return;
+    }
+    const senderId = event.getSender();
+    // The duo's own echo is dropped defensively (the module comment on
+    // sendCard/editCard states why this account could never legitimately
+    // be the response's sender) — and a response with no sender at all is
+    // unattributable, so it is dropped the same way a candidate message
+    // with no sender is in the listener above.
+    if (senderId === undefined || senderId === settings.userId) {
+      return;
+    }
+    const content = event.getContent() as Record<string, unknown>;
+    const eventId = event.getId();
+    const roomId = event.getRoomId() ?? room?.roomId;
+    if (eventId === undefined || roomId === undefined) {
+      return;
+    }
+    const response = cardResponseOf(content, eventId, roomId, senderId, event.getTs());
+    if (response === undefined) {
+      // Malformed shape, or an unknown `v` (cards.md §4: "the daemon drops
+      // responses carrying an unknown v") — dropped, never thrown, so one
+      // bad response can never take the listener down for every other one.
+      return;
+    }
+    for (const handler of cardResponseHandlers) {
+      handler(response);
     }
   });
 
@@ -334,8 +442,33 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
     async sendAnswer(roomId: string, content: AnswerEventContent) {
       // Sent as the duo's own account — protocol-level attribution
       // (decision record §6): the room's members cannot read this as the
-      // owner, whatever a client renders.
-      await client.sendMessage(roomId, { msgtype: MsgType.Text, body: content.body });
+      // owner, whatever a client renders. The sent event's id is returned
+      // (W-S4-3) so a caller can later point a card's result link at it.
+      const sent = await client.sendMessage(roomId, { msgtype: MsgType.Text, body: content.body });
+      return { eventId: sent.event_id };
+    },
+
+    async sendCard(roomId: string, content: DuoCardEventContent) {
+      // Exactly the builder's content, verbatim — nothing added or
+      // dropped, matching the "the type allows nothing else" contract the
+      // seam states. See sendRoomMessage's doc comment for the SDK-type cast.
+      const sent = await sendRoomMessage(client, roomId, content);
+      return { eventId: sent.event_id };
+    },
+
+    async editCard(roomId: string, _eventId: string, content: DuoCardEditContent) {
+      // An edit is an ordinary new message carrying m.relates_to/m.replace
+      // and m.new_content (cards.md §3) — not a distinct SDK primitive, so
+      // it rides the same sendMessage call sendCard does. `_eventId` (the
+      // card's own event id) already lives inside `content["m.relates_to"]`
+      // — the builder put it there — so it isn't threaded separately here;
+      // it is kept as a parameter because the seam's doc states the edit
+      // is "against the card's own event id," which content already encodes.
+      await sendRoomMessage(client, roomId, content);
+    },
+
+    onCardResponse(handler: (response: WorkspaceCardResponse) => void) {
+      cardResponseHandlers.push(handler);
     },
 
     async fetchFile(reference: string, options: { readonly maxBytes: number }): Promise<WorkspaceFileBody> {

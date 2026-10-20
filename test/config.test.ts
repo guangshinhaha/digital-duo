@@ -40,6 +40,7 @@ describe("loadConfig", () => {
       reconnect: { initialDelayMs: 1000, maxDelayMs: 60000 },
       presenceIntervalMs: 240000,
       backlog: { maxAgeMs: 3600000, maxAnswersPerMinute: 30 },
+      ackAfterMs: 2000,
     });
   });
 
@@ -80,6 +81,7 @@ describe("loadConfig", () => {
       DUO_WORKSPACE_PRESENCE_INTERVAL_MS: "5000",
       DUO_WORKSPACE_BACKLOG_MAX_AGE_MS: "900000",
       DUO_WORKSPACE_MAX_ANSWERS_PER_MINUTE: "5",
+      DUO_WORKSPACE_ACK_AFTER_MS: "500",
     });
     expect(config).toEqual({
       providerName: "ollama",
@@ -116,6 +118,7 @@ describe("loadConfig", () => {
         reconnect: { initialDelayMs: 250, maxDelayMs: 30000 },
         presenceIntervalMs: 5000,
         backlog: { maxAgeMs: 900000, maxAnswersPerMinute: 5 },
+        ackAfterMs: 500,
       },
     });
   });

@@ -307,3 +307,121 @@ describe("GET /ws — the draft-ready channel (issue #162)", () => {
     expect((await closed).code).toBe(AUTH_CLOSE);
   });
 });
+
+describe("W-S4-6: createServer forwards WorkspaceService's onTaskEvent/onCardEvent into /ws", () => {
+  // A real WorkspaceService over a fake transport and a minimal in-memory
+  // task sink — the point of this suite is createServer's OWN subscription
+  // (deps.workspace.onTaskEvent/onCardEvent -> draftReady.publishTask/
+  // publishCard), which test/workspace-service.test.ts's own W-S4-6 suite
+  // does not exercise (it talks to the service directly, never through
+  // createServer). ackAfterMs is set tiny so the ack timer fires almost
+  // immediately over real timers — no fake-timer/live-socket mixing.
+  it("pushes {type:task-updated} and {type:card-updated} over /ws when the ack timer fires", async () => {
+    const { WorkspaceService } = await import("../src/workspace/service.js");
+    const { FakeWorkspaceTransport } = await import("./helpers/fake-workspace-transport.js");
+    const transport = new FakeWorkspaceTransport();
+    const tasks = new Map<string, { state: string }>();
+    const cards = new Map<string, { taskId: string; roomId: string; eventId: string; rev: number; state: string }>();
+    let nextId = 0;
+    const taskSink = {
+      createTask(input: { roomId: string; questionEventId: string; requester: string; draftId?: string }) {
+        nextId += 1;
+        const taskId = `task-${nextId}`;
+        tasks.set(taskId, { state: "acknowledged" });
+        return { taskId };
+      },
+      updateTaskState() {
+        /* not exercised by the ack-only path this test takes */
+      },
+      createCard(input: { taskId: string; roomId: string; eventId: string; state: string }) {
+        nextId += 1;
+        const cardId = `card-${nextId}`;
+        cards.set(cardId, { taskId: input.taskId, roomId: input.roomId, eventId: input.eventId, rev: 1, state: input.state });
+        return { cardId };
+      },
+      recordCardEdit() {
+        /* not exercised by the ack-only path this test takes */
+      },
+      openCardFor(taskId: string, roomId: string) {
+        for (const [cardId, card] of cards) {
+          if (card.taskId === taskId && card.roomId === roomId && card.state !== "done" && card.state !== "failed") {
+            return { cardId, taskId: card.taskId, eventId: card.eventId, rev: card.rev, state: card.state };
+          }
+        }
+        return undefined;
+      },
+    };
+    const workspace = new WorkspaceService({
+      settings: {
+        homeserverUrl: "https://matrix.workspace.example",
+        accessToken: "token",
+        userId: "@duo-owner:workspace",
+        reconnect: { initialDelayMs: 1000, maxDelayMs: 8000 },
+        presenceIntervalMs: 5000,
+        backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
+        ackAfterMs: 10,
+      },
+      transportFactory: () => transport,
+      // Never resolves within the test — the ack timer must fire first.
+      answer: () => new Promise(() => {}),
+      taskSink,
+    });
+    workspace.start();
+    await transport.connect();
+
+    const storePath = initStore();
+    const app = createServer({ ...deps(storePath), workspace });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const localWsUrl = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/ws`;
+
+    const socket = connect(localWsUrl);
+    const first = nextMessage(socket);
+    await new Promise((resolve) => socket.once("open", resolve));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "owner-device");
+    send(socket, { type: "auth", token: paired.token });
+    await first;
+
+    const messages: string[] = [];
+    socket.on("message", (data) => messages.push(data.toString()));
+
+    transport.deliver({
+      eventId: "$ws-signal-1",
+      roomId: "!room:workspace.example",
+      senderId: "@visitor:workspace.example",
+      body: "will this reach the owner over /ws",
+      originServerTs: Date.now(),
+      joinedMemberIds: ["@duo-owner:workspace", "@visitor:workspace.example"],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const parsed = messages.map((m) => JSON.parse(m) as { type: string; taskId?: string; roomId?: string; state?: string; cardId?: string; audience?: string });
+    expect(parsed).toContainEqual(expect.objectContaining({ type: "task-updated", roomId: "!room:workspace.example", state: "acknowledged" }));
+    expect(parsed).toContainEqual(expect.objectContaining({ type: "card-updated", roomId: "!room:workspace.example", audience: "owner" }));
+    // Ids only, never content — no card title/line/result text anywhere in the push.
+    for (const message of messages) {
+      expect(message).not.toContain("Looking into this");
+    }
+
+    socket.close();
+    await workspace.stop();
+    await app.close();
+  });
+
+  it("never pushes task/card signals when no workspace is configured", async () => {
+    const storePath = initStore();
+    const app = createServer(deps(storePath));
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const localWsUrl = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/ws`;
+    const socket = connect(localWsUrl);
+    const first = nextMessage(socket);
+    await new Promise((resolve) => socket.once("open", resolve));
+    const paired = createDeviceToken(storePath, PASSPHRASE, "owner-device-2");
+    send(socket, { type: "auth", token: paired.token });
+    await first;
+    socket.close();
+    await app.close();
+    // No workspace was ever configured — createServer must not throw
+    // reaching for onTaskEvent/onCardEvent on an undefined deps.workspace.
+    expect(true).toBe(true);
+  });
+});

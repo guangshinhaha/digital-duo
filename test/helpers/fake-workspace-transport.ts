@@ -1,7 +1,9 @@
+import type { DuoCardEditContent, DuoCardEventContent } from "../../src/workspace/cards.js";
 import type { RoomInvite } from "../../src/workspace/messages.js";
 import type {
   AnswerEventContent,
   WorkspaceCandidateMessage,
+  WorkspaceCardResponse,
   WorkspaceFileBody,
   WorkspaceMemberIdentityListing,
   WorkspaceMemberListing,
@@ -50,6 +52,10 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
   /** Every invite the duo issued (guangshinhaha/duo#314). */
   inviteCalls: { roomId: string; userId: string }[] = [];
   readonly sentAnswers: { roomId: string; content: AnswerEventContent }[] = [];
+  /** W-S4-3: every card sent, in order — the event id each resolved with, index-aligned. */
+  readonly sentCards: { roomId: string; content: DuoCardEventContent; eventId: string }[] = [];
+  /** W-S4-3: every card edit, in order. */
+  readonly editedCards: { roomId: string; eventId: string; content: DuoCardEditContent }[] = [];
   /** The membership the fake homeserver holds — what a join added and a leave removed. */
   readonly joinedRooms = new Set<string>();
   /** Every fetchFile call, in order — the door's "was the body read at all" evidence (#190). */
@@ -57,7 +63,9 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
 
   private failNextConnects = 0;
   private connected = false;
+  private nextEventIdSuffix = 0;
   private messageHandlers: ((message: WorkspaceCandidateMessage) => void)[] = [];
+  private cardResponseHandlers: ((response: WorkspaceCardResponse) => void)[] = [];
   private inviteHandlers: ((invite: RoomInvite) => void)[] = [];
   private disconnectHandlers: (() => void)[] = [];
   private held: WorkspaceCandidateMessage[] = [];
@@ -117,6 +125,13 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
     }
   }
 
+  /** W-S4-3: a `duo.card.response` arriving over the connection, live or sync-replayed — the same `deliver`/`onMessage` pairing, for card taps. */
+  deliverCardResponse(response: WorkspaceCardResponse): void {
+    for (const handler of this.cardResponseHandlers) {
+      handler(response);
+    }
+  }
+
   /** The homeserver holds a message for us while we're offline. */
   hold(message: WorkspaceCandidateMessage): void {
     this.held.push(message);
@@ -161,11 +176,38 @@ export class FakeWorkspaceTransport implements WorkspaceTransport {
     this.connected = false;
   }
 
-  async sendAnswer(roomId: string, content: AnswerEventContent): Promise<void> {
+  /** Fake, incrementing event ids — distinct per send so tests can tell one sent event from another without a real homeserver. */
+  private nextEventId(): string {
+    this.nextEventIdSuffix += 1;
+    return `$fake-event-${this.nextEventIdSuffix}`;
+  }
+
+  async sendAnswer(roomId: string, content: AnswerEventContent): Promise<{ readonly eventId: string }> {
     if (!this.connected) {
       throw new Error("fake: not connected");
     }
     this.sentAnswers.push({ roomId, content });
+    return { eventId: this.nextEventId() };
+  }
+
+  async sendCard(roomId: string, content: DuoCardEventContent): Promise<{ readonly eventId: string }> {
+    if (!this.connected) {
+      throw new Error("fake: not connected");
+    }
+    const eventId = this.nextEventId();
+    this.sentCards.push({ roomId, content, eventId });
+    return { eventId };
+  }
+
+  async editCard(roomId: string, eventId: string, content: DuoCardEditContent): Promise<void> {
+    if (!this.connected) {
+      throw new Error("fake: not connected");
+    }
+    this.editedCards.push({ roomId, eventId, content });
+  }
+
+  onCardResponse(handler: (response: WorkspaceCardResponse) => void): void {
+    this.cardResponseHandlers.push(handler);
   }
 
   async markAlive(): Promise<void> {

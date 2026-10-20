@@ -8,6 +8,7 @@ import { WorkspaceService } from "../workspace/service.js";
 import type { WorkspaceQuestion, WorkspaceTransportFactory } from "../workspace/transport.js";
 import type { DraftProvenance } from "../drafting/draft-log.js";
 import { durableDuoReadState } from "./workspace-read-state.js";
+import { durableWorkspaceTaskSink } from "./workspace-tasks.js";
 import type { ServeDeps } from "./server.js";
 
 /** What one duo's workspace connection needs of the duo itself: its own store, folder, providers and owner. */
@@ -80,6 +81,14 @@ export function createDuoWorkspaceService(duo: DuoWorkspaceInputs, options: DuoW
     // should admit (every other surface already fails the same value
     // at its own point of use).
     attachmentDoor: attachmentGroundingDoor(parseClassificationCeiling(duo.classificationCeiling)),
+    // W-S4-4/W-S4-5: the task and card store, over the same encrypted
+    // store every other daemon-side table lives in. The impl lives in
+    // src/serve/ for the same reason durableDuoReadState does (the
+    // workspace boundary scan forbids src/workspace/** from reaching
+    // src/tasks/ directly) — wired whenever a workspace exists at all, so
+    // the ack timer and the passed_on/answered/declined card behavior are
+    // never half-configured.
+    taskSink: durableWorkspaceTaskSink(duo.storePath, duo.passphrase),
     // THE answering pipeline, not a workspace twin: the identical
     // answerPublicly call POST /ask makes, argument for argument, with
     // the asking Matrix user resolved through the same directory

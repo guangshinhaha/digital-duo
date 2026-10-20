@@ -26,6 +26,7 @@ describe("workspaceSettingsFrom — no workspace is a supported state, half a wo
       reconnect: { initialDelayMs: 1000, maxDelayMs: 60000 },
       presenceIntervalMs: 240000,
       backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
+      ackAfterMs: 2000,
     });
   });
 
@@ -98,6 +99,17 @@ describe("workspaceSettingsFrom — no workspace is a supported state, half a wo
     expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_PRESENCE_INTERVAL_MS: "0" }))).toThrow(
       /DUO_WORKSPACE_PRESENCE_INTERVAL_MS must be a positive number/,
     );
+    expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_ACK_AFTER_MS: "0" }))).toThrow(
+      /DUO_WORKSPACE_ACK_AFTER_MS must be a positive number/,
+    );
+    expect(() => workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_ACK_AFTER_MS: "-500" }))).toThrow(
+      /DUO_WORKSPACE_ACK_AFTER_MS must be a positive number/,
+    );
+  });
+
+  it("defaults ackAfterMs to 2000 (PRD v0.4 Q2) and honors DUO_WORKSPACE_ACK_AFTER_MS from env", () => {
+    expect(workspaceSettingsFrom(configWithWorkspace(FULL))?.ackAfterMs).toBe(2000);
+    expect(workspaceSettingsFrom(configWithWorkspace({ ...FULL, DUO_WORKSPACE_ACK_AFTER_MS: "500" }))?.ackAfterMs).toBe(500);
   });
 
   it("honors the reconnect and presence knobs from env — #188 retunes hold behavior without a code change", () => {
