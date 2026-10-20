@@ -26,6 +26,7 @@
  * contract's own `RoomInvite` (messages.ts) — imported type-only below so the
  * seam and the contract cannot drift apart on what an invitation is.
  */
+import type { DuoCardEditContent, DuoCardEventContent } from "./cards.js";
 import type { RoomInvite } from "./messages.js";
 
 export interface WorkspaceTransport {
@@ -73,9 +74,44 @@ export interface WorkspaceTransport {
    * sender — protocol-level attribution, the decision record's §6) into the
    * room the question was asked in. The content is exactly what
    * `buildAnswerEvent` produced: nothing else in this codebase can put a
-   * payload on the wire.
+   * payload on the wire. Resolves the sent event's id (W-S4-3) — the real
+   * adapter's `client.sendMessage` already resolves `{event_id}`, so this
+   * is a widening of what was already available, not a new round trip —
+   * needed so an `answered` outcome can edit an already-sent task card to
+   * `done` with a `result` link that points at this very event (W-S4-5).
    */
-  sendAnswer(roomId: string, content: AnswerEventContent): Promise<void>;
+  sendAnswer(roomId: string, content: AnswerEventContent): Promise<{ readonly eventId: string }>;
+
+  /**
+   * W-S4-3: posts a brand-new `duo.card` (cards.md §2), as the duo's own
+   * account, exactly like `sendAnswer`. The content is exactly what
+   * `buildCardEvent` produced. Resolves the sent event's id — the one a
+   * later `editCard` or a card response's `cardEventId` refers back to.
+   */
+  sendCard(roomId: string, content: DuoCardEventContent): Promise<{ readonly eventId: string }>;
+
+  /**
+   * W-S4-3: edits an already-sent card in place (cards.md §3) — a
+   * same-sender `m.replace` whose content is exactly what `buildCardEdit`
+   * produced. `eventId` is the card's own event id (the one `sendCard` or
+   * a previous `editCard` resolved); the edit's own event id is never
+   * needed by anything above this seam, so nothing is resolved beyond
+   * completion.
+   */
+  editCard(roomId: string, eventId: string, content: DuoCardEditContent): Promise<void>;
+
+  /**
+   * W-S4-3: a `duo.card.response` arrived (cards.md §2) — a person's tap on
+   * a card's option, live or replayed by the sync catch-up `connect()`
+   * resolves on, the same held-not-lost recovery a question gets. The
+   * adapter normalizes and drops anything malformed (unknown `v`, a
+   * missing `card_id`/`action_id`, a non-object `values`) before it ever
+   * reaches a handler — never throws, the same "adapter normalizes, service
+   * decides" split `onMessage` already uses. The duo's own echo (a response
+   * this account could never actually send, but checked for defensively —
+   * see matrix-transport.ts) is dropped the same way.
+   */
+  onCardResponse(handler: (response: WorkspaceCardResponse) => void): void;
 
   /**
    * Reports liveness to the homeserver (Matrix presence/last-seen —
@@ -377,6 +413,40 @@ export type WorkspaceAttachmentDoor = (
 export interface AnswerEventContent {
   readonly msgtype: "m.text";
   readonly body: string;
+}
+
+/**
+ * W-S4-2: the full set of shapes that may ever ride outbound on the
+ * workspace connection — `AnswerEventContent` (payload.ts's three
+ * constructors) and the two card shapes `src/workspace/cards.ts` builds
+ * (`DuoCardEventContent` for a brand-new card, `DuoCardEditContent` for a
+ * same-sender replacement, cards.md §2/§3). This is the contract the same
+ * way `AnswerEventContent` itself is: `sendAnswer`/`sendCard`/`editCard`
+ * below are typed against exactly these three members, so nothing else in
+ * this codebase can shape a payload the two builder files didn't produce.
+ */
+export type OutboundWorkspaceContent = AnswerEventContent | DuoCardEventContent | DuoCardEditContent;
+
+/**
+ * W-S4-3: one `duo.card.response` as the adapter normalized it (cards.md
+ * §2/§6). `cardEventId` is the response's own `m.relates_to.event_id` — the
+ * card event it claims to answer; the service looks it up in
+ * `workspace_cards` before acting on anything here (cards.md §6's
+ * anti-spoofing checks: the card must be one this daemon sent, still open,
+ * `actionId` one of that card's options, and `senderId` the card's own
+ * `requester` or the owner). The adapter's job stops at shape — it never
+ * decides whether the response is legitimate, only whether it is
+ * well-formed enough to hand to something that will.
+ */
+export interface WorkspaceCardResponse {
+  readonly eventId: string;
+  readonly roomId: string;
+  readonly senderId: string;
+  readonly cardEventId: string;
+  readonly cardId: string;
+  readonly actionId: string;
+  readonly values: Record<string, unknown>;
+  readonly originServerTs: number;
 }
 
 /**
