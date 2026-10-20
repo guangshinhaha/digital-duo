@@ -105,9 +105,12 @@ class StubMatrixClient {
     this.stopCalls += 1;
   }
 
-  async sendMessage(roomId: string, content: unknown): Promise<unknown> {
+  sendMessageEventIdSuffix = 0;
+
+  async sendMessage(roomId: string, content: unknown): Promise<{ event_id: string }> {
     this.sentMessages.push({ roomId, content });
-    return {};
+    this.sendMessageEventIdSuffix += 1;
+    return { event_id: `$sent-${this.sendMessageEventIdSuffix}` };
   }
 
   async setPresence(): Promise<unknown> {
@@ -172,6 +175,7 @@ function settings(): WorkspaceSettings {
     reconnect: { initialDelayMs: 1000, maxDelayMs: 8000 },
     presenceIntervalMs: 5000,
     backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
+    ackAfterMs: 2000,
   };
 }
 
@@ -410,18 +414,185 @@ describe("Matrix adapter — timeline normalization at the seam", () => {
 });
 
 describe("Matrix adapter — outbound calls", () => {
-  it("sendAnswer posts exactly the built content to the question's room, as the duo's own m.text", async () => {
+  it("sendAnswer posts exactly the built content to the question's room, as the duo's own m.text, and resolves the sent event's id (W-S4-3)", async () => {
     const transport = createMatrixTransport(settings());
-    await transport.sendAnswer("!room:workspace", { msgtype: "m.text", body: "Approved on 2026-08-14." });
+    const sent = await transport.sendAnswer("!room:workspace", { msgtype: "m.text", body: "Approved on 2026-08-14." });
     expect(client.sentMessages).toEqual([
       { roomId: "!room:workspace", content: { msgtype: "m.text", body: "Approved on 2026-08-14." } },
     ]);
+    expect(sent).toEqual({ eventId: "$sent-1" });
   });
 
   it("markAlive reports online presence to the homeserver", async () => {
     const transport = createMatrixTransport(settings());
     await transport.markAlive();
     expect(client.presenceReports).toBe(1);
+  });
+
+  it("sendCard posts exactly the builder's content, verbatim, and resolves the sent event's id (W-S4-3)", async () => {
+    const transport = createMatrixTransport(settings());
+    const content = {
+      msgtype: "duo.card" as const,
+      body: "Looking into this — I'll update this message.",
+      "m.mentions": {},
+      "duo.card": { v: 1 as const, rev: 1, card_id: "c_01TASK", kind: "task" as const, state: "acknowledged", requester: "@alice:workspace", title: "Checking" },
+    };
+    const sent = await transport.sendCard("!room:workspace", content);
+    expect(client.sentMessages).toEqual([{ roomId: "!room:workspace", content }]);
+    expect(sent).toEqual({ eventId: "$sent-1" });
+  });
+
+  it("editCard sends exactly the builder's edit content, verbatim, against the card's own event id", async () => {
+    const transport = createMatrixTransport(settings());
+    const edit = {
+      msgtype: "duo.card" as const,
+      body: "* Looking into this — I'll update this message.",
+      "m.new_content": {
+        msgtype: "duo.card" as const,
+        body: "Looking into this — I'll update this message.",
+        "m.mentions": {},
+        "duo.card": { v: 1 as const, rev: 2, card_id: "c_01TASK", kind: "task" as const, state: "working", requester: "@alice:workspace", title: "Checking" },
+      },
+      "m.relates_to": { rel_type: "m.replace" as const, event_id: "$card1" },
+    };
+    await transport.editCard("!room:workspace", "$card1", edit);
+    expect(client.sentMessages).toEqual([{ roomId: "!room:workspace", content: edit }]);
+  });
+});
+
+describe("Matrix adapter — duo.card.response, a non-message custom event (W-S4-3, cards.md §2/§6)", () => {
+  function cardResponseEvent(init: {
+    eventId?: string;
+    roomId?: string;
+    senderId?: string;
+    senderMissing?: boolean;
+    ts?: number;
+    content?: Record<string, unknown>;
+  } = {}) {
+    return {
+      getType: () => "duo.card.response",
+      getContent: () =>
+        init.content ?? {
+          "m.relates_to": { rel_type: "m.reference", event_id: "$card1" },
+          "duo.card.response": { v: 1, card_id: "c_01TASK", action_id: "o1", values: {} },
+        },
+      getSender: () => (init.senderMissing ? undefined : (init.senderId ?? "@alice:workspace")),
+      getId: () => init.eventId ?? "$resp1",
+      getRoomId: () => init.roomId ?? "!room:workspace",
+      getTs: () => init.ts ?? 1_758_000_000_000,
+    };
+  }
+
+  it("delivers a live duo.card.response, parsed into the seam's shape", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    client.emit(RoomEvent.Timeline, cardResponseEvent(), room(), false, false, {});
+    expect(responses).toEqual([
+      {
+        eventId: "$resp1",
+        roomId: "!room:workspace",
+        senderId: "@alice:workspace",
+        cardEventId: "$card1",
+        cardId: "c_01TASK",
+        actionId: "o1",
+        values: {},
+        originServerTs: 1_758_000_000_000,
+      },
+    ]);
+  });
+
+  it("delivers a sync-replayed duo.card.response the same as a live one — held-not-lost applies to responses too", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    // `removed: false` either way — replayed-by-backlog events arrive with
+    // the same flag live ones do (see the text-message listener above);
+    // this test exists so a future adapter change that started gating on a
+    // "replayed" flag that doesn't exist on this event would be caught.
+    client.emit(RoomEvent.Timeline, cardResponseEvent({ eventId: "$resp2" }), room(), true, false, {});
+    expect(responses).toHaveLength(1);
+    expect((responses[0] as { eventId: string }).eventId).toBe("$resp2");
+  });
+
+  it("drops a response with an unknown v, never throwing", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    client.emit(
+      RoomEvent.Timeline,
+      cardResponseEvent({ content: { "m.relates_to": { rel_type: "m.reference", event_id: "$card1" }, "duo.card.response": { v: 2, card_id: "c1", action_id: "o1", values: {} } } }),
+      room(),
+      false,
+      false,
+      {},
+    );
+    expect(responses).toEqual([]);
+  });
+
+  it("drops a response missing card_id, action_id, or m.relates_to.event_id, never throwing", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    const malformed = [
+      { "m.relates_to": { rel_type: "m.reference", event_id: "$card1" }, "duo.card.response": { v: 1, card_id: "", action_id: "o1", values: {} } },
+      { "m.relates_to": { rel_type: "m.reference", event_id: "$card1" }, "duo.card.response": { v: 1, card_id: "c1", action_id: "", values: {} } },
+      { "m.relates_to": { rel_type: "m.reference" }, "duo.card.response": { v: 1, card_id: "c1", action_id: "o1", values: {} } },
+      { "duo.card.response": { v: 1, card_id: "c1", action_id: "o1", values: {} } },
+      { "m.relates_to": { rel_type: "m.reference", event_id: "$card1" } },
+    ];
+    for (const content of malformed) {
+      client.emit(RoomEvent.Timeline, cardResponseEvent({ content }), room(), false, false, {});
+    }
+    expect(responses).toEqual([]);
+  });
+
+  it("drops a response whose values is not a plain object, never throwing", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    client.emit(
+      RoomEvent.Timeline,
+      cardResponseEvent({ content: { "m.relates_to": { rel_type: "m.reference", event_id: "$card1" }, "duo.card.response": { v: 1, card_id: "c1", action_id: "o1", values: "not-an-object" } } }),
+      room(),
+      false,
+      false,
+      {},
+    );
+    expect(responses).toEqual([]);
+  });
+
+  it("ignores the duo's own echo — a response whose sender is this account's own user id", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    client.emit(RoomEvent.Timeline, cardResponseEvent({ senderId: "@duo-alice:workspace" }), room(), false, false, {});
+    expect(responses).toEqual([]);
+  });
+
+  it("drops a response with no sender at all", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    client.emit(RoomEvent.Timeline, cardResponseEvent({ senderMissing: true }), room(), false, false, {});
+    expect(responses).toEqual([]);
+  });
+
+  it("never reaches the text-message handlers — a duo.card.response is not an m.room.message", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: unknown[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(RoomEvent.Timeline, cardResponseEvent(), room(), false, false, {});
+    expect(messages).toEqual([]);
+  });
+
+  it("is silent after stop() — a late response delivery never reaches a handler", () => {
+    const transport = createMatrixTransport(settings());
+    const responses: unknown[] = [];
+    transport.onCardResponse((response) => responses.push(response));
+    void transport.stop();
+    client.emit(RoomEvent.Timeline, cardResponseEvent(), room(), false, false, {});
+    expect(responses).toEqual([]);
   });
 });
 
