@@ -322,6 +322,10 @@ function roomMessage(message: { eventId: string; body: string; senderId?: string
     body: message.body,
     originServerTs: Date.now(),
     joinedMemberIds: message.joinedMemberIds ?? [SELF, BOB, "@carol:workspace"],
+    // These tests exercise consent (#192), not addressing (#312/S1) — every
+    // shared-room message here @mentions the duo so the consent gate is
+    // what's under test, same as before S1 added its own gate on top.
+    mentionedUserIds: [SELF],
   };
 }
 

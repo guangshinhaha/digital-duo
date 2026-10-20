@@ -171,6 +171,100 @@ function attachmentsForQuestion(room: Room, questionEventId: string, senderId: s
 }
 
 /**
+ * A crude `matrix.to` member-link matcher — `https://matrix.to/#/<mxid>`
+ * (URL-encoded), the anchor a client renders for a mention pill in
+ * `formatted_body`. Only the fallback path for a client that didn't send
+ * `m.mentions` (#312/S1) reads this; it never runs when `m.mentions` is
+ * present, even an empty one — an explicit empty mentions object is the
+ * client's own word that it named nobody, not evidence of an older client.
+ */
+const MATRIX_TO_USER_LINK = /https:\/\/matrix\.to\/#\/(%40[^"'\s)]+|@[^"'\s)]+)/g;
+
+/**
+ * #312/S1: who a message named. `m.mentions.user_ids` (MSC3952/the stable
+ * spec) is read first and, when present at all, is authoritative — an
+ * empty list is "names nobody," not "didn't say." Only its total absence
+ * falls back to scanning `formatted_body` for `matrix.to` anchors, for a
+ * client that renders mention pills as plain links without the structured
+ * field.
+ */
+function mentionedUserIdsOf(content: Record<string, unknown>): string[] {
+  const mentions = content["m.mentions"];
+  if (mentions !== null && typeof mentions === "object") {
+    const userIds = (mentions as Record<string, unknown>).user_ids;
+    if (Array.isArray(userIds)) {
+      return userIds.filter((id): id is string => typeof id === "string");
+    }
+  }
+  const formattedBody = content.formatted_body;
+  if (typeof formattedBody !== "string") {
+    return [];
+  }
+  const found: string[] = [];
+  for (const match of formattedBody.matchAll(MATRIX_TO_USER_LINK)) {
+    try {
+      found.push(decodeURIComponent(match[1]!));
+    } catch {
+      // A malformed percent-encoding in a hostile or buggy formatted_body
+      // contributes nothing rather than throwing out of a content parse.
+    }
+  }
+  return found;
+}
+
+/**
+ * #312/S1: resolves one related event's sender through the room's own
+ * known timelines (`room.findEventById` — not only the live one, matching
+ * what the real SDK searches). `undefined`/missing room support, or a
+ * target the room has never loaded, both resolve to `null` rather than
+ * throwing — a reply or thread root the adapter cannot see is an honest
+ * "don't know who," never a crash.
+ */
+function senderOfRelatedEvent(room: Room, eventId: string | undefined): string | null {
+  if (eventId === undefined) {
+    return null;
+  }
+  const found = (room as { findEventById?: (id: string) => MatrixEvent | undefined }).findEventById?.(eventId);
+  return found?.getSender() ?? null;
+}
+
+/**
+ * #312/S1: the reply target's sender — `m.relates_to["m.in_reply_to"].event_id`
+ * resolved through the room. `null` when the message isn't a reply at all.
+ */
+function replyToSenderIdOf(room: Room, content: Record<string, unknown>): string | null {
+  const relatesTo = content["m.relates_to"];
+  if (relatesTo === null || typeof relatesTo !== "object") {
+    return null;
+  }
+  const inReplyTo = (relatesTo as Record<string, unknown>)["m.in_reply_to"];
+  if (inReplyTo === null || typeof inReplyTo !== "object") {
+    return null;
+  }
+  const eventId = (inReplyTo as Record<string, unknown>).event_id;
+  return senderOfRelatedEvent(room, typeof eventId === "string" ? eventId : undefined);
+}
+
+/**
+ * #312/S1: the thread root's sender — `m.relates_to.event_id` resolved
+ * through the room, but only when `rel_type` names the thread relation
+ * (`m.thread`); an `m.replace`/`m.reference`/any other relation is not a
+ * thread, so this stays `null` for those (the edit-unwrap path above reads
+ * `m.replace` itself; this function never confuses the two).
+ */
+function threadRootSenderIdOf(room: Room, content: Record<string, unknown>): string | null {
+  const relatesTo = content["m.relates_to"];
+  if (relatesTo === null || typeof relatesTo !== "object") {
+    return null;
+  }
+  const record = relatesTo as Record<string, unknown>;
+  if (record.rel_type !== "m.thread") {
+    return null;
+  }
+  return senderOfRelatedEvent(room, typeof record.event_id === "string" ? record.event_id : undefined);
+}
+
+/**
  * W-S4-3: parses one `duo.card.response` timeline event's content into the
  * seam's shape, or `undefined` for anything malformed — cards.md §2's wire
  * shape plus the §4 rule that the daemon drops an unknown `v`. Never
@@ -310,6 +404,13 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
       originServerTs: event.getTs(),
       joinedMemberIds: room.getJoinedMembers().map((member) => member.userId),
       ...(attachments.length > 0 ? { attachments } : {}),
+      // #312/S1: mentions and reply/thread targets, normalized here and
+      // nowhere else — the shared-room question filter (questions.ts) is
+      // the one consumer, gating a group room on whether the duo's own id
+      // shows up in any of the three.
+      mentionedUserIds: mentionedUserIdsOf(content),
+      replyToSenderId: replyToSenderIdOf(room, content),
+      threadRootSenderId: threadRootSenderIdOf(room, content),
     };
     for (const handler of messageHandlers) {
       handler(message);
