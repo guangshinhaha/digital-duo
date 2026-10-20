@@ -12,6 +12,9 @@ function candidate(overrides: Partial<WorkspaceCandidateMessage> = {}): Workspac
     body: "What did Alice decide about the vendor?",
     originServerTs: Date.now(),
     joinedMemberIds: [SELF, "@bob:workspace"],
+    mentionedUserIds: [],
+    replyToSenderId: null,
+    threadRootSenderId: null,
     ...overrides,
   };
 }
@@ -74,9 +77,9 @@ describe("answerableQuestionFrom — #192: reachable means a direct room, or a r
     expect(question?.receivedAt).toBeTruthy();
   });
 
-  it("answers in an owner-allowed room of any size", () => {
+  it("answers in an owner-allowed room of any size, once addressed (#312/S1)", () => {
     const allowed: RoomDecisionLookup = (roomId) => (roomId === "!room:workspace" ? "allowed" : null);
-    const question = answerableQuestionFrom(candidate(GROUP), SELF, allowed);
+    const question = answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: [SELF] }), SELF, allowed);
     expect(question).toMatchObject({ eventId: "$1", roomId: "!room:workspace", body: "What did Alice decide about the vendor?" });
   });
 
@@ -116,8 +119,8 @@ describe("answerableQuestionFrom — #192: reachable means a direct room, or a r
       seenBy.push(roomId);
       return roomId === "!room:workspace" ? "allowed" : null;
     };
-    expect(answerableQuestionFrom(candidate(GROUP), SELF, lookup)).not.toBeNull();
-    expect(answerableQuestionFrom(candidate({ ...GROUP, roomId: "!other:workspace" }), SELF, lookup)).toBeNull();
+    expect(answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: [SELF] }), SELF, lookup)).not.toBeNull();
+    expect(answerableQuestionFrom(candidate({ ...GROUP, roomId: "!other:workspace", mentionedUserIds: [SELF] }), SELF, lookup)).toBeNull();
     expect(seenBy).toEqual(["!room:workspace", "!other:workspace"]);
   });
 
@@ -125,5 +128,47 @@ describe("answerableQuestionFrom — #192: reachable means a direct room, or a r
     expect(answerableQuestionFrom(candidate(), SELF)).not.toBeNull();
     expect(answerableQuestionFrom(candidate(GROUP), SELF)).toBeNull();
     expect(answerableQuestionFrom(candidate({ roomId: "!dm:workspace", joinedMemberIds: [SELF] }), SELF)).toBeNull();
+  });
+});
+
+describe("answerableQuestionFrom — #312/S1: an allowed shared room still only answers what it's addressed to", () => {
+  const GROUP = { roomId: "!room:workspace", joinedMemberIds: [SELF, "@bob:workspace", "@carol:workspace"] };
+  const allowed: RoomDecisionLookup = () => "allowed";
+
+  it("an allowed group room with no mention, reply or thread to the duo is not a question", () => {
+    expect(answerableQuestionFrom(candidate(GROUP), SELF, allowed)).toBeNull();
+  });
+
+  it("a mention of the duo's own id addresses it", () => {
+    expect(answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: [SELF] }), SELF, allowed)).not.toBeNull();
+    // Mentioning someone else does not — the duo's own id must be among them.
+    expect(answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: ["@carol:workspace"] }), SELF, allowed)).toBeNull();
+  });
+
+  it("a reply to the duo's own message addresses it", () => {
+    expect(answerableQuestionFrom(candidate({ ...GROUP, replyToSenderId: SELF }), SELF, allowed)).not.toBeNull();
+  });
+
+  it("a reply to a person's message does not address the duo", () => {
+    expect(answerableQuestionFrom(candidate({ ...GROUP, replyToSenderId: "@carol:workspace" }), SELF, allowed)).toBeNull();
+  });
+
+  it("a thread whose root the duo posted addresses it", () => {
+    expect(answerableQuestionFrom(candidate({ ...GROUP, threadRootSenderId: SELF }), SELF, allowed)).not.toBeNull();
+  });
+
+  it("a thread whose root a person posted does not address the duo", () => {
+    expect(answerableQuestionFrom(candidate({ ...GROUP, threadRootSenderId: "@carol:workspace" }), SELF, allowed)).toBeNull();
+  });
+
+  it("a refused or withdrawn room stays silent even when the message addresses the duo — consent outranks addressing", () => {
+    for (const status of ["refused", "withdrawn"] as const) {
+      const decision: RoomDecisionLookup = () => status;
+      expect(answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: [SELF] }), SELF, decision)).toBeNull();
+    }
+  });
+
+  it("the direct-room posture is unaffected by addressing — an unmentioned DM still answers (S2)", () => {
+    expect(answerableQuestionFrom(candidate(), SELF)).not.toBeNull();
   });
 });
