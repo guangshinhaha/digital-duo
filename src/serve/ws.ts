@@ -41,6 +41,19 @@ export interface DraftReadyHub {
    */
   publishDrafting(roomId: string): void;
   /**
+   * W-S4-6 (docs/workspace/cards.md §7): "a duo's task/card signal carries
+   * ids and state only, never content" — the owner's client fetches the
+   * actual facts over authenticated HTTP (`GET /tasks/:id`, `GET
+   * /cards/:id`, `src/serve/task-routes.ts`) once it hears this. Pushed by
+   * `createServer`'s subscription to the workspace service's own
+   * `onTaskEvent` (W-S4-5's ack timer and outcome branches are the only
+   * emitters) — never called directly from a route body, the same
+   * separation `publishDrafting`'s own subscription keeps.
+   */
+  publishTask(taskId: string, roomId: string, state: string): void;
+  /** W-S4-6: the card-shaped twin of `publishTask` — ids and state only, never the card's `lines`/`title`/`result`. */
+  publishCard(cardId: string, roomId: string): void;
+  /**
    * Closes every live socket authenticated as one device (#177). Same close
    * code and reason the re-verify pass uses for an out-of-process `duo pair
    * revoke`, but same-tick: an in-process revocation (POST
@@ -175,6 +188,22 @@ export function registerDraftReadySocket(
     },
     publishDrafting(roomId: string): void {
       const payload = JSON.stringify({ type: "draft-drafting", roomId });
+      for (const socket of live.keys()) {
+        if (socket.readyState === socket.OPEN) {
+          socket.send(payload);
+        }
+      }
+    },
+    publishTask(taskId: string, roomId: string, state: string): void {
+      const payload = JSON.stringify({ type: "task-updated", taskId, roomId, state });
+      for (const socket of live.keys()) {
+        if (socket.readyState === socket.OPEN) {
+          socket.send(payload);
+        }
+      }
+    },
+    publishCard(cardId: string, roomId: string): void {
+      const payload = JSON.stringify({ type: "card-updated", cardId, roomId, audience: "owner" });
       for (const socket of live.keys()) {
         if (socket.readyState === socket.OPEN) {
           socket.send(payload);
