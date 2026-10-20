@@ -26,6 +26,13 @@ const POISON = {
   cardId: "POISON-card-id",
   taskId: "POISON-task-id",
   confidenceScore: "POISON-confidence-0.97",
+  // Never legitimately embedded in any field below — these only ever reach
+  // `buildCardEvent`/`buildCardEdit` by a caller smuggling an extra key
+  // past the type system (an `as any` cast, exactly as a careless call site
+  // could). A full-string scan of the output must never contain one.
+  smuggledDraftId: "POISON-smuggled-draft-id",
+  smuggledEvidence: "POISON-smuggled-grounding-chunk-evidence-text",
+  smuggledOwnerNotice: "POISON-smuggled-owner-notice",
 } as const;
 
 function confidence(): ConfidenceResult {
@@ -243,6 +250,28 @@ describe("buildCardEvent/buildCardEdit — the SAME corpus-never-crosses invaria
       expect(edit["m.new_content"]["duo.card"].rev).toBe(2);
       expect(Object.keys(edit).sort()).toEqual(["body", "m.new_content", "m.relates_to", "msgtype"].sort());
       expect(edit["m.relates_to"]).toEqual({ rel_type: "m.replace", event_id: "$cardEvent" });
+    });
+
+    it(`${label} card: a caller that smuggles an extra forbidden-shaped key past the type system never gets it echoed anywhere in the serialized output`, () => {
+      // DuoCardV1Input's TYPE has no slot for these — this simulates the
+      // one way they could still arrive at runtime: a cast that defeats
+      // the compile-time guarantee the test above documents. cardOf()
+      // builds the wire object field-by-field from named, allowlisted
+      // properties (src/workspace/cards.ts), so a key it never reads for
+      // must never surface — this is the full-string scan the top-level
+      // Object.keys check above does not perform.
+      const smuggled = {
+        ...input,
+        draftId: POISON.smuggledDraftId,
+        evidence: [{ kind: "evidence", id: "x", label: POISON.smuggledEvidence }],
+        ownerNotice: POISON.smuggledOwnerNotice,
+      } as unknown as DuoCardV1Input;
+      const event = buildCardEvent(smuggled);
+      const edit = buildCardEdit("$cardEvent", smuggled, 1);
+      for (const marker of [POISON.smuggledDraftId, POISON.smuggledEvidence, POISON.smuggledOwnerNotice]) {
+        expect(JSON.stringify(event)).not.toContain(marker);
+        expect(JSON.stringify(edit)).not.toContain(marker);
+      }
     });
   }
 

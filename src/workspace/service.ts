@@ -1266,50 +1266,71 @@ export class WorkspaceService {
       // same task.
       const passedOnText = decision.content.body;
       if (cardState.taskId === undefined) {
-        const { taskId } = taskSink.createTask({
-          roomId: question.roomId,
-          questionEventId: question.eventId,
-          requester: question.senderId,
-          draftId: decision.passedOnDraftId,
-        });
-        cardState.taskId = taskId;
-        this.emitTaskEvent({ taskId, roomId: question.roomId, state: "acknowledged" });
-        const card: DuoCardV1Input = {
-          kind: "task",
-          cardId: taskId,
-          taskId,
-          state: "acknowledged",
-          requester: question.senderId,
-          title: "Passed on",
-          lines: [passedOnText],
-        };
-        const sent = await transport.sendCard(question.roomId, buildCardEvent(card));
-        const { cardId } = taskSink.createCard({ taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
-        this.emitCardEvent({ cardId, roomId: question.roomId });
+        // Fast passed_on: the ack never fired, so this is the FIRST card
+        // for this task — unlike the `answered` branch above, the plain-
+        // text passed-on message is not gated on anything the card side
+        // produces (no sent-event id it needs back), so it is never worth
+        // losing to a card failure. Isolate the task-create/card-send pair
+        // in its own try/catch, exactly like the `answered` branch isolates
+        // its card edit: a failure here is logged and swallowed, and this
+        // method still returns `false`, so handleQuestion's own
+        // `transport.sendAnswer` call below carries the passed-on text to
+        // the asker regardless of whether the card made it out.
+        try {
+          const { taskId } = taskSink.createTask({
+            roomId: question.roomId,
+            questionEventId: question.eventId,
+            requester: question.senderId,
+            draftId: decision.passedOnDraftId,
+          });
+          cardState.taskId = taskId;
+          this.emitTaskEvent({ taskId, roomId: question.roomId, state: "acknowledged" });
+          const card: DuoCardV1Input = {
+            kind: "task",
+            cardId: taskId,
+            taskId,
+            state: "acknowledged",
+            requester: question.senderId,
+            title: "Passed on",
+            lines: [passedOnText],
+          };
+          const sent = await transport.sendCard(question.roomId, buildCardEvent(card));
+          const { cardId } = taskSink.createCard({ taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
+          this.emitCardEvent({ cardId, roomId: question.roomId });
+        } catch (error) {
+          this.consoleError(`sending the passed-on task card for workspace question ${question.eventId} failed (the passed-on text will still be sent)`, error);
+        }
         return false;
       }
       // The ack already fired: edit that SAME card to carry the passed-on
       // text instead of the ack-timer text — still "acknowledged", still
-      // one card.
+      // one card. Same isolation as the fast path above: handleQuestion
+      // sends `passedOnText` itself once this returns `false`, and the
+      // asker already has the ack card on screen either way, so an edit
+      // failure here must never block that send.
       taskSink.updateTaskState(cardState.taskId, undefined, { draftId: decision.passedOnDraftId });
       const openCard = taskSink.openCardFor(cardState.taskId, question.roomId);
       if (openCard === undefined) {
         return false;
       }
-      const card: DuoCardV1Input = {
-        kind: "task",
-        cardId: openCard.cardId,
-        taskId: cardState.taskId,
-        state: "acknowledged",
-        requester: question.senderId,
-        title: "Passed on",
-        lines: [passedOnText],
-      };
-      const edit = buildCardEdit(openCard.eventId, card, openCard.rev);
-      await transport.editCard(question.roomId, openCard.eventId, edit);
-      taskSink.recordCardEdit(openCard.cardId, { rev: edit["m.new_content"]["duo.card"].rev, state: "acknowledged" });
-      this.emitCardEvent({ cardId: openCard.cardId, roomId: question.roomId });
-      this.emitTaskEvent({ taskId: cardState.taskId, roomId: question.roomId, state: "acknowledged" });
+      try {
+        const card: DuoCardV1Input = {
+          kind: "task",
+          cardId: openCard.cardId,
+          taskId: cardState.taskId,
+          state: "acknowledged",
+          requester: question.senderId,
+          title: "Passed on",
+          lines: [passedOnText],
+        };
+        const edit = buildCardEdit(openCard.eventId, card, openCard.rev);
+        await transport.editCard(question.roomId, openCard.eventId, edit);
+        taskSink.recordCardEdit(openCard.cardId, { rev: edit["m.new_content"]["duo.card"].rev, state: "acknowledged" });
+        this.emitCardEvent({ cardId: openCard.cardId, roomId: question.roomId });
+        this.emitTaskEvent({ taskId: cardState.taskId, roomId: question.roomId, state: "acknowledged" });
+      } catch (error) {
+        this.consoleError(`editing the passed-on task card for workspace question ${question.eventId} failed (the passed-on text will still be sent)`, error);
+      }
       return false;
     }
     // declined_refused, an attachment refusal (outcomeKind undefined, not

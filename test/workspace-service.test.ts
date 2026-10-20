@@ -1985,6 +1985,56 @@ describe("WorkspaceService — the ack timer and the outcome → card mapping (W
     await service.stop();
   });
 
+  it("a fast passed_on whose card send fails still delivers the passed-on text to the asker (review finding on PR #318)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const taskSink = new FakeTaskSink();
+    const transport = new FakeWorkspaceTransport();
+    transport.sendCard = async () => {
+      throw new Error("fake: sendCard failed");
+    };
+    const service = new WorkspaceService({
+      settings: settings(),
+      transportFactory: () => (transport as WorkspaceTransport),
+      answer: async () => passedOn("passed on despite the card failure", "draft-fast-fail"),
+      taskSink,
+    });
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-passed-card-fails", body: "pass this on" }));
+    await flush();
+    expect(consoleError).toHaveBeenCalled();
+    // The card never made it out, but the asker must never see silence —
+    // the SAME passed-on text handleQuestion would have sent with no
+    // taskSink at all still goes out.
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["passed on despite the card failure"]);
+    await service.stop();
+  });
+
+  it("a slow passed_on whose card edit fails still delivers the passed-on text to the asker", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-passed-edit-fails", body: "slow pass-on" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    transport.editCard = async () => {
+      throw new Error("fake: editCard failed");
+    };
+    resolve(passedOn("passed on despite the edit failure", "draft-slow-fail"));
+    await flush();
+    expect(consoleError).toHaveBeenCalled();
+    // The ack card's edit failed, but the asker already saw the ack and
+    // must still get the passed-on text — never silence.
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["passed on despite the edit failure"]);
+    expect(transport.editedCards).toEqual([]);
+    await service.stop();
+  });
+
   it("the ack is sent within ackAfterMs + 500ms (fake timers)", async () => {
     const taskSink = new FakeTaskSink();
     const { impl } = controllableAnswer();
