@@ -50,11 +50,11 @@
 
 ## Sign-in (added 2026-09-26)
 
-- **Google sign-in, bound to the account.** With `DUO_HOSTED_GOOGLE_CLIENT_ID` set, redeeming an
-  invite requires a Google sign-in. The account is bound to that Google subject's stable id: one
-  personal duo, plus up to five desk duos that only the owner can use (`concept.md` §12).
-  `POST /hosted/login` with a Google ID token then mints a fresh device token on any browser. That
-  device shows up in the duo's device list and can be revoked like any other.
+- **Google sign-in, bound once.** With `DUO_HOSTED_GOOGLE_CLIENT_ID` set, redeeming an invite
+  requires a Google sign-in. The personal duo is bound to that account's stable subject id, one personal duo
+  per account. An account may also own up to five desk duos, each its own tenant bound to the same subject with
+  `kind: "desk"`. `POST /hosted/login` mints a device token for the personal duo, and the app reaches its desk duos
+  from there. That device shows up in the duo's device list and can be revoked like any other.
 - **Verified without an SDK.** The server checks the token's RS256 signature against Google's
   published keys, plus audience, issuer, expiry and verified email (`src/hosted/google.ts`). No
   client secret is involved. Google is one `IdentityVerifier`, so an agency IdP (TechPass,
@@ -194,10 +194,12 @@ Decision record: `hosted-workspace.md`. When the Synapse admin variables (below)
 daemon creates every duo's two accounts through Synapse's admin API. Nobody registers on the
 homeserver, and neither account has a password.
 
-- **Names** carry the org: the person is `@<orgId>.<handle>:<server>`, their duo
-  `@duo-<orgId>.<handle>:<server>`. `<handle>` is the tenant id, or `root` for the pre-hosted root
-  duo (which gets accounts too). Display names are the person's name (from the Google profile
-  when there is one) and `<name>'s duo`.
+- **Names** carry the org: the person is `@<orgId>.<handle>:<server>`, their personal duo
+  `@duo-<orgId>.<handle>:<server>`, and each desk duo `@duo-<orgId>.<handle>.<deskId>:<server>`. The extra segment
+  keeps every desk duo derivable back to exactly one owner, so the mapping stays an owner→duos function (one owner,
+  up to six duos; never two owners for one duo) with no mapping table. Display names are `<name>'s duo` and
+  `<name>'s <role> desk`. `<handle>` is the tenant id, or `root` for the pre-hosted root
+  duo (which gets accounts too).
 - **When.** After an invite is redeemed, before the sign-up answers, but bounded: sign-up waits a
   few seconds for Synapse and then answers regardless. A Synapse that is down, slow or refusing
   never blocks an invite. The duo is marked pending in the registry (`matrixPending`, with the

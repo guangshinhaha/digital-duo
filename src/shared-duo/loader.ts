@@ -109,10 +109,10 @@ export function createSharedDuo(definition: unknown): Duo {
 /**
  * Reads the shared duo's persona file from disk and constructs it. There
  * is deliberately no counterpart function anywhere in this module that
- * writes one back — the only in-scope authoring interface (v1-spec.md §3,
- * concept.md §12's "never build a persona-authoring product" guardrail)
- * is hand-editing the checked-in file and proposing that as a reviewable
- * diff (#67 AC3), which is a version-control operation, not a runtime one.
+ * writes one back — the shared duo's only authoring interface is hand-editing
+ * the checked-in file (desk duos, concept.md §12, are authored in-app; this
+ * team-wide shared duo is not) and proposing that as a reviewable diff
+ * (#67 AC3), which is a version-control operation, not a runtime one.
  * Defaults to `shared-duo/persona.json` (or `DUO_SHARED_PERSONA_PATH`,
  * loadSharedDuoConfig) when no path is given.
  */

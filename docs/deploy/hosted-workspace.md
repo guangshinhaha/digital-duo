@@ -117,25 +117,27 @@ Rules the code must keep:
 | Account | Matrix user id | Example |
 |---|---|---|
 | Person | `@<orgId>.<handle>:<server>` | `@k7m2x9pq.c4rt8h2wvn:duo` |
-| Their duo | `@duo-<orgId>.<handle>:<server>` | `@duo-k7m2x9pq.c4rt8h2wvn:duo` |
+| Their personal duo | `@duo-<orgId>.<handle>:<server>` | `@duo-k7m2x9pq.c4rt8h2wvn:duo` |
+| Their desk duo | `@duo-<orgId>.<handle>.<desk>:<server>` | `@duo-k7m2x9pq.c4rt8h2wvn.leave:duo` |
 | The daemon's service account | `@workspace-admin:<server>` | one account, a Synapse admin |
 
 - `<handle>` is the tenant id (10 characters, already unique and URL-safe). The root duo's handle
-  is the literal `root`, which no tenant id can equal. Display names carry the human name (set
-  from the Google profile and the duo's name); the id is not meant to be read.
-- The duo's id is exactly `duoUserIdFor(personUserId)` in `src/workspace/directory.ts`: prefix
-  `duo-` on the localpart. That function, its inverse `duoOwnerUserIdOf`, and the bijection
-  claim in its comment are **unchanged**, so the directory keeps working without a mapping
-  table.
+  is the literal `root`, which no tenant id can equal. The id is not meant to be read.
+- **Names** carry the org: the person is `@<orgId>.<handle>:<server>`, their personal duo
+  `@duo-<orgId>.<handle>:<server>`, and each desk duo `@duo-<orgId>.<handle>.<deskId>:<server>`. The extra segment
+  keeps every desk duo derivable back to exactly one owner, so the mapping stays an owner→duos function (one owner,
+  up to six duos; never two owners for one duo) with no mapping table. Display names are `<name>'s duo` and
+  `<name>'s <role> desk`.
 - The service account has no dot, so it has no org, and it does not start with `duo-`, so the
   directory never mistakes it for a duo. It is the only account with `admin: true`.
 - `<server>` is Synapse's `server_name`. It is permanent (it is baked into every user id), so
   #230 picks a stable label and not the generated Railway domain. Federation is off and the
   daemon hands each client the homeserver's base URL directly, so no `.well-known` delegation is
   needed.
-- Matrix localparts allow lowercase letters, digits and `. _ = - / +`. Ours use letters, digits,
-  one `.`, and (for duos) one leading `duo-`. Org ids and handles never contain `.`, so the first
-  dot always separates them.
+- Matrix localparts allow lowercase letters, digits and `. _ = - / +`. A personal duo uses letters,
+  digits, one `.`, and a leading `duo-`. A desk duo adds a second `.` before `<desk>`
+  (`@duo-<orgId>.<handle>.<desk>`). Org ids and handles never contain `.`, so the first
+  dot always separates org id from handle — the same split the org wall reads.
 
 ### 4.2 The module derives the org from the id
 

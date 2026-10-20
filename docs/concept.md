@@ -160,7 +160,9 @@ Target: **15 minutes, 10 of them optional.**
    labelled corrections plus confidence calibration.
 5. **Go live in shadow mode** — useful in hour one, public in month three.
 
-> **Principle: the user never writes their personality. They approve a draft of it.**
+> **Principle: the user never writes their *personal duo's* personality. They approve a draft of it.**
+> A desk duo is the one exception: its owner writes its brief and instructions, because a desk has no history
+> to derive from yet.
 
 ## 8. What each source is good for
 
@@ -217,9 +219,10 @@ Written up properly, this list *is* the security review submission.
 - Not a general org-wide knowledge oracle — a duo is **someone's**, accountable to them
 - Not a search engine over documents
 - Not a clone, not an impersonation, never unlabelled
-- No duos *of* someone, created *by* someone else. Self-created only, instantly killable.
-- No template gallery, no marketplace. An owner may create their own agents — one personal duo plus up to five desk duos. See §12.
-- Nothing is ever called an "employee" or a "virtual employee". See §12.
+- No duos *of* someone, created *by* someone else. Self-created only, instantly killable — personal and desk duos alike.
+- **Not a persona marketplace.** An owner may create up to five desk duos of their own (§12), each from a short
+  create flow. There is no template gallery, no marketplace, no sharing of definitions, and no duo made for someone else.
+- Nothing is ever called a "virtual employee", an assistant or a teammate. A desk duo is a desk duo. See §12.
 
 ## 12. Synthetic personas and role duos
 
@@ -269,13 +272,20 @@ attached is what an organisation would actually institutionalise.
    while the gating unknowns are still open, touches no personal data, and gets the runtime used.
 3. **Phase 3, as role duos.** Absorbs continuity: handover, transfer, and archival all become
    special cases of a duo belonging to a desk rather than to a person.
+4. **Desk duos (2026-10-20).** The role-duo primitive opened to its owner: up to five per owner, created in-app,
+   owner-private, with authored knowledge (`KnowledgeSourceConfig.kind: "authored"`) and the owner's own instructions.
+   A desk duo has decision history only once its owner's corrections give it some. Until then it answers from what it
+   was given, and says so.
 
 ### Two guardrails
 
-- **Owners may create their own agents.** Each owner has one personal duo plus up to five desk
-  duos that only the owner can use, each set up in about a minute via a create-agent flow.
-  Chatting with someone else's personal duo stays as it is. No template gallery, no marketplace.
-- **Never call them employees.** An owner's extra agents are "desk duos" in product copy, never
-  "employees" or "virtual employees". "Virtual employee" in a public-service context reads as
-  headcount replacement, and that framing will kill the project by people who never look at
-  what it does.
+- **Desk duos are owner-private, bounded and killable — not a platform.**
+  - **Amended 2026-10-20 (owner decision):** an owner may create up to five desk duos beside their personal duo.
+    Each is role-scoped (a role duo whose only holder is its creator), built in about a minute from a name, role,
+    one-line brief, instructions, avatar and knowledge sources.
+  - What keeps this out of the platform team's lane is what it refuses to be: no template gallery, no marketplace,
+    no sharing or publishing a definition, no duo created for or of anyone else. Every desk duo is labelled as its
+    owner's and can be ended in one step.
+- **Never call them employees.** "Virtual employee" in a public-service context reads as headcount
+  replacement, and that framing will kill the project by people who never look at what it does.
+  Desk duo, role duo, duty desk — all fine; employee, assistant, teammate — never.

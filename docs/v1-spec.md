@@ -52,8 +52,9 @@ address duos directly in consented shared conversations, with every corpus still
 ([`v1-tech-design.md`](v1-tech-design.md) §1.1). Nothing here is repealed: private drafting is
 still what v1 built, still the on-ramp, and still the corpus pipeline a workspace duo answers
 from. The §3 out-scope row "Public answering (T0 to others)" is superseded by that layer;
-"Multi-tenant anything" still holds — a daemon is one duo, one owner, one encrypted store, and
-org mode ([`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md)) adds a place
+"Multi-tenant anything" still holds — every duo (personal or desk) is one duo, one owner, one encrypted store;
+an owner may now hold up to six of them (one personal, five desk), each still its own unchanged app. Org
+mode ([`workspace/org-mode-deployment.md`](workspace/org-mode-deployment.md)) adds a place
 a daemon may run, not a multi-tenant rewrite.
 
 ## 3. Scope

@@ -82,8 +82,9 @@ export function loadRoleDuoDefinition(path: string): RoleDuoDefinition {
  * ever written by code, used only by `withdrawHolderConsent` (see seed.ts)
  * to flip a holder's own consent value. Every other change to who has held
  * the post is a hand-edit proposed as a reviewable diff, same convention
- * `shared-duo/persona.json` uses (concept.md §12's "never build a
- * persona-authoring product" guardrail).
+ * `shared-duo/persona.json` uses. Desk duos (concept.md §12, 2026-10-20) are
+ * written by the daemon's create route instead; seeded multi-holder role duos
+ * keep the hand-edit convention.
  */
 export function writeRoleDuoDefinition(path: string, definition: RoleDuoDefinition): void {
   writeFileSync(path, `${JSON.stringify(definition, null, 2)}\n`, "utf8");
