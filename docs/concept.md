@@ -1,7 +1,7 @@
 # Digital Duo — Concept
 
 > Status: converged direction, pre-build. Internal GovTech project, dogfood pilot.
-> Last updated: 2026-09-18
+> Last updated: 2026-10-20
 
 ## 1. What it is
 
@@ -218,8 +218,8 @@ Written up properly, this list *is* the security review submission.
 - Not a search engine over documents
 - Not a clone, not an impersonation, never unlabelled
 - No duos *of* someone, created *by* someone else. Self-created only, instantly killable.
-- **Not a persona-authoring product.** No builder UI, no template gallery, no marketplace. See §12.
-- Nothing is ever called a "virtual employee". See §12.
+- No template gallery, no marketplace. An owner may create their own agents — one personal duo plus up to five desk duos. See §12.
+- Nothing is ever called an "employee" or a "virtual employee". See §12.
 
 ## 12. Synthetic personas and role duos
 
@@ -272,9 +272,10 @@ attached is what an organisation would actually institutionalise.
 
 ### Two guardrails
 
-- **Never build a persona-authoring product.** Synthetic personas are configuration — a file next
-  to the standing orders. The moment there is a "create your agent" screen, this is a platform, it
-  is in the internal platform team's lane, and focus is gone.
-- **Never call them employees.** "Virtual employee" in a public-service context reads as headcount
-  replacement, and that framing will kill the project by people who never look at what it does.
-  Role duo, desk duo, duty desk — all fine.
+- **Owners may create their own agents.** Each owner has one personal duo plus up to five desk
+  duos that only the owner can use, each set up in about a minute via a create-agent flow.
+  Chatting with someone else's personal duo stays as it is. No template gallery, no marketplace.
+- **Never call them employees.** An owner's extra agents are "desk duos" in product copy, never
+  "employees" or "virtual employees". "Virtual employee" in a public-service context reads as
+  headcount replacement, and that framing will kill the project by people who never look at
+  what it does.

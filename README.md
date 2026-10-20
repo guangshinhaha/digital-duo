@@ -55,7 +55,7 @@ role duos).
 - **The user never writes their personality — they approve a draft of it.**
 - **Self-created duos only**, always labelled, instantly killable.
 - **Start with what needs no one's permission.** Every approval you wait on is a week not shipped.
-- **A persona without decision history is a commodity.** Never build a persona-authoring product, and never call a duo an employee.
+- **A persona without decision history is a commodity.** Owners may create their own agents: one personal duo plus up to five desk duos only the owner can use, each set up in about a minute via a create-agent flow. Chatting with someone else's personal duo stays as it is. In product copy those agents are desk duos, never employees or virtual employees.
 
 ## Development
 

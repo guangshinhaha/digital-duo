@@ -50,10 +50,11 @@
 
 ## Sign-in (added 2026-09-26)
 
-- **Google sign-in, bound once.** With `DUO_HOSTED_GOOGLE_CLIENT_ID` set, redeeming an invite
-  requires a Google sign-in. The duo is bound to that account's stable subject id, one duo per
-  account. `POST /hosted/login` with a Google ID token then mints a fresh device token on any
-  browser. That device shows up in the duo's device list and can be revoked like any other.
+- **Google sign-in, bound to the account.** With `DUO_HOSTED_GOOGLE_CLIENT_ID` set, redeeming an
+  invite requires a Google sign-in. The account is bound to that Google subject's stable id: one
+  personal duo, plus up to five desk duos that only the owner can use (`concept.md` §12).
+  `POST /hosted/login` with a Google ID token then mints a fresh device token on any browser. That
+  device shows up in the duo's device list and can be revoked like any other.
 - **Verified without an SDK.** The server checks the token's RS256 signature against Google's
   published keys, plus audience, issuer, expiry and verified email (`src/hosted/google.ts`). No
   client secret is involved. Google is one `IdentityVerifier`, so an agency IdP (TechPass,
