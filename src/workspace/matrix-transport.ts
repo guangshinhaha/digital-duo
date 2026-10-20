@@ -177,24 +177,29 @@ function attachmentsForQuestion(room: Room, questionEventId: string, senderId: s
  * `m.mentions` (#312/S1) reads this; it never runs when `m.mentions` is
  * present, even an empty one — an explicit empty mentions object is the
  * client's own word that it named nobody, not evidence of an older client.
+ * The excluded trailing characters include ordinary sentence punctuation
+ * (`,.;:!?`) in addition to quotes/whitespace/`)`, so "...reply to
+ * https://matrix.to/#/@duo-alice:workspace, thanks" matches the mxid alone,
+ * not the mxid with a trailing comma glued on (review finding on PR #319).
  */
-const MATRIX_TO_USER_LINK = /https:\/\/matrix\.to\/#\/(%40[^"'\s)]+|@[^"'\s)]+)/g;
+const MATRIX_TO_USER_LINK = /https:\/\/matrix\.to\/#\/(%40[^"'\s),.;:!?]+|@[^"'\s),.;:!?]+)/g;
 
 /**
- * #312/S1: who a message named. `m.mentions.user_ids` (MSC3952/the stable
- * spec) is read first and, when present at all, is authoritative — an
- * empty list is "names nobody," not "didn't say." Only its total absence
- * falls back to scanning `formatted_body` for `matrix.to` anchors, for a
- * client that renders mention pills as plain links without the structured
- * field.
+ * #312/S1: who a message named. `m.mentions`'s PRESENCE as an object is
+ * authoritative (an older client that never sends the key is the only
+ * thing the `formatted_body` fallback is for) — whether or not it carries
+ * a `user_ids` array. `m.mentions: {}` is valid MSC3952 shorthand for
+ * "mentions nobody" (no `user_ids` key at all, not an empty array), and
+ * must read the same as `m.mentions: { user_ids: [] }`: both are "named
+ * nobody," never a reason to fall back to scanning formatted_body for an
+ * older client's plain link (review finding on PR #319 — a non-array
+ * `user_ids` previously still fell through to the regex scan).
  */
 function mentionedUserIdsOf(content: Record<string, unknown>): string[] {
   const mentions = content["m.mentions"];
   if (mentions !== null && typeof mentions === "object") {
     const userIds = (mentions as Record<string, unknown>).user_ids;
-    if (Array.isArray(userIds)) {
-      return userIds.filter((id): id is string => typeof id === "string");
-    }
+    return Array.isArray(userIds) ? userIds.filter((id): id is string => typeof id === "string") : [];
   }
   const formattedBody = content.formatted_body;
   if (typeof formattedBody !== "string") {

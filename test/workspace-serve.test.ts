@@ -326,6 +326,8 @@ function roomMessage(message: { eventId: string; body: string; senderId?: string
     // shared-room message here @mentions the duo so the consent gate is
     // what's under test, same as before S1 added its own gate on top.
     mentionedUserIds: [SELF],
+    replyToSenderId: null,
+    threadRootSenderId: null,
   };
 }
 

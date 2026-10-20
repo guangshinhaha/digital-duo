@@ -501,6 +501,49 @@ describe("Matrix adapter — mentions and reply targets (#312/S1)", () => {
     expect(messages[0]!.mentionedUserIds).toEqual([]);
   });
 
+  it("does not fall back to formatted_body when m.mentions is present with no user_ids key at all — MSC3952's own shorthand for naming nobody (review finding on PR #319)", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$bare-mentions-object",
+        content: {
+          "m.mentions": {},
+          format: "org.matrix.custom.html",
+          formatted_body: `<a href="https://matrix.to/#/${encodeURIComponent(DUO)}">Alice's duo</a> hello`,
+        },
+      }),
+      room([DUO, "@bob:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([]);
+  });
+
+  it("a matrix.to anchor followed by sentence punctuation mentions the mxid alone, not the mxid with the punctuation glued on (review finding on PR #319)", () => {
+    const transport = createMatrixTransport(settings());
+    const messages: WorkspaceCandidateMessage[] = [];
+    transport.onMessage((message) => messages.push(message));
+    client.emit(
+      RoomEvent.Timeline,
+      timelineEvent({
+        eventId: "$punctuated-mention",
+        content: {
+          format: "org.matrix.custom.html",
+          formatted_body: `see https://matrix.to/#/${encodeURIComponent(DUO)}, thanks`,
+        },
+      }),
+      room([DUO, "@bob:workspace"]),
+      false,
+      false,
+      {},
+    );
+    expect(messages[0]!.mentionedUserIds).toEqual([DUO]);
+  });
+
   it("resolves a reply's target sender through room.findEventById", () => {
     const transport = createMatrixTransport(settings());
     const messages: WorkspaceCandidateMessage[] = [];
