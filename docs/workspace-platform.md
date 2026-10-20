@@ -124,6 +124,12 @@ soften §5, they strengthen it: the workspace server cannot read what it cannot 
 Anything that would put decision history on org infrastructure is a change to epic #184, not an
 implementation detail inside it.
 
+> **Amended 2026-10-20 (interaction-model PRD v0.4, Phase 1, W-S4-1).** A `duo.card` is workspace
+> data like any other message — the daemon sends and edits it — but the boundary above still
+> holds: a card's builder (`src/workspace/cards.ts`) takes only asker-visible text, fixed copy,
+> permalinks and mxc references already in that room, never corpus, evidence, draft text or any
+> other forbidden item. See `docs/workspace/cards.md` §9 for the full amended invariant.
+
 ## 6. The duo's identity is structural
 
 A duo posts as **its own Matrix user** — e.g. `@duo-alice:workspace` beside `@alice:workspace` —

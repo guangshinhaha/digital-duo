@@ -13,6 +13,11 @@ import type { AnswerEventContent } from "./transport.js";
  * with no code path that could serialize a record, evidence text, rule or
  * the passphrase into an event. test/workspace-payload.test.ts pins both the
  * shape and the absences.
+ *
+ * Amended 2026-10-20 (interaction-model PRD v0.4, Phase 1, W-S4-1): the SAME
+ * invariant now also covers `src/workspace/cards.ts`'s card builder, which
+ * is the only other constructor of an outbound workspace payload. See
+ * docs/workspace/cards.md §9.
  */
 export function buildAnswerEvent(outcome: PublicAnswerOutcome): AnswerEventContent {
   return {
