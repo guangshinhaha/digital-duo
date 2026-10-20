@@ -1383,9 +1383,15 @@ export class WorkspaceService {
    * sets it; nothing else does.
    */
   private async answerOrRefuse(question: WorkspaceQuestion): Promise<AnswerDecision> {
+    // W-S3-1 (#313): a shared-room answer rides as a reply to the question
+    // itself — `isDirect` is the one fact `questions.ts`'s two filters
+    // already compute, so there is nothing new to derive here. A direct
+    // question passes `undefined`, keeping `buildAnswerEvent`'s output the
+    // pre-#313 two-key shape byte for byte.
+    const replyOptions: { readonly inReplyTo?: string } | undefined = question.isDirect ? undefined : { inReplyTo: question.eventId };
     if (question.attachments.length === 0) {
       const outcome = await this.options.answer(question);
-      return { content: buildAnswerEvent(outcome), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
+      return { content: buildAnswerEvent(outcome, replyOptions), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
     }
     const door = this.options.attachmentDoor;
     if (door === undefined) {
@@ -1394,7 +1400,7 @@ export class WorkspaceService {
         new Error("no attachment grounding door is configured (DUO_CLASSIFICATION_CEILING wiring) — the question's files were not read"),
       );
       const outcome = await this.options.answer({ ...question, grounding: [] });
-      return { content: buildAnswerEvent(outcome), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
+      return { content: buildAnswerEvent(outcome, replyOptions), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
     }
     // Captured before the door runs (not after): the door fetches file
     // bodies over this very transport, so it must be live now; a connection
@@ -1409,7 +1415,7 @@ export class WorkspaceService {
       return { content: buildAttachmentRefusalEvent(result.message) };
     }
     const outcome = await this.options.answer({ ...question, grounding: result.grounding });
-    return { content: buildAnswerEvent(outcome), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
+    return { content: buildAnswerEvent(outcome, replyOptions), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
   }
 
   /**

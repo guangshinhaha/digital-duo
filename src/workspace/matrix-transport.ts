@@ -324,12 +324,14 @@ export type MatrixSdkLogger = NonNullable<Parameters<typeof createClient>[0]["lo
 /**
  * `client.sendMessage`'s SDK type is `RoomMessageEventContent` — a closed
  * set of known msgtypes that does not (and should not) know about
- * `duo.card`. The card builders are this codebase's only constructors of
- * that content (cards.ts), already schema-validated before it reaches
- * here, so this cast is the one place a card's wire shape crosses into the
- * SDK's narrower type — never a license to send arbitrary content.
+ * `duo.card`, or (W-S3-1, #313) about `m.relates_to["m.in_reply_to"]` riding
+ * on a plain `m.text`. The card builders and `buildAnswerEvent` (payload.ts)
+ * are this codebase's only constructors of these shapes, already schema-
+ * validated before they reach here, so this cast is the one place their
+ * wire shape crosses into the SDK's narrower type — never a license to send
+ * arbitrary content.
  */
-function sendRoomMessage(client: MatrixClient, roomId: string, content: DuoCardEventContent | DuoCardEditContent): Promise<{ event_id: string }> {
+function sendRoomMessage(client: MatrixClient, roomId: string, content: AnswerEventContent | DuoCardEventContent | DuoCardEditContent): Promise<{ event_id: string }> {
   return client.sendMessage(roomId, content as unknown as Parameters<MatrixClient["sendMessage"]>[1] & object);
 }
 
@@ -550,7 +552,11 @@ export function createMatrixTransport(settings: WorkspaceSettings, options: { re
       // (decision record §6): the room's members cannot read this as the
       // owner, whatever a client renders. The sent event's id is returned
       // (W-S4-3) so a caller can later point a card's result link at it.
-      const sent = await client.sendMessage(roomId, { msgtype: MsgType.Text, body: content.body });
+      // W-S3-1 (#313): the content is forwarded exactly as `buildAnswerEvent`
+      // produced it — msgtype and body always, plus `m.relates_to` when the
+      // question it answers came from a shared room — rather than hand-
+      // picking `body` alone, which would silently drop the reply relation.
+      const sent = await sendRoomMessage(client, roomId, content);
       return { eventId: sent.event_id };
     },
 

@@ -378,6 +378,18 @@ export interface WorkspaceQuestion {
    * exactly one draft call).
    */
   readonly grounding?: readonly WorkspaceGroundedAttachment[];
+  /**
+   * W-S3-1 (#313): whether this question arrived in a direct (person-to-duo)
+   * room, as `questions.ts`'s own filters already distinguish it —
+   * `directQuestionFrom` always produces `true`; `answerableQuestionFrom`
+   * produces `true` for its direct-room branch and `false` for its
+   * owner-allowed shared-room branch. The one consumer is the answer's own
+   * reply shape (`service.ts`): a direct answer stays the pre-#313 two-key
+   * shape, a shared-room answer carries `m.relates_to["m.in_reply_to"]`
+   * pointing back at this question's own event id, so a follow-up reply to
+   * the duo passes the #312/S1 addressing gate.
+   */
+  readonly isDirect: boolean;
 }
 
 /**
@@ -430,14 +442,29 @@ export type WorkspaceAttachmentDoor = (
 
 /**
  * The one outbound payload shape (#186 AC5): the answer event's content is
- * `{ msgtype: "m.text", body }` and nothing else — `body` carries the
- * asker-visible answer text exactly as `POST /ask` projects it. The type is
- * the contract; `buildAnswerEvent` (payload.ts) is its only constructor and
- * the boundary test pins that no other field can appear.
+ * `{ msgtype: "m.text", body }`, plus — W-S3-1 — an optional reply relation,
+ * and nothing else — `body` carries the asker-visible answer text exactly as
+ * `POST /ask` projects it. The type is the contract; `buildAnswerEvent`
+ * (payload.ts) is its only constructor and the boundary test pins that no
+ * other field can appear.
+ *
+ * W-S3-1 (#313): `"m.relates_to"` carries ONLY `m.in_reply_to` — a plain
+ * Matrix reply to the question's own event, set when the question came from
+ * a shared room (so a visitor's "reply to the duo" passes the #312/S1
+ * addressing gate). A direct-room answer never carries this field at all —
+ * not even `undefined` serialized in — keeping that shape byte-identical to
+ * before this story (exactly two keys). This is deliberately NOT the same
+ * relation shape `m.replace` (card edits) or `m.thread` (threads) use: those
+ * are cards.ts's concern, unrelated to this plain-text reply.
  */
 export interface AnswerEventContent {
   readonly msgtype: "m.text";
   readonly body: string;
+  readonly "m.relates_to"?: {
+    readonly "m.in_reply_to": {
+      readonly event_id: string;
+    };
+  };
 }
 
 /**
