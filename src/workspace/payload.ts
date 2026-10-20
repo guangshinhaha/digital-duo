@@ -2,9 +2,11 @@ import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../permi
 import type { AnswerEventContent } from "./transport.js";
 
 /**
- * #186 AC5 — the corpus never crosses. These two functions are the ONLY
- * constructors of an outbound workspace payload, and they can build exactly
- * one shape: the asker-visible answer text as a Matrix text message.
+ * #186 AC5 — the corpus never crosses. Every function in this file is a
+ * constructor of an outbound workspace payload, and together with
+ * `src/workspace/cards.ts`'s card builder (added W-S4-1) they are the ONLY
+ * ones that exist. This one builds exactly one shape: the asker-visible
+ * answer text as a Matrix text message.
  * `outcome.text` (answered) and `outcome.message` (passed on / refused) are
  * the same asker projection `POST /ask` sends — the composed text already
  * carries its own citations and attribution (public-answer.ts) — and nothing
@@ -15,9 +17,7 @@ import type { AnswerEventContent } from "./transport.js";
  * shape and the absences.
  *
  * Amended 2026-10-20 (interaction-model PRD v0.4, Phase 1, W-S4-1): the SAME
- * invariant now also covers `src/workspace/cards.ts`'s card builder, which
- * is the only other constructor of an outbound workspace payload. See
- * docs/workspace/cards.md §9.
+ * invariant applies to the card builder noted above. See docs/workspace/cards.md §9.
  */
 export function buildAnswerEvent(outcome: PublicAnswerOutcome): AnswerEventContent {
   return {

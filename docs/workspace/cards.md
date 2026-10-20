@@ -20,7 +20,7 @@ Two things stay as they are and are not reopened here:
 - Streamed text (MSC4357-shaped edits of ordinary text) stays off Matrix. Streaming stays on the
   owner's SSE (`POST /drafts/stream`).
 - Draft content, evidence, and anything else listed in `docs/workspace-platform.md` §5 as
-  forbidden to the workspace store never crosses into a card. §6 below amends that section's
+  forbidden to the workspace store never crosses into a card. §9 below amends that section's
   text to say so explicitly.
 
 ## 2. Event types and content (Matrix, visitor-visible)
@@ -38,7 +38,10 @@ constant, each — no reverse-DNS namespace (resolved question Q1, Phase 1 build
     "v": 1,                               // schema major version
     "rev": 3,                             // monotonically increasing per card; every edit bumps it
     "card_id": "c_01J…",                  // daemon-issued ULID, stable across edits
-    "kind": "task" | "decision" | "result" | "confirm",   // Phase 1 kinds on Matrix
+    "kind": "task" | "decision" | "result" | "confirm",   // DuoCardV1's Phase 1 kinds; the
+                                                           // Matrix builder accepts only task,
+                                                           // decision and result — it refuses
+                                                           // confirm (owner-only, §7)
     "state": "acknowledged" | "working" | "needs_decision" | "done" | "failed"   // task
            | "open" | "chosen" | "expired",                                     // decision
     "task_id": "t_01J…",                  // optional; links cards of one task
