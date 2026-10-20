@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>duo · interaction prototype v0.1 (conversation first)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&family=Newsreader:ital,opsz,wght@0,6..72,400;1,6..72,400&display=swap" rel="stylesheet">
+<style>
+/* ---- Hairline tokens, copied from guangshinhaha/duo src/styles/tokens.css ---- */
+:root{
+  --bg:#0b0c0e; --surface:#141619; --surface-2:#1c1f24; --text:#e8eaed; --muted:#a6acb2; --faint:#5f6469;
+  --accent:#7c8cff; --edge:#24282e; --escalate:#d9a441; --confident:#4b9e6a; --refused:#6b7280;
+  --paper-warm:#edeae4;
+  --font-ui:"Inter",-apple-system,"SF Pro Text",system-ui,sans-serif;
+  --font-reflection:"Newsreader","Iowan Old Style",Georgia,serif;
+  --font-record:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  --r-sm:6px; --r-md:10px; --r-lg:14px; --sp:4px;
+  --ease-standard:cubic-bezier(0.2,0,0,1); --ease-enter:cubic-bezier(0.05,0.7,0.1,1); --ease-spring:cubic-bezier(0.34,1.32,0.64,1);
+  --dur-quick:120ms; --dur-std:200ms; --dur-slow:320ms; --dur-exit:150ms; --rise:8px;
+  --t:var(--dur-quick) var(--ease-standard);
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--font-ui);font-size:14px;line-height:22px;font-feature-settings:"cv11","ss03";-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;cursor:pointer;transition:transform var(--dur-std) var(--ease-spring),background-color var(--t),border-color var(--t)}
+button:not(:disabled):active{transform:scale(.98)}
+button:disabled{cursor:not-allowed;opacity:.45}
+input,textarea,select{font:inherit;color:var(--text)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mono{font-family:var(--font-record);font-size:12px;line-height:18px;font-weight:500}
+.prov{font-size:12px;line-height:18px;color:var(--muted)}
+.faint{color:var(--faint)}
+.muted{color:var(--muted)}
+h1,h2,h3{margin:0;font-size:16px;line-height:22px;letter-spacing:-.011em;font-weight:600}
+.proto{display:flex;align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--edge);background:#08090a;flex-wrap:wrap}
+.proto .tag{font-family:var(--font-record);font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;margin-right:4px}
+.tab{background:transparent;border:1px solid transparent;border-radius:var(--r-sm);padding:2px 8px;color:var(--muted);font-size:12px;line-height:20px}
+.tab:hover{border-color:var(--edge)}
+.tab[aria-current="true"]{color:var(--text);border-color:var(--edge);background:var(--surface-2)}
+.tab .v{font-family:var(--font-record);font-size:10px;color:var(--faint);margin-left:4px}
+.sw{display:flex;gap:8px;margin-left:auto;align-items:center}
+.sw label{font-size:12px;color:var(--muted);display:flex;gap:4px;align-items:center;cursor:pointer}
+.app{display:grid;grid-template-columns:268px 1fr auto;height:calc(100vh - 41px)}
+body.shot .app{height:auto;min-height:calc(100vh - 41px)}
+.list{border-right:1px solid var(--edge);display:flex;flex-direction:column;min-height:0;background:var(--bg)}
+.list .top{display:flex;align-items:center;gap:8px;padding:12px 12px 8px}
+.wordmark{font-weight:600;letter-spacing:-.02em;font-size:16px;display:flex;gap:8px;align-items:center}
+.search{margin:0 12px 8px;background:var(--surface-2);border-radius:var(--r-sm);padding:4px 8px;color:var(--faint);font-size:12px;display:flex;justify-content:space-between}
+.filters{display:flex;gap:4px;padding:0 12px 8px}
+.chip{border:1px solid var(--edge);background:transparent;border-radius:999px;padding:0 10px;font-size:12px;line-height:24px;color:var(--muted);display:inline-flex;gap:6px;align-items:center}
+.chip:hover{border-color:var(--faint)}
+.chip[aria-pressed="true"]{background:var(--surface-2);color:var(--text)}
+.chip.sig{border-color:var(--accent);color:var(--text)}
+.rows{overflow:auto;padding:0 6px 12px;flex:1}
+body.shot .rows{overflow:visible}
+.shelf{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;padding:12px 8px 4px}
+.row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:var(--r-sm);position:relative;cursor:pointer;color:var(--muted)}
+.row:hover{background:var(--surface)}
+.row[aria-current="true"]{background:var(--surface-2);color:var(--text)}
+.row[aria-current="true"]::after{content:"";position:absolute;left:0;top:24%;bottom:24%;width:2px;background:var(--text);border-radius:2px}
+.row .nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}
+.row .ct{font-family:var(--font-record);font-size:11px;color:var(--text);background:var(--surface-2);border-radius:999px;padding:0 6px}
+.row .ct.sig{background:var(--accent);color:#0b0c0e}
+.row .ic{width:20px;height:20px;display:grid;place-items:center;flex:none}
+.av{width:20px;height:20px;border-radius:50%;background:var(--surface-2);border:1px solid var(--edge);font-size:9px;display:grid;place-items:center;color:var(--muted);flex:none;font-weight:600}
+.av.lg{width:28px;height:28px;font-size:11px}
+.duo-mark{display:inline-flex;gap:2px;height:12px;align-items:stretch;flex:none}
+.duo-mark i{display:block;border-radius:1px}
+.duo-mark i:first-child{width:3px;background:var(--text)}
+.duo-mark i:last-child{width:1px;background:var(--accent);transform-origin:top}
+.duo-mark.lg{height:18px}.duo-mark.lg i:first-child{width:4px}.duo-mark.lg i:last-child{width:1.5px}
+.duo-mark.desk i:first-child{background:var(--muted)}
+.duo-mark[data-working] i:last-child{animation:work 800ms var(--ease-standard) infinite}
+@keyframes work{0%{opacity:1;transform:scaleY(0)}50%{opacity:1;transform:scaleY(1)}75%{opacity:0;transform:scaleY(1)}100%{opacity:0;transform:scaleY(0)}}
+.avt{width:30px;height:30px;border-radius:var(--r-sm);border:1px solid var(--edge);background:var(--surface-2);color:var(--muted);font-size:13px;display:inline-grid;place-items:center;padding:0}
+.avt.sel{border-color:var(--text);color:var(--text)}
+.deskTag{font-family:var(--font-record);font-size:9px;color:var(--muted);border:1px solid var(--edge);border-radius:4px;padding:0 3px;line-height:14px;font-weight:500}
+.conv{display:flex;flex-direction:column;min-width:0;min-height:0}
+.hdr{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--edge);min-height:56px}
+.hdr .who{flex:1;min-width:0}
+.hdr .who .t{font-weight:600;display:flex;gap:8px;align-items:center}
+.hdr .who .s{font-size:12px;color:var(--muted);line-height:16px}
+.banner{margin:0;padding:6px 20px;border-bottom:1px solid var(--edge);font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:center;background:var(--surface)}
+.banner.ver{background:transparent;color:var(--faint)}
+.offline{display:none;padding:6px 20px;background:var(--surface-2);border-bottom:1px solid var(--edge);font-size:12px;color:var(--text)}
+body.is-offline .offline{display:block}
+.label-bar{padding:6px 20px;border-bottom:1px solid var(--edge);font-size:12px;color:var(--text);background:var(--surface-2);display:flex;gap:8px;align-items:center}
+.stream{flex:1;overflow:auto;padding:20px 20px 12px;display:flex;flex-direction:column;gap:18px}
+body.shot .stream{overflow:visible}
+.stream > *{max-width:720px;width:100%}
+.day{align-self:center;max-width:none;width:auto!important;font-size:11px;color:var(--faint);font-family:var(--font-record)}
+.msg{display:flex;gap:10px;animation:rise var(--dur-std) var(--ease-enter) backwards}
+@keyframes rise{from{opacity:0;transform:translateY(var(--rise))}}
+.msg .body{flex:1;min-width:0}
+.msg .meta{font-size:12px;line-height:18px;color:var(--muted);display:flex;gap:6px;align-items:center}
+.msg .meta b{color:var(--text);font-weight:600}
+.msg .txt{margin-top:2px}
+.msg.me .txt{background:var(--surface-2);border-radius:var(--r-md);padding:8px 12px;display:inline-block}
+.foot{font-size:11px;color:var(--faint);margin-top:2px}
+.pill{background:color-mix(in srgb,var(--text) 10%,transparent);border-radius:4px;padding:0 4px;font-weight:500}
+.pill.duo{display:inline-flex;gap:4px;align-items:center;white-space:nowrap}
+.duo{animation:rise var(--dur-std) var(--ease-enter) backwards;position:relative}
+.attr{display:flex;gap:6px;align-items:center;font-size:12px;line-height:18px;color:var(--muted);margin-bottom:4px}
+.attr b{color:var(--text);font-weight:600}
+.attr .vis{margin-left:auto;font-family:var(--font-record);font-size:11px;color:var(--faint)}
+.line{position:relative;border:1px solid var(--edge);border-left:0;border-radius:0 var(--r-md) var(--r-md) 0;background:var(--surface);padding:10px 14px}
+.line::before{content:"";position:absolute;left:0;top:-1px;bottom:-1px;width:2px;background:var(--ln,var(--faint));transform-origin:top;animation:draw var(--dur-slow) var(--ease-enter) 60ms backwards}
+@keyframes draw{from{transform:scaleY(0)}}
+.ln-moss{--ln:var(--confident)}.ln-amber{--ln:var(--escalate)}.ln-ash{--ln:var(--refused)}.ln-faint{--ln:var(--faint)}
+.line.quiet{background:var(--surface-2);border-color:transparent}
+.line.draft{border-style:dashed;border-color:var(--faint);border-left:0;background:transparent}
+.draftnote{font-family:var(--font-record);font-size:11px;color:var(--faint);margin-top:6px}
+.card-h{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+.card-h .k{font-family:var(--font-record);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.card-h .st{margin-left:auto;font-size:12px;color:var(--muted)}
+.acts{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center}
+.btn{white-space:nowrap;border:1px solid var(--edge);background:transparent;border-radius:var(--r-sm);padding:0 12px;line-height:30px;font-size:13px;min-height:32px}
+.btn:hover:not(:disabled){border-color:var(--faint)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:#0b0c0e;font-weight:600}
+.btn.sm{line-height:24px;min-height:26px;padding:0 10px;font-size:12px}
+.btn.link{border:0;padding:0 4px;color:var(--muted);text-decoration:underline;text-underline-offset:3px;min-height:0;line-height:20px}
+.kbd{font-family:var(--font-record);font-size:10px;opacity:.7;margin-left:6px}
+.reason{font-size:12px;color:var(--muted);width:100%}
+.decided{opacity:.55}
+.ms{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
+.ms li{display:flex;gap:8px;font-size:13px;color:var(--muted)}
+.ms li .dot{width:14px;flex:none;color:var(--faint);font-family:var(--font-record);font-size:11px}
+.ms li.now{color:var(--text)}
+.ms li.done .dot{color:var(--confident)}
+.res{margin-top:10px;border-top:1px solid var(--edge);padding-top:10px}
+.file{display:flex;gap:10px;align-items:center;border:1px solid var(--edge);border-radius:var(--r-sm);padding:6px 10px;margin-top:6px;background:var(--bg)}
+.fi{font-family:var(--font-record);font-size:10px;color:var(--muted);border:1px solid var(--edge);border-radius:4px;padding:0 4px}
+.file .fn{flex:1;font-size:13px;display:flex;gap:6px;align-items:center}
+a{color:var(--text);text-underline-offset:3px}
+.opts{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.opt{text-align:left;border:1px solid var(--edge);background:var(--bg);border-radius:var(--r-sm);padding:8px 12px;display:flex;gap:10px;align-items:baseline}
+.opt:hover:not(:disabled){border-color:var(--accent)}
+.opt .n{font-family:var(--font-record);font-size:11px;color:var(--faint)}
+.opt .d{display:block;font-size:12px;color:var(--muted)}
+.opt.chosen{border-color:var(--text);opacity:1}
+.reacts{display:flex;gap:4px;margin-top:8px;align-items:center;flex-wrap:wrap}
+.rx{border:1px solid var(--edge);background:transparent;border-radius:999px;font-size:12px;line-height:20px;padding:0 8px}
+.rx.mine{border-color:var(--muted);background:var(--surface-2)}
+.rx.add{color:var(--faint)}
+.notice{font-size:12px;color:var(--muted);margin-top:6px}
+.trust{font-size:12px;color:var(--muted);margin-top:8px;display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.trust .bar{display:inline-block;width:2px;height:10px;background:var(--ln,var(--faint))}
+.outcome{font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:center;margin-top:-8px}
+.outcome .o{font-family:var(--font-record);font-size:11px;border:1px solid var(--edge);border-radius:4px;padding:0 6px;color:var(--text)}
+.ph{font-family:var(--font-record);font-size:12px;color:var(--muted);background:var(--bg);border:1px dashed var(--edge);border-radius:4px;padding:1px 6px}
+.form{display:grid;grid-template-columns:120px 1fr;gap:8px 12px;align-items:center;margin-top:8px}
+.form > label{font-size:12px;color:var(--muted)}
+.form input,.form textarea{background:var(--bg);border:1px solid var(--edge);border-radius:var(--r-sm);padding:4px 8px;width:calc(100% - 60px)}
+.form input:disabled,.form textarea:disabled{color:var(--muted)}
+.form textarea{resize:vertical;min-height:52px;vertical-align:middle}
+.guess{font-family:var(--font-record);font-size:10px;color:var(--faint);margin-left:6px}
+.toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
+.toggle .tr{width:28px;height:16px;border-radius:999px;background:var(--surface-2);border:1px solid var(--edge);position:relative;flex:none;transition:background-color var(--t)}
+.toggle .tr::after{content:"";position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;background:var(--muted);transition:transform var(--dur-std) var(--ease-spring)}
+.toggle.on .tr{background:var(--text)}.toggle.on .tr::after{transform:translateX(12px);background:var(--bg)}
+.toggle.locked{cursor:default;opacity:.7}
+.mchips{display:flex;gap:6px;flex-wrap:wrap}
+.mchip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--edge);border-radius:999px;padding:0 4px 0 6px;font-size:12px;line-height:22px;background:var(--bg)}
+.mchip button{border:0;background:transparent;color:var(--faint);padding:0 4px}
+.warn{border:1px solid var(--edge);border-radius:var(--r-sm);padding:6px 10px;font-size:12px;color:var(--text);background:var(--surface-2);margin-top:10px}
+.hatch{background:repeating-linear-gradient(135deg,transparent 0 6px,color-mix(in srgb,var(--text) 6%,transparent) 6px 7px);border:1px dashed var(--edge);border-radius:var(--r-sm);padding:8px 10px;font-size:13px;color:var(--text)}
+.diff del{color:var(--faint)}.diff ins{text-decoration:none;background:color-mix(in srgb,var(--text) 14%,transparent);border-radius:3px;padding:0 2px}
+.pcols{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.pcol{background:var(--bg);border:1px solid var(--edge);border-radius:var(--r-sm);padding:8px}
+.pcol h4{margin:0 0 6px;font-size:12px;font-weight:600;color:var(--text)}
+.pitem{display:flex;gap:6px;align-items:center;font-size:12px;line-height:18px;padding:4px 6px;border-radius:4px;border:1px solid transparent;width:100%;background:transparent;text-align:left;color:var(--text)}
+.pitem:hover:not(:disabled){border-color:var(--edge)}
+.pitem:disabled{opacity:1;cursor:default}
+.pitem.sel{border-color:var(--accent)}
+.pitem .tier{font-family:var(--font-record);font-size:10px;color:var(--faint);margin-left:auto}
+.pitem.new{background:color-mix(in srgb,var(--text) 8%,transparent)}
+.mover{display:flex;gap:6px;align-items:center;margin-top:8px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.reach{margin:6px 0 0;display:grid;grid-template-columns:120px 1fr;gap:4px 12px;font-size:12px}
+.reach dt{color:var(--muted)}.reach dd{margin:0}
+.composer{border-top:1px solid var(--edge);padding:10px 20px 14px}
+.sugg{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;align-items:center}
+.cbox{display:flex;gap:8px;align-items:center;background:var(--surface-2);border-radius:var(--r-md);padding:6px 6px 6px 12px}
+.cbox input{flex:1;background:transparent;border:0;outline:0;font-size:14px;min-width:0}
+.cnote{font-size:11px;color:var(--faint);margin-top:6px}
+.insp{width:0;overflow:hidden;border-left:1px solid var(--edge);transition:width var(--dur-std) var(--ease-standard)}
+.insp.on{width:288px}
+.insp .in{width:288px;padding:16px;display:flex;flex-direction:column;gap:18px}
+.insp h5{margin:0 0 6px;font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:500}
+.insp .blk{font-size:13px;color:var(--muted)}
+.insp .blk p{margin:0 0 6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.portrait{font-family:var(--font-reflection);font-size:20px;line-height:28px;color:var(--paper-warm);text-wrap:balance}
+.mem{display:flex;gap:8px;align-items:center;font-size:13px;padding:3px 0;color:var(--text)}
+.mem .r{margin-left:auto;font-size:11px;color:var(--faint)}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;text-align:left;font-weight:500;padding:6px 8px;border-bottom:1px solid var(--edge)}
+.tbl td{padding:9px 8px;border-bottom:1px solid var(--edge);vertical-align:middle;color:var(--muted)}
+.tbl td:first-child{color:var(--text)}
+.state{font-family:var(--font-record);font-size:11px;padding:0 6px 0 10px;border-radius:4px;border:1px solid var(--edge);color:var(--text);white-space:nowrap;position:relative}
+.state::before{content:"";position:absolute;left:3px;top:3px;bottom:3px;width:2px;background:var(--ln,var(--faint))}
+.empty{color:var(--muted);font-size:13px;padding:24px 0}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(6px);display:grid;place-items:center;z-index:20;animation:fade var(--dur-std) var(--ease-standard)}
+@keyframes fade{from{opacity:0}}
+.dialog{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r-lg);padding:20px;width:440px;box-shadow:0 24px 64px rgba(0,0,0,.55);animation:pop var(--dur-slow) var(--ease-spring)}
+@keyframes pop{from{opacity:0;filter:blur(5px);transform:translateY(12px) scale(.96)}}
+.dialog p{color:var(--muted);margin:8px 0}
+.toast{position:fixed;right:20px;bottom:20px;background:var(--surface-2);border:1px solid var(--edge);border-radius:var(--r-md);padding:8px 8px 8px 14px;display:flex;gap:12px;align-items:center;font-size:13px;z-index:30;animation:toast var(--dur-slow) var(--ease-spring);max-width:520px}
+@keyframes toast{from{opacity:0;transform:translateX(16px)}}
+.popover{position:absolute;z-index:10;right:0;top:100%;width:320px;background:var(--surface);border:1px solid var(--edge);border-radius:var(--r-md);padding:12px;margin-top:6px;box-shadow:0 12px 32px rgba(0,0,0,.45)}
+.popover h5{margin:8px 0 2px;font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:500}
+.popover h5:first-child{margin-top:0}
+.popover div{font-size:13px;color:var(--muted)}
+@media (prefers-reduced-motion:reduce){*,::before,::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+body.shot *{animation:none!important}
+</style>
+</head>
+<body>
+<div class="proto" id="proto"></div>
+<div class="app">
+  <aside class="list" id="list"></aside>
+  <main class="conv" id="conv"></main>
+  <aside class="insp on" id="insp"></aside>
+</div>
+<div id="overlay"></div>
+<script>
+/* ============ data & state ============ */
+const OWNER = 'Rachel', OWNER_FULL = 'Rachel Lim';
+const SCREENS = [
+  ['duo','1:1 · task','v1'],
+  ['cards','Draft · confirm · reactions','v1'],
+  ['visitor','Visitor view','v1'],
+  ['owner','Owner view','v1'],
+  ['perms','Permissions in chat','v1'],
+  ['mkgroup','Create group in chat','v1'],
+  ['group','Group room · @mention','v1'],
+  ['tasks','Task list','v1'],
+  ['mkdesk','Create desk duo in chat','v2'],
+  ['orch','Orchestrator room','v2'],
+];
+const init = () => ({
+  screen:'duo', offline:false, error:false, empty:false, insp:true,
+  rx:{a1:{'👍':1}}, rxPick:null, wrongFor:null, wrongSent:false,
+  task:0, taskChoice:null,
+  draft:'open', draftText:"Hi Priya, yes. The vendor shortlist for the records-digitisation pilot is in the Q4 folder. Two of the three vendors have cleared security review; the third is due on 28 Oct.", why:false,
+  t4:'card', dlg:null,
+  req:'pending', q1:null, own:[], takeover:false, ownDraft:'open', vq:[],
+  perm:0, permSel:null, permMoves:[], pending:null, scope:'Everyone', tiers:false,
+  grp:0, grpName:'Records pilot · vendor review', grpMembers:['Priya Nair','Arun Pillai','Policy research (desk duo)'], grpDuoJoins:true,
+  gmsgs:[], gmention:true,
+  tfilter:'All',
+  desk:0, deskName:'Policy research', deskRole:'Policy research', deskBrief:'Finds and summarises policy circulars and past papers for my team.', deskInstr:'Cite the circular number and date for every claim. Flag anything older than 2 years.', deskTag:'PR', deskSources:['Policy circulars','Past EXCO papers'], deskCount:3, routine:0, deskAv:1,
+  orch:0, tone:null,
+  toast:null,
+});
+let S = init();
+
+/* ============ helpers ============ */
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const mark = (o={}) => `<span class="duo-mark ${o.lg?'lg':''} ${o.desk?'desk':''}" ${o.working?'data-working':''} aria-label="duo mark"><i></i><i></i></span>`;
+const av = (ini, lg) => `<span class="av ${lg?'lg':''}">${ini}</span>`;
+const ini = n => n.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+const off = () => S.offline;
+const offReason = (what='Send') => S.offline ? `<div class="reason">You're offline. ${what} is off until you reconnect. It is never queued.</div>` : '';
+function duo({name='Your duo', state='', time='', ln='faint', html='', working=false, vis='', desk=false, tag='', quiet=false, draft=false, cls='', after=''}){
+  return `<div class="duo ${cls}">
+    <div class="attr">${mark({working,desk})}<b>${name}</b>${tag?`<span class="deskTag">${tag}</span>`:''}${state?`<span>· ${state}</span>`:''}${time?`<span class="faint">· ${time}</span>`:''}${vis?`<span class="vis">${vis}</span>`:''}</div>
+    <div class="line ln-${ln} ${quiet?'quiet':''} ${draft?'draft':''}">${html}</div>${after}</div>`;
+}
+function person({name, ini:i, time='', html, me=false, foot=''}){
+  return `<div class="msg ${me?'me':''}">${av(i,true)}<div class="body"><div class="meta"><b>${name}</b><span class="faint">${time}</span></div><div class="txt">${html}</div>${foot?`<div class="foot">${foot}</div>`:''}</div></div>`;
+}
+function reacts(id, who='owner'){
+  const r = S.rx[id] || {};
+  const setE = ['👍','👎','👀','✅'];
+  let h = Object.entries(r).filter(([,n])=>n>0).map(([e,n])=>`<button class="rx mine" onclick="react('${id}','${e}','${who}')">${e} ${n}</button>`).join('');
+  if (S.rxPick===id) h += setE.filter(e=>!r[e]).map(e=>`<button class="rx" onclick="react('${id}','${e}','${who}')">${e}</button>`).join('');
+  else h += `<button class="rx add" aria-label="Add reaction" onclick="S.rxPick='${id}';render()">＋</button>`;
+  return `<div class="reacts">${h}</div>`;
+}
+function react(id, e, who){
+  S.rx[id] = S.rx[id] || {};
+  S.rx[id][e] = S.rx[id][e] ? 0 : 1;
+  S.rxPick = null;
+  if (e==='👎' && S.rx[id][e]) { S.wrongFor = id; S.wrongSent = false; }
+  if (id==='d1' && e==='👍' && S.rx[id][e]) { toast("👍 recorded as feedback. Nothing was sent: your duo doesn't send to Priya on this topic without you."); return; }
+  render();
+}
+function toast(msg, undo){ S.toast = {msg, undo}; render(); clearTimeout(window._tt); window._tt = setTimeout(()=>{ S.toast=null; render(); }, 5000); }
+function undo(){ const u = S.toast && S.toast.undo; S.toast = null; if (u) u(); render(); }
+function go(s){ S.screen = s; S.why = false; S.rxPick = null; render(); }
+function set(k,v){ S[k] = v; render(); }
+function wrongBox(who){
+  if (S.wrongSent) return `<div class="notice">Thanks. Logged as a wrong-answer report${who==='visitor'?` and sent to ${OWNER}`:''}.</div>`;
+  return `<div class="notice">What was wrong?<span style="display:flex;gap:6px;margin-top:4px"><input style="flex:1;background:var(--bg);border:1px solid var(--edge);border-radius:6px;padding:2px 8px" placeholder="Optional: one line"><button class="btn sm" onclick="S.wrongSent=true;render()">Report</button></span></div>`;
+}
+function hdrDuo(){
+  return `<div>${mark({lg:true})}</div><div class="who"><div class="t">Your duo</div><div class="s">Personal duo · ${OWNER_FULL} · remembers this chat</div></div>
+  <button class="btn sm" onclick="go('perms')">What it may do</button><button class="btn sm" onclick="set('insp',!S.insp)">Info<span class="kbd">⌘I</span></button>`;
+}
+function composer(ph, sugg=[], extra=''){
+  const map = {'Create a desk duo for policy research':"go('mkdesk')", 'What can you do?':"go('perms')", 'Make a group with Priya and Arun':"go('mkgroup')", "What's open?":"go('tasks')"};
+  return `<div class="composer">${sugg.length?`<div class="sugg">${sugg.map(s=>`<button class="chip" onclick="${map[s]||''}">${s}</button>`).join('')}</div>`:''}
+  <div class="cbox"><input placeholder="${esc(ph)}" aria-label="Message"><button class="btn sm pri" aria-label="Send">↑</button></div>${extra}</div>`;
+}
+
+/* ============ chat lists ============ */
+function ownerList(active){
+  const waiting = S.empty ? 0 : (S.draft==='open'||S.draft==='editing'?1:0) + (S.req==='pending'?1:0) + (S.ownDraft==='open' && (S.req==='allowed'||S.req==='always')?1:0) + (S.t4==='card'?1:0);
+  const cur = id => active===id ? 'aria-current="true"' : '';
+  const row = (id, ic, nm, ct, sig, isCur) => `<div class="row" ${isCur===undefined?cur(id):(isCur?'aria-current="true"':'')} onclick="go('${id}')"><span class="ic">${ic}</span><span class="nm">${nm}</span>${ct?`<span class="ct ${sig?'sig':''}">${ct}</span>`:''}</div>`;
+  return `
+  <div class="top"><span class="wordmark">${mark()} duo</span><span style="margin-left:auto" class="faint mono">${OWNER_FULL}</span></div>
+  <div class="search"><span>Search what your duo knows</span><span class="mono">⌘K</span></div>
+  <div class="filters"><button class="chip" aria-pressed="true">All</button><button class="chip ${waiting?'sig':''}">Waiting on you${waiting?` <span class="mono">${waiting}</span>`:''}</button></div>
+  <div class="rows">
+    ${row('duo', mark(), 'Your duo', '', false, ['duo','perms','mkgroup','mkdesk'].includes(active))}
+    <div class="shelf">Pinned</div>
+    ${row('cards', av('PN'), 'Priya Nair', (S.draft==='open'||S.t4==='card')&&!S.empty?String((S.draft==='open'?1:0)+(S.t4==='card'?1:0)):'', true)}
+    <div class="shelf">Q4 budget</div>
+    ${row('orch', mark(), 'Q4 briefing room <span class="mono faint">v2</span>', '')}
+    <div class="shelf">Channels</div>
+    ${row('group', '<span class="mono faint">#</span>', 'proc-reform', '@ 1')}
+    ${S.grp>=3 ? row('group', '<span class="mono faint">#</span>', 'records-pilot-vendor-review', 'new', false, false) : ''}
+    <div class="shelf">Direct messages</div>
+    ${row('owner', av('AP'), 'Arun Pillai <span class="faint">· with your duo</span>', S.req==='pending'&&!S.empty?'1':'', true)}
+    ${row('tasks', '<span class="mono faint">≡</span>', 'Tasks <span class="faint">· mirror</span>', S.empty?'':'5')}
+    <div class="shelf">Duos</div>
+    ${row('visitor', mark(), "Bala's duo", '', false, false)}
+    <div class="shelf">Desk duos <span class="mono">${S.deskCount}/5</span></div>
+    ${S.desk>=3 ? row('mkdesk', mark({desk:true}), 'Policy research <span class="deskTag">PR</span>', 'new', false, false) : ''}
+    ${row('orch', mark({desk:true}), 'Data <span class="deskTag">DA</span>', '', false, false)}
+    ${row('orch', mark({desk:true}), 'Comms <span class="deskTag">CO</span>', '', false, false)}
+    ${row('orch', mark({desk:true}), 'Procurement <span class="deskTag">PC</span>', '', false, false)}
+  </div>`;
+}
+function visitorList(){
+  return `
+  <div class="top"><span class="wordmark">${mark()} duo</span><span style="margin-left:auto" class="faint mono">Arun Pillai</span></div>
+  <div class="search"><span>Search what your duo knows</span><span class="mono">⌘K</span></div>
+  <div class="filters"><button class="chip" aria-pressed="true">All</button><button class="chip">Waiting on you</button></div>
+  <div class="rows">
+    <div class="row"><span class="ic">${mark()}</span><span class="nm">Your duo</span></div>
+    <div class="shelf">Direct messages</div>
+    <div class="row"><span class="ic">${av('RL')}</span><span class="nm">Rachel Lim</span></div>
+    <div class="row"><span class="ic">${av('WJ')}</span><span class="nm">Wei Jie Ong</span></div>
+    <div class="shelf">Duos</div>
+    <div class="row" aria-current="true"><span class="ic">${mark()}</span><span class="nm">Rachel's duo</span></div>
+    <div class="row"><span class="ic">${mark()}</span><span class="nm">Bala's duo</span></div>
+  </div>`;
+}
+
+const scr = {};
+
+/* 1. Your duo 1:1 */
+scr.duo = () => {
+  if (S.empty) return {
+    hdr: hdrDuo(),
+    body: `<div style="align-self:center;text-align:center;padding-top:96px;max-width:520px">${mark({lg:true})}<p style="color:var(--text);margin:14px 0 4px">Ask your duo anything, or tell it what to set up.</p><p class="prov">Answers arrive behind the line with their sources. Anything it can't do at once becomes a task here, with short updates.</p></div>`,
+    composer: composer('Ask your duo…', ['Create a desk duo for policy research','Make a group with Priya and Arun','What can you do?']),
+  };
+  const step = S.task; // 0 ack · 1,2 working · 3 needs-decision · 4 done
+  const failed = S.error && step>=2;
+  const stateTxt = failed ? 'failed' : step===0?'acknowledged' : step<3?'working' : step===3?'needs decision' : 'done';
+  const ln = failed ? 'faint' : step===3?'amber' : step===4?'moss' : 'faint';
+  const M = ['Read the 3 division updates (Ops, Digital, Corporate)','Found 11 savings items; 2 figures disagree','Asked you which Ops travel figure to use','Drafted the one-pager'];
+  let li = '';
+  for (let i=0;i<4;i++){
+    if (i>=step && !(i===2 && step===3)) break;
+    if (i===2 && step===3) { li += `<li class="now"><span class="dot">·</span>Needs your choice on Ops travel</li>`; break; }
+    li += `<li class="done"><span class="dot">✓</span>${M[i]}${i===2&&S.taskChoice?` <span class="faint">· you chose ${S.taskChoice}</span>`:''}</li>`;
+  }
+  if (step===1 || step===2) li += `<li class="now"><span class="dot">·</span>${step===1?'Comparing figures':'Checking against Finance'}</li>`;
+  if (failed) li += `<li class="now"><span class="dot">×</span>Stopped</li>`;
+  const decision = step===3 && !failed ? `<div class="res"><div style="font-size:13px">Ops reports travel savings two ways. Which figure should the one-pager use?</div>
+    <div class="opts">${[['$42,000','From the Ops division update, 9 Oct'],['$38,000','From the Finance reconciliation, 14 Oct (newer)'],['Show both, flagged','Footnote the difference for EXCO']].map((o,i)=>`<button class="opt" onclick="S.taskChoice='${o[0]}';S.task=4;render()"><span class="n">${i+1}</span><span>${o[0]}<span class="d">${o[1]}</span></span></button>`).join('')}</div></div>` : '';
+  const result = step===4 && !failed ? `<div class="res"><div>Done. Q4 savings come to <b>$214,000</b> across 11 items, all headcount-neutral. Ops travel uses ${S.taskChoice||'$38,000'}.</div>
+      <div class="file"><span class="fi">DOCX</span><span class="fn">Q4-savings-one-pager-v1.docx</span><span class="prov">2 pages</span><button class="btn sm">Open</button></div>
+      <div class="file"><span class="fi">XLSX</span><span class="fn">Q4-savings-items.xlsx</span><span class="prov">11 rows</span><button class="btn sm">Open</button></div>
+      <div class="prov" style="margin-top:6px">Drew on 4 sources: <a href="#">Ops update, 9 Oct</a> · <a href="#">Digital update, 10 Oct</a> · <a href="#">Corporate update, 10 Oct</a> · <a href="#">Finance reconciliation, 14 Oct</a></div>
+      ${reacts('v0')}${S.wrongFor==='v0'?wrongBox('owner'):''}</div>` : '';
+  const failBlock = failed ? `<div class="res"><div>Stopped: <span class="ph">daemon reason, verbatim</span></div><div class="prov">Nothing was sent anywhere. The finished steps are kept.</div><div class="acts"><button class="btn sm" onclick="S.error=false;render()">Try again</button></div></div>` : '';
+  const body = `
+    <div class="day">Yesterday</div>
+    ${person({name:'You', ini:'RL', time:'17:40', html:'Remind me what Finance said about the travel cap.', me:true})}
+    ${duo({state:'answer', time:'17:40', ln:'moss', html:'Finance capped Q4 travel at $60,000 per division (Finance note FN-22, 2 Oct). Anything above needs DS approval.<div class="trust"><span class="bar" style="--ln:var(--confident)"></span>Confident. Drew on 1 source.</div>'})}
+    <div class="day">Today</div>
+    ${person({name:'You', ini:'RL', time:'09:12', html:'Pull together the Q4 headcount-neutral savings from the three division updates and draft a one-pager for EXCO.', me:true})}
+    ${duo({state:'ack', time:'09:12', ln:'faint', html:"On it. I'll post short updates here and the one-pager when it's ready." + reacts('a1')})}
+    ${duo({state:`task · ${stateTxt}`, time:'09:12', ln, working: (step===1||step===2) && !failed, html:`
+      <div class="card-h"><span class="k">Task</span><span>Q4 savings one-pager</span><span class="st mono">${stateTxt}</span></div>
+      <ul class="ms">${li || '<li class="now"><span class="dot">·</span>Starting</li>'}</ul>
+      ${decision}${result}${failBlock}
+      ${step<3 && !failed ? `<div class="acts"><button class="btn sm" onclick="S.task++;render()">Simulate next update</button><span class="prov">Updates only on a state change or a real step, at most 3.</span></div>`:''}`})}`;
+  return { hdr: hdrDuo(), body, composer: composer('Ask your duo…', ['Create a desk duo for policy research','What can you do?',"What's open?"]) };
+};
+
+/* 2. Cards */
+scr.cards = () => {
+  let draft = '';
+  if (S.draft==='open' || S.draft==='editing') {
+    const txt = S.draft==='editing' ? `<textarea id="dtxt" style="width:100%;min-height:72px;background:var(--bg);border:1px solid var(--edge);border-radius:6px;padding:6px 8px">${esc(S.draftText)}</textarea>` : `<div>${esc(S.draftText)}</div>`;
+    const pop = S.why ? `<div class="popover"><h5>Trust reading</h5><div>Confident. You've sent 9 answers like this without an edit.</div><h5>Standing orders hit</h5><div><a href="#">"Vendor status: answer from the Q4 folder"</a></div><h5>Drew on 3 sources</h5><div><a href="#">Vendor-shortlist.xlsx</a> · <a href="#">Security review tracker</a> · <a href="#">IT Sec email, 15 Oct</a></div><h5>Who's asking</h5><div>Priya Nair · Records Division</div></div>` : '';
+    draft = duo({state:'draft', time:'10:31', ln:'moss', vis:'visible to: you', draft:true, after:pop, html:`${txt}
+      <div class="prov" style="margin-top:6px">Why: your standing order on vendor status, and the Q4 folder.</div>
+      <div class="acts">${S.draft==='editing'
+          ? `<button class="btn pri" ${off()?'disabled':''} onclick="S.draftText=document.getElementById('dtxt').value;sendDraft()">Send edited<span class="kbd">⌘⏎</span></button><button class="btn" onclick="set('draft','open')">Cancel</button>`
+          : `<button class="btn pri" ${off()?'disabled':''} onclick="sendDraft()">Send<span class="kbd">⏎</span></button><button class="btn" onclick="set('draft','editing')">Edit<span class="kbd">E</span></button><button class="btn" onclick="dismissDraft()">Dismiss<span class="kbd">X</span></button><button class="btn link" onclick="set('why',!S.why)">Why?</button>`}
+        ${offReason('Send')}</div>
+      <div class="draftnote">only you can see this · not sent</div>${reacts('d1')}`});
+  } else if (S.draft==='sent') {
+    draft = person({name:'You', ini:'RL', time:'10:33', html:esc(S.draftText), me:true, foot: S.error ? `Couldn't deliver — <span class="ph">delivery failure reason, verbatim</span> <button class="btn link">Retry</button>` : "from your duo's draft · only you see this note"});
+  } else {
+    draft = `<div class="prov">Draft dismissed. Your duo learns from it. <button class="btn link" onclick="set('draft','open')">Show again</button></div>`;
+  }
+  const t4body = `<div class="card-h"><span class="k">Needs your confirm</span><span class="deskTag">Sample, nothing runs</span>${S.tiers?'<span class="mono faint">T4</span>':''}<span class="st">Never on its own</span></div>
+      <div><b>Withdraw</b> tender <span class="mono">TND-2026-0412</span> (records-digitisation pilot) from the procurement portal.</div>
+      <div class="prov">Asked by Priya Nair · 10:35 · <b style="color:var(--text)">This can't be undone.</b> The portal notifies all 3 vendors.</div>`;
+  let t4 = '';
+  if (S.t4==='card') t4 = duo({state:'confirmation', time:'10:35', ln:'amber', vis:'visible to: you', html: t4body + `<div class="acts"><button class="btn" ${off()?'disabled':''} onclick="set('dlg','t4')">Review and confirm…</button><button class="btn link" onclick="set('t4','cancelled')">Don't go ahead</button>${offReason('Confirm')}</div><div class="prov" style="margin-top:6px">Priya sees "Needs Rachel's OK".</div>`});
+  if (S.t4==='done') t4 = duo({state:'confirmation · confirmed', time:'10:37', ln:'amber', vis:'visible to: you', cls:'decided', html: t4body + `<div class="outcome" style="margin-top:8px"><span class="o">Confirmed by you · 10:37</span>v1 has no executor: you withdraw it on the portal. Your duo told Priya and logged it in Activity.</div>`});
+  if (S.t4==='cancelled') t4 = duo({state:'confirmation · not going ahead', time:'10:36', ln:'ash', vis:'visible to: you', cls:'decided', html: t4body + `<div class="outcome" style="margin-top:8px"><span class="o">Not going ahead</span>Nothing happened. Priya sees "Rachel didn't go ahead".</div>`});
+  const body = `
+    ${person({name:'Priya Nair', ini:'PN', time:'10:30', html:'Hi Rachel, where are we on the vendor shortlist for the records-digitisation pilot?'})}
+    ${draft}
+    ${person({name:'Priya Nair', ini:'PN', time:'10:35', html:'Also, given the budget freeze, can we just withdraw the tender for now?'})}
+    ${duo({state:'ack', time:'10:35', ln:'faint', vis:'visible to: Priya and you', html:"That needs Rachel's OK. I've asked her; the outcome will show here."})}
+    ${t4}`;
+  return {
+    hdr: `${av('PN',true)}<div class="who"><div class="t">Priya Nair</div><div class="s">Records Division · direct message</div></div><button class="btn sm" onclick="set('insp',!S.insp)">Info<span class="kbd">⌘I</span></button>`,
+    body, composer: composer('Message Priya…', [], `<div class="cnote">Your own messages queue while offline and send on reconnect. Drafts and confirms never queue.</div>`)
+  };
+};
+function sendDraft(){ if (off()) return; S.draft='sent'; render(); }
+function dismissDraft(){ S.draft='dismissed'; toast('Draft dismissed.', ()=>{ S.draft='open'; }); }
+</script>
+<script>
+/* shared visitor <-> owner conversation */
+const Q1 = "What's the limit for a small-value purchase without quotes?";
+const Q2 = "Can Rachel's team co-fund the Q1 user research with us?";
+const Q3 = "What's the procurement officer's mobile number?";
+const A1c = "Under circular PS-14/2026 (in force since 1 Apr 2026) you can buy up to $6,000 without quotes, from any approved vendor. Above that, get 3 quotes.";
+const A1o = "Under PS-09/2025 the limit was $5,000. It was replaced on 1 Apr 2026; the current limit is $6,000.";
+const DRAFT2 = "Yes, we can co-fund up to half if it's booked by 15 Dec. I'll confirm the cost centre with Finance this week.";
+function convItems(view){
+  const V = view==='visitor';
+  const dn = V ? "Rachel's duo" : 'Your duo';
+  const visA = V ? '' : 'visible to: Arun and you';
+  const out = [];
+  out.push(person({name:V?'You':'Arun Pillai', ini:'AP', time:'14:02', html:esc(Q1), me:V}));
+  if (S.req==='pending') {
+    if (V) out.push(`<div class="outcome" style="margin-top:0"><span class="o">Waiting for Rachel's OK</span>A first message to Rachel's duo goes to Rachel first.</div>`);
+    else out.push(duo({state:'request', time:'14:02', ln:'faint', vis:'visible to: you', html:`
+      <div class="card-h"><span class="k">First message</span><span class="st">Arun Pillai · Finance Ops</span></div>
+      <div>Arun wants to ask your duo: <i>"${esc(Q1)}"</i></div>
+      <div class="acts"><button class="btn pri" onclick="allow('allowed')">Allow</button><button class="btn" onclick="allow('always')">Allow and always allow Arun</button><button class="btn" onclick="allow('declined')">Decline</button></div>
+      <div class="prov" style="margin-top:6px">Always allow covers one-to-one chats only. A group is always a fresh decision.</div>`}));
+    return out;
+  }
+  if (S.req==='declined') {
+    out.push(duo({name:dn, state:'declined', time:'14:03', ln:'ash', vis:visA, html:`<span class="ph">daemon's fixed decline message, verbatim</span>`}));
+    out.push(`<div class="outcome"><span class="o">Declined</span>${V?"Rachel's duo won't take questions from you here.":"You declined. Arun was told in the daemon's fixed words."}</div>`);
+    return out;
+  }
+  if (!V) out.push(`<div class="outcome" style="margin-top:0"><span class="o">${S.req==='always'?'Always allowed':'Allowed'}</span>${S.req==='always'?'Arun can ask your duo directly from now on. Change it by asking "who can reach you?".':'For this conversation.'}</div>`);
+  if (!S.q1) out.push(duo({name:dn, state:'needs a choice', time:'14:03', ln:'amber', vis:visA, html:`
+      <div>Did you mean one of these?</div>
+      <div class="opts">
+        <button class="opt" ${V?'':'disabled'} onclick="set('q1','current')"><span class="n">1</span><span>"What's the limit for a small-value purchase without quotes, today?"</span></button>
+        <button class="opt" ${V?'':'disabled'} onclick="set('q1','old')"><span class="n">2</span><span>"What was the limit for a purchase made before April 2026?"</span></button>
+      </div>${V?'':'<div class="prov" style="margin-top:6px">Read-only: only Arun, who asked, can choose. You can watch, or take over.</div>'}`}));
+  else {
+    out.push(duo({name:dn, state:'answered', time:'14:03', ln:'moss', vis:visA, html:`<div class="prov" style="margin-bottom:4px">${V?'You':'Arun'} chose: "${S.q1==='current'?"What's the limit … today?":'What was the limit … before April 2026?'}"</div>${S.q1==='current'?A1c:A1o}
+      <div class="trust"><span class="bar" style="--ln:var(--confident)"></span>Rachel has trusted this duo with this topic, and it's sure of this answer. Drew on <a href="#">PS-14/2026 §3.2</a>, dated 1 Apr 2026.${V?'':' <button class="btn link">Why?</button>'}</div>
+      ${reacts('v1', V?'visitor':'owner')}${S.wrongFor==='v1'&&V?wrongBox('visitor'):''}${!V&&S.wrongFor==='v1'&&S.wrongSent?'<div class="notice">Arun reported this answer as wrong.</div>':''}`}));
+    out.push(`<div class="outcome"><span class="o">Answered by Rachel's duo</span></div>`);
+  }
+  out.push(person({name:V?'You':'Arun Pillai', ini:'AP', time:'14:05', html:esc(Q2), me:V}));
+  out.push(duo({name:dn, state:'passed on', time:'14:05', ln:'amber', vis:visA, html:`<span class="ph">PUBLIC_PASSED_ON_MESSAGE, verbatim</span><div class="trust"><span class="bar" style="--ln:var(--escalate)"></span>Outside what this duo answers on its own.</div>
+    <div class="file"><span class="fi">TASK</span><span class="fn">Co-funding Q1 user research</span><span class="mono faint">${S.ownDraft==='sent'?'done':S.takeover?'with Rachel':'working'}</span></div>`}));
+  if (S.ownDraft==='sent') {
+    out.push(person({name:V?'Rachel Lim':'You', ini:'RL', time:'14:20', html:DRAFT2, me:!V, foot:V?'':"from your duo's draft · only you see this note"}));
+    out.push(`<div class="outcome"><span class="o">Rachel replied</span></div>`);
+  } else {
+    out.push(`<div class="outcome"><span class="o">Passed to Rachel — waiting on them</span></div>`);
+    if (!V && !S.takeover) out.push(duo({state:'draft', time:'14:05', ln:'amber', vis:'visible to: you', draft:true, html:`<div>${DRAFT2}</div>
+      <div class="prov" style="margin-top:6px">Why: you agreed a similar split with Finance Ops in August. Hedged: no standing order covers co-funding.</div>
+      <div class="acts"><button class="btn pri" ${off()?'disabled':''} onclick="set('ownDraft','sent')">Send<span class="kbd">⏎</span></button><button class="btn">Edit<span class="kbd">E</span></button><button class="btn" onclick="toast('Draft dismissed.',()=>{})">Dismiss<span class="kbd">X</span></button><button class="btn link">Why?</button>${offReason('Send')}</div>
+      <div class="draftnote">only you can see this · not sent</div>`}));
+  }
+  out.push(person({name:V?'You':'Arun Pillai', ini:'AP', time:'14:07', html:esc(Q3), me:V}));
+  out.push(duo({name:dn, state:V?'declined':'refused', time:'14:07', ln:'ash', vis:visA, html:`<span class="ph">PUBLIC_REFUSAL_MESSAGE, verbatim</span><div class="trust"><span class="bar" style="--ln:var(--refused)"></span>A boundary Rachel set.</div>`}));
+  out.push(`<div class="outcome"><span class="o">${V?'Declined':'Your duo refused this one.'}</span>${V?'':'Never-answer rule: personal contact details.'}</div>`);
+  S.own.forEach(m => out.push(person({name:V?'Rachel Lim':'You', ini:'RL', time:'now', html:esc(m), me:!V})));
+  S.vq.forEach(m => { out.push(person({name:V?'You':'Arun Pillai', ini:'AP', time:'now', html:esc(m), me:V})); if (!S.takeover) out.push(duo({name:dn, state:'ack', ln:'faint', time:'now', vis:visA, html:'Checking with Rachel… <span class="mono faint">task · acknowledged</span>'})); });
+  return out;
+}
+function allow(v){ S.req = v; if (v==='always') toast('Arun is always allowed in one-to-one chats.', ()=>{ S.req='pending'; }); else render(); }
+
+scr.visitor = () => ({
+  list: visitorList(),
+  hdr: `${mark({lg:true})}<div class="who"><div class="t">Rachel's duo</div><div class="s">Rachel Lim's duo · Policy &amp; Planning · not Rachel herself</div></div><button class="btn sm" onclick="set('insp',!S.insp)">Info<span class="kbd">⌘I</span></button>`,
+  banner: `<div class="banner">${mark()} Rachel's duo — answers within limits Rachel set.</div>` + (S.takeover?`<div class="label-bar">${av('RL')} Rachel is replying. Her duo is paused in this conversation.</div>`:''),
+  body: convItems('visitor').join(''),
+  composer: S.req==='declined' ? `<div class="composer"><div class="cnote">Rachel's duo isn't taking questions from you here. You can message Rachel directly.</div></div>` :
+    `<div class="composer"><div class="cbox"><input id="vin" placeholder="${S.takeover?'Message Rachel…':"Ask Rachel's duo…"}" ${S.req==='pending'?'disabled':''}><button class="btn sm pri" ${S.req==='pending'?'disabled':''} onclick="const v=document.getElementById('vin').value.trim();if(v){S.vq.push(v);render()}">↑</button></div><div class="cnote">You see only your own tasks.${S.req==='pending'?" You can ask more once Rachel says OK.":''}</div></div>`,
+  insp: `<div><h5>Who this is</h5><div class="blk"><p>Rachel's duo answers within limits Rachel set, passes the rest to her, and never speaks as her.</p></div></div>
+         <div><h5>Your tasks with it</h5><div class="blk"><p>Co-funding Q1 user research <span class="mono">${S.ownDraft==='sent'?'done':S.req==='pending'?'—':'working'}</span></p></div></div>
+         <div><h5>Prototype note</h5><div class="blk"><p>State is shared with "Owner view". Allow, Send or Take over there, then come back.</p></div></div>`
+});
+scr.owner = () => ({
+  hdr: `${av('AP',true)}<div class="who"><div class="t">Arun Pillai <span class="faint" style="font-weight:400">with your duo</span></div><div class="s">Finance Ops · your duo answers here</div></div>
+    ${S.req==='allowed'||S.req==='always' ? (S.takeover ? `<button class="btn sm pri" onclick="S.takeover=false;toast('Handed back. Your duo is answering again.')">Hand back</button>` : `<button class="btn sm" onclick="set('takeover',true)">I'll take it from here</button>`) : ''}
+    <button class="btn sm" onclick="set('insp',!S.insp)">Info<span class="kbd">⌘I</span></button>`,
+  banner: `<div class="banner">${mark()} Arun sees: "Rachel's duo — answers within limits Rachel set."</div>` + (S.takeover?`<div class="label-bar">You're replying. Your duo is paused here and open tasks are assigned to you. Arun sees "Rachel is replying".</div>`:''),
+  body: convItems('owner').join(''),
+  composer: S.takeover ? `<div class="composer"><div class="cbox"><input id="oin" placeholder="Message Arun as yourself…"><button class="btn sm pri" onclick="const v=document.getElementById('oin').value.trim();if(v){S.own.push(v);render()}">↑</button></div></div>`
+    : `<div class="composer"><div class="cnote">Your duo is answering Arun. Tap "I'll take it from here" to reply yourself; it stays paused until you hand back.</div></div>`,
+  insp: `<div><h5>Who's asking</h5><div class="blk"><p>${av('AP')} Arun Pillai · Finance Ops</p><p>${S.req==='always'?'Always allowed (1:1)':S.req==='allowed'?'Allowed for this chat':S.req==='declined'?'Declined':'First message, waiting on you'}</p></div></div>
+         <div><h5>Tasks here</h5><div class="blk"><p>Co-funding Q1 user research <span class="mono">${S.ownDraft==='sent'?'done':S.req==='pending'?'—':'working'}</span></p></div></div>
+         <div><h5>What applies</h5><div class="blk"><p>Procurement limits: answers on its own</p><p>Budget and co-funding: drafts for you</p><p>Personal contact details: never</p></div></div>`
+});
+
+/* 5. permissions card, in chat */
+const PERM = {
+  'Answers on its own': [['Procurement limits','T1'],['Vendor shortlist status','T1'],['Leave and claims process','T1']],
+  'Drafts for you': [['Budget and co-funding','T2'],['Project timelines','T2'],['EXCO paper drafts','T2']],
+  'Never': [['Personal contact details','—'],['Staff performance','—']],
+};
+function permCols(){
+  const cols = JSON.parse(JSON.stringify(PERM));
+  S.permMoves.forEach(([item,from,to])=>{ const it = cols[from].find(i=>i[0]===item); cols[from] = cols[from].filter(i=>i[0]!==item); cols[to].push([item, to==='Never'?'—':to==='Drafts for you'?'T2':'T1', 'new']); });
+  return cols;
+}
+function permCard(editable){
+  const cols = permCols();
+  const scopes = ['Everyone','Arun Pillai','Priya Nair'];
+  return `<div class="card-h"><span class="k">What your duo may do</span><span class="st">from your current settings</span></div>
+    <div class="mover"><span>For</span>${scopes.map(s=>`<button class="chip" aria-pressed="${S.scope===s}" onclick="set('scope','${s}')">${s}</button>`).join('')}
+      <label class="toggle ${S.tiers?'on':''}" style="margin-left:auto" onclick="set('tiers',!S.tiers)"><span class="tr"></span><span class="prov">Tier codes</span></label></div>
+    ${S.scope!=='Everyone'?`<div class="prov" style="margin-top:4px">${S.scope==='Arun Pillai'?'Arun: same as everyone, and always allowed in one-to-one chats.':"Priya: same as everyone, except her own division's projects draft for you."}</div>`:''}
+    <div class="pcols">${Object.entries(cols).map(([c,items])=>`<div class="pcol"><h4>${c}</h4>${items.map(([n,t,nw])=>`<button class="pitem ${S.permSel&&S.permSel[0]===n?'sel':''} ${nw?'new':''}" ${editable?`onclick="S.permSel=['${n}','${c}'];render()"`:'disabled'}>${n}${S.tiers?`<span class="tier">${t}</span>`:''}</button>`).join('')||'<div class="prov">Nothing earned yet.</div>'}</div>`).join('')}</div>
+    ${S.permSel && editable ? `<div class="mover">Move <b style="color:var(--text)">${S.permSel[0]}</b> to ${Object.keys(cols).filter(c=>c!==S.permSel[1]).map(c=>`<button class="btn sm" onclick="S.pending=['${S.permSel[0]}','${S.permSel[1]}','${c}'];S.permSel=null;S.perm=2;render()">${c}</button>`).join('')}<button class="btn link" onclick="set('permSel',null)">Cancel</button></div>`:''}
+    <div class="hatch" style="margin-top:8px">Never on its own. You confirm each one.${S.tiers?' <span class="mono faint">T4</span>':''}<div class="prov">Anything external or irreversible: withdrawing a tender, sending outside the org, deleting records. No control here, by design.</div></div>
+    <div class="card-h" style="margin-top:12px"><span class="k">Who can reach it</span></div>
+    <dl class="reach">
+      <dt>Org wall</dt><dd>Anyone in the Agency for Sample Services (fictional) can send a first message. You allow each one.</dd>
+      <dt>Always allowed</dt><dd>${S.req==='always'?'Arun Pillai, ':''}Wei Jie Ong <button class="btn link" onclick="toast('Wei Jie removed from always allowed.',()=>{})">Remove</button></dd>
+      <dt>Rooms</dt><dd>#proc-reform · replies on @mention only</dd>
+      <dt>Ask links</dt><dd><span class="mono">ask/rl-7f3c</span> · 20 questions a day · expires 30 Nov <button class="btn link" onclick="toast('Ask link revoked.',()=>{})">Revoke</button></dd>
+      <dt>Away mode</dt><dd>Off <button class="btn link">Say "I'm away until…"</button></dd>
+    </dl>`;
+}
+scr.perms = () => {
+  const it = [];
+  it.push(person({name:'You', ini:'RL', time:'11:02', html:'What can you do?', me:true}));
+  it.push(duo({state:'permissions', time:'11:02', ln:'faint', html: permCard(S.perm<2) + `<div class="prov" style="margin-top:10px">Tap an item to move it, or just tell me, like "never answer questions about budgets".</div>`}));
+  if (S.said) it.push(person({name:'You', ini:'RL', time:'11:04', html:'Never answer questions about budgets.', me:true}));
+  if (S.perm>=2 && S.pending) {
+    const [itn,from,to] = S.pending;
+    const cbody = `<div class="card-h"><span class="k">Confirm this change</span><span class="st">for ${S.scope==='Everyone'?'everyone':S.scope}</span></div>
+      <div class="diff"><b>${itn}</b>: <del>${from}</del> → <ins>${to}</ins></div>
+      <div class="prov">${to==='Never'?"Your duo will decline these with its fixed polite words. 2 open drafts on this topic stay with you.":to==='Answers on its own'?'Your duo will answer these without asking you first.':'Your duo will draft these for you to send.'}</div>`;
+    if (S.perm===2) it.push(duo({state:'confirm change', time:'11:04', ln:'amber', html: cbody + `<div class="acts"><button class="btn pri" ${off()?'disabled':''} onclick="S.permMoves.push(S.pending);S.perm=3;toast('Permission changed.',()=>{S.permMoves.pop();S.perm=2})">Confirm</button><button class="btn" onclick="S.pending=null;S.perm=0;S.said=false;render()">Cancel</button>${offReason('Confirm')}</div>`}));
+    else {
+      it.push(duo({state:'confirm change · confirmed', time:'11:04', ln:'amber', cls:'decided', html: cbody}));
+      it.push(duo({state:'result', time:'11:04', ln:S.error?'faint':'moss', html: S.error ? `Couldn't save: <span class="ph">daemon error, verbatim</span>. Nothing changed. <div class="acts"><button class="btn sm" onclick="S.error=false;render()">Try again</button></div>`
+        : `<div class="card-h"><span class="k">Updated</span></div><b>${itn}</b> is now under <b>${to}</b>. The card above shows it highlighted. <a href="#">Activity log entry</a>`}));
+    }
+  }
+  const sugg = S.perm===0 ? `<div class="sugg"><button class="chip" onclick="S.said=true;S.pending=['Budget and co-funding','Drafts for you','Never'];S.perm=2;render()">Never answer questions about budgets</button><button class="chip" onclick="set('scope','Arun Pillai')">What can Arun see?</button></div>` : '';
+  return { hdr: hdrDuo(), body: it.join(''), composer: `<div class="composer">${sugg}<div class="cbox"><input placeholder="Ask your duo…"><button class="btn sm pri">↑</button></div></div>` };
+};
+
+/* 6. create a group, in chat */
+scr.mkgroup = () => {
+  const it = [];
+  it.push(person({name:'You', ini:'RL', time:'15:10', html:'Make a group with Priya, Arun and my policy research desk duo to review the records-pilot vendors.', me:true}));
+  it.push(duo({state:'ack', time:'15:10', ln:'faint', html:"Sure. I've filled in what I could. Check it, then create."}));
+  const form = locked => `<div class="card-h"><span class="k">New group</span><span class="st">filled from your message</span></div>
+    <div class="form">
+      <label>Name</label><div><input value="${esc(S.grpName)}" ${locked?'disabled':''} oninput="S.grpName=this.value"><span class="guess">guessed</span></div>
+      <label>People and duos</label><div class="mchips">${S.grpMembers.map((m,i)=>`<span class="mchip">${m.includes('desk duo')?mark({desk:true}):av(ini(m))}${esc(m)}${locked?'':`<button aria-label="Remove ${esc(m)}" onclick="S.grpMembers.splice(${i},1);render()">×</button>`}</span>`).join('')}${locked?'':'<button class="chip">+ Add</button>'}</div>
+      <label>Your duo joins</label><div><label class="toggle ${S.grpDuoJoins?'on':''} ${locked?'locked':''}" onclick="${locked?'':"set('grpDuoJoins',!S.grpDuoJoins)"}"><span class="tr"></span>${S.grpDuoJoins?'Yes':'No'}</label></div>
+      <label>Duos reply</label><div><label class="toggle on locked"><span class="tr"></span>Only when @mentioned or replied to</label><span class="guess">always, in groups</span></div>
+    </div>`;
+  if (S.grp<2) it.push(duo({state:'form', time:'15:10', ln:'faint', html: form(false) + `<div class="acts"><button class="btn pri" ${off()?'disabled':''} onclick="S.grp=2;render();setTimeout(()=>{S.grp=3;render()},900)">Create group</button><button class="btn" onclick="toast('Cancelled. Nothing was created.')">Cancel</button>${offReason('Create')}</div><div class="prov" style="margin-top:6px">Priya and Arun get an invite. Your desk duo joins because you own it.</div>`}));
+  else it.push(duo({state:'form · submitted', time:'15:11', ln:'faint', cls:'decided', html: form(true)}));
+  if (S.grp===2) it.push(duo({state:'working', time:'15:11', ln:'faint', working:true, html:'Creating the room and sending invites…'}));
+  if (S.grp>=3) it.push(S.error ? duo({state:'result', time:'15:11', ln:'faint', html:`Couldn't create the room: <span class="ph">daemon error, verbatim</span>. Nothing was created and no invites went out.<div class="acts"><button class="btn sm" onclick="S.error=false;render()">Try again</button></div>`})
+    : duo({state:'result', time:'15:11', ln:'moss', html:`<div class="card-h"><span class="k">Group created</span></div>
+      <div style="display:flex;gap:10px;align-items:center"><span class="mono faint">#</span><b>records-pilot-vendor-review</b><span class="prov">${S.grpMembers.length + 1 + (S.grpDuoJoins?1:0)} members · Priya and Arun invited</span></div>
+      <div class="acts"><button class="btn pri" onclick="go('group')">Open</button><button class="btn">Edit members</button><button class="btn" onclick="S.grp=0;toast('Room removed. Invites withdrawn.',()=>{S.grp=3})">Undo</button></div>`}));
+  return { hdr: hdrDuo(), body: it.join(''), composer: composer('Ask your duo…') };
+};
+
+/* 7. group room with @mention gating */
+scr.group = () => {
+  const it = [
+    person({name:'Priya Nair', ini:'PN', time:'15:20', html:'Morning all. Vendor B sent their revised quote.'}),
+    `<div class="prov" style="display:flex;gap:6px;align-items:center;margin-top:-8px">${mark()} No duo replied: nobody @mentioned one.</div>`,
+    person({name:'Arun Pillai', ini:'AP', time:'15:22', html:`<span class="pill duo">${mark()} Rachel's duo</span> is the revised quote still under the $90k approval band?`}),
+    duo({name:"Rachel's duo", state:'answered', time:'15:22', ln:'moss', html:'Yes. $84,600 is under the $90,000 band (PS-14/2026 §4.1), so approval stays with the division.<div class="trust"><span class="bar" style="--ln:var(--confident)"></span>Confident. Drew on 2 sources.</div>' + reacts('g1')}),
+  ];
+  it.push(person({name:'Wei Jie Ong', ini:'WJ', time:'15:23', html:`<span class="pill duo">${mark()} Rachel's duo</span> when does it close?`}));
+  it.push(duo({name:"Rachel's duo", state:S.gpick?'decided':'needs a choice', time:'15:23', ln:'amber', html:`Wei Jie, did you mean one of these?<div class="opts">${['"When does the records-pilot tender close?"','"When does Vendor B\'s revised quote expire?"'].map((o,i)=>`<button class="opt ${S.gpick===i+1?'chosen':''}" disabled><span class="n">${i+1}</span><span>${o}</span></button>`).join('')}</div><div class="prov" style="margin-top:6px">Read-only for you: only Wei Jie, who asked, can choose.</div>`}));
+  S.gmsgs.forEach(m => {
+    it.push(person({name:'You', ini:'RL', time:'now', html: m.mention?`<span class="pill duo">${mark()} Rachel's duo</span> ${esc(m.t)}`:esc(m.t), me:true}));
+    if (m.mention) it.push(duo({name:"Rachel's duo", state:'ack', time:'now', ln:'faint', html:"On it. I'll post the table here when it's ready. <span class='mono faint'>task · acknowledged</span>"}));
+    else it.push(`<div class="prov" style="display:flex;gap:6px;align-items:center;margin-top:-8px">${mark()} No duo replied: nobody @mentioned one.</div>`);
+  });
+  return {
+    hdr: `<span class="mono faint" style="font-size:16px">#</span><div class="who"><div class="t">proc-reform</div><div class="s">5 people · 2 duos</div></div><button class="btn sm" onclick="set('insp',!S.insp)">Members<span class="kbd">⌘I</span></button>`,
+    banner: `<div class="banner ver">${mark()} Duos here reply only when @mentioned, or when you reply to one of their messages.</div>`,
+    body: it.join(''),
+    composer: `<div class="composer"><div class="sugg"><span class="prov">@</span><button class="chip">${av('PN')} Priya Nair</button><button class="chip" onclick="set('gmention',true)">${mark()} Rachel's duo</button><button class="chip">${mark()} Bala's duo</button></div>
+      <div class="cbox">${S.gmention?`<span class="pill duo">${mark()} Rachel's duo</span>`:''}<input id="gin" value="compare all three quotes in a table"><label class="toggle ${S.gmention?'on':''}" onclick="set('gmention',!S.gmention)"><span class="tr"></span><span class="prov">mention</span></label><button class="btn sm pri" onclick="S.gmsgs.push({t:document.getElementById('gin').value,mention:S.gmention});render()">↑</button></div>
+      <div class="cnote">${S.gmention?"Rachel's duo will reply to this.":"No duo will reply to this message."}</div></div>`,
+    insp: `<div><h5>People</h5>${['Rachel Lim (you)','Priya Nair','Arun Pillai','Wei Jie Ong','Bala Krishnan'].map(n=>`<div class="mem">${av(ini(n))}${n}</div>`).join('')}</div>
+      <div><h5>Duos</h5><div class="mem">${mark()} Rachel's duo<span class="r">@mention only</span></div><div class="mem">${mark()} Bala's duo<span class="r">@mention only</span></div></div>
+      <div><h5>Add a duo</h5><div class="blk"><p>Ask your duo: "add my policy research desk duo to #proc-reform". You confirm on a card.</p></div></div>`
+  };
+};
+
+/* 8. owner task list */
+scr.tasks = () => {
+  const rows = [
+    ['Co-funding Q1 user research','Arun Pillai','working','escalate','Draft waiting on you','14:05','owner'],
+    ['Withdraw tender TND-2026-0412','Priya Nair','needs decision','escalate','Needs your confirm','10:35','cards'],
+    ['Q4 savings one-pager','You','done','confident','2 files','09:12','duo'],
+    ['Vendor quote comparison','You · #proc-reform','acknowledged','faint','Starting','15:24','group'],
+    ['Weekly status (routine)','Weekly reports desk duo','failed','faint','Over budget: stopped at 20 min','Mon 09:00','mkdesk'],
+  ];
+  const f = S.tfilter;
+  const shown = S.empty ? [] : rows.filter(r => f==='All' || r[2]===f.toLowerCase());
+  return {
+    hdr: `<span class="mono faint">≡</span><div class="who"><div class="t">Tasks</div><div class="s">Every task your duos hold. A read-only mirror: you act in the chat it came from.</div></div>`,
+    body: `<div class="sugg" style="max-width:none">${['All','Acknowledged','Working','Needs decision','Done','Failed'].map(x=>`<button class="chip" aria-pressed="${f===x}" onclick="set('tfilter','${x}')">${x}</button>`).join('')}</div>
+      <div style="max-width:none">${shown.length ? `<table class="tbl"><tr><th>Task</th><th>Asked by</th><th>State</th><th>Latest</th><th>Since</th><th></th></tr>
+      ${shown.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td><span class="state" style="--ln:var(--${r[3]})">${r[2]}</span></td><td>${r[4]}</td><td class="mono">${r[5]}</td><td><button class="btn sm" onclick="go('${r[6]}')">Open chat</button></td></tr>`).join('')}</table>`
+      : `<div class="empty">${S.empty?"No tasks yet. When someone asks your duo something it can't answer at once, the task shows up here and in that chat.":'Nothing in this state.'}</div>`}</div>
+      <div class="prov">You can also ask your duo "what's open?" and it replies with this list as a card.</div>`,
+    composer: ''
+  };
+};
+</script>
+<script>
+/* 9. create a desk duo in chat (v2) + routine in chat */
+const AV = ['◆','▲','●','■','✶'];
+scr.mkdesk = () => {
+  const it = [];
+  const atCap = S.deskCount>=5 && S.desk<3;
+  it.push(person({name:'You', ini:'RL', time:'16:00', html:'Create a new desk duo for policy research.', me:true}));
+  if (atCap) {
+    it.push(duo({state:'needs a choice', time:'16:00', ln:'amber', html:`You already have 5 desk duos, the most you can have. Remove one to make room?
+      <div class="opts">${['Weekly reports','Procurement','Comms','Data','Events'].map((n,i)=>`<button class="opt" onclick="S.deskCount=4;toast('${n} desk duo ended.',()=>{S.deskCount=5})"><span class="n">${i+1}</span><span>End ${n}<span class="d">Its chat and memory end now</span></span></button>`).join('')}<button class="opt" onclick="toast('Kept all 5. Nothing was created.')"><span class="n">·</span><span>Keep all 5</span></button></div>`}));
+    return { hdr: hdrDuo(), body: it.join(''), composer: composer('Ask your duo…'), banner: deskBanner() };
+  }
+  it.push(duo({state:'ack', time:'16:00', ln:'faint', html:`Sure. I've filled in what I could from your message. You have ${Math.min(S.deskCount, S.desk>=3?S.deskCount-1:S.deskCount)} of 5 desk duos.`}));
+  const form = locked => `<div class="card-h"><span class="k">New desk duo</span><span class="st">about a minute</span></div>
+    <div class="form">
+      <label>Name</label><div><input value="${esc(S.deskName)}" ${locked?'disabled':''} oninput="S.deskName=this.value"><span class="guess">guessed</span></div>
+      <label>Role</label><div><input value="${esc(S.deskRole)}" ${locked?'disabled':''}><span class="guess">guessed</span></div>
+      <label>One-line brief</label><div><input value="${esc(S.deskBrief)}" ${locked?'disabled':''}><span class="guess">guessed</span></div>
+      <label>Instructions</label><div><textarea ${locked?'disabled':''}>${esc(S.deskInstr)}</textarea></div>
+      <label>Avatar</label><div style="display:flex;gap:6px;align-items:center">${AV.map((g,i)=>`<button class="avt ${S.deskAv===i?'sel':''}" ${locked?'disabled':''} onclick="set('deskAv',${i})" aria-label="Avatar ${i+1}">${g}</button>`).join('')}<button class="chip" ${locked?'disabled':''}>Upload image</button><span class="prov">Never a person's photo.</span></div>
+      <label>Tag</label><div style="display:flex;gap:8px;align-items:center"><input style="width:56px" class="mono" value="${S.deskTag}" maxlength="2" ${locked?'disabled':''}><span class="prov">Shown beside the name everywhere, with the duo mark.</span></div>
+
+      <label>Knows</label><div class="mchips">${S.deskSources.map(s=>`<span class="mchip"><span class="fi">DIR</span>${s}${locked?'':'<button aria-label="Remove">×</button>'}</span>`).join('')}${locked?'':'<button class="chip">+ Add source</button>'}</div>
+      <label>May do</label><div><label class="toggle on locked"><span class="tr"></span>Drafts everything for you</label><span class="guess">default; it earns more</span></div>
+      <label>Who can use it</label><div class="prov">Only you. Visitors can't reach desk duos.</div>
+    </div>
+    <div class="warn">Not cleared for classified or sensitive government data. Only add sources cleared for this pilot.</div>`;
+  if (S.desk<2) it.push(duo({state:'form', time:'16:00', ln:'faint', html: form(false) + `<div class="acts"><button class="btn pri" ${off()?'disabled':''} onclick="S.desk=2;render();setTimeout(()=>{S.desk=3;S.deskCount++;render()},1100)">Create desk duo</button><button class="btn" onclick="toast('Cancelled. Nothing was created.')">Cancel</button>${offReason('Create')}</div>`}));
+  else it.push(duo({state:'form · submitted', time:'16:01', ln:'faint', cls:'decided', html: form(true)}));
+  if (S.desk===2) it.push(duo({state:'task · working', time:'16:01', ln:'faint', working:true, html:`<ul class="ms" style="margin:0"><li class="done"><span class="dot">✓</span>Created Policy research</li><li class="now"><span class="dot">·</span>Reading 2 folders (142 documents)</li></ul>`}));
+  if (S.desk>=3) {
+    if (S.error) it.push(duo({state:'result', time:'16:01', ln:'faint', html:`Couldn't create it: <span class="ph">daemon error, verbatim</span>. Nothing was created.<div class="acts"><button class="btn sm" onclick="S.error=false;render()">Try again</button></div>`}));
+    else {
+      it.push(duo({state:'result', time:'16:01', ln:'moss', html:`<div class="card-h"><span class="k">Desk duo created</span><span class="st mono">52 s</span></div>
+        <div style="display:flex;gap:12px;align-items:center"><span class="avt sel" style="cursor:default">${AV[S.deskAv]}</span><div><div>${mark({desk:true})} <b>${esc(S.deskName)}</b> <span class="deskTag">${S.deskTag}</span> <span class="prov">· Rachel's desk duo</span></div><div class="prov">${esc(S.deskBrief)}</div></div></div>
+        <div class="prov" style="margin-top:6px">Read 142 documents. Drafts everything for you until it earns more. Only you can use it.</div>
+        <div class="acts"><button class="btn pri">Open its chat</button><button class="btn">Edit</button><button class="btn" onclick="S.desk=0;S.deskCount--;S.routine=0;toast('Policy research desk duo ended.',()=>{S.desk=3;S.deskCount++})">End it</button></div>`}));
+      it.push(person({name:'You', ini:'RL', time:'16:03', html:'Every Monday 9am, have it draft the weekly policy digest from new circulars.', me:true}));
+      const rb = `<div class="card-h"><span class="k">New routine</span></div>
+        <div class="form"><label>When</label><div><input value="Every Monday, 09:00" ${S.routine?'disabled':''}></div><label>Desk duo</label><div style="display:flex;gap:6px;align-items:center">${mark({desk:true})} Policy research</div><label>Does</label><div><input value="Drafts the weekly policy digest from new circulars" ${S.routine?'disabled':''}></div><label>Delivers to</label><div class="prov">This chat, as a task with links. Nothing goes to anyone else.</div></div>`;
+      if (!S.routine) it.push(duo({state:'confirm', time:'16:03', ln:'amber', html: rb + `<div class="acts"><button class="btn pri" ${off()?'disabled':''} onclick="set('routine',1)">Set routine</button><button class="btn" onclick="toast('Cancelled. No routine was set.')">Cancel</button>${offReason('Confirm')}</div>`}));
+      else {
+        it.push(duo({state:'confirm · done', time:'16:03', ln:'amber', cls:'decided', html: rb}));
+        it.push(duo({state:'result', time:'16:03', ln:'moss', html:`<div class="card-h"><span class="k">Your routines</span><span class="st">3</span></div>
+          <table class="tbl"><tr><th>When</th><th>Desk duo</th><th>Does</th><th>Last run</th><th>On</th></tr>
+          <tr><td>Mon 09:00</td><td>Policy research</td><td>Weekly policy digest</td><td class="mono">first run 26 Oct</td><td><label class="toggle on" onclick="this.classList.toggle('on')"><span class="tr"></span></label></td></tr>
+          <tr><td>Mon 09:00</td><td>Weekly reports</td><td>Weekly status</td><td><span class="state">failed</span></td><td><label class="toggle on" onclick="this.classList.toggle('on')"><span class="tr"></span></label></td></tr>
+          <tr><td>New file in Circulars/</td><td>Procurement</td><td>Summarise it</td><td><span class="state" style="--ln:var(--confident)">done</span></td><td><label class="toggle" onclick="this.classList.toggle('on')"><span class="tr"></span></label></td></tr></table>
+          <div class="prov" style="margin-top:6px">The switch pauses a routine. Say "delete the weekly status routine" to remove one.</div>`}));
+      }
+    }
+  }
+  return { hdr: hdrDuo(), body: it.join(''), composer: composer('Ask your duo…'), banner: deskBanner() };
+};
+function deskBanner(){ return `<div class="banner ver"><span class="mono">v2</span> One personal duo plus up to 5 desk duos, owner-only (D1, decided 20 Oct 2026). <button class="btn link" onclick="S.desk=0;S.routine=0;S.deskCount=S.deskCount>=5?3:5;render()">${S.deskCount>=5?'Show the normal case':'Show the at-5 case'}</button></div>`; }
+
+/* 10. orchestrator room (v2) */
+scr.orch = () => {
+  const st = S.orch;
+  const it = [];
+  it.push(person({name:'You', ini:'RL', time:'09:30', html:`<span class="pill duo">${mark()} Your duo</span> I need a one-page briefing on vendor consolidation for Thursday's EXCO, with the spend numbers.`, me:true}));
+  it.push(duo({name:'Your duo', tag:'LEAD', state:'ack', time:'09:30', ln:'faint', html:"On it. The spend analysis goes to Data and the summary to Comms. I'll post the finished briefing here."}));
+  it.push(duo({name:'Your duo', tag:'LEAD', state:'handoffs', time:'09:30', ln:'faint', quiet:true, html:`
+    <div class="file" style="margin-top:0"><span class="fi">HANDOFF</span><span class="fn">${mark({desk:true})} Data · vendor spend FY25–26</span><span class="mono faint">hop 1/1 · 20 min</span><span class="mono">${st>=1?'done':'working'}</span></div>
+    <div class="file"><span class="fi">HANDOFF</span><span class="fn">${mark({desk:true})} Comms · EXCO summary</span><span class="mono faint">hop 1/1 · 15 min</span><span class="mono">${S.error&&st>=1?'failed':st>=4?'done':st>=2?'needs decision':'waiting on Data'}</span></div>
+    <div class="prov" style="margin-top:6px">Only your duo hands off. Desk duos can't hand off again.</div>`}));
+  if (st>=1) it.push(duo({name:'Data', desk:true, tag:'DA', state:'finished', time:'09:41', ln:'moss', html:`Spend with 14 vendors totalled $3.2M in FY25–26. The top 3 vendors hold most of it (bar below).<div style="margin-top:6px;height:6px;background:var(--surface-2);border-radius:3px;overflow:hidden"><div style="width:71%;height:100%;background:var(--muted)"></div></div><div class="file"><span class="fi">XLSX</span><span class="fn">vendor-spend-FY25-26.xlsx</span><button class="btn sm">Open</button></div>`}));
+  if (S.error && st>=1) it.push(duo({name:'Comms', desk:true, tag:'CO', state:'failed', time:'09:50', ln:'faint', html:'Over budget: stopped at 15 min and returned to your duo.'}), duo({name:'Your duo', tag:'LEAD', state:'needs a choice', time:'09:50', ln:'amber', html:`Comms ran out of time on the summary. What now?<div class="opts"><button class="opt"><span class="n">1</span><span>Give it 15 more minutes</span></button><button class="opt"><span class="n">2</span><span>Send me the spend table only</span></button></div>`}));
+  else {
+    if (st>=2) it.push(duo({name:'Comms', desk:true, tag:'CO', state:st>=3?'decided':'needs a choice', time:'09:47', ln:'amber', html:`Which framing should the briefing lead with?<div class="opts">${['Savings first','Risk first (single-vendor dependency)','Neutral options paper'].map((o,i)=>`<button class="opt ${S.tone===o?'chosen':''}" ${st>=3?'disabled':''} onclick="S.tone='${o}';S.orch=3;render()"><span class="n">${i+1}</span><span>${o}</span></button>`).join('')}</div>`}));
+    if (st>=4) it.push(duo({name:'Your duo', tag:'LEAD', state:'result', time:'09:55', ln:'moss', html:`Briefing ready, leading with ${(S.tone||'Savings first').toLowerCase()}.<div class="file"><span class="fi">DOCX</span><span class="fn">EXCO-briefing-vendor-consolidation.docx</span><span class="prov">1 page</span><button class="btn sm">Open</button></div><div class="prov" style="margin-top:6px">From Data (spend table) and Comms (summary). 2 handoffs, 25 min.</div>` + reacts('o1')}));
+  }
+  const next = (st===0||st===1||st===3) && !(S.error&&st>=1) ? `<div><button class="btn sm" onclick="S.orch=${st===3?4:st+1};render()">Simulate next</button></div>` : '';
+  return {
+    hdr: `${mark({lg:true})}<div class="who"><div class="t">Q4 briefing room</div><div class="s">You · your duo (lead) · 3 desk duos</div></div><button class="btn sm" onclick="set('insp',!S.insp)">Members<span class="kbd">⌘I</span></button>`,
+    banner: `<div class="banner ver"><span class="mono">v2</span> You talk to your duo. Desk duos post only finished work or a choice. Made in chat: "make a room with my Data, Comms and Procurement desk duos".</div>`,
+    body: it.join('') + next,
+    composer: composer('Message your duo (lead)…'),
+    insp: `<div><h5>People</h5><div class="mem">${av('RL')} Rachel Lim (you)</div></div>
+      <div><h5>Lead</h5><div class="mem">${mark()} Your duo<span class="r">hands off work</span></div></div>
+      <div><h5>Desk duos</h5>${[['Data','DA'],['Comms','CO'],['Procurement','PC']].map(([n,t])=>`<div class="mem">${mark({desk:true})} ${n} <span class="deskTag">${t}</span><span class="r">finished work only</span></div>`).join('')}</div>
+      <div><h5>Budget</h5><div class="blk"><p>Each handoff carries a time budget. Over budget ends it as failed, with a reason, back to the lead.</p></div></div>`
+  };
+};
+
+function inspDefault(){
+  if (S.screen==='cards') return `<div><h5>Why it drafted</h5><div class="blk"><p>Trust reading: confident.</p><p>Standing order: "Vendor status: answer from the Q4 folder".</p><p>Drew on 3 sources.</p></div></div><div><h5>Who's asking</h5><div class="blk"><p>${av('PN')} Priya Nair · Records Division</p></div></div><div><h5>Waiting on you here</h5><div class="blk"><p>${(S.draft==='open'||S.draft==='editing'?1:0)+(S.t4==='card'?1:0)}</p></div></div>`;
+  if (S.screen==='tasks') return `<div><h5>About this list</h5><div class="blk"><p>A read-only mirror. Every row opens the chat where you act on it.</p></div></div><div><h5>States</h5><div class="blk"><p>acknowledged → working → needs decision → done or failed</p></div></div>`;
+  return `<div><h5>Portrait</h5><div class="portrait">You were asked about procurement limits 23 times in six months.</div></div>
+  <div><h5>Knows</h5><div class="blk"><p>Q4 folder · Policy circulars · 3 bridged chats</p></div></div>
+  <div><h5>Desk duos</h5><div class="blk"><p>${S.deskCount} of 5</p></div></div>
+  <div><h5>Ask it</h5><div class="blk"><p>"What can you do?" · "What's open?" · "Make a group with…" · "Create a desk duo for…"</p></div></div>`;
+}
+
+/* ============ render ============ */
+function render(){
+  document.body.classList.toggle('is-offline', S.offline);
+  const s = scr[S.screen]();
+  document.getElementById('proto').innerHTML = `<span class="tag">duo prototype v0.1</span>${SCREENS.map(([id,l,v])=>`<button class="tab" aria-current="${S.screen===id}" onclick="go('${id}')">${l}<span class="v">${v}</span></button>`).join('')}
+    <span class="sw"><label><input type="checkbox" ${S.offline?'checked':''} onchange="set('offline',this.checked)">Offline</label><label><input type="checkbox" ${S.error?'checked':''} onchange="set('error',this.checked)">Error</label><label><input type="checkbox" ${S.empty?'checked':''} onchange="set('empty',this.checked)">Empty</label><button class="tab" onclick="const sc=S.screen;S=init();S.screen=sc;render()">Reset</button></span>`;
+  document.getElementById('list').innerHTML = s.list || ownerList(S.screen);
+  document.getElementById('conv').innerHTML = `<div class="offline">You're offline. Messages you write send when you reconnect. Send, Confirm and Create are off until then.</div>
+    <div class="hdr">${s.hdr}</div>${s.banner||''}<div class="stream" id="stream">${s.body}</div>${s.composer||''}`;
+  const insp = document.getElementById('insp'); insp.classList.toggle('on', S.insp);
+  insp.innerHTML = `<div class="in">${s.insp || inspDefault()}</div>`;
+  let ov = '';
+  if (S.dlg==='t4') ov = `<div class="scrim"><div class="dialog" role="alertdialog" aria-labelledby="dt"><h3 id="dt">Withdraw tender TND-2026-0412?</h3><p class="mono faint">Sample, nothing runs</p><p>This withdraws the records-digitisation pilot tender from the procurement portal. The portal notifies all 3 vendors. <b style="color:var(--text)">It can't be undone.</b></p><p class="prov">Confirm has no keyboard shortcut. Cancel is focused.</p><div class="acts" style="justify-content:flex-end"><button class="btn" id="dcancel" onclick="S.dlg=null;render()">Cancel</button><button class="btn pri" ${off()?'disabled':''} onclick="S.dlg=null;S.t4='done';render()">Confirm</button></div></div></div>`;
+  if (S.toast) ov += `<div class="toast">${esc(S.toast.msg)}${S.toast.undo?`<button class="btn sm" onclick="undo()">Undo<span class="kbd">⌘Z</span></button>`:''}</div>`;
+  document.getElementById('overlay').innerHTML = ov;
+  if (S.dlg) setTimeout(()=>{ const c=document.getElementById('dcancel'); c && c.focus(); }, 0);
+}
+document.addEventListener('keydown', e => {
+  if ((e.metaKey||e.ctrlKey) && e.key==='i') { e.preventDefault(); set('insp',!S.insp); }
+  if ((e.metaKey||e.ctrlKey) && e.key==='z' && S.toast && S.toast.undo) { e.preventDefault(); undo(); }
+  if (e.key==='Escape' && S.dlg) { S.dlg=null; render(); }
+});
+const q = new URLSearchParams(location.search);
+if (q.get('screen')) S.screen = q.get('screen');
+if (q.get('shot')) document.body.classList.add('shot');
+window.__S = () => S; window.__set = o => { Object.assign(S, o); render(); };
+render();
+</script>
+</body>
+</html>
