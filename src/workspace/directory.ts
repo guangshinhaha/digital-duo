@@ -23,8 +23,9 @@ import type { WorkspaceMember, WorkspaceMemberListing, WorkspacePresence } from 
  * the duo's identity is structural, so the owner↔duo linkage needs no second
  * registry, no mapping file, and no synchronization — `duoUserIdFor` and its
  * inverse are pure string derivations over that convention, and the mapping
- * is a bijection on user ids by construction (two owners cannot contest one
- * duo; one duo cannot belong to two people). The cost of deriving instead of
+ * is a function from duo ids to their one owner (two owners cannot contest
+ * one duo); an owner may hold a personal duo and up to five desk duos
+ * (`@duo-<owner>.<desk>`). The cost of deriving instead of
  * registering is that the `duo-` localpart namespace is reserved by the
  * convention: a person whose localpart starts with `duo-` is
  * indistinguishable from a duo and the directory says so by exclusion — on a

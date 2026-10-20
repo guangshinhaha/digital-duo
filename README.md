@@ -46,16 +46,18 @@ is annoying.
 
 Backlog: **13 epics, 72 issues** across phase 1 (private drafting), phase 1.5 (a shared
 document-grounded duo), phase 2 (public answering, permissions, trust) and phase 3 (actions,
-role duos).
+role duos, desk duos (owner-created role duos)).
 
 ## Principles
 
 - **Trust is per-topic and per-action, never global.** Promote slowly, demote fast.
 - **Anything external or irreversible is never autonomous.** A stated principle, not a caveat — `docs/concept.md` §6, on T4 actions: "Never autonomous. Product principle, not a limitation." Enforced structurally, not by convention: no trust-grid cell for T4 can exist (a database `CHECK` constraint, not just an absent grant), and every T4 action requires a separate, explicit human confirmation at the moment of execution (`src/actions/t4-guard.ts`).
-- **The user never writes their personality — they approve a draft of it.**
-- **Self-created duos only**, always labelled, instantly killable.
+- **Your personal duo's personality is derived, never written — you approve a draft of it.** Desk duos are the
+  exception: you write their brief and instructions.
+- **Self-created duos only**, always labelled, instantly killable: one personal duo, plus up to five desk duos of your own.
 - **Start with what needs no one's permission.** Every approval you wait on is a week not shipped.
-- **A persona without decision history is a commodity.** Never build a persona-authoring product, and never call a duo an employee.
+- **A persona without decision history is a commodity.** Desk duos are owner-private and bounded — no template
+  gallery, no marketplace — and no duo is ever called an employee, assistant or teammate.
 
 ## Development
 

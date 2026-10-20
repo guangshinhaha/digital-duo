@@ -136,6 +136,9 @@ pairing — and never leave the daemon. It joins rooms by invitation, the same a
 (An application service managing many duo accounts is the later, scaled shape; the pilot needs
 one account per duo and nothing more.)
 
+A desk duo is a duo like any other — its own account, posting under its own identity — whose id names its owner
+and its desk (`@duo-alice.leave:workspace`). Every rule here holds for it unchanged.
+
 Our own second layer stays: `DuoMessage` remains avatarless, the ESLint rule and the
 `InsideDuoMessage` guard remain and extend to multi-party rooms (duo issue #60). Protocol
 enforcement plus rendering enforcement — belt and braces, because an officer's word carries

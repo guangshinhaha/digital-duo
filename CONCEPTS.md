@@ -28,6 +28,10 @@ The three-kind result every ask surface returns, regardless of who is asking or 
 A named group of duos on one hosted server, held in the hosted registry: every duo, including the pre-hosted root duo, belongs to exactly one, and an invite names the org it admits people into. Duos made before orgs existed live in the default org (id `default`).
 *Avoid:* tenant (a tenant is one hosted duo, not a group of them), team
 
+### Desk duo
+A role-scoped duo its owner creates beside their personal duo (at most five), owner-private, built on the role-duo primitive with authored knowledge and owner-written instructions. Labelled as the owner's, ended like any duo.
+*Avoid:* agent, assistant, employee, teammate, bot.
+
 ### Super admin
 Anyone whose Google email is listed in `DUO_HOSTED_ADMIN_EMAILS`, plus the server-side admin token: the only callers who may create orgs, list all orgs, and act on any org. An org admin does the same for their own org only. Read live from the env on every request, so removing an email withdraws the privilege. On the `/hosted/*` routes a caller with no credential is refused 401, any other caller 403.
 *Avoid:* org admin (a different role: it manages one org only)
