@@ -6,7 +6,16 @@ import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../src/p
 import { readRoomConsent, RoomConsentNotFoundError, type RoomConsentEntry } from "../src/workspace/consent.js";
 import type { DuoReadState } from "../src/workspace/read-state.js";
 import type { RoomInvite } from "../src/workspace/messages.js";
-import { availabilityOfState, NoPendingInviteError, reconnectDelayMs, RecentlySeenEventIds, WorkspaceService, type WorkspaceServiceState } from "../src/workspace/service.js";
+import {
+  availabilityOfState,
+  NoPendingInviteError,
+  reconnectDelayMs,
+  RecentlySeenEventIds,
+  WorkspaceService,
+  type OpenWorkspaceCard,
+  type WorkspaceServiceState,
+  type WorkspaceTaskSink,
+} from "../src/workspace/service.js";
 import type { WorkspaceSettings } from "../src/workspace/settings.js";
 import {
   WorkspaceTokenRevokedError,
@@ -30,6 +39,7 @@ function settings(overrides: Partial<WorkspaceSettings> = {}): WorkspaceSettings
     reconnect: { initialDelayMs: 1000, maxDelayMs: 8000 },
     presenceIntervalMs: 5000,
     backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
+    ackAfterMs: 2000,
     ...overrides,
   };
 }
@@ -1786,6 +1796,504 @@ describe("WorkspaceService — the attachment grounding door (#190)", () => {
     expect(answers[0]!.grounding).toBeUndefined();
     expect(transport.fetchFileCalls).toEqual([]);
     expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to plain question"]);
+    await service.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W-S4-5: the ack timer and the outcome → card mapping. A small in-memory
+// WorkspaceTaskSink stands in for src/serve/workspace-tasks.ts — narrow,
+// following FakeWorkspaceTransport's style but much smaller since the
+// interface itself is narrow (service.ts's own doc comment on it).
+// ---------------------------------------------------------------------------
+
+class FakeTaskSink implements WorkspaceTaskSink {
+  private nextId = 0;
+  readonly tasks = new Map<string, { state: string; draftId?: string }>();
+  readonly cards = new Map<string, { taskId: string; roomId: string; eventId: string; rev: number; state: string }>();
+  readonly createTaskCalls: { roomId: string; questionEventId: string; requester: string; draftId?: string }[] = [];
+  readonly createCardCalls: { taskId: string; roomId: string; eventId: string; kind: string; audience: string; state: string; requester: string }[] = [];
+  readonly recordCardEditCalls: { cardId: string; rev: number; state: string }[] = [];
+  readonly updateTaskStateCalls: { taskId: string; event: string | undefined; fields?: { draftId?: string } }[] = [];
+
+  createTask(input: { roomId: string; questionEventId: string; requester: string; draftId?: string }): { taskId: string } {
+    this.nextId += 1;
+    const taskId = `task-${this.nextId}`;
+    this.tasks.set(taskId, { state: "acknowledged", draftId: input.draftId });
+    this.createTaskCalls.push({ ...input });
+    return { taskId };
+  }
+
+  updateTaskState(taskId: string, event: "start_working" | "need_decision" | "resume_working" | "complete" | "fail" | undefined, fields?: { draftId?: string }): void {
+    this.updateTaskStateCalls.push({ taskId, event, fields });
+    const task = this.tasks.get(taskId);
+    if (task === undefined) {
+      return;
+    }
+    if (event !== undefined) {
+      task.state = event === "complete" ? "done" : event === "fail" ? "failed" : event === "start_working" || event === "resume_working" ? "working" : "needs_decision";
+    }
+    if (fields?.draftId !== undefined) {
+      task.draftId = fields.draftId;
+    }
+  }
+
+  createCard(input: { taskId: string; roomId: string; eventId: string; kind: string; audience: string; state: string; requester: string }): { cardId: string } {
+    this.nextId += 1;
+    const cardId = `card-${this.nextId}`;
+    this.cards.set(cardId, { taskId: input.taskId, roomId: input.roomId, eventId: input.eventId, rev: 1, state: input.state });
+    this.createCardCalls.push({ ...input });
+    return { cardId };
+  }
+
+  recordCardEdit(cardId: string, fields: { rev: number; state: string }): void {
+    this.recordCardEditCalls.push({ cardId, ...fields });
+    const card = this.cards.get(cardId);
+    if (card === undefined) {
+      return;
+    }
+    card.rev = fields.rev;
+    card.state = fields.state;
+  }
+
+  openCardFor(taskId: string, roomId: string): OpenWorkspaceCard | undefined {
+    for (const [cardId, card] of this.cards) {
+      if (card.taskId === taskId && card.roomId === roomId && card.state !== "done" && card.state !== "failed") {
+        return { cardId, taskId: card.taskId, eventId: card.eventId, rev: card.rev, state: card.state };
+      }
+    }
+    return undefined;
+  }
+}
+
+function taskSinkHarness(
+  taskSink: FakeTaskSink,
+  harnessSettings: WorkspaceSettings = settings(),
+  answerImpl?: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>,
+): Harness {
+  const transport = new FakeWorkspaceTransport();
+  const answers: WorkspaceQuestion[] = [];
+  const service = new WorkspaceService({
+    settings: harnessSettings,
+    transportFactory: () => (transport as WorkspaceTransport),
+    answer: answerImpl ?? (async (question) => {
+      answers.push(question);
+      return answered(`answer to ${question.body}`);
+    }),
+    taskSink,
+  });
+  const states: WorkspaceServiceState[] = [];
+  service.onState((state) => states.push(state));
+  return { transport, service, answers, states };
+}
+
+function passedOn(message: string, draftId = "d1"): PublicAnswerOutcome {
+  return { kind: "passed_on", draftId, logEntryId: "l", message, topicId: undefined, ownerNotice: undefined };
+}
+
+function declinedRefused(message: string): PublicAnswerOutcome {
+  return { kind: "declined_refused", draftId: "d", logEntryId: "l", message };
+}
+
+/** Resolves a pending answer on demand — for racing the ack timer against a slow pipeline. */
+function controllableAnswer(): { impl: (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>; resolve: (outcome: PublicAnswerOutcome) => void } {
+  let resolveFn: (outcome: PublicAnswerOutcome) => void = () => {};
+  const impl = (_question: WorkspaceQuestion) =>
+    new Promise<PublicAnswerOutcome>((resolve) => {
+      resolveFn = resolve;
+    });
+  return { impl, resolve: (outcome) => resolveFn(outcome) };
+}
+
+describe("WorkspaceService — the ack timer and the outcome → card mapping (W-S4-5)", () => {
+  it("sends 0 cards for a fast answer — taskSink is never even asked to create a task", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-answer", body: "quick question" }));
+    await flush();
+    expect(transport.sentCards).toEqual([]);
+    expect(transport.editedCards).toEqual([]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to quick question"]);
+    expect(taskSink.createTaskCalls).toEqual([]);
+    await service.stop();
+  });
+
+  it("sends 1 card then 1 edit for a slow answer — the ack fires, then the outcome edits it to done with a result link", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-answer", body: "slow question" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.sentCards[0]!.content["duo.card"].state).toBe("acknowledged");
+    expect(transport.sentCards[0]!.content.body).toBe("Looking into this — I'll update this message.");
+    resolve(answered("the final answer"));
+    await flush();
+    expect(transport.editedCards).toHaveLength(1);
+    const edited = transport.editedCards[0]!;
+    expect(edited.content["m.new_content"]["duo.card"].state).toBe("done");
+    expect(edited.content["m.new_content"]["duo.card"].rev).toBe(2);
+    expect(edited.content["m.new_content"]["duo.card"].result?.text).toBe("the final answer");
+    expect(edited.content["m.new_content"]["duo.card"].result?.links).toHaveLength(1);
+    expect(edited.content["m.new_content"]["duo.card"].result?.links?.[0]?.url).toContain("matrix.to");
+    // The answer's own m.text was sent too (sendAnswer resolved the event id the link points at).
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["the final answer"]);
+    expect(taskSink.updateTaskStateCalls.some((call) => call.event === "complete")).toBe(true);
+    await service.stop();
+  });
+
+  it("sends exactly 1 card for a fast passed_on — the task is created with the outcome's draftId", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink, settings(), async () => passedOn("passed on, fast", "draft-fast"));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-passed", body: "pass this on" }));
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.editedCards).toEqual([]);
+    expect(transport.sentCards[0]!.content.body).toBe("passed on, fast");
+    expect(taskSink.createTaskCalls).toEqual([{ roomId: "!dm:workspace", questionEventId: "$fast-passed", requester: "@bob:workspace", draftId: "draft-fast" }]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["passed on, fast"]);
+    await service.stop();
+  });
+
+  it("sends 1 card then 1 edit for a slow passed_on — the ack's card is edited in place, never a second card", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-passed", body: "slow pass-on" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.sentCards[0]!.content.body).toBe("Looking into this — I'll update this message.");
+    resolve(passedOn("passed on, slow", "draft-slow"));
+    await flush();
+    // Exactly one card total: the ack card was edited, never a second send.
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.editedCards).toHaveLength(1);
+    expect(transport.editedCards[0]!.content["m.new_content"]["duo.card"].state).toBe("acknowledged");
+    expect(transport.editedCards[0]!.content.body).toBe("* passed on, slow");
+    await service.stop();
+  });
+
+  it("the ack is sent within ackAfterMs + 500ms (fake timers)", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$within-bound", body: "slow one" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000 + 500);
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    await service.stop();
+  });
+
+  it("a declined_refused outcome edits an existing ack card to done with lines ['Declined']", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$declined", body: "slow decline" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    resolve(declinedRefused("Declined, politely"));
+    await flush();
+    expect(transport.editedCards).toHaveLength(1);
+    const card = transport.editedCards[0]!.content["m.new_content"]["duo.card"];
+    expect(card.state).toBe("done");
+    expect(card.lines).toEqual(["Declined"]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["Declined, politely"]);
+    await service.stop();
+  });
+
+  it("a fast declined_refused sends no card at all — no ack ever fired, nothing to edit", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink, settings(), async () => declinedRefused("Declined fast"));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-declined", body: "fast decline" }));
+    await flush();
+    expect(transport.sentCards).toEqual([]);
+    expect(transport.editedCards).toEqual([]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["Declined fast"]);
+    await service.stop();
+  });
+
+  it("a pipeline failure after the ack fired edits the card to failed", async () => {
+    const taskSink = new FakeTaskSink();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const releaseAnswer = { reject: (() => {}) as (error: Error) => void };
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), async () => {
+      return new Promise<PublicAnswerOutcome>((_resolve, reject) => {
+        releaseAnswer.reject = reject;
+      });
+    });
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$pipeline-fail", body: "boom slow" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    releaseAnswer.reject(new Error("internal pipeline error"));
+    await flush();
+    expect(transport.editedCards).toHaveLength(1);
+    expect(transport.editedCards[0]!.content["m.new_content"]["duo.card"].state).toBe("failed");
+    expect(JSON.stringify(transport.editedCards)).not.toContain("internal pipeline error");
+    expect(consoleError).toHaveBeenCalled();
+    await service.stop();
+  });
+
+  it("taskSink undefined: card/task behavior is skipped entirely, byte-identical to pre-S4 behavior", async () => {
+    const { transport, service } = harness(settings({ ackAfterMs: 10 }));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$no-sink", body: "no task sink configured" }));
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    expect(transport.sentCards).toEqual([]);
+    expect(transport.editedCards).toEqual([]);
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["answer to no task sink configured"]);
+    await service.stop();
+  });
+
+  it("withdrawn consent mid-draft sends neither a card nor an edit — the ack timer re-checks withdrawal at send time too", async () => {
+    const dir = duoDir();
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const transport = new FakeWorkspaceTransport();
+    // Gate sendCard so it doesn't resolve until the test releases it — the
+    // real race the re-check exists for: the ack timer FIRES while the
+    // room is still consented, but the withdrawal lands before the card's
+    // own send call completes.
+    let releaseSendCard: () => void = () => {};
+    const sendCardGate = new Promise<void>((resolveGate) => {
+      releaseSendCard = resolveGate;
+    });
+    const originalSendCard = transport.sendCard.bind(transport);
+    transport.sendCard = async (roomId, content) => {
+      await sendCardGate;
+      return originalSendCard(roomId, content);
+    };
+    const gated = new WorkspaceService({
+      settings: settings({ ackAfterMs: 2000 }),
+      transportFactory: () => (transport as WorkspaceTransport),
+      answer: impl,
+      consent: { duoDir: dir },
+      taskSink,
+    });
+    gated.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await gated.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$mid-withdraw", body: "asked just before withdrawal" }));
+    await flush();
+    // The ack timer fires WHILE the room is still consented — sendAckCard's
+    // own withdrawal check (before it calls sendCard) passes, and it is now
+    // blocked inside the gated sendCard call.
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    // The withdrawal lands while that send is still in flight…
+    await gated.withdrawRoom("!room:workspace");
+    // …and only now does the gated sendCard resolve — too late: the card
+    // row is recorded, but handleQuestion's own withdrawal re-check (made
+    // right after the pipeline resolves, below) is what actually matters
+    // for the text answer; the card send itself cannot be un-sent once in
+    // flight, so this assembles the rest of the question's fate the same
+    // way a real homeserver round trip would.
+    releaseSendCard();
+    resolve(answered("too late"));
+    await flush();
+    expect(transport.editedCards).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    await gated.stop();
+  });
+
+  it("withdrawn consent before the ack timer fires sends neither a card nor an edit — the simple case", async () => {
+    const dir = duoDir();
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const transport = new FakeWorkspaceTransport();
+    const gated = new WorkspaceService({
+      settings: settings({ ackAfterMs: 2000 }),
+      transportFactory: () => (transport as WorkspaceTransport),
+      answer: impl,
+      consent: { duoDir: dir },
+      taskSink,
+    });
+    gated.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await gated.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$withdraw-before-ack", body: "asked, then withdrawn before the ack" }));
+    await flush();
+    await gated.withdrawRoom("!room:workspace");
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    resolve(answered("too late"));
+    await flush();
+    expect(transport.sentCards).toEqual([]);
+    expect(transport.editedCards).toEqual([]);
+    expect(transport.sentAnswers).toEqual([]);
+    await gated.stop();
+  });
+
+  it("a failed card edit on the answered path is logged and swallowed, never forgotten — the answer itself already sent, and forgetting would double-answer on replay", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const transport = new FakeWorkspaceTransport();
+    const service = new WorkspaceService({
+      settings: settings({ ackAfterMs: 2000 }),
+      transportFactory: () => (transport as WorkspaceTransport),
+      answer: impl,
+      taskSink,
+    });
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$edit-fails", body: "slow and doomed" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    transport.editCard = async () => {
+      throw new Error("fake: editCard failed");
+    };
+    resolve(answered("the answer still lands"));
+    await flush();
+    // The asker's answer is never held hostage to a card bookkeeping
+    // failure — it already went out.
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["the answer still lands"]);
+    expect(transport.editedCards).toEqual([]);
+    expect(consoleError).toHaveBeenCalled();
+    await service.stop();
+  });
+
+  it("a failed card send on the ack path (no answer sent yet) forgets the event id, exactly like a failed sendAnswer does today", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const transport = new FakeWorkspaceTransport();
+    transport.sendCard = async () => {
+      throw new Error("fake: sendCard failed");
+    };
+    const service = new WorkspaceService({
+      settings: settings({ ackAfterMs: 2000 }),
+      transportFactory: () => (transport as WorkspaceTransport),
+      answer: impl,
+      taskSink,
+    });
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$ack-send-fails", body: "slow and unlucky" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(consoleError).toHaveBeenCalled();
+    resolve(answered("still answered despite the ack failure"));
+    await flush();
+    // The ack send failed before anything was sent: no task was ever
+    // created for the outcome to find a card for, so this question
+    // behaves like one with no taskSink at all — plain text, once.
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["still answered despite the ack failure"]);
+    await service.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W-S4-6: onTaskEvent/onCardEvent — the ids-and-state-only signals
+// `createServer` forwards into DraftReadyHub.publishTask/publishCard.
+// Verified at this layer (not over a live /ws socket): the service's own
+// emission timing is what these facts pin, and test/serve-ws.test.ts covers
+// that createServer actually wires the subscription through.
+// ---------------------------------------------------------------------------
+describe("WorkspaceService — onTaskEvent/onCardEvent (W-S4-6)", () => {
+  it("emits a task event (acknowledged) and a card event together when the ack timer fires first", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    const taskEvents: { taskId: string; roomId: string; state: string }[] = [];
+    const cardEvents: { cardId: string; roomId: string }[] = [];
+    service.onTaskEvent((event) => taskEvents.push(event));
+    service.onCardEvent((event) => cardEvents.push(event));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$ack-signal", body: "slow question" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(taskEvents).toEqual([{ taskId: expect.stringMatching(/^task-/), roomId: "!dm:workspace", state: "acknowledged" }]);
+    expect(cardEvents).toEqual([{ cardId: expect.stringMatching(/^card-/), roomId: "!dm:workspace" }]);
+    await service.stop();
+  });
+
+  it("never emits anything for a fast answer — no task, no card, no signal", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink);
+    const taskEvents: unknown[] = [];
+    const cardEvents: unknown[] = [];
+    service.onTaskEvent((event) => taskEvents.push(event));
+    service.onCardEvent((event) => cardEvents.push(event));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-signal", body: "fast question" }));
+    await flush();
+    expect(taskEvents).toEqual([]);
+    expect(cardEvents).toEqual([]);
+    await service.stop();
+  });
+
+  it("emits a second task/card event (done) when a slow answer's outcome edits the ack card", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    const taskEvents: { taskId: string; roomId: string; state: string }[] = [];
+    const cardEvents: { cardId: string; roomId: string }[] = [];
+    service.onTaskEvent((event) => taskEvents.push(event));
+    service.onCardEvent((event) => cardEvents.push(event));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-done-signal", body: "slow question" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    resolve(answered("the answer, at last"));
+    await flush();
+    expect(taskEvents.map((event) => event.state)).toEqual(["acknowledged", "done"]);
+    expect(cardEvents).toHaveLength(2);
+    // Same task/card id both times — never a second task for one question.
+    expect(new Set(taskEvents.map((event) => event.taskId)).size).toBe(1);
+    expect(new Set(cardEvents.map((event) => event.cardId)).size).toBe(1);
+    await service.stop();
+  });
+
+  it("emits a task/card event for a fast passed_on even though the ack timer never fired", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink, settings(), async () => passedOn("passed on, fast signal", "draft-fast-signal"));
+    const taskEvents: { taskId: string; roomId: string; state: string }[] = [];
+    const cardEvents: { cardId: string; roomId: string }[] = [];
+    service.onTaskEvent((event) => taskEvents.push(event));
+    service.onCardEvent((event) => cardEvents.push(event));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-passed-signal", body: "fast passed on question" }));
+    await flush();
+    expect(taskEvents).toEqual([{ taskId: expect.stringMatching(/^task-/), roomId: "!dm:workspace", state: "acknowledged" }]);
+    expect(cardEvents).toHaveLength(1);
     await service.stop();
   });
 });

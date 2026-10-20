@@ -1,4 +1,4 @@
-import type { PublicAnswerOutcome } from "../permissions/public-answer.js";
+import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import {
   forgetAlwaysAllowed,
   forgetRoomDecision,
@@ -12,6 +12,7 @@ import {
   type RoomConsentEntry,
   type RoomConsentStatus,
 } from "./consent.js";
+import { buildCardEdit, buildCardEvent, type DuoCardV1Input } from "./cards.js";
 import { duoOwnerUserIdOf, workspaceDirectoryFrom, type WorkspaceAvailability, type WorkspaceDirectoryEntry } from "./directory.js";
 import type { RoomInvite } from "./messages.js";
 import { buildAnswerEvent, buildAttachmentRefusalEvent, buildFailedAnswerEvent } from "./payload.js";
@@ -62,6 +63,20 @@ export interface WorkspaceServiceState {
 export type WorkspaceAnswerPipeline = (question: WorkspaceQuestion) => Promise<PublicAnswerOutcome>;
 
 /**
+ * W-S4-5: one question's decided fate as `answerOrRefuse`/the pipeline-
+ * failure catch branch produce it — the `m.text` content every question
+ * sends regardless (unchanged), plus exactly the card-relevant facts
+ * `resolveOutcomeCard` needs. See `answerOrRefuse`'s own doc comment for
+ * what each optional field means and why it is safe to carry.
+ */
+interface AnswerDecision {
+  readonly content: AnswerEventContent;
+  readonly outcomeKind?: PublicAnswerOutcome["kind"];
+  readonly passedOnDraftId?: string;
+  readonly pipelineFailed?: boolean;
+}
+
+/**
  * The service's own connection state → #187's availability, asleep-duo.md §6
  * exactly: `online` iff the outbound connection is live (phase `connected`);
  * otherwise offline with `lastAliveAt` — the most recent liveness the
@@ -110,6 +125,18 @@ export interface WorkspaceServiceOptions {
    */
   readonly attachmentDoor?: WorkspaceAttachmentDoor;
   /**
+   * W-S4-4/W-S4-5: the task and card store, injected like `readState` and
+   * `attachmentDoor` because the pinned import boundary keeps this module
+   * off `src/tasks/store.ts` (and now `src/tasks/` generally — see the
+   * boundary scan's own comment). Present means the ack timer and the
+   * outcome branches (W-S4-5) create and update tasks and send/edit
+   * `duo.card` events; absent means card/task behavior is skipped
+   * entirely, byte-identical to pre-S4 behavior — the same "feature
+   * absent" degradation `readState`/`consent`/`attachmentDoor` already
+   * take when their own option is omitted.
+   */
+  readonly taskSink?: WorkspaceTaskSink;
+  /**
    * #236: where this service's own log lines go. Absent is the `duo serve` behavior exactly
    * (`console.error("workspace: <what>:", <message>)`). A hosted daemon runs one service per duo
    * in one process, so it passes a logger that names the duo (and scrubs the duo's token);
@@ -133,6 +160,72 @@ export interface WorkspaceConsentOptions {
    * it with the owner's name). Absent is the bare, silent rejection.
    */
   readonly declineNotice?: string;
+}
+
+/**
+ * W-S4-4: the one open task card for a room — what the service needs to
+ * decide "send a brand-new card" versus "edit the one already out there"
+ * (W-S4-5: at most one task card per task, ever, even across an
+ * ack-then-outcome race). Carries exactly the fields an edit needs:
+ * the card's own event id (so `editCard` can target it) and its current
+ * rev (so the next edit bumps it by exactly one, per cards.md §4).
+ */
+export interface OpenWorkspaceCard {
+  readonly cardId: string;
+  readonly taskId: string;
+  readonly eventId: string;
+  readonly rev: number;
+  readonly state: string;
+}
+
+/**
+ * W-S4-4: the narrow interface `src/workspace/service.ts` is written
+ * against for everything task/card-shaped — mirroring `DuoReadState`'s own
+ * minimalism (read-state.ts): just enough for the ack timer to create a
+ * Task and send its first card, and for the outcome branches to find and
+ * edit that same card (W-S4-5). The implementation
+ * (`src/serve/workspace-tasks.ts`) is injected the same way
+ * `durableDuoReadState` is — this module never imports `src/tasks/store.ts`
+ * (the boundary scan forbids it).
+ */
+/** W-S4-6: the ids-and-state-only fact `onTaskEvent` hands subscribers — never a draftId, never card content (cards.md §7). */
+export interface WorkspaceTaskSignal {
+  readonly taskId: string;
+  readonly roomId: string;
+  readonly state: string;
+}
+
+/** W-S4-6: the ids-only fact `onCardEvent` hands subscribers. */
+export interface WorkspaceCardSignal {
+  readonly cardId: string;
+  readonly roomId: string;
+}
+
+export interface WorkspaceTaskSink {
+  /** Creates a task in `acknowledged`, optionally with a known draftId (the passed_on path). */
+  createTask(input: { readonly roomId: string; readonly questionEventId: string; readonly requester: string; readonly draftId?: string }): { readonly taskId: string };
+
+  /**
+   * Applies one state-machine event to the task's state, and/or sets its
+   * draftId — the field update the passed_on path needs when a task was
+   * created ack-first, with no draftId yet. The event union is spelled out
+   * literally rather than imported from `src/tasks/state.ts`'s own
+   * `TaskEvent` (the boundary scan forbids that import here) — a future
+   * change to that union would fail typecheck at
+   * `src/serve/workspace-tasks.ts`'s call into `src/tasks/store.ts`
+   * (whose own `updateTaskState` takes the real `TaskEvent`), not silently
+   * drift, so this copy is safe to keep literal.
+   */
+  updateTaskState(taskId: string, event: "start_working" | "need_decision" | "resume_working" | "complete" | "fail" | undefined, fields?: { readonly draftId?: string }): void;
+
+  /** Records a brand-new card's row — called right after `transport.sendCard` resolves its event id. */
+  createCard(input: { readonly taskId: string; readonly roomId: string; readonly eventId: string; readonly kind: string; readonly audience: string; readonly state: string; readonly requester: string }): { readonly cardId: string };
+
+  /** Records an edit's new rev/state — called right after `transport.editCard` resolves. */
+  recordCardEdit(cardId: string, fields: { readonly rev: number; readonly state: string }): void;
+
+  /** The open (not done/failed) card for this task in this room, if one has already been sent — the W-S4-5 "send once, then only ever edit" lookup. */
+  openCardFor(taskId: string, roomId: string): OpenWorkspaceCard | undefined;
 }
 
 /** Thrown when the duo's own owner can't be named from its user id — nobody to bring into the conversation. Maps to 409. */
@@ -257,6 +350,10 @@ export class WorkspaceService {
   private presenceTimer: ReturnType<typeof setInterval> | undefined;
   private stateValue: WorkspaceServiceState;
   private readonly stateHandlers = new Set<(state: WorkspaceServiceState) => void>();
+  /** W-S4-6: ids-and-state-only task signal subscribers — `createServer`'s own subscription is the one production consumer, forwarding into `DraftReadyHub.publishTask` over `/ws`. */
+  private readonly taskEventHandlers = new Set<(event: WorkspaceTaskSignal) => void>();
+  /** W-S4-6: the card-shaped twin of `taskEventHandlers` — ids only, forwarded into `DraftReadyHub.publishCard`. */
+  private readonly cardEventHandlers = new Set<(event: WorkspaceCardSignal) => void>();
   private readonly seenEventIds = new RecentlySeenEventIds(10_000);
   private membersById = new Map<string, WorkspaceMemberIdentity>();
   private readonly answerRate: AnswerRateWindow;
@@ -294,6 +391,35 @@ export class WorkspaceService {
 
   onState(handler: (state: WorkspaceServiceState) => void): void {
     this.stateHandlers.add(handler);
+  }
+
+  /**
+   * W-S4-6: subscribes to every task created or state-changed by the ack
+   * timer / outcome branches (W-S4-5) — ids and state only (cards.md §7),
+   * never the task's draftId or any card content. `createServer` is the one
+   * production subscriber, forwarding each event into
+   * `DraftReadyHub.publishTask` same-tick, the same shape `onDraftingStarted`
+   * already uses for the sibling `draft-drafting` signal.
+   */
+  onTaskEvent(handler: (event: WorkspaceTaskSignal) => void): void {
+    this.taskEventHandlers.add(handler);
+  }
+
+  /** W-S4-6: the card-shaped twin of `onTaskEvent` — fired on every card create/edit, ids only. */
+  onCardEvent(handler: (event: WorkspaceCardSignal) => void): void {
+    this.cardEventHandlers.add(handler);
+  }
+
+  private emitTaskEvent(event: WorkspaceTaskSignal): void {
+    for (const handler of this.taskEventHandlers) {
+      handler(event);
+    }
+  }
+
+  private emitCardEvent(event: WorkspaceCardSignal): void {
+    for (const handler of this.cardEventHandlers) {
+      handler(event);
+    }
   }
 
   /**
@@ -872,6 +998,13 @@ export class WorkspaceService {
    * the event unrecorded so the post-restart replay re-answers it, the same
    * at-least-once recovery a send failure gets (read-state.ts's stated
    * semantics).
+   *
+   * W-S4-5: when `taskSink` is injected, an ack timer is armed right here —
+   * before `answerOrRefuse` runs — for `ackAfterMs`. If it fires first, a
+   * task card in `acknowledged` goes out (`sendAckCard`); whichever happens
+   * second (the outcome, almost always) edits that same card if one exists,
+   * or sends/edits exactly one card of its own otherwise. `taskSink`
+   * undefined skips all of this — the pre-S4 behavior above, untouched.
    */
   private async handleQuestion(question: WorkspaceQuestion, originServerTs: number): Promise<void> {
     if (this.queryReadState(question)) {
@@ -915,16 +1048,42 @@ export class WorkspaceService {
       );
       return;
     }
-    let content;
+    // W-S4-5: the ack timer. Armed only when a task sink is injected — its
+    // absence is the whole feature's "off" switch (the same degradation
+    // readState/consent/attachmentDoor take). `taskIdRef` is filled in by
+    // whichever of the timer or the answer finishes first that decides to
+    // create a Task; the other branch reads it back rather than creating a
+    // second one.
+    const taskSink = this.options.taskSink;
+    let ackTimer: ReturnType<typeof setTimeout> | undefined;
+    // Set only once the timer actually fires and starts sending — awaited
+    // below BEFORE resolveOutcomeCard runs, so a slow outcome that resolves
+    // while the ack send is still in flight (sendCard's own round trip)
+    // cannot race it: cardState.taskId must be fully set before the
+    // outcome branches read it.
+    let ackCardSend: Promise<void> | undefined;
+    const cardState: { taskId?: string } = {};
+    if (taskSink !== undefined) {
+      ackTimer = setTimeout(() => {
+        ackCardSend = this.sendAckCard(question, cardState);
+      }, this.options.settings.ackAfterMs);
+    }
+    let decision: AnswerDecision;
     try {
-      content = await this.answerOrRefuse(question);
+      decision = await this.answerOrRefuse(question);
     } catch (error) {
       // The asker must never see internals (the /ask route's own rule) —
       // but they also must not stare at silence: send the same generic
       // failure event that route's 500 body comes from, and keep the
       // daemon alive for the next question.
       this.consoleError(`answering workspace question ${question.eventId} failed`, error);
-      content = buildFailedAnswerEvent();
+      decision = { content: buildFailedAnswerEvent(), pipelineFailed: true };
+    }
+    if (ackTimer !== undefined) {
+      clearTimeout(ackTimer);
+    }
+    if (ackCardSend !== undefined) {
+      await ackCardSend;
     }
     if (this.roomDecisionLookup !== undefined && (this.withdrawnRoomIds.has(question.roomId) || !this.roomStillPermitted(question.roomId))) {
       // #192: withdrawal is immediate, with no in-flight grace — the draft
@@ -933,9 +1092,11 @@ export class WorkspaceService {
       // leave already landed and deleted the record (the executed-exit
       // rule), where a fresh read alone would read as "never consented".
       // Nothing goes out (not even the failure event above: that is an
-      // asker-visible send too). The event id is forgotten, the send-failure
-      // stance, so a replay re-decides under whatever consent holds then;
-      // the backlog age window bounds how long that door stays open.
+      // asker-visible send too, and NEITHER is any card send/edit — W-S4-5
+      // extends this same immediate-kill rule to cards). The event id is
+      // forgotten, the send-failure stance, so a replay re-decides under
+      // whatever consent holds then; the backlog age window bounds how
+      // long that door stays open.
       this.seenEventIds.forget(question.eventId);
       this.consoleError(
         `not sending the answer to workspace question ${question.eventId}`,
@@ -956,8 +1117,20 @@ export class WorkspaceService {
       );
       return;
     }
+    let answerAlreadySent = false;
+    if (taskSink !== undefined) {
+      try {
+        answerAlreadySent = await this.resolveOutcomeCard(question, decision, cardState);
+      } catch (error) {
+        this.consoleError(`sending/editing the task card for workspace question ${question.eventId} failed`, error);
+        this.seenEventIds.forget(question.eventId);
+        return;
+      }
+    }
     try {
-      await transport.sendAnswer(question.roomId, content);
+      if (!answerAlreadySent) {
+        await transport.sendAnswer(question.roomId, decision.content);
+      }
     } catch (error) {
       // The send failed, not the answering: forget the event id so the
       // homeserver's post-reconnect replay re-answers the question instead
@@ -977,21 +1150,221 @@ export class WorkspaceService {
   }
 
   /**
-   * #190: the door step of one question's fate. A question with no
-   * attachments takes the pre-#190 path untouched — `answer`, composed
-   * into an answer event — so the sibling seams see byte-identical
-   * behavior for every text-only question. A question that rode with
-   * files goes through the injected door first, over the live transport's
-   * own `fetchFile`: refused → the door's message as a refusal event
-   * (send/markRead/accounting continue as for any answer, below); grounded
-   * → the pipeline answers with `grounding` set, and the fetched text
-   * lives exactly that long. No door configured → text-only, with an
-   * owner-side log saying so — never a silent grounding, and never a
-   * dropped question.
+   * W-S4-5: the ack timer fired before the pipeline resolved. Creates the
+   * Task (`acknowledged`, no draftId yet — the outcome may still turn out
+   * to be `answered`, which never gets one) and sends its first card, with
+   * the ack-timer fallback text from cards.md §5. Re-checks withdrawn
+   * consent at send time (the timer fires asynchronously and can race a
+   * withdrawal the same way the final send already re-checks) — a
+   * withdrawn room gets neither this card nor anything else. Failures are
+   * logged and swallowed: an ack that didn't make it out must never crash
+   * the answer chain the real outcome still needs to finish on.
    */
-  private async answerOrRefuse(question: WorkspaceQuestion): Promise<AnswerEventContent> {
+  private async sendAckCard(question: WorkspaceQuestion, cardState: { taskId?: string }): Promise<void> {
+    const taskSink = this.options.taskSink;
+    const transport = this.transport;
+    if (taskSink === undefined || transport === undefined) {
+      return;
+    }
+    if (this.roomDecisionLookup !== undefined && (this.withdrawnRoomIds.has(question.roomId) || !this.roomStillPermitted(question.roomId))) {
+      return;
+    }
+    try {
+      const { taskId } = taskSink.createTask({ roomId: question.roomId, questionEventId: question.eventId, requester: question.senderId });
+      cardState.taskId = taskId;
+      this.emitTaskEvent({ taskId, roomId: question.roomId, state: "acknowledged" });
+      const card: DuoCardV1Input = {
+        kind: "task",
+        cardId: taskId,
+        taskId,
+        state: "acknowledged",
+        requester: question.senderId,
+        title: "Looking into this",
+        lines: ["Looking into this — I'll update this message."],
+      };
+      const event = buildCardEvent(card);
+      const sent = await transport.sendCard(question.roomId, event);
+      const { cardId } = taskSink.createCard({ taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
+      this.emitCardEvent({ cardId, roomId: question.roomId });
+    } catch (error) {
+      this.consoleError(`sending the ack task card for workspace question ${question.eventId} failed`, error);
+    }
+  }
+
+  /**
+   * W-S4-5: once the outcome has resolved (and the ack timer, if armed,
+   * has been cleared), decide what the task/card side needs: create the
+   * Task if the ack never fired (the fast path, or a fast `passed_on`),
+   * and send or edit exactly one card — never two for one task. Re-checks
+   * withdrawn consent itself is NOT needed here: `handleQuestion` already
+   * refused to reach this point under withdrawal (the existing check runs
+   * first), so this method only runs when the send is actually going out.
+   * Returns true when it already sent the `m.text` answer itself (the
+   * `answered` branch needs the answer's own sent event id before it can
+   * build the `result` link, so it sends there instead of letting
+   * `handleQuestion`'s own `sendAnswer` call do it) — the caller must not
+   * send it a second time.
+   */
+  private async resolveOutcomeCard(question: WorkspaceQuestion, decision: AnswerDecision, cardState: { taskId?: string }): Promise<boolean> {
+    const taskSink = this.options.taskSink;
+    const transport = this.transport;
+    if (taskSink === undefined || transport === undefined) {
+      return false;
+    }
+    const outcomeKind = decision.outcomeKind;
+    if (outcomeKind === "answered") {
+      // A fast answer never gets a task at all (0 cards) — the common case
+      // stays byte-identical in cost. A slow answer (the ack fired first)
+      // edits that card to done, with a result link at the ANSWER's own
+      // sent event — which means the answer must be sent from inside this
+      // method, before the edit can be built at all.
+      if (cardState.taskId === undefined) {
+        return false;
+      }
+      const openCard = taskSink.openCardFor(cardState.taskId, question.roomId);
+      if (openCard === undefined) {
+        return false;
+      }
+      // The real send: once this resolves, the asker has their answer —
+      // nothing below this line may ever cause it to be sent again (not a
+      // forget, not a retry), because the answer itself did not fail. Any
+      // THROW from here still propagates to handleQuestion's own catch
+      // (forget + no further send), which is correct: the asker got
+      // nothing and a replay should try again. Once this line succeeds,
+      // the contract changes: a card-editing problem afterward is the
+      // card's problem, never the asker's — logged and swallowed, not
+      // forgotten, so a replay is never caused to double-answer just to
+      // retry a card edit.
+      const sentAnswer = await transport.sendAnswer(question.roomId, decision.content);
+      try {
+        const permalink = `https://matrix.to/#/${encodeURIComponent(question.roomId)}/${encodeURIComponent(sentAnswer.eventId)}`;
+        const card: DuoCardV1Input = {
+          kind: "task",
+          cardId: openCard.cardId,
+          taskId: cardState.taskId,
+          state: "done",
+          requester: question.senderId,
+          title: "Done",
+          result: { text: decision.content.body, links: [{ label: "Reply", url: permalink }] },
+        };
+        const edit = buildCardEdit(openCard.eventId, card, openCard.rev);
+        await transport.editCard(question.roomId, openCard.eventId, edit);
+        taskSink.recordCardEdit(openCard.cardId, { rev: edit["m.new_content"]["duo.card"].rev, state: "done" });
+        taskSink.updateTaskState(cardState.taskId, "complete");
+        this.emitCardEvent({ cardId: openCard.cardId, roomId: question.roomId });
+        this.emitTaskEvent({ taskId: cardState.taskId, roomId: question.roomId, state: "done" });
+      } catch (error) {
+        this.consoleError(`editing the task card to done for workspace question ${question.eventId} failed (the answer itself already sent)`, error);
+      }
+      // The answer already went out above; tell handleQuestion not to send it again.
+      return true;
+    }
+    if (outcomeKind === "passed_on") {
+      // Exactly one card total for this path: create the Task now if the
+      // ack never fired (fast passed_on), or reuse the one it already
+      // created. Either way, send once or edit once — never both for the
+      // same task.
+      const passedOnText = decision.content.body;
+      if (cardState.taskId === undefined) {
+        const { taskId } = taskSink.createTask({
+          roomId: question.roomId,
+          questionEventId: question.eventId,
+          requester: question.senderId,
+          draftId: decision.passedOnDraftId,
+        });
+        cardState.taskId = taskId;
+        this.emitTaskEvent({ taskId, roomId: question.roomId, state: "acknowledged" });
+        const card: DuoCardV1Input = {
+          kind: "task",
+          cardId: taskId,
+          taskId,
+          state: "acknowledged",
+          requester: question.senderId,
+          title: "Passed on",
+          lines: [passedOnText],
+        };
+        const sent = await transport.sendCard(question.roomId, buildCardEvent(card));
+        const { cardId } = taskSink.createCard({ taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
+        this.emitCardEvent({ cardId, roomId: question.roomId });
+        return false;
+      }
+      // The ack already fired: edit that SAME card to carry the passed-on
+      // text instead of the ack-timer text — still "acknowledged", still
+      // one card.
+      taskSink.updateTaskState(cardState.taskId, undefined, { draftId: decision.passedOnDraftId });
+      const openCard = taskSink.openCardFor(cardState.taskId, question.roomId);
+      if (openCard === undefined) {
+        return false;
+      }
+      const card: DuoCardV1Input = {
+        kind: "task",
+        cardId: openCard.cardId,
+        taskId: cardState.taskId,
+        state: "acknowledged",
+        requester: question.senderId,
+        title: "Passed on",
+        lines: [passedOnText],
+      };
+      const edit = buildCardEdit(openCard.eventId, card, openCard.rev);
+      await transport.editCard(question.roomId, openCard.eventId, edit);
+      taskSink.recordCardEdit(openCard.cardId, { rev: edit["m.new_content"]["duo.card"].rev, state: "acknowledged" });
+      this.emitCardEvent({ cardId: openCard.cardId, roomId: question.roomId });
+      this.emitTaskEvent({ taskId: cardState.taskId, roomId: question.roomId, state: "acknowledged" });
+      return false;
+    }
+    // declined_refused, an attachment refusal (outcomeKind undefined, not
+    // a pipeline failure), or the pipeline-failure catch branch
+    // (`pipelineFailed`): if a card already exists (the ack fired), edit
+    // it — "done"/"Declined" for the first two, "failed" for a genuine
+    // pipeline failure — otherwise nothing card-shaped ever happened for
+    // this question, and the plain text send below is the whole story,
+    // exactly as pre-S4.
+    if (cardState.taskId === undefined) {
+      return false;
+    }
+    const openCard = taskSink.openCardFor(cardState.taskId, question.roomId);
+    if (openCard === undefined) {
+      return false;
+    }
+    // cards.md §5 has no fixed copy for a bare pipeline failure (only for
+    // task/done and the decline path) — PUBLIC_ANSWER_FAILED_MESSAGE is the
+    // asker's own m.text for this case (sent unchanged, below), so the
+    // card's one line echoes that same fixed vocabulary rather than
+    // inventing a second one.
+    const card: DuoCardV1Input = decision.pipelineFailed === true
+      ? { kind: "task", cardId: openCard.cardId, taskId: cardState.taskId, state: "failed", requester: question.senderId, title: "Failed", lines: [PUBLIC_ANSWER_FAILED_MESSAGE] }
+      : { kind: "task", cardId: openCard.cardId, taskId: cardState.taskId, state: "done", requester: question.senderId, title: "Declined", lines: ["Declined"] };
+    const edit = buildCardEdit(openCard.eventId, card, openCard.rev);
+    await transport.editCard(question.roomId, openCard.eventId, edit);
+    taskSink.recordCardEdit(openCard.cardId, { rev: edit["m.new_content"]["duo.card"].rev, state: card.state });
+    taskSink.updateTaskState(cardState.taskId, decision.pipelineFailed === true ? "fail" : "complete");
+    this.emitCardEvent({ cardId: openCard.cardId, roomId: question.roomId });
+    this.emitTaskEvent({ taskId: cardState.taskId, roomId: question.roomId, state: card.state });
+    return false;
+  }
+
+  /**
+   * W-S4-5: one question's decided fate, carrying both the `m.text` content
+   * `handleQuestion` always sends (unchanged, byte-identical to before S4)
+   * and the card-relevant facts the ack timer/outcome branches need —
+   * never more than that. `outcomeKind` is undefined for an attachment
+   * refusal (#190): for card purposes a refusal behaves exactly like
+   * `declined_refused` (done, "Declined"), so there is no fourth kind to
+   * add here — `handleQuestion` treats `undefined` the same way.
+   * `passedOnDraftId` is the ONE owner-facing-shaped field that crosses
+   * this boundary, and only because it is already asker-adjacent: it is
+   * the id the OWNER's existing draft-reply flow already keys on, and it
+   * never itself reaches the wire — only `taskSink.createTask` (store-side)
+   * and never `cards.ts`'s input type see it. `pipelineFailed` distinguishes
+   * a thrown pipeline failure (card → `failed`) from every outcome that
+   * resolved normally, including a declined_refused or an attachment
+   * refusal (card → `done`, "Declined") — `handleQuestion`'s catch branch
+   * sets it; nothing else does.
+   */
+  private async answerOrRefuse(question: WorkspaceQuestion): Promise<AnswerDecision> {
     if (question.attachments.length === 0) {
-      return buildAnswerEvent(await this.options.answer(question));
+      const outcome = await this.options.answer(question);
+      return { content: buildAnswerEvent(outcome), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
     }
     const door = this.options.attachmentDoor;
     if (door === undefined) {
@@ -999,7 +1372,8 @@ export class WorkspaceService {
         `answering workspace question ${question.eventId} text-only`,
         new Error("no attachment grounding door is configured (DUO_CLASSIFICATION_CEILING wiring) — the question's files were not read"),
       );
-      return buildAnswerEvent(await this.options.answer({ ...question, grounding: [] }));
+      const outcome = await this.options.answer({ ...question, grounding: [] });
+      return { content: buildAnswerEvent(outcome), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
     }
     // Captured before the door runs (not after): the door fetches file
     // bodies over this very transport, so it must be live now; a connection
@@ -1011,9 +1385,10 @@ export class WorkspaceService {
     }
     const result = await door(question.attachments, (reference, options) => transport.fetchFile(reference, options));
     if (result.kind === "refused") {
-      return buildAttachmentRefusalEvent(result.message);
+      return { content: buildAttachmentRefusalEvent(result.message) };
     }
-    return buildAnswerEvent(await this.options.answer({ ...question, grounding: result.grounding }));
+    const outcome = await this.options.answer({ ...question, grounding: result.grounding });
+    return { content: buildAnswerEvent(outcome), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
   }
 
   /**

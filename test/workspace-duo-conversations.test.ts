@@ -42,6 +42,7 @@ function settings(overrides: Partial<WorkspaceSettings> = {}): WorkspaceSettings
     reconnect: { initialDelayMs: 1000, maxDelayMs: 8000 },
     presenceIntervalMs: 5000,
     backlog: { maxAgeMs: 3_600_000, maxAnswersPerMinute: 30 },
+    ackAfterMs: 2000,
     ...overrides,
   };
 }
