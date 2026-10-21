@@ -1388,7 +1388,7 @@ export class WorkspaceService {
     // already compute, so there is nothing new to derive here. A direct
     // question passes `undefined`, keeping `buildAnswerEvent`'s output the
     // pre-#313 two-key shape byte for byte.
-    const replyOptions: { readonly inReplyTo?: string } | undefined = question.isDirect ? undefined : { inReplyTo: question.eventId };
+    const replyOptions: Parameters<typeof buildAnswerEvent>[1] = question.isDirect ? undefined : { inReplyTo: question.eventId };
     if (question.attachments.length === 0) {
       const outcome = await this.options.answer(question);
       return { content: buildAnswerEvent(outcome, replyOptions), outcomeKind: outcome.kind, ...(outcome.kind === "passed_on" ? { passedOnDraftId: outcome.draftId } : {}) };
