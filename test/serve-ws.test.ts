@@ -333,9 +333,8 @@ describe("W-S4-6: createServer forwards WorkspaceService's onTaskEvent/onCardEve
       updateTaskState() {
         /* not exercised by the ack-only path this test takes */
       },
-      createCard(input: { taskId: string; roomId: string; eventId: string; state: string }) {
-        nextId += 1;
-        const cardId = `card-${nextId}`;
+      createCard(input: { cardId: string; taskId: string; roomId: string; eventId: string; state: string }) {
+        const { cardId } = input;
         cards.set(cardId, { taskId: input.taskId, roomId: input.roomId, eventId: input.eventId, rev: 1, state: input.state });
         return { cardId };
       },

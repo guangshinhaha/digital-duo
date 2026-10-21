@@ -248,6 +248,17 @@ function rowToCard(row: WorkspaceCardRow): WorkspaceCard {
 }
 
 export interface CreateCardInput {
+  /**
+   * Caller-supplied (#312/S2 fix): the SAME id the caller already placed in
+   * the `duo.card.card_id` field of the event it sent to Matrix, generated
+   * before `sendCard` so it could go on the wire at all — `card_id` must
+   * stay "stable across edits" (docs/workspace/cards.md §3), and the store
+   * generating its own id here, independent of the wire payload's, is
+   * exactly how that stability broke (caught by the #312/S2 "exactly one
+   * card" test: the wire's first send and its first edit disagreed on
+   * `card_id`).
+   */
+  readonly id: string;
   readonly taskId: string;
   readonly roomId: string;
   readonly eventId: string;
@@ -262,7 +273,7 @@ export interface CreateCardInput {
 export function createCard(storePath: string, passphrase: string, input: CreateCardInput): WorkspaceCard {
   return withDatabase(storePath, passphrase, true, (db) => {
     ensureTasksSchema(db);
-    const id = randomUUID();
+    const id = input.id;
     const now = new Date().toISOString();
     db.prepare(
       `INSERT INTO workspace_cards (id, task_id, room_id, event_id, kind, audience, rev, state, payload_json, requester, created_at, updated_at)

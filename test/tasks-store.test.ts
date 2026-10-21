@@ -131,6 +131,7 @@ describe("workspace_cards — CRUD round-trips, rev strictly increasing", () => 
     const storePath = initStore();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!room:workspace", questionEventId: "$q1", requester: "@alice:workspace" });
     const card = createCard(storePath, PASSPHRASE, {
+      id: "card-1",
       taskId: task.id,
       roomId: "!room:workspace",
       eventId: "$card1",
@@ -148,6 +149,7 @@ describe("workspace_cards — CRUD round-trips, rev strictly increasing", () => 
     const storePath = initStore();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!room:workspace", questionEventId: "$q1", requester: "@alice:workspace" });
     const visitorCard = createCard(storePath, PASSPHRASE, {
+      id: "card-2",
       taskId: task.id,
       roomId: "!room:workspace",
       eventId: "$card1",
@@ -158,6 +160,7 @@ describe("workspace_cards — CRUD round-trips, rev strictly increasing", () => 
       requester: "@alice:workspace",
     });
     const ownerCard = createCard(storePath, PASSPHRASE, {
+      id: "card-3",
       taskId: task.id,
       roomId: "!other:workspace",
       eventId: "$card2",
@@ -175,6 +178,7 @@ describe("workspace_cards — CRUD round-trips, rev strictly increasing", () => 
     const storePath = initStore();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!room:workspace", questionEventId: "$q1", requester: "@alice:workspace" });
     const card = createCard(storePath, PASSPHRASE, {
+      id: "card-4",
       taskId: task.id,
       roomId: "!room:workspace",
       eventId: "$card1",
@@ -193,6 +197,7 @@ describe("workspace_cards — CRUD round-trips, rev strictly increasing", () => 
     const storePath = initStore();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!room:workspace", questionEventId: "$q1", requester: "@alice:workspace" });
     const card = createCard(storePath, PASSPHRASE, {
+      id: "card-5",
       taskId: task.id,
       roomId: "!room:workspace",
       eventId: "$card1",
