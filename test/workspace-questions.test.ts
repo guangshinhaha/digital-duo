@@ -31,6 +31,10 @@ describe("directQuestionFrom — v1: a direct question is a text message from th
     expect(question?.receivedAt).toBeTruthy();
   });
 
+  it("W-S3-1 (#313): marks every question isDirect — the one fact the answer's reply shape reads", () => {
+    expect(directQuestionFrom(candidate(), SELF)?.isDirect).toBe(true);
+  });
+
   it("never treats the duo's own messages as questions — including its own answers replayed by sync", () => {
     expect(directQuestionFrom(candidate({ senderId: SELF }), SELF)).toBeNull();
   });
@@ -81,6 +85,12 @@ describe("answerableQuestionFrom — #192: reachable means a direct room, or a r
     const allowed: RoomDecisionLookup = (roomId) => (roomId === "!room:workspace" ? "allowed" : null);
     const question = answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: [SELF] }), SELF, allowed);
     expect(question).toMatchObject({ eventId: "$1", roomId: "!room:workspace", body: "What did Alice decide about the vendor?" });
+  });
+
+  it("W-S3-1 (#313): isDirect is true for the direct-room branch and false for the shared-room branch — the fact the answer's reply shape reads", () => {
+    expect(answerableQuestionFrom(candidate(), SELF)?.isDirect).toBe(true);
+    const allowed: RoomDecisionLookup = (roomId) => (roomId === "!room:workspace" ? "allowed" : null);
+    expect(answerableQuestionFrom(candidate({ ...GROUP, mentionedUserIds: [SELF] }), SELF, allowed)?.isDirect).toBe(false);
   });
 
   it("treats a shared room with no record as not-a-question — the pre-#192 default refusal, structurally ahead of any retrieval", () => {

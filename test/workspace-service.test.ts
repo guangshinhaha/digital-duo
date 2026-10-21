@@ -1315,7 +1315,14 @@ describe("WorkspaceService — the owner's allow is the only join (#192)", () =>
     transport.deliver(roomMessage({ eventId: "$q", body: "What did Alice decide?" }));
     await flush();
     expect(answers.map((question) => question.body)).toEqual(["What did Alice decide?"]);
-    expect(transport.sentAnswers).toEqual([{ roomId: "!room:workspace", content: { msgtype: "m.text", body: "answer to What did Alice decide?" } }]);
+    // W-S3-1 (#313): a shared-room answer carries the reply relation back to
+    // the question's own event id — unlike a DM's two-key shape.
+    expect(transport.sentAnswers).toEqual([
+      {
+        roomId: "!room:workspace",
+        content: { msgtype: "m.text", body: "answer to What did Alice decide?", "m.relates_to": { "m.in_reply_to": { event_id: "$q" } } },
+      },
+    ]);
     await service.stop();
   });
 
@@ -1437,6 +1444,46 @@ describe("WorkspaceService — #312/S1: an allowed shared room still only answer
     await flush();
     expect(answers.map((question) => question.body)).toEqual(["@duo-alice what did Alice decide?"]);
     expect(transport.sentAnswers.map((sent) => sent.roomId)).toEqual(["!room:workspace"]);
+    // W-S3-1 (#313): the reply relation points back at this very question's event id.
+    expect(transport.sentAnswers[0]!.content).toEqual({
+      msgtype: "m.text",
+      body: "answer to @duo-alice what did Alice decide?",
+      "m.relates_to": { "m.in_reply_to": { event_id: "$addressed" } },
+    });
+    await service.stop();
+  });
+});
+
+describe("WorkspaceService — W-S3-1 (#313): shared-room answers reply to the question; direct-room answers are untouched", () => {
+  it("a direct-room (DM) answer stays byte-identical: exactly msgtype and body, no m.relates_to at all", async () => {
+    const { transport, service } = harness();
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$dm-q", body: "What did Alice decide?" }));
+    await flush();
+    expect(transport.sentAnswers).toEqual([{ roomId: "!dm:workspace", content: { msgtype: "m.text", body: "answer to What did Alice decide?" } }]);
+    expect(Object.keys(transport.sentAnswers[0]!.content).sort()).toEqual(["body", "msgtype"]);
+    await service.stop();
+  });
+
+  it("a shared-room answer has exactly three keys — msgtype, body, and m.relates_to.m.in_reply_to.event_id pointing at the question", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { transport, service } = harness(settings(), undefined, undefined, duoDir());
+    service.start();
+    await flush();
+    transport.deliverInvite(invite());
+    await flush();
+    await service.allowInvite("!room:workspace");
+    transport.deliver(roomMessage({ eventId: "$shared-q", body: "What did Alice decide?", mentionedUserIds: [SELF] }));
+    await flush();
+    expect(transport.sentAnswers).toHaveLength(1);
+    const content = transport.sentAnswers[0]!.content;
+    expect(Object.keys(content).sort()).toEqual(["body", "m.relates_to", "msgtype"]);
+    expect(content).toEqual({
+      msgtype: "m.text",
+      body: "answer to What did Alice decide?",
+      "m.relates_to": { "m.in_reply_to": { event_id: "$shared-q" } },
+    });
     await service.stop();
   });
 });

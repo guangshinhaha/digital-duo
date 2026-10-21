@@ -661,6 +661,21 @@ describe("Matrix adapter — outbound calls", () => {
     expect(sent).toEqual({ eventId: "$sent-1" });
   });
 
+  it("W-S3-1 (#313): sendAnswer forwards m.relates_to verbatim — a shared-room reply is not dropped on the way to the homeserver", async () => {
+    const transport = createMatrixTransport(settings());
+    await transport.sendAnswer("!room:workspace", {
+      msgtype: "m.text",
+      body: "Approved on 2026-08-14.",
+      "m.relates_to": { "m.in_reply_to": { event_id: "$question-event" } },
+    });
+    expect(client.sentMessages).toEqual([
+      {
+        roomId: "!room:workspace",
+        content: { msgtype: "m.text", body: "Approved on 2026-08-14.", "m.relates_to": { "m.in_reply_to": { event_id: "$question-event" } } },
+      },
+    ]);
+  });
+
   it("markAlive reports online presence to the homeserver", async () => {
     const transport = createMatrixTransport(settings());
     await transport.markAlive();

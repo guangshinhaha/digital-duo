@@ -64,6 +64,65 @@ describe("buildAnswerEvent — the corpus never crosses (#186 AC5, decision reco
     expect(event).toEqual({ msgtype: "m.text", body: "The owner approved the vendor renewal on 2026-08-14." });
   });
 
+  it("W-S3-1 (#313): with no options — or options.inReplyTo omitted — stays the exact two-key shape, byte-identical to a direct-room answer", () => {
+    const outcome: PublicAnswerOutcome = {
+      kind: "answered",
+      draftId: POISON.draftId,
+      logEntryId: POISON.logEntryId,
+      text: "The owner approved the vendor renewal on 2026-08-14.",
+      sources: [],
+      confidence: confidence(),
+      topicId: POISON.topicId,
+      evidenceAgeDays: 42,
+    };
+    // Both call shapes a direct-room caller might use: no second argument at
+    // all, and an options bag with inReplyTo explicitly absent.
+    expect(buildAnswerEvent(outcome)).toEqual({ msgtype: "m.text", body: "The owner approved the vendor renewal on 2026-08-14." });
+    expect(buildAnswerEvent(outcome, {})).toEqual({ msgtype: "m.text", body: "The owner approved the vendor renewal on 2026-08-14." });
+    expect(buildAnswerEvent(outcome, { inReplyTo: undefined })).toEqual({ msgtype: "m.text", body: "The owner approved the vendor renewal on 2026-08-14." });
+    expect(Object.keys(buildAnswerEvent(outcome)).sort()).toEqual(["body", "msgtype"]);
+  });
+
+  it("W-S3-1 (#313): options.inReplyTo adds exactly one key — m.relates_to.m.in_reply_to.event_id — and nothing else, for a shared-room question", () => {
+    const outcome: PublicAnswerOutcome = {
+      kind: "answered",
+      draftId: POISON.draftId,
+      logEntryId: POISON.logEntryId,
+      text: "The owner approved the vendor renewal on 2026-08-14.",
+      sources: [],
+      confidence: confidence(),
+      topicId: POISON.topicId,
+      evidenceAgeDays: 42,
+    };
+    const event = buildAnswerEvent(outcome, { inReplyTo: "$question-event" });
+    expect(event).toEqual({
+      msgtype: "m.text",
+      body: "The owner approved the vendor renewal on 2026-08-14.",
+      "m.relates_to": { "m.in_reply_to": { event_id: "$question-event" } },
+    });
+    // Exactly three keys — never m.replace or m.thread (those are cards.ts's
+    // edit/thread relations, unrelated to this plain reply).
+    expect(Object.keys(event).sort()).toEqual(["body", "m.relates_to", "msgtype"]);
+    expect(event["m.relates_to"]).toEqual({ "m.in_reply_to": { event_id: "$question-event" } });
+  });
+
+  it("W-S3-1 (#313): the reply relation carries no POISON — it is built from the question's own event id, never from the outcome", () => {
+    const outcome: PublicAnswerOutcome = {
+      kind: "passed_on",
+      draftId: POISON.draftId,
+      logEntryId: POISON.logEntryId,
+      message: "I can't answer that one for you directly — I've passed it on to the owner, and they'll follow up.",
+      topicId: POISON.topicId,
+      ownerNotice: POISON.ownerNotice,
+    };
+    const event = buildAnswerEvent(outcome, { inReplyTo: "$question-event" });
+    const serialized = JSON.stringify(event);
+    expect(serialized).toContain("$question-event");
+    for (const forbidden of [POISON.draftId, POISON.logEntryId, POISON.topicId, POISON.ownerNotice]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
   it("serializes none of the owner-facing or corpus-shaped outcome fields — the payload cannot carry what it never copies", () => {
     const outcome: PublicAnswerOutcome = {
       kind: "answered",

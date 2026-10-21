@@ -18,12 +18,25 @@ import type { AnswerEventContent } from "./transport.js";
  *
  * Amended 2026-10-20 (interaction-model PRD v0.4, Phase 1, W-S4-1): the SAME
  * invariant applies to the card builder noted above. See docs/workspace/cards.md §9.
+ *
+ * W-S3-1 (#313): `options.inReplyTo` — the question's own event id — is the
+ * ONE optional widening this story adds: when present, the returned content
+ * additionally carries `"m.relates_to": { "m.in_reply_to": { event_id } }`,
+ * a plain Matrix reply to the question. It rides in through this same
+ * options bag (never copied off the outcome itself — the event id comes
+ * from the question, which the corpus-never-crosses rule above was never
+ * about), so a direct-room answer (no `inReplyTo` passed) stays the
+ * pre-#313 two-key shape byte for byte, and a shared-room answer gets
+ * exactly three keys — never a fourth. See `src/workspace/service.ts`,
+ * which decides whether to pass `inReplyTo` at all from the question's own
+ * `isDirect` fact (questions.ts).
  */
-export function buildAnswerEvent(outcome: PublicAnswerOutcome): AnswerEventContent {
-  return {
-    msgtype: "m.text",
-    body: outcome.kind === "answered" ? outcome.text : outcome.message,
-  };
+export function buildAnswerEvent(outcome: PublicAnswerOutcome, options?: { readonly inReplyTo?: string }): AnswerEventContent {
+  const body = outcome.kind === "answered" ? outcome.text : outcome.message;
+  if (options?.inReplyTo === undefined) {
+    return { msgtype: "m.text", body };
+  }
+  return { msgtype: "m.text", body, "m.relates_to": { "m.in_reply_to": { event_id: options.inReplyTo } } };
 }
 
 /**

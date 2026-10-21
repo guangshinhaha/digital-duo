@@ -63,6 +63,9 @@ export function directQuestionFrom(message: WorkspaceCandidateMessage, selfUserI
     // filter's. An empty list is the pre-#190 shape, normalized here so
     // every consumer downstream can rely on the field.
     attachments: message.attachments ?? [],
+    // W-S3-1 (#313): every question this filter produces is, by definition,
+    // from a direct room — the one fact the answer's reply shape needs.
+    isDirect: true,
   };
 }
 
@@ -175,5 +178,9 @@ export function answerableQuestionFrom(
     // direct ones (see directQuestionFrom) — the door judges them, never
     // the filter, and never the room's consent state.
     attachments: message.attachments ?? [],
+    // W-S3-1 (#313): this branch is reached only once `directQuestionFrom`
+    // above has already returned null for this message — it is, by
+    // construction, a shared (non-direct) room's question.
+    isDirect: false,
   };
 }
