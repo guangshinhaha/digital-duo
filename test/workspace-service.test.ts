@@ -1914,7 +1914,7 @@ class FakeTaskSink implements WorkspaceTaskSink {
   readonly tasks = new Map<string, { state: string; draftId?: string }>();
   readonly cards = new Map<string, { taskId: string; roomId: string; eventId: string; rev: number; state: string }>();
   readonly createTaskCalls: { roomId: string; questionEventId: string; requester: string; draftId?: string }[] = [];
-  readonly createCardCalls: { taskId: string; roomId: string; eventId: string; kind: string; audience: string; state: string; requester: string }[] = [];
+  readonly createCardCalls: { cardId: string; taskId: string; roomId: string; eventId: string; kind: string; audience: string; state: string; requester: string }[] = [];
   readonly recordCardEditCalls: { cardId: string; rev: number; state: string }[] = [];
   readonly updateTaskStateCalls: { taskId: string; event: string | undefined; fields?: { draftId?: string } }[] = [];
 
@@ -1940,9 +1940,8 @@ class FakeTaskSink implements WorkspaceTaskSink {
     }
   }
 
-  createCard(input: { taskId: string; roomId: string; eventId: string; kind: string; audience: string; state: string; requester: string }): { cardId: string } {
-    this.nextId += 1;
-    const cardId = `card-${this.nextId}`;
+  createCard(input: { cardId: string; taskId: string; roomId: string; eventId: string; kind: string; audience: string; state: string; requester: string }): { cardId: string } {
+    const { cardId } = input;
     this.cards.set(cardId, { taskId: input.taskId, roomId: input.roomId, eventId: input.eventId, rev: 1, state: input.state });
     this.createCardCalls.push({ ...input });
     return { cardId };
@@ -2367,6 +2366,143 @@ describe("WorkspaceService — the ack timer and the outcome → card mapping (W
 });
 
 // ---------------------------------------------------------------------------
+// #312/S2 (W-S2-1): the 1:1 posture is unchanged (directQuestionFrom is
+// untouched — the AC says so in words, and the direct-room tests above
+// already pin every branch of it unmodified) plus the "always one outcome"
+// table: across every PublicAnswerOutcome kind, fast or slow (the ack timer
+// having fired or not), a single DM question ends in exactly one
+// asker-visible resolution — never two cards, never a card AND a
+// second unrelated text, never silence outside the documented policies
+// (withdrawn consent, rate bound, backlog age — exercised elsewhere, not
+// here). "One card, possibly edited once" counts as one outcome: the edit
+// updates the SAME card, it is not a second one.
+// ---------------------------------------------------------------------------
+describe("WorkspaceService — #312/S2: a 1:1 ends in exactly one outcome, across every outcome kind and both timings", () => {
+  function distinctCardIds(cards: { content: { "duo.card": { card_id: string } } }[]): Set<string> {
+    return new Set(cards.map((card) => card.content["duo.card"].card_id));
+  }
+
+  it("fast answered: exactly one m.text answer, no card at all", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink, settings(), async () => answered("the fast answer"));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-answered", body: "q" }));
+    await flush();
+    expect(transport.sentAnswers).toHaveLength(1);
+    expect(transport.sentCards).toHaveLength(0);
+    await service.stop();
+  });
+
+  it("slow answered: one ack card (edited once to done) plus exactly one m.text answer — one outcome, not two", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-answered", body: "q" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    resolve(answered("the slow answer"));
+    await flush();
+    expect(transport.sentAnswers).toHaveLength(1);
+    expect(distinctCardIds(transport.sentCards)).toEqual(new Set([transport.sentCards[0]!.content["duo.card"].card_id]));
+    expect(transport.editedCards).toHaveLength(1);
+    await service.stop();
+  });
+
+  it("fast passed_on: exactly one card, carrying the passed-on text as its own m.text fallback — no separate answer send", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink, settings(), async () => passedOn("passed on, fast"));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-passed", body: "q" }));
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.editedCards).toHaveLength(0);
+    // The one asker-visible text is the card's own body — handleQuestion's
+    // sendAnswer call is told not to repeat it (resolveOutcomeCard already
+    // returned false having sent nothing itself; the card alone carries it).
+    expect(transport.sentAnswers.map((sent) => sent.content.body)).toEqual(["passed on, fast"]);
+    await service.stop();
+  });
+
+  it("slow passed_on: one card, edited once — never a second card for the same task", async () => {
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-passed", body: "q" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    resolve(passedOn("passed on, slow"));
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.editedCards).toHaveLength(1);
+    const allCards = [...transport.sentCards, ...transport.editedCards.map((edit) => ({ content: edit.content["m.new_content"] }))];
+    expect(distinctCardIds(allCards).size).toBe(1);
+    await service.stop();
+  });
+
+  it("fast declined_refused: exactly one m.text decline, no card — nothing was ever acknowledged", async () => {
+    const taskSink = new FakeTaskSink();
+    const { transport, service } = taskSinkHarness(taskSink, settings(), async () => declinedRefused("no, sorry"));
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$fast-declined", body: "q" }));
+    await flush();
+    expect(transport.sentAnswers).toHaveLength(1);
+    expect(transport.sentCards).toHaveLength(0);
+    await service.stop();
+  });
+
+  it("slow declined_refused: the ack card is edited to done once — the decline text and the card are the SAME outcome, not two", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const taskSink = new FakeTaskSink();
+    const { impl, resolve } = controllableAnswer();
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), impl);
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-declined", body: "q" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    resolve(declinedRefused("no, sorry"));
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.editedCards).toHaveLength(1);
+    expect(transport.editedCards[0]!.content["m.new_content"]["duo.card"].state).toBe("done");
+    await service.stop();
+  });
+
+  it("a pipeline failure after the ack fired edits that ack card to failed — never a second card and never silence", async () => {
+    const taskSink = new FakeTaskSink();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const releaseAnswer = { reject: (() => {}) as (error: Error) => void };
+    const { transport, service } = taskSinkHarness(taskSink, settings({ ackAfterMs: 2000 }), async () => {
+      return new Promise<PublicAnswerOutcome>((_resolve, reject) => {
+        releaseAnswer.reject = reject;
+      });
+    });
+    service.start();
+    await flush();
+    transport.deliver(dm({ eventId: "$slow-fails", body: "q" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    releaseAnswer.reject(new Error("fake: the pipeline itself threw"));
+    await flush();
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.editedCards).toHaveLength(1);
+    expect(transport.editedCards[0]!.content["m.new_content"]["duo.card"].state).toBe("failed");
+    await service.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // W-S4-6: onTaskEvent/onCardEvent — the ids-and-state-only signals
 // `createServer` forwards into DraftReadyHub.publishTask/publishCard.
 // Verified at this layer (not over a live /ws socket): the service's own
@@ -2389,7 +2525,10 @@ describe("WorkspaceService — onTaskEvent/onCardEvent (W-S4-6)", () => {
     await vi.advanceTimersByTimeAsync(2000);
     await flush();
     expect(taskEvents).toEqual([{ taskId: expect.stringMatching(/^task-/), roomId: "!dm:workspace", state: "acknowledged" }]);
-    expect(cardEvents).toEqual([{ cardId: expect.stringMatching(/^card-/), roomId: "!dm:workspace" }]);
+    // #312/S2 fix: cardId is now generated by the service itself (randomUUID,
+    // the same id placed on the wire's card_id) rather than by the taskSink,
+    // so it is no longer shaped like the FakeTaskSink's own `card-N` ids.
+    expect(cardEvents).toEqual([{ cardId: expect.stringMatching(/^[0-9a-f-]{36}$/), roomId: "!dm:workspace" }]);
     await service.stop();
   });
 

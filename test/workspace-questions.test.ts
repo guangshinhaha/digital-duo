@@ -70,6 +70,28 @@ describe("directQuestionFrom — v1: a direct question is a text message from th
     // convention and stays a person's message.
     expect(directQuestionFrom(candidate({ senderId: "@duo:workspace", joinedMemberIds: [SELF, "@duo:workspace"] }), SELF)).not.toBeNull();
   });
+
+  it("the owner invited into their own duo's direct room doesn't turn it into a group room (guangshinhaha/duo#314, #312/S2 AC)", () => {
+    // Three joined members — the duo, its owner, and the visitor — would
+    // read as a group room by count alone. `directQuestionFrom` sets the
+    // owner aside first (duoOwnerUserIdOf(SELF) === "@alice:workspace"),
+    // so the room is still exactly the duo and the one visitor underneath.
+    const question = directQuestionFrom(
+      candidate({ senderId: "@bob:workspace", joinedMemberIds: [SELF, "@alice:workspace", "@bob:workspace"] }),
+      SELF,
+    );
+    expect(question).not.toBeNull();
+    expect(question?.senderId).toBe("@bob:workspace");
+  });
+
+  it("the owner's own messages in that same room are never questions to their duo — only the visitor's are", () => {
+    expect(
+      directQuestionFrom(
+        candidate({ senderId: "@alice:workspace", joinedMemberIds: [SELF, "@alice:workspace", "@bob:workspace"] }),
+        SELF,
+      ),
+    ).toBeNull();
+  });
 });
 
 describe("answerableQuestionFrom — #192: reachable means a direct room, or a room the owner allowed", () => {

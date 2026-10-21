@@ -112,6 +112,7 @@ describe("GET /cards/:id, GET /cards — the owner's card read surface (W-S4-6)"
     const { app, auth, storePath } = setup();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!r:w", questionEventId: "$1", requester: "@a:w" });
     const card = createCard(storePath, PASSPHRASE, {
+      id: "card-1",
       taskId: task.id,
       roomId: "!r:w",
       eventId: "$card1",
@@ -137,8 +138,8 @@ describe("GET /cards/:id, GET /cards — the owner's card read surface (W-S4-6)"
     const { app, auth, storePath } = setup();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!r1:w", questionEventId: "$1", requester: "@a:w" });
     const other = createTask(storePath, PASSPHRASE, { roomId: "!r2:w", questionEventId: "$2", requester: "@b:w" });
-    createCard(storePath, PASSPHRASE, { taskId: task.id, roomId: "!r1:w", eventId: "$c1", kind: "task", audience: "visitor", state: "acknowledged", payloadJson: "{}", requester: "@a:w" });
-    createCard(storePath, PASSPHRASE, { taskId: other.id, roomId: "!r2:w", eventId: "$c2", kind: "task", audience: "visitor", state: "acknowledged", payloadJson: "{}", requester: "@b:w" });
+    createCard(storePath, PASSPHRASE, { id: "card-1", taskId: task.id, roomId: "!r1:w", eventId: "$c1", kind: "task", audience: "visitor", state: "acknowledged", payloadJson: "{}", requester: "@a:w" });
+    createCard(storePath, PASSPHRASE, { id: "card-2", taskId: other.id, roomId: "!r2:w", eventId: "$c2", kind: "task", audience: "visitor", state: "acknowledged", payloadJson: "{}", requester: "@b:w" });
 
     const response = await app.inject({ method: "GET", url: "/cards?roomId=!r1:w", headers: auth });
     expect(response.statusCode).toBe(200);
@@ -157,7 +158,7 @@ describe("GET /cards/:id, GET /cards — the owner's card read surface (W-S4-6)"
   it("refuses an ask-link token on every card route", async () => {
     const { app, storePath } = setup();
     const task = createTask(storePath, PASSPHRASE, { roomId: "!r:w", questionEventId: "$1", requester: "@a:w" });
-    const card = createCard(storePath, PASSPHRASE, { taskId: task.id, roomId: "!r:w", eventId: "$c1", kind: "task", audience: "visitor", state: "acknowledged", payloadJson: "{}", requester: "@a:w" });
+    const card = createCard(storePath, PASSPHRASE, { id: "card-1", taskId: task.id, roomId: "!r:w", eventId: "$c1", kind: "task", audience: "visitor", state: "acknowledged", payloadJson: "{}", requester: "@a:w" });
     const ask = createAskToken(storePath, PASSPHRASE, "visitor link", new Date(Date.now() + 86_400_000).toISOString());
     const askAuth = { authorization: `Bearer ${ask.token}` };
 

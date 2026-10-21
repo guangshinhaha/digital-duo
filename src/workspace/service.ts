@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { PUBLIC_ANSWER_FAILED_MESSAGE, type PublicAnswerOutcome } from "../permissions/public-answer.js";
 import {
   forgetAlwaysAllowed,
@@ -218,8 +219,23 @@ export interface WorkspaceTaskSink {
    */
   updateTaskState(taskId: string, event: "start_working" | "need_decision" | "resume_working" | "complete" | "fail" | undefined, fields?: { readonly draftId?: string }): void;
 
-  /** Records a brand-new card's row — called right after `transport.sendCard` resolves its event id. */
-  createCard(input: { readonly taskId: string; readonly roomId: string; readonly eventId: string; readonly kind: string; readonly audience: string; readonly state: string; readonly requester: string }): { readonly cardId: string };
+  /**
+   * Records a brand-new card's row — called right after `transport.sendCard`
+   * resolves its event id. `cardId` is the SAME id the caller already put
+   * in the wire card's `card_id` field before sending it (#312/S2 fix):
+   * `card_id` must be stable across edits (docs/workspace/cards.md §3), so
+   * the store records the caller's id rather than minting its own.
+   */
+  createCard(input: {
+    readonly cardId: string;
+    readonly taskId: string;
+    readonly roomId: string;
+    readonly eventId: string;
+    readonly kind: string;
+    readonly audience: string;
+    readonly state: string;
+    readonly requester: string;
+  }): { readonly cardId: string };
 
   /** Records an edit's new rev/state — called right after `transport.editCard` resolves. */
   recordCardEdit(cardId: string, fields: { readonly rev: number; readonly state: string }): void;
@@ -1173,9 +1189,14 @@ export class WorkspaceService {
       const { taskId } = taskSink.createTask({ roomId: question.roomId, questionEventId: question.eventId, requester: question.senderId });
       cardState.taskId = taskId;
       this.emitTaskEvent({ taskId, roomId: question.roomId, state: "acknowledged" });
+      // #312/S2: the id placed on the wire now and the id the store records
+      // below are the SAME value — the store used to mint its own, which
+      // is why a later edit's card_id (read back from the store) disagreed
+      // with what was already sent. Decided once, here, before either use.
+      const cardId = randomUUID();
       const card: DuoCardV1Input = {
         kind: "task",
-        cardId: taskId,
+        cardId,
         taskId,
         state: "acknowledged",
         requester: question.senderId,
@@ -1184,7 +1205,7 @@ export class WorkspaceService {
       };
       const event = buildCardEvent(card);
       const sent = await transport.sendCard(question.roomId, event);
-      const { cardId } = taskSink.createCard({ taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
+      taskSink.createCard({ cardId, taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
       this.emitCardEvent({ cardId, roomId: question.roomId });
     } catch (error) {
       this.consoleError(`sending the ack task card for workspace question ${question.eventId} failed`, error);
@@ -1285,9 +1306,12 @@ export class WorkspaceService {
           });
           cardState.taskId = taskId;
           this.emitTaskEvent({ taskId, roomId: question.roomId, state: "acknowledged" });
+          // #312/S2: see sendAckCard's own comment — the wire's card_id and
+          // the store's recorded id must be the same value, decided once.
+          const cardId = randomUUID();
           const card: DuoCardV1Input = {
             kind: "task",
-            cardId: taskId,
+            cardId,
             taskId,
             state: "acknowledged",
             requester: question.senderId,
@@ -1295,7 +1319,7 @@ export class WorkspaceService {
             lines: [passedOnText],
           };
           const sent = await transport.sendCard(question.roomId, buildCardEvent(card));
-          const { cardId } = taskSink.createCard({ taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
+          taskSink.createCard({ cardId, taskId, roomId: question.roomId, eventId: sent.eventId, kind: "task", audience: "visitor", state: "acknowledged", requester: question.senderId });
           this.emitCardEvent({ cardId, roomId: question.roomId });
         } catch (error) {
           this.consoleError(`sending the passed-on task card for workspace question ${question.eventId} failed (the passed-on text will still be sent)`, error);

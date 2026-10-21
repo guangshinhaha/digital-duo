@@ -37,6 +37,7 @@ export function durableWorkspaceTaskSink(storePath: string, passphrase: string):
 
     createCard(input) {
       const card = createCard(storePath, passphrase, {
+        id: input.cardId,
         taskId: input.taskId,
         roomId: input.roomId,
         eventId: input.eventId,
